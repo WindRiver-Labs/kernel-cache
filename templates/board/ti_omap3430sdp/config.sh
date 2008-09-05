@@ -1,7 +1,0 @@
-TARGET_LINUX_LINKS="uImage"
-LINUX_BOOT_IMAGE="uImage"
-TARGET_BOARD="ti_omap3430sdp"
-TARGET_SUPPORTED_KERNEL="standard small"
-TARGET_SUPPORTED_ROOTFS="glibc_small uclibc_small glibc_std"
-TARGET_PROCFAM="omap34xx"
-TARGET_PLATFORMS="PCD"
