@@ -1,0 +1,208 @@
+From bf11198144070b449fbc0c9cf322978d02078fcd Mon Sep 17 00:00:00 2001
+From: auto commit <unknown@unknown>
+Date: Wed, 1 Oct 2008 21:39:11 -0400
+Subject: [PATCH] add transient timer to block layer failover
+
+The multipath failover did not work on a correctly on a fiber channel
+system.  It took 65 seconds instead of the minimum of 7 seconds.  This
+patch also adds in the ability to change the failover timeout at
+runtime through the procfs.
+
+Signed-off-by: Liming Wang <liming.wang@windriver.com>
+---
+ block/blk-core.c       |   84 ++++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/blkdev.h |    7 ++++
+ include/linux/sysctl.h |    8 ++++
+ 3 files changed, 99 insertions(+), 0 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 2cba5ef..f161ea0 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -30,6 +30,7 @@
+ #include <linux/cpu.h>
+ #include <linux/blktrace_api.h>
+ #include <linux/fault-inject.h>
++#include <linux/sysctl.h>
+ 
+ #include "blk.h"
+ 
+@@ -51,6 +52,39 @@ struct kmem_cache *blk_requestq_cachep;
+ static struct workqueue_struct *kblockd_workqueue;
+ 
+ static DEFINE_PER_CPU(struct list_head, blk_cpu_done);
++/*
++ * For transient error response
++ */
++static unsigned int request_timeout = 7;
++
++static ctl_table req_table[] = {
++ 	{
++		.ctl_name = BLOCK_REQUEST_TIMEOUT,
++		.procname = "req_timeout",
++		.data = &request_timeout,
++		.maxlen = sizeof(request_timeout),
++		.mode = 0644,
++		.proc_handler = &proc_dointvec },
++	{}
++};
++
++static ctl_table blk_root_table[] = {
++	{
++		.ctl_name = CTL_BLK,
++		.procname = "block",
++		.mode = 0555,
++		.child = req_table },
++	{}
++};
++
++int __init blk_init_sysctl(void);
++
++static struct ctl_table_header *blk_table_header;
++
++module_param(request_timeout, int, S_IRUGO | S_IWUSR);
++MODULE_PARM_DESC(request_timeout, "Set timeout value for block request");
++
++static void request_timer_expired(unsigned long data);
+ 
+ static void drive_stat_acct(struct request *rq, int new_io)
+ {
+@@ -1041,6 +1075,13 @@ void __blk_put_request(struct request_queue *q, struct request *req)
+ 	elv_completed_request(q, req);
+ 
+ 	/*
++	 * Delete timer for transient error
++	 */
++	if ((req->cmd_flags & REQ_SET_TIMER) && !(req->cmd_flags & REQ_TE_RESPONSE)) {
++		del_timer( &req->te_timeout );
++	}
++
++	/*
+ 	 * Request may not have originated from ll_rw_blk. if not,
+ 	 * it didn't come out of our reserved rq pools
+ 	 */
+@@ -1199,6 +1240,18 @@ get_rq:
+ 	 */
+ 	init_request_from_bio(req, bio);
+ 
++	/*
++ 	 * Set timer for transient error
++	 */
++	if ( blk_noretry_request(req) && unlikely(request_timeout)) {
++		req->cmd_flags |= REQ_SET_TIMER;
++		init_timer( &req->te_timeout );
++		req->te_timeout.data = (unsigned long) req;
++		req->te_timeout.expires = jiffies + request_timeout*HZ;
++		req->te_timeout.function =  request_timer_expired;
++		add_timer( &req->te_timeout );
++	}
++
+ 	spin_lock_irq(q->queue_lock);
+ 	if (elv_queue_empty(q))
+ 		blk_plug_device(q);
+@@ -1536,6 +1589,11 @@ static int __end_that_request_first(struct request *req, int error,
+ 	int total_bytes, bio_nbytes, next_idx = 0;
+ 	struct bio *bio;
+ 
++	if (( req->cmd_flags & REQ_SET_TIMER ) && ( req->cmd_flags & REQ_TE_RESPONSE )) {
++		printk("transient timer: already set TE_RESPONSE\n");
++		return 0;
++	}
++
+ 	blk_add_trace_rq(req->q, req, BLK_TA_COMPLETE);
+ 
+ 	/*
+@@ -2065,6 +2123,32 @@ int __init blk_dev_init(void)
+ 	open_softirq(BLOCK_SOFTIRQ, blk_done_softirq);
+ 	register_hotcpu_notifier(&blk_cpu_notifier);
+ 
++	blk_init_sysctl();
++
++	return 0;
++}
++
++/*
++ * At initialization register the sysfs entries
++ */
++int __init blk_init_sysctl(void)
++{
++	blk_table_header = register_sysctl_table( blk_root_table );
++	if ( !blk_table_header )
++		return -ENOMEM;
++
+ 	return 0;
+ }
+ 
++static void request_timer_expired( unsigned long data )
++{
++	struct request *req = (struct request*) data;
++
++	printk("transient timer: request_timer_expired()\n");
++	while (__end_that_request_first(req, 0, req->nr_sectors << 9));
++	req->ref_count++;
++	req->cmd_flags |= REQ_TE_RESPONSE;
++	end_that_request_last( req, 0 );
++
++	return;
++}
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 53ea933..6a06f68 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -105,6 +105,8 @@ enum rq_flag_bits {
+ 	__REQ_RW_SYNC,		/* request is sync (O_DIRECT) */
+ 	__REQ_ALLOCED,		/* request came from our alloc pool */
+ 	__REQ_RW_META,		/* metadata io request */
++	__REQ_TE_RESPONSE,	/* return transient error response */
++	__REQ_SET_TIMER,	/* set timer for transient error response */
+ 	__REQ_COPY_USER,	/* contains copies of user pages */
+ 	__REQ_INTEGRITY,	/* integrity metadata has been remapped */
+ 	__REQ_NR_BITS,		/* stops here */
+@@ -128,6 +130,8 @@ enum rq_flag_bits {
+ #define REQ_RW_SYNC	(1 << __REQ_RW_SYNC)
+ #define REQ_ALLOCED	(1 << __REQ_ALLOCED)
+ #define REQ_RW_META	(1 << __REQ_RW_META)
++#define REQ_TE_RESPONSE (1 << __REQ_TE_RESPONSE)
++#define REQ_SET_TIMER   (1 << __REQ_SET_TIMER)
+ #define REQ_COPY_USER	(1 << __REQ_COPY_USER)
+ #define REQ_INTEGRITY	(1 << __REQ_INTEGRITY)
+ 
+@@ -229,6 +233,9 @@ struct request {
+ 	rq_end_io_fn *end_io;
+ 	void *end_io_data;
+ 
++	/* Used to time out for transient error response */
++	struct timer_list te_timeout;
++
+ 	/* for bidi */
+ 	struct request *next_rq;
+ };
+diff --git a/include/linux/sysctl.h b/include/linux/sysctl.h
+index d0437f3..1633655 100644
+--- a/include/linux/sysctl.h
++++ b/include/linux/sysctl.h
+@@ -69,6 +69,7 @@ enum
+ 	CTL_BUS=8,		/* Busses */
+ 	CTL_ABI=9,		/* Binary emulation */
+ 	CTL_CPU=10,		/* CPU stuff (speed scaling, etc) */
++	CTL_BLK=11,		/* Block transient error */
+ 	CTL_ARLAN=254,		/* arlan wireless driver */
+ 	CTL_S390DBF=5677,	/* s390 debug */
+ 	CTL_SUNRPC=7249,	/* sunrpc debug */
+@@ -939,6 +940,13 @@ enum
+ 	ABI_FAKE_UTSNAME=6,	/* fake target utsname information */
+ };
+ 
++/*
++ * /proc/sys/block for parametrizable failover timeout
++ */
++enum {
++	BLOCK_REQUEST_TIMEOUT = 1,
++};
++
+ #ifdef __KERNEL__
+ #include <linux/list.h>
+ 
+-- 
+1.5.5.1
+
