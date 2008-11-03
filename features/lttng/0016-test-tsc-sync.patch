@@ -1,0 +1,212 @@
+From d2b1326e3a309ea08516caba7edcbdea26dbc7e8 Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@polymtl.ca>
+Date: Thu, 30 Oct 2008 23:26:42 -0400
+Subject: [PATCH] test-tsc-sync
+
+LTTng - TSC synchronicity test
+
+Test TSC synchronization across CPUs. Architecture independant and can therefore
+be used on various architectures. Aims at testing the TSC synchronization on a
+running system (not only at early boot), with minimal impact on interrupt
+latency.
+
+I've written this code before x86 tsc_sync.c existed and given it worked well
+for my needs, I never switched to tsc_sync.c. Although it has the same goal, it
+does it a bit differently :
+
+tsc_sync looks at the cycle counters on two CPUs to see if one compared to the
+other are going backward when read in loop. The LTTng code synchronizes both
+cores with a counter used as a memory barrier and then reads the two TSCs at a
+delta equal to the cache line exchange. Instruction and data caches are primed.
+This test is repeated in loops to insure we deal with MCE, NMIs which could skew
+the results.
+
+The problem I see with tsc_sync.c is that is one of the two CPUs is delayed by
+an interrupt handler (for way too long) while the other CPU is doing its
+check_tsc_warp() execution, and if the CPU with the lowest TSC values runs
+first, this code will fail to detect unsynchronized CPUs.
+
+LTTng TSC sync test code does not have this problem.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@polymtl.ca>
+CC: Ingo Molnar <mingo@redhat.com>
+CC: Jan Kiszka <jan.kiszka@siemens.com>
+CC: Linus Torvalds <torvalds@linux-foundation.org>
+CC: Andrew Morton <akpm@linux-foundation.org>
+CC: Peter Zijlstra <a.p.zijlstra@chello.nl>
+CC: Thomas Gleixner <tglx@linutronix.de>
+CC: Steven Rostedt <rostedt@goodmis.org>
+---
+ init/Kconfig           |    7 +++
+ kernel/time/Makefile   |    1 +
+ kernel/time/tsc-sync.c |  131 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 139 insertions(+), 0 deletions(-)
+ create mode 100644 kernel/time/tsc-sync.c
+
+diff --git a/init/Kconfig b/init/Kconfig
+index 998e390..cab0f33 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -358,6 +358,13 @@ config HAVE_TRACE_CLOCK_32_TO_64
+ 	default y if (!HAVE_TRACE_CLOCK)
+ 	default n if HAVE_TRACE_CLOCK
+ 
++#
++# Architectures which need to dynamically detect if their TSC is unstable should
++# select this.
++#
++config HAVE_UNSTABLE_TSC
++	def_bool n
++
+ config GROUP_SCHED
+ 	bool "Group CPU scheduler"
+ 	depends on EXPERIMENTAL
+diff --git a/kernel/time/Makefile b/kernel/time/Makefile
+index 905b0b5..f1f3e7a 100644
+--- a/kernel/time/Makefile
++++ b/kernel/time/Makefile
+@@ -6,3 +6,4 @@ obj-$(CONFIG_GENERIC_CLOCKEVENTS_BROADCAST)	+= tick-broadcast.o
+ obj-$(CONFIG_TICK_ONESHOT)			+= tick-oneshot.o
+ obj-$(CONFIG_TICK_ONESHOT)			+= tick-sched.o
+ obj-$(CONFIG_TIMER_STATS)			+= timer_stats.o
++obj-$(CONFIG_HAVE_UNSTABLE_TSC)			+= tsc-sync.o
+diff --git a/kernel/time/tsc-sync.c b/kernel/time/tsc-sync.c
+new file mode 100644
+index 0000000..f0fb00b
+--- /dev/null
++++ b/kernel/time/tsc-sync.c
+@@ -0,0 +1,131 @@
++/*
++ * kernel/time/tsc-sync.c
++ *
++ * Test TSC synchronization
++ *
++ * Copyright 2007, 2008
++ *    Mathieu Desnoyers <mathieu.desnoyers@polymtl.ca>
++ */
++#include <linux/module.h>
++#include <linux/timer.h>
++#include <linux/timex.h>
++#include <linux/jiffies.h>
++#include <linux/cpu.h>
++#include <linux/kthread.h>
++#include <linux/mutex.h>
++
++#define MAX_CYCLES_DELTA 1000ULL
++
++static DEFINE_PER_CPU(cycles_t, tsc_count);
++static DEFINE_MUTEX(tscsync_mutex);
++
++static DEFINE_PER_CPU(int, wait_sync);
++static DEFINE_PER_CPU(int, wait_end_sync);
++
++int tsc_is_sync = 1;
++EXPORT_SYMBOL(tsc_is_sync);
++
++/*
++ * Mark it noinline so we make sure it is not unrolled.
++ * Wait until value is reached.
++ */
++static noinline void tsc_barrier(long wait_cpu, int value)
++{
++	sync_core();
++	per_cpu(wait_sync, smp_processor_id())--;
++	do {
++		smp_mb();
++	} while (unlikely(per_cpu(wait_sync, wait_cpu) > value));
++	rdtsc_barrier();
++	__get_cpu_var(tsc_count) = get_cycles();
++	rdtsc_barrier();
++}
++
++/*
++ * Worker thread called on each CPU.
++ * First wait with interrupts enabled, then wait with interrupt disabled,
++ * for precision. We are already bound to one CPU.
++ */
++static void test_sync(void *arg)
++{
++	long wait_cpu = (long)arg;
++	unsigned long flags;
++
++	local_irq_save(flags);
++	/* Make sure the instructions are in I-CACHE */
++	tsc_barrier(wait_cpu, 1);
++	tsc_barrier(wait_cpu, 0);
++	per_cpu(wait_end_sync, smp_processor_id())--;
++	do {
++		smp_mb();
++	} while (unlikely(per_cpu(wait_end_sync, wait_cpu) > 1));
++	per_cpu(wait_end_sync, smp_processor_id())--;
++	local_irq_restore(flags);
++}
++
++/*
++ * Do loops (making sure no unexpected event changes the timing), keep the
++ * best one. The result of each loop is the highest tsc delta between the
++ * master CPU and the slaves.
++ */
++static int test_tsc_synchronization(void)
++{
++	long cpu, master;
++	cycles_t max_diff = 0, diff, best_loop, worse_loop = 0;
++	int i;
++
++	mutex_lock(&tscsync_mutex);
++	preempt_disable();
++	master = smp_processor_id();
++	for_each_online_cpu(cpu) {
++		if (master == cpu)
++			continue;
++		best_loop = ULLONG_MAX;
++		for (i = 0; i < 10; i++) {
++			/*
++			 * Each CPU (master and slave) must decrement the
++			 * wait_sync value twice (one for priming in cache).
++			 */
++			per_cpu(wait_sync, master) = 2;
++			per_cpu(wait_sync, cpu) = 2;
++			per_cpu(wait_end_sync, master) = 2;
++			per_cpu(wait_end_sync, cpu) = 2;
++			smp_call_function_single(cpu, test_sync,
++						(void *)master, 0);
++			test_sync((void *)cpu);
++			/*
++			 * Wait until slave is done so that we don't overwrite
++			 * wait_end_sync prematurely.
++			 */
++			while (unlikely(per_cpu(wait_end_sync, cpu) > 0))
++				cpu_relax();
++
++			diff = abs(per_cpu(tsc_count, cpu)
++				- per_cpu(tsc_count, master));
++			best_loop = min(best_loop, diff);
++			worse_loop = max(worse_loop, diff);
++		}
++		max_diff = max(best_loop, max_diff);
++	}
++	preempt_enable();
++	if (max_diff >= MAX_CYCLES_DELTA) {
++		printk(KERN_WARNING
++			"tsc_sync: your timestamp counter is not reliable.\n"
++			"Slower fallback will be used for tracing. See "
++			"the LTTng documentation to find an appropriate "
++			"workaround for your architecture.\n");
++		printk("TSC unsynchronized : %llu cycles delta is over "
++			"threshold %llu\n", max_diff, MAX_CYCLES_DELTA);
++	}
++	mutex_unlock(&tscsync_mutex);
++	return max_diff < MAX_CYCLES_DELTA;
++}
++EXPORT_SYMBOL_GPL(test_tsc_synchronization);
++
++static int __init tsc_test_sync_init(void)
++{
++	tsc_is_sync = test_tsc_synchronization();
++	return 0;
++}
++
++__initcall(tsc_test_sync_init);
+-- 
+1.5.5.1
+

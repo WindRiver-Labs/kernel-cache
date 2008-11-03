@@ -1,0 +1,582 @@
+From 7c29a64753954b74754749b7f4c68b9f8be54e4c Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@polymtl.ca>
+Date: Thu, 30 Oct 2008 23:26:57 -0400
+Subject: [PATCH] lttng-transport-formal-verif-fix-2
+
+LTTng transport formal verif fix 2
+
+(This is take 2 of this fix, the previous one being buggy. I took time to think
+carefully about the offsets involved and fixed the issues the previous version
+had)
+
+Running a ltt relay buffer model into the spin verification tool shown that in
+rare cases, where subbuffers are so small that enough reserve (uncomitted) space
+would be equal to the subbuffer size, the reader size could think that the
+subbuffer is fully committed when in fact the data is currently being written to
+it.
+
+Fix this by checking the commit count and write offset difference to figure out
+if all the reserved space for this subbuffer has been committed. Given that the
+write offset increments for the whole subbuffer each time a given subbuffer's
+commit count increment of the amount of bytes found in a subbuffer, we have to
+multiply the commit count by the number of subbuffers to match the value of the
+write offset. Also, the write offset has to be brought back to the window
+corresponding to the commit count being checked. This is done by substracting
+the subbuffer offset and by then aligning on the buffer size (- 1 is used to
+align an already aligned offset on the current value, not the next).
+
+Note that the retrieve count solution, used in the formal model, has not been
+implemented in C code because of atomicity constraints due to the fact that
+writers can push readers in flight recorder mode. Having an extra counter to
+update makes synchronization messy.
+
+This fix also moves the memory barriers found in the ltt_ioctl code to make sure
+the commit count is read before the write offset, given that the write barrier
+orders :
+
+write offset and buffer write
+smp_wmb()
+commit count write
+
+the read-side should look like :
+
+commit count read
+smp_rmb()
+write offset and buffer read
+
+Previously, the read-side did do :
+commit count read and write offset read
+smp_rmb()
+buffer read
+
+Which could lead to unordered write and commit count reads.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@polymtl.ca>
+CC: Paul McKenney <Paul.McKenney@us.ibm.com>
+CC: Robert Wisniewski <bob@watson.ibm.com>
+---
+ include/linux/ltt-tracer.h |   29 ++++--
+ ltt/ltt-relay.c            |  211 +++++++++++++++++++++++++++-----------------
+ 2 files changed, 148 insertions(+), 92 deletions(-)
+
+diff --git a/include/linux/ltt-tracer.h b/include/linux/ltt-tracer.h
+index ac4e0cf..8dc6e78 100644
+--- a/include/linux/ltt-tracer.h
++++ b/include/linux/ltt-tracer.h
+@@ -143,6 +143,7 @@ struct ltt_channel_struct {
+ 	void (*buffer_end) (struct rchan_buf *buf,
+ 			u64 tsc, unsigned int offset, unsigned int subbuf_idx);
+ 	struct kref kref;
++	unsigned int n_subbufs_order;
+ 	char channel_name[PATH_MAX];
+ } ____cacheline_aligned;
+ 
+@@ -157,12 +158,12 @@ struct ltt_trace_ops {
+ 	int (*reserve_slot) (struct ltt_trace_struct *trace,
+ 				struct ltt_channel_struct *channel,
+ 				void **transport_data, size_t data_size,
+-				size_t *slot_size, u64 *tsc,
++				size_t *slot_size, long *buf_offset, u64 *tsc,
+ 				unsigned int *rflags,
+ 				int largest_align,
+ 				int cpu);
+ 	void (*commit_slot) (struct ltt_channel_struct *channel,
+-				void **transport_data, size_t reserved,
++				void **transport_data, long buf_offset,
+ 				size_t slot_size);
+ 	void (*wakeup_channel) (struct ltt_channel_struct *ltt_channel);
+ 	int (*user_blocking) (struct ltt_trace_struct *trace,
+@@ -463,7 +464,7 @@ static inline unsigned char ltt_get_header_size(
+  */
+ static inline size_t ltt_write_event_header(struct ltt_trace_struct *trace,
+ 		struct ltt_channel_struct *channel,
+-		struct rchan_buf *buf, size_t buf_offset,
++		struct rchan_buf *buf, long buf_offset,
+ 		u16 eID, size_t event_size,
+ 		u64 tsc, unsigned int rflags)
+ {
+@@ -537,6 +538,12 @@ static inline size_t ltt_write_event_header(struct ltt_trace_struct *trace,
+ 
+ /* Buffer offset macros */
+ 
++/*
++ * BUFFER_TRUNC zeroes the subbuffer offset and the subbuffer number parts of
++ * the offset, which leaves only the buffer number.
++ */
++#define BUFFER_TRUNC(offset, chan) \
++	((offset) & (~((chan)->alloc_size-1)))
+ #define BUFFER_OFFSET(offset, chan) ((offset) & ((chan)->alloc_size - 1))
+ #define SUBBUF_OFFSET(offset, chan) ((offset) & ((chan)->subbuf_size - 1))
+ #define SUBBUF_ALIGN(offset, chan) \
+@@ -559,26 +566,28 @@ static inline size_t ltt_write_event_header(struct ltt_trace_struct *trace,
+  * @transport_data : specific transport data.
+  * @data_size : size of the variable length data to log.
+  * @slot_size : pointer to total size of the slot (out)
++ * @buf_offset : pointer to reserve offset (out)
+  * @tsc : pointer to the tsc at the slot reservation (out)
+  * @rflags : reservation flags (header specificity)
+  * @cpu : cpu id
+  *
+- * Return : -ENOSPC if not enough space, else returns the offset
+- * 					to the beginning of the reserved slot.
++ * Return : -ENOSPC if not enough space, else 0.
+  */
+-static inline ssize_t ltt_reserve_slot(
++static inline int ltt_reserve_slot(
+ 		struct ltt_trace_struct *trace,
+ 		struct ltt_channel_struct *channel,
+ 		void **transport_data,
+ 		size_t data_size,
+ 		size_t *slot_size,
++		long *buf_offset,
+ 		u64 *tsc,
+ 		unsigned int *rflags,
+ 		int largest_align,
+ 		int cpu)
+ {
+ 	return trace->ops->reserve_slot(trace, channel, transport_data,
+-			data_size, slot_size, tsc, rflags, largest_align, cpu);
++			data_size, slot_size, buf_offset, tsc, rflags,
++			largest_align, cpu);
+ }
+ 
+ 
+@@ -592,18 +601,18 @@ static inline ssize_t ltt_reserve_slot(
+  *
+  * @channel : the chanel to reserve space into.
+  * @transport_data : specific transport data.
+- * @reserved : address of the beginning of the reserved slot.
++ * @buf_offset : offset of beginning of reserved slot
+  * @slot_size : size of the reserved slot.
+  */
+ static inline void ltt_commit_slot(
+ 		struct ltt_channel_struct *channel,
+ 		void **transport_data,
+-		size_t reserved,
++		long buf_offset,
+ 		size_t slot_size)
+ {
+ 	struct ltt_trace_struct *trace = channel->trace;
+ 
+-	trace->ops->commit_slot(channel, transport_data, reserved, slot_size);
++	trace->ops->commit_slot(channel, transport_data, buf_offset, slot_size);
+ }
+ 
+ /*
+diff --git a/ltt/ltt-relay.c b/ltt/ltt-relay.c
+index b6de267..c6e1d52 100644
+--- a/ltt/ltt-relay.c
++++ b/ltt/ltt-relay.c
+@@ -340,26 +340,40 @@ static int ltt_ioctl(struct inode *inode, struct file *filp,
+ 	switch (cmd) {
+ 	case RELAY_GET_SUBBUF:
+ 	{
+-		long consumed_old, consumed_idx;
++		long consumed_old, consumed_idx, commit_count, write_offset;
+ 		atomic_long_inc(&ltt_buf->active_readers);
+ 		consumed_old = atomic_long_read(&ltt_buf->consumed);
+ 		consumed_idx = SUBBUF_INDEX(consumed_old, buf->chan);
+-		if (SUBBUF_OFFSET(local_read(
+-					&ltt_buf->commit_count[consumed_idx]),
+-				  buf->chan)
++		commit_count = local_read(&ltt_buf->commit_count[consumed_idx]);
++		/*
++		 * Make sure we read the commit count before reading the buffer
++		 * data and the write offset. Correct consumed offset ordering
++		 * wrt commit count is insured by the use of cmpxchg to update
++		 * the consumed offset.
++		 */
++		smp_rmb();
++		write_offset = local_read(&ltt_buf->offset);
++		/*
++		 * Check that the subbuffer we are trying to consume has been
++		 * already fully committed.
++		 */
++		if (commit_count - buf->chan->subbuf_size
++		    - (BUFFER_TRUNC(consumed_old, buf->chan)
++		       >> ltt_channel->n_subbufs_order)
+ 		    != 0) {
+ 			atomic_long_dec(&ltt_buf->active_readers);
+ 			return -EAGAIN;
+ 		}
+-		if ((SUBBUF_TRUNC(local_read(&ltt_buf->offset), buf->chan)
++		/*
++		 * Check that we are not about to read the same subbuffer in
++		 * which the writer head is.
++		 */
++		if ((SUBBUF_TRUNC(write_offset, buf->chan)
+ 		   - SUBBUF_TRUNC(consumed_old, buf->chan))
+ 		   == 0) {
+ 			atomic_long_dec(&ltt_buf->active_readers);
+ 			return -EAGAIN;
+ 		}
+-		/* must make sure we read the counter before reading the data
+-		 * in the buffer. */
+-		smp_rmb();
+ 		return put_user((u32)consumed_old, argp);
+ 		break;
+ 	}
+@@ -566,23 +580,29 @@ static void ltt_relay_print_subbuffer_errors(
+ 	struct rchan *rchan = ltt_chan->trans_channel_data;
+ 	struct ltt_channel_buf_struct *ltt_buf =
+ 		percpu_ptr(ltt_chan->buf, cpu);
+-	long cons_idx;
++	long cons_idx, commit_count, write_offset;
+ 
++	cons_idx = SUBBUF_INDEX(cons_off, rchan);
++	commit_count = local_read(&ltt_buf->commit_count[cons_idx]);
++	/*
++	 * No need to order commit_count and write_offset reads because we
++	 * execute after trace is stopped when there are no readers left.
++	 */
++	write_offset = local_read(&ltt_buf->offset);
+ 	printk(KERN_WARNING
+ 		"LTT : unread channel %s offset is %ld "
+ 		"and cons_off : %ld (cpu %u)\n",
+-		ltt_chan->channel_name,
+-		local_read(&ltt_buf->offset), cons_off, cpu);
+-	/* Check each sub-buffer for non zero commit count */
+-	cons_idx = SUBBUF_INDEX(cons_off, rchan);
+-	if (SUBBUF_OFFSET(local_read(&ltt_buf->commit_count[cons_idx]), rchan))
++		ltt_chan->channel_name, write_offset, cons_off, cpu);
++	/* Check each sub-buffer for non filled commit count */
++	if (commit_count - rchan->subbuf_size
++	    - (BUFFER_TRUNC(cons_off, rchan) >> ltt_chan->n_subbufs_order)
++	    != 0)
+ 		printk(KERN_ALERT
+-			"LTT : %s : subbuffer %lu has non zero "
+-			"commit count.\n",
+-			ltt_chan->channel_name, cons_idx);
++			"LTT : %s : subbuffer %lu has non filled "
++			"commit count %lu.\n",
++			ltt_chan->channel_name, cons_idx, commit_count);
+ 	printk(KERN_ALERT "LTT : %s : commit count : %lu, subbuf size %zd\n",
+-			ltt_chan->channel_name,
+-			local_read(&ltt_buf->commit_count[cons_idx]),
++			ltt_chan->channel_name, commit_count,
+ 			rchan->subbuf_size);
+ }
+ 
+@@ -740,6 +760,7 @@ static int ltt_relay_create_channel(const char *trace_name,
+ 	(*ltt_chan)->buffer_begin = ltt_buffer_begin_callback;
+ 	(*ltt_chan)->buffer_end = ltt_buffer_end_callback;
+ 	(*ltt_chan)->overwrite = overwrite;
++	(*ltt_chan)->n_subbufs_order = get_count_order(n_subbufs);
+ 	(*ltt_chan)->buf =
+ 		percpu_alloc_mask(sizeof(struct ltt_channel_buf_struct),
+ 			GFP_KERNEL, cpu_possible_map);
+@@ -921,17 +942,18 @@ static inline int ltt_relay_try_reserve(
+ 		}
+ 	}
+ 	if (offsets->begin_switch) {
++		long subbuf_index;
++
+ 		if (offsets->end_switch_old)
+ 			offsets->begin = SUBBUF_ALIGN(offsets->begin,
+ 						      buf->chan);
+ 		offsets->begin = offsets->begin + ltt_subbuffer_header_size();
+ 		/* Test new buffer integrity */
++		subbuf_index = SUBBUF_INDEX(offsets->begin, buf->chan);
+ 		offsets->reserve_commit_diff =
+-			SUBBUF_OFFSET(buf->chan->subbuf_size
+-				      - local_read(&ltt_buf->commit_count[
+-						SUBBUF_INDEX(offsets->begin,
+-							     buf->chan)]),
+-				      buf->chan);
++			(BUFFER_TRUNC(offsets->begin, buf->chan)
++			 >> ltt_channel->n_subbufs_order)
++			- local_read(&ltt_buf->commit_count[subbuf_index]);
+ 		if (offsets->reserve_commit_diff == 0) {
+ 			/* Next buffer not corrupted. */
+ 			if (!ltt_channel->overwrite &&
+@@ -1011,6 +1033,8 @@ static inline int ltt_relay_try_switch(
+ 		struct ltt_reserve_switch_offsets *offsets,
+ 		u64 *tsc)
+ {
++	long subbuf_index;
++
+ 	offsets->begin = local_read(&ltt_buf->offset);
+ 	offsets->old = offsets->begin;
+ 	offsets->begin_switch = 0;
+@@ -1031,12 +1055,11 @@ static inline int ltt_relay_try_switch(
+ 	 * Always begin_switch in FORCE_ACTIVE mode.
+ 	 * Test new buffer integrity
+ 	 */
++	subbuf_index = SUBBUF_INDEX(offsets->begin, buf->chan);
+ 	offsets->reserve_commit_diff =
+-		SUBBUF_OFFSET(buf->chan->subbuf_size
+-			      - local_read(&ltt_buf->commit_count[
+-						SUBBUF_INDEX(offsets->begin,
+-							     buf->chan)]),
+-			      buf->chan);
++		(BUFFER_TRUNC(offsets->begin, buf->chan)
++		 >> ltt_channel->n_subbufs_order)
++		- local_read(&ltt_buf->commit_count[subbuf_index]);
+ 	if (offsets->reserve_commit_diff == 0) {
+ 		/* Next buffer not corrupted. */
+ 		if (mode == FORCE_ACTIVE
+@@ -1060,7 +1083,9 @@ static inline int ltt_relay_try_switch(
+ }
+ 
+ static inline void ltt_reserve_push_reader(
+-		struct ltt_channel_buf_struct *ltt_buf, struct rchan *rchan,
++		struct ltt_channel_struct *ltt_channel,
++		struct ltt_channel_buf_struct *ltt_buf,
++		struct rchan *rchan,
+ 		struct rchan_buf *buf,
+ 		struct ltt_reserve_switch_offsets *offsets)
+ {
+@@ -1104,14 +1129,28 @@ static inline void ltt_reserve_push_reader(
+ 		 */
+ 		if (offsets->reserve_commit_diff) {
+ 			/*
+-			 * We have to alter the sub-buffer commit count : a
+-			 * sub-buffer is corrupted. We do not deliver it.
++			 * We have to alter the sub-buffer commit count.
++			 * We do not deliver the previous subbuffer, given it
++			 * was either corrupted or not consumed (overwrite
++			 * mode).
+ 			 */
+ 			local_add(offsets->reserve_commit_diff,
+ 				  &ltt_buf->commit_count[
+ 					SUBBUF_INDEX(offsets->begin,
+ 						     buf->chan)]);
+-			local_inc(&ltt_buf->corrupted_subbuffers);
++			if (!ltt_channel->overwrite
++			    || offsets->reserve_commit_diff
++			       != rchan->subbuf_size) {
++				/*
++				 * The reserve commit diff was not subbuf_size :
++				 * it means the subbuffer was partly written to
++				 * and is therefore corrupted. If it is multiple
++				 * of subbuffer size and we are in flight
++				 * recorder mode, we are skipping over a whole
++				 * subbuffer.
++				 */
++				local_inc(&ltt_buf->corrupted_subbuffers);
++			}
+ 		}
+ 	}
+ }
+@@ -1143,21 +1182,21 @@ static inline void ltt_reserve_switch_old_subbuf(
+ 		struct rchan_buf *buf,
+ 		struct ltt_reserve_switch_offsets *offsets, u64 *tsc)
+ {
+-	ltt_channel->buffer_end(buf, *tsc, offsets->old,
+-		SUBBUF_INDEX(offsets->old - 1, buf->chan));
++	long oldidx = SUBBUF_INDEX(offsets->old - 1, rchan);
++
++	ltt_channel->buffer_end(buf, *tsc, offsets->old, oldidx);
+ 	/* Must write buffer end before incrementing commit count */
+ 	smp_wmb();
+ 	offsets->commit_count =
+-		local_add_return(buf->chan->subbuf_size
+-				 - (SUBBUF_OFFSET(offsets->old - 1, buf->chan)
++		local_add_return(rchan->subbuf_size
++				 - (SUBBUF_OFFSET(offsets->old - 1, rchan)
+ 				 + 1),
+-				 &ltt_buf->commit_count[
+-					SUBBUF_INDEX(offsets->old - 1,
+-						     buf->chan)]);
+-	if (SUBBUF_OFFSET(offsets->commit_count, buf->chan) == 0)
+-		ltt_deliver(buf,
+-			    SUBBUF_INDEX(offsets->old - 1, buf->chan),
+-			    NULL);
++				 &ltt_buf->commit_count[oldidx]);
++	if ((BUFFER_TRUNC(offsets->old - 1, rchan)
++			>> ltt_channel->n_subbufs_order)
++			+ rchan->subbuf_size
++			- offsets->commit_count == 0)
++		ltt_deliver(buf, oldidx, NULL);
+ }
+ 
+ /*
+@@ -1173,16 +1212,19 @@ static inline void ltt_reserve_switch_new_subbuf(
+ 		struct rchan_buf *buf,
+ 		struct ltt_reserve_switch_offsets *offsets, u64 *tsc)
+ {
+-	ltt_channel->buffer_begin(buf, *tsc,
+-				  SUBBUF_INDEX(offsets->begin, buf->chan));
++	long beginidx = SUBBUF_INDEX(offsets->begin, rchan);
++
++	ltt_channel->buffer_begin(buf, *tsc, beginidx);
+ 	/* Must write buffer end before incrementing commit count */
+ 	smp_wmb();
+ 	offsets->commit_count = local_add_return(ltt_subbuffer_header_size(),
+-		&ltt_buf->commit_count[SUBBUF_INDEX(offsets->begin,
+-						    buf->chan)]);
++			&ltt_buf->commit_count[beginidx]);
+ 	/* Check if the written buffer has to be delivered */
+-	if (SUBBUF_OFFSET(offsets->commit_count, buf->chan) == 0)
+-		ltt_deliver(buf, SUBBUF_INDEX(offsets->begin, buf->chan), NULL);
++	if ((BUFFER_TRUNC(offsets->begin, rchan)
++			>> ltt_channel->n_subbufs_order)
++			+ rchan->subbuf_size
++			- offsets->commit_count == 0)
++		ltt_deliver(buf, beginidx, NULL);
+ }
+ 
+ 
+@@ -1210,21 +1252,21 @@ static inline void ltt_reserve_end_switch_current(
+ 		struct rchan_buf *buf,
+ 		struct ltt_reserve_switch_offsets *offsets, u64 *tsc)
+ {
+-	ltt_channel->buffer_end(buf, *tsc, offsets->end,
+-		SUBBUF_INDEX((offsets->end - 1), buf->chan));
++	long endidx = SUBBUF_INDEX(offsets->end - 1, rchan);
++
++	ltt_channel->buffer_end(buf, *tsc, offsets->end, endidx);
+ 	/* Must write buffer begin before incrementing commit count */
+ 	smp_wmb();
+ 	offsets->commit_count =
+-		local_add_return(buf->chan->subbuf_size
+-				 - (SUBBUF_OFFSET(offsets->end - 1,
+-						  buf->chan)
++		local_add_return(rchan->subbuf_size
++				 - (SUBBUF_OFFSET(offsets->end - 1, rchan)
+ 				 + 1),
+-				 &ltt_buf->commit_count[
+-					SUBBUF_INDEX(offsets->end - 1,
+-						     buf->chan)]);
+-	if (SUBBUF_OFFSET(offsets->commit_count, buf->chan) == 0)
+-		ltt_deliver(buf, SUBBUF_INDEX((offsets->end - 1),
+-			buf->chan), NULL);
++				 &ltt_buf->commit_count[endidx]);
++	if ((BUFFER_TRUNC(offsets->end - 1, rchan)
++			>> ltt_channel->n_subbufs_order)
++			+ rchan->subbuf_size
++			- offsets->commit_count == 0)
++		ltt_deliver(buf, endidx, NULL);
+ }
+ 
+ /**
+@@ -1234,17 +1276,17 @@ static inline void ltt_reserve_end_switch_current(
+  * @transport_data : data structure specific to ltt relay
+  * @data_size : size of the variable length data to log.
+  * @slot_size : pointer to total size of the slot (out)
++ * @buf_offset : pointer to reserved buffer offset (out)
+  * @tsc : pointer to the tsc at the slot reservation (out)
+  * @cpu : cpuid
+  *
+- * Return : -ENOSPC if not enough space, else returns the offset
+- * 		to the beginning of the reserved slot, aligned for the
+- * 		event header.
++ * Return : -ENOSPC if not enough space, else returns 0.
++ *
+  * It will take care of sub-buffer switching.
+  */
+-static notrace ssize_t ltt_relay_reserve_slot(struct ltt_trace_struct *trace,
++static notrace int ltt_relay_reserve_slot(struct ltt_trace_struct *trace,
+ 		struct ltt_channel_struct *ltt_channel, void **transport_data,
+-		size_t data_size, size_t *slot_size, u64 *tsc,
++		size_t data_size, size_t *slot_size, long *buf_offset, u64 *tsc,
+ 		unsigned int *rflags, int largest_align, int cpu)
+ {
+ 	struct rchan *rchan = ltt_channel->trans_channel_data;
+@@ -1283,7 +1325,7 @@ static notrace ssize_t ltt_relay_reserve_slot(struct ltt_trace_struct *trace,
+ 	/*
+ 	 * Push the reader if necessary
+ 	 */
+-	ltt_reserve_push_reader(ltt_buf, rchan, buf, &offsets);
++	ltt_reserve_push_reader(ltt_channel, ltt_buf, rchan, buf, &offsets);
+ 
+ 	/*
+ 	 * Switch old subbuffer if needed.
+@@ -1304,8 +1346,8 @@ static notrace ssize_t ltt_relay_reserve_slot(struct ltt_trace_struct *trace,
+ 			buf, &offsets, tsc);
+ 
+ 	*slot_size = offsets.size;
+-
+-	return BUFFER_OFFSET(offsets.begin, buf->chan) + offsets.before_hdr_pad;
++	*buf_offset = offsets.begin + offsets.before_hdr_pad;
++	return 0;
+ }
+ 
+ /*
+@@ -1353,7 +1395,8 @@ static notrace void ltt_force_switch(struct rchan_buf *buf,
+ 	 * Push the reader if necessary
+ 	 */
+ 	if (mode == FORCE_ACTIVE)
+-		ltt_reserve_push_reader(ltt_buf, rchan, buf, &offsets);
++		ltt_reserve_push_reader(ltt_channel, ltt_buf, rchan,
++					buf, &offsets);
+ 
+ 	/*
+ 	 * Switch old subbuffer if needed.
+@@ -1381,7 +1424,7 @@ static notrace void ltt_force_switch(struct rchan_buf *buf,
+  */
+ #ifdef CONFIG_LTT_VMCORE
+ static inline void ltt_write_commit_counter(struct rchan_buf *buf,
+-		size_t reserved, size_t slot_size)
++		long buf_offset, size_t slot_size)
+ {
+ 	struct ltt_channel_struct *ltt_channel =
+ 		(struct ltt_channel_struct *)buf->chan->private_data;
+@@ -1391,8 +1434,8 @@ static inline void ltt_write_commit_counter(struct rchan_buf *buf,
+ 	long offset, subbuf_idx, commit_count;
+ 	uint32_t lost_old, lost_new;
+ 
+-	offset = reserved + slot_size;
+-	subbuf_idx = (offset - 1) / buf->chan->subbuf_size;
++	subbuf_idx = SUBBUF_INDEX(buf_offset - 1, buf->chan);
++	offset = buf_offset + slot_size;
+ 	header = (struct ltt_subbuffer_header *)
+ 			ltt_relay_offset_address(buf,
+ 				subbuf_idx * buf->chan->subbuf_size);
+@@ -1414,7 +1457,7 @@ static inline void ltt_write_commit_counter(struct rchan_buf *buf,
+ }
+ #else
+ static inline void ltt_write_commit_counter(struct rchan_buf *buf,
+-		size_t reserved, size_t slot_size)
++		long buf_offset, size_t slot_size)
+ {
+ }
+ #endif
+@@ -1427,32 +1470,36 @@ static inline void ltt_write_commit_counter(struct rchan_buf *buf,
+  *
+  * @ltt_channel : channel structure
+  * @transport_data: transport-specific data
+- * @reserved : address following the event header.
++ * @buf_offset : offset following the event header.
+  * @slot_size : size of the reserved slot.
+  */
+ static notrace void ltt_relay_commit_slot(
+ 		struct ltt_channel_struct *ltt_channel,
+-		void **transport_data, size_t reserved, size_t slot_size)
++		void **transport_data, long buf_offset, size_t slot_size)
+ {
+ 	struct rchan_buf *buf = *transport_data;
+ 	struct ltt_channel_buf_struct *ltt_buf =
+ 			percpu_ptr(ltt_channel->buf, buf->cpu);
+-	unsigned int offset_end = reserved;
++	struct rchan *rchan = buf->chan;
++	long offset_end = buf_offset;
++	long endidx = SUBBUF_INDEX(offset_end - 1, rchan);
+ 	long commit_count;
+ 
+ 	/* Must write slot data before incrementing commit count */
+ 	smp_wmb();
+ 	commit_count = local_add_return(slot_size,
+-		&ltt_buf->commit_count[SUBBUF_INDEX(offset_end - 1,
+-						    buf->chan)]);
++		&ltt_buf->commit_count[endidx]);
+ 	/* Check if all commits have been done */
+-	if (SUBBUF_OFFSET(commit_count, buf->chan) == 0)
+-		ltt_deliver(buf, SUBBUF_INDEX(offset_end - 1, buf->chan), NULL);
++	if ((BUFFER_TRUNC(offset_end - 1, rchan)
++			>> ltt_channel->n_subbufs_order)
++			+ rchan->subbuf_size
++			- commit_count == 0)
++		ltt_deliver(buf, endidx, NULL);
+ 	/*
+ 	 * Update lost_size for each commit. It's needed only for extracting
+ 	 * ltt buffers from vmcore, after crash.
+ 	 */
+-	ltt_write_commit_counter(buf, reserved, slot_size);
++	ltt_write_commit_counter(buf, buf_offset, slot_size);
+ }
+ 
+ /*
+-- 
+1.5.5.1
+
