@@ -1,0 +1,567 @@
+From 90d334855d9b443ae825a063732d7298133a5c11 Mon Sep 17 00:00:00 2001
+From: Chris Torek <chris.torek@windriver.com>
+Date: Sat, 13 Dec 2008 16:23:23 -0700
+Subject: [PATCH] sparc64: add oprofile support
+
+For oprofile, we have to be able to detect system calls and
+do stack traces back into user code.  This needs one exported
+symbol in the system call assembly code.  We must also provide
+code to produce the stack traces on timer ticks.
+
+Signed-off-by: Chris Krumme <Chris.Krumme@windriver.com>
+Signed-off-by: Chris Torek <chris.torek@windriver.com>
+---
+ arch/sparc64/kernel/syscalls.S    |    1 +
+ arch/sparc64/oprofile/Makefile    |    2 +-
+ arch/sparc64/oprofile/backtrace.c |  485 +++++++++++++++++++++++++++++++++++++
+ arch/sparc64/oprofile/init.c      |   10 +-
+ 4 files changed, 495 insertions(+), 3 deletions(-)
+ create mode 100644 arch/sparc64/oprofile/backtrace.c
+
+diff --git a/arch/sparc64/kernel/syscalls.S b/arch/sparc64/kernel/syscalls.S
+index ba7eafb..a4e6903 100644
+--- a/arch/sparc64/kernel/syscalls.S
++++ b/arch/sparc64/kernel/syscalls.S
+@@ -232,6 +232,7 @@ linux_sparc_syscall:
+ 	nop
+ 
+ 3:	stx	%o0, [%sp + PTREGS_OFF + PT_V9_I0]
++	.globl	ret_sys_call
+ ret_sys_call:
+ 	ldx	[%sp + PTREGS_OFF + PT_V9_TSTATE], %g3
+ 	ldx	[%sp + PTREGS_OFF + PT_V9_TNPC], %l1 ! pc = npc
+diff --git a/arch/sparc64/oprofile/Makefile b/arch/sparc64/oprofile/Makefile
+index e9feca1..76aab2e 100644
+--- a/arch/sparc64/oprofile/Makefile
++++ b/arch/sparc64/oprofile/Makefile
+@@ -6,4 +6,4 @@ DRIVER_OBJS = $(addprefix ../../../drivers/oprofile/, \
+ 		oprofilefs.o oprofile_stats.o \
+ 		timer_int.o )
+ 
+-oprofile-y				:= $(DRIVER_OBJS) init.o
++oprofile-y				:= $(DRIVER_OBJS) init.o backtrace.o
+diff --git a/arch/sparc64/oprofile/backtrace.c b/arch/sparc64/oprofile/backtrace.c
+new file mode 100644
+index 0000000..4c0b5d6
+--- /dev/null
++++ b/arch/sparc64/oprofile/backtrace.c
+@@ -0,0 +1,485 @@
++/**
++ * @file backtrace.c
++ *
++ * @remark Copyright 2008 OProfile authors - Wind River
++ * @remark Read the file COPYING
++ *
++ * @author Chris Krumme <Chris.Krumme@windriver.com>
++ * @author Chris Torek <Chris.Torek@windriver.com>
++ */
++
++#include <linux/kernel.h>
++#include <linux/oprofile.h>
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/sched.h>
++#include <asm/stacktrace.h>
++#include <asm/uaccess_64.h>
++
++#include "../kernel/kstack.h"
++
++#include <stdbool.h>
++
++#define	NO_FRAME   0
++
++/* #define DEBUG_OPROFILE 1 */
++
++
++#ifndef CONFIG_STACKTRACE
++#error The define  CONFIG_STACKTRACE  is required for this to build.
++#endif
++
++/**
++ *  How things lay out on the sparc 64.
++ *
++ *  The Sparc moves registers around, output registers become inputs, and
++ *  skew the frame pointer to allow better offsets in the bits available.
++ *
++ *  The good news is that despite being a RISC processor there is a frame
++ *  pointer and a well defined return address.  This saving to stack process
++ *  is used almost 100% of the time.
++ *
++ *  One of the assumptions made here is that the user really only want to hear
++ *  about user code stacks, user code stacks that made a system call, and other
++ *  general kernel code based stacks.
++ *  This means that we only cross from system code to user code when across the
++ *  function linux_sparc_syscall.  See isSysCall for more details.
++ *
++ *  Old-style 32-bit stack frames have no frame-pointer skew applied
++ *  (hence STACK_BIAS gets added for 64-bit frames, but not for 32-bit).
++ *
++ *  One word of caution: A leaf function does not have to use the stack.  It
++ *  can operate entirely in registers.  Fortunately for us, since this code
++ *  is operating in the kernel, we never "see" the leaf directly, only
++ *  indirectly once we leave the kernel stack.
++ *
++ *  Kernel and user addresses are not architecturally distinguishable --
++ *  you must know in advance whether you are dealing with a kernel-space
++ *  address or a user-space address.  To read the contents of a user
++ *  address, you must use copy_from_user() or get_user().  Since we are
++ *  operating in interrupt context, we must call set_fs(USER_DS) first,
++ *  and save and restore the original "fs" (really %asi) value.
++ *
++ *  NOTE: When debugging, the code in buffer_sync does not really handle state
++ *  very well.  The memory map code should really be in cpu_buffer, or better
++ *  yet resolved before adding to the buffer at all, which is tick time, and
++ *  not in sync time.  What this means is that slow calls like printk result in
++ *  a weird nesting of things.  The result is the memory map can easily be NULL
++ *  in buffer_sync and the back trace no longer works from kernel into user.  A
++ *  clue of this error is the number in /dev/oprofile/stats/bt_lost_no_mapping
++ *  will be much greater that 1.
++ */
++
++
++/**
++ * ReturnAddress_t is used to represent a return address.
++ */
++typedef unsigned long ReturnAddress_t;
++
++
++/*
++ * The frame structure is used to represent one frame.  Because the
++ * real frame may be in user-land, and may have a bias applied, the fp
++ * value here cannot be used directly.  You must use the accessor
++ * functions to climb to previous frames.
++ */
++struct frame {
++	unsigned long fp;
++	ReturnAddress_t return_address;
++};
++
++
++/******************************************************************************
++ *  This section has the tests for different attributes used below in the
++ *  stack walk.
++ */
++
++
++/*
++ * The StackState is used to track the current state of the stack as we shift
++ * through the stack.
++ *
++ * Note: in_kernel_stack mainly tells us whether frame.fp is a kernel frame
++ * pointer or a user frame pointer.
++ */
++struct StackState {
++	int  depth;              /**<  Current stack depth */
++	bool in_kernel_stack;    /**<  Flag: user vs kernel stack */
++	struct frame frame;      /**<  Current frame */
++	bool did_set_fs;         /**<  Flag: did a set_fs(USER_DS) */
++	mm_segment_t saved_fs;   /**<  original %asi before set_fs() */
++#ifdef DEBUG_OPROFILE
++	bool debug_state;        /**<  Used to pass around the debug state    */
++#endif
++};
++
++
++/*
++ * The StackStateInit function constructs the stackState object.
++ */
++static inline void StackStateInit(struct StackState *stackState)
++{
++	memset(stackState, 0, sizeof(*stackState));
++}
++
++/*
++ * isValidFramePointer will return true if the stack pointer seems valid.
++ * Note that this does not mean it really is valid, if it is a user address.
++ */
++static inline bool isValidFramePointer(unsigned long fp)
++{
++	if ((fp == NO_FRAME) || (fp == -1UL))
++		return false;
++
++	return true;
++}
++
++
++/**
++ *   isValidReturnAddress will return true if the return address seems valid.
++ */
++static inline bool isValidReturnAddress(ReturnAddress_t address)
++{
++	if ((address == 0)
++			|| (address == (ReturnAddress_t) -1)
++			|| (address & 0x3))
++		return false;
++
++	return true;
++}
++
++/* The isSysCall function uses these to find address in the back trace.
++ * No attempt has been made to get correct signatures.
++ * Note: The use of internal variables like this means oprofile cannot be a
++ * module.
++ */
++extern void linux_sparc_syscall(void);
++extern void ret_sys_call(void);
++
++/** The isSysCall function is called frequently to determine if the return
++ *  address on the stack is that of the syscall interface.  The user most cares
++ *  about kernel stack traces that cross at the syscall line.
++ *
++ *  As this was written the layout was a global symbol at linux_sparc_syscall,
++ *  followed by code to get things set up. The pc is left on the stack pointing
++ *  at a 'call %l7' instruction.  The next global symbol is ret_sys_call.
++ *  Assumption: No other entry point is used.  We don't need to check the
++ *      call instruction.
++ */
++static inline bool isSysCall(ReturnAddress_t pc)
++{
++	void (*ptr)(void) = (void *)pc;
++	if ((ptr > linux_sparc_syscall) && (ptr < ret_sys_call))
++		return true;
++	return false;
++}
++
++
++/*
++ * The isValidFrame function will check each part of the frame.
++ */
++static bool isValidFrame(struct StackState *state)
++{
++
++	if (!isValidFramePointer(state->frame.fp))
++		return false;
++
++	if (!isValidReturnAddress(state->frame.return_address))
++		return false;
++
++	return true;
++}
++
++/*
++ * Initialize interrupt-context to do user-space access operations.
++ * This is a no-op if we have already initialized (and not finalized).
++ */
++static inline void init_user_access(struct StackState *state)
++{
++	if (!state->did_set_fs) {
++		state->saved_fs = get_fs();
++		set_fs(USER_DS);
++		state->did_set_fs = true;
++	}
++}
++
++/*
++ * Clean up: finished with user-space access operations.
++ */
++static inline void fini_user_access(struct StackState *state)
++{
++	if (state->did_set_fs) {
++		set_fs(state->saved_fs);
++		state->did_set_fs = false;
++	}
++}
++
++/*
++ * The initial and next frame functions all do the same thing when
++ * copying a user stack frame, so we factor it out into get_user_frame().
++ */
++static inline void get_user_frame(struct StackState *state, unsigned long fp)
++{
++	void __user *addr;
++	unsigned long ufp;
++	unsigned int fppc[2];
++	int ret;
++
++	init_user_access(state);
++	if (test_thread_flag(TIF_32BIT)) {
++		ufp = fp + offsetof(struct sparc_stackf32, fp);
++		addr = (void __user *)ufp;
++		ret = copy_from_user(fppc, addr, sizeof(fppc));
++		/*
++		 * Even if the copy failed, it's OK to do this,
++		 * and it saves testing again later.
++		 */
++		state->frame.fp = fppc[0];
++		state->frame.return_address = fppc[1];
++	} else {
++		ufp = fp + STACK_BIAS + offsetof(struct sparc_stackf, fp);
++		addr = (void __user *)ufp;
++		ret = copy_from_user(&state->frame, addr, sizeof(struct frame));
++	}
++	if (unlikely(ret)) {
++#ifdef DEBUG_OPROFILE
++		printk(KERN_ERR "oprofile: fp Copy from User failed: %p - %d\n",
++			addr, ret);
++#endif
++		state->frame.fp = NO_FRAME;
++	}
++}
++
++/*
++ * The get_first_frame() function uses the provided registers (and state)
++ * to find the first frame to trace, bootstrapping the state for future
++ * frames.
++ *
++ * Note that, despite its name, regs->u_regs[UREG_FP] can be a
++ * kernel frame pointer.  Also, while it would be logical to set
++ * the in_kernel_stack state here, we need it earlier, so we just
++ * reference it here to decide how to interpret regs->u_regs[UREG_FP].
++ *
++ * We always copy the pointed-to frame into a local copy so we don't
++ * have to worry about offsets and user/kernel memory in the upper logic.
++ * This also gives us a chance to massage a 32-bit user frame into a
++ * pseudo 64-bit frame.
++ */
++static inline void get_first_frame(struct StackState *state,
++		struct pt_regs * const regs) {
++	unsigned long fp;
++
++	if (state->in_kernel_stack) {
++		fp = regs->u_regs[UREG_FP] + STACK_BIAS;
++		memcpy(&state->frame, &((struct sparc_stackf *)fp)->fp,
++			sizeof(struct frame));
++	} else {
++		fp = regs->u_regs[UREG_FP];
++		get_user_frame(state, fp);
++	}
++}
++
++
++/*
++ * The get_next_frame() function uses the current frame and state
++ * to find the next frame on the stack.
++ *
++ * Note tricky case: when we are on a kernel stack, kstack_is_trap_frame()
++ * tells us whether the frame we are looking at now is another frame
++ * with another set of "regs", much like the initial frame.  In this
++ * case, we *may* get a transition from kernel to user space.
++ *
++ * Aside from the tricky case, this is really essentially the same as
++ * finding the initial frame.  The tricky case must be separated out,
++ * though.
++ */
++static inline void get_next_frame(struct StackState *state)
++{
++	unsigned long fp = state->frame.fp;
++
++	if (state->in_kernel_stack) {
++		struct thread_info *tp = current_thread_info();
++		struct sparc_stackf *sf;
++		struct pt_regs *regs;
++		unsigned long pc;
++
++		/*
++		 * This is largely copied from ../kernel/stacktrace.c.
++		 * The kstack_valid() and kstack_is_trap_frame() macros
++		 * perform the necessary magic.  Note that "regs" is not
++		 * actually valid unless kstack_is_trap_frame() is true.
++		 * The kstack_is_trap_frame() code handles this properly,
++		 * but we must use "regs" only if it says "yes".
++		 */
++		fp += STACK_BIAS;
++		if (!kstack_valid(tp, fp)) {
++			state->frame.fp = NO_FRAME;
++			return;
++		}
++		sf = (struct sparc_stackf *) fp;
++		regs = (struct pt_regs *) (sf + 1);
++		if (kstack_is_trap_frame(tp, regs)) {
++			pc = regs->tpc;
++			/*
++			 * If returning to user mode, this must
++			 * have been a trap/interrupt that we are
++			 * not supposed to backtrace through (not
++			 * a syscall).
++			 */
++			if (user_mode(regs))
++				fp = NO_FRAME;
++			else
++				fp = regs->u_regs[UREG_I6];
++		} else {
++			/* still in kernel, and normal frame */
++			pc = sf->callers_pc;
++			fp = (unsigned long)sf->fp;
++		}
++		state->frame.fp = fp;
++		state->frame.return_address = pc;
++	} else {
++		get_user_frame(state, fp);
++	}
++
++	state->depth++;
++}
++
++/*
++ * The switch_to_user_stack() function is called when we detect a
++ * system call, so as to switch smoothly back to user code.  This
++ * is basically the same as the kstack_is_trap_frame() test
++ * in get_next_frame(), except that we must be returning
++ * to user state, and we want to keep tracing into user stacks.
++ */
++static inline void switch_to_user_stack(struct StackState *state)
++{
++	unsigned long fp = state->frame.fp;
++	struct thread_info *tp = current_thread_info();
++	struct sparc_stackf *sf;
++	struct pt_regs *regs;
++
++	fp += STACK_BIAS;
++	if (!kstack_valid(tp, fp)) {
++		state->frame.fp = NO_FRAME;
++		return;
++	}
++	sf = (struct sparc_stackf *) fp;
++	regs = (struct pt_regs *) (sf + 1);
++	if (!kstack_is_trap_frame(tp, regs)) {
++		if (printk_ratelimit())
++			printk(KERN_ERR
++				"switch_to_user_stack: not trap_frame?\n");
++		state->frame.fp = NO_FRAME;
++		return;
++	}
++	if (!user_mode(regs)) {
++		if (printk_ratelimit())
++			printk(KERN_ERR
++				"switch_to_user_stack: not user mode?\n");
++		state->frame.fp = NO_FRAME;
++		return;
++	}
++	state->frame.fp = regs->u_regs[UREG_I6];
++	state->frame.return_address = regs->tpc;
++	state->in_kernel_stack = false;
++}
++
++
++/******************************************************************************
++ *  This section is the stack walk.
++ */
++
++/**
++ *  The sparc64_backtrace function controls the actual stack walk.
++ *
++ *  The "regs" tell us whether we are initially tracing user or kernel.
++ */
++void sparc64_backtrace(struct pt_regs * const regs, unsigned int depth)
++{
++	struct StackState state;
++	bool must_push;
++
++	StackStateInit(&state);
++
++	state.in_kernel_stack = !user_mode(regs);
++
++#ifdef DEBUG_OPROFILE
++	state.debug_state = printk_ratelimit();
++
++	if (state.debug_state)
++		printk(KERN_ERR "oprofile: bfs %lx TOP [%s] depth=%d\n",
++				regs->u_regs[UREG_FP],
++				state.in_kernel_stack ? "kernel" : "user",
++				depth);
++#endif
++
++	/*
++	 * Copy kernel stack frame pointers and return addresses
++	 * into memory so that we can access them.  Note: this
++	 * does not copy user registers out of the CPU, if there
++	 * are any lingering.
++	 */
++	stack_trace_flush();
++	get_first_frame(&state, regs);
++
++	if (state.in_kernel_stack) {
++		bool found_syscall = false;
++
++		while (state.depth < depth && isValidFrame(&state)) {
++			oprofile_add_trace(state.frame.return_address);
++			found_syscall = isSysCall(state.frame.return_address);
++			if (found_syscall) {
++				if (oprofile_get_trace_thru_syscall()) {
++					oprofile_syscall_trace_boundary();
++					switch_to_user_stack(&state);
++				} else {
++					/* terminate trace */
++					state.frame.fp = NO_FRAME;
++				}
++				break;
++			}
++			get_next_frame(&state);
++		}
++		/*
++		 * Regardless of what got us out of the loop above, if
++		 * we did not find a system call, terminate further
++		 * tracing.
++		 */
++		if (!found_syscall)
++			state.frame.fp = NO_FRAME;
++	}
++
++	/*
++	 * At this point, at least one of several things is true:
++	 *  - there are no frames left to trace
++	 *  - we went as deep as we were asked
++	 *  - we have reached a user frame, either by starting at
++	 *    one, or by reaching a system call that we were told
++	 *    to trace through.
++	 *
++	 * If we have reached a user frame and should keep going, we
++	 * must push any lingering user windows to the user stack (once).
++	 * Note that synchronize_user_stack() accesses user space.
++	 */
++	must_push = true;
++	while (state.depth < depth && isValidFrame(&state)) {
++		oprofile_add_trace(state.frame.return_address);
++		if (must_push) {
++			init_user_access(&state);
++			synchronize_user_stack();
++			must_push = false;
++		}
++		get_next_frame(&state);
++	}
++
++	fini_user_access(&state);
++
++#ifdef DEBUG_OPROFILE
++	if (state.debug_state)
++		printk(KERN_ERR "oprofile: bfu Bot %lx [%s/%s]: %d\n",
++				state.frame.fp,
++				state.in_kernel_stack ? "kernel" : "user",
++				isValidFrame(&state) ? "valid" : "inval",
++				state.depth);
++#endif
++}
+diff --git a/arch/sparc64/oprofile/init.c b/arch/sparc64/oprofile/init.c
+index 9ab815b..bf0aadc 100644
+--- a/arch/sparc64/oprofile/init.c
++++ b/arch/sparc64/oprofile/init.c
+@@ -1,7 +1,7 @@
+ /**
+  * @file init.c
+  *
+- * @remark Copyright 2002 OProfile authors
++ * @remark Copyright 2008 OProfile authors
+  * @remark Read the file COPYING
+  *
+  * @author John Levon <levon@movementarian.org>
+@@ -11,10 +11,16 @@
+ #include <linux/oprofile.h>
+ #include <linux/errno.h>
+ #include <linux/init.h>
+- 
++
++extern void  sparc64_backtrace(struct pt_regs * const regs, unsigned int depth);
++
+ int __init oprofile_arch_init(struct oprofile_operations * ops)
+ {
++	ops->backtrace = sparc64_backtrace;
++
+ 	return -ENODEV;
++
++	/*  return 0;  Only used if we have our own timer. */
+ }
+ 
+ 
+-- 
+1.6.0.2.GIT
+
