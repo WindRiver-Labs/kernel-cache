@@ -1,0 +1,906 @@
+From 0d41dbe892af1f6a1a26a1f4492bab74b6f0fde0 Mon Sep 17 00:00:00 2001
+From: Shinya Kuribayashi <shinya.kuribayashi@necel.com>
+Date: Tue, 28 Apr 2009 14:34:05 +0900
+Subject: [PATCH] i2c-emma: EMMA3PF I2C driver
+
+EMMA3PF has two I2C interfaces of 64 bytes FIFO (tx and rx).  They are
+operable in standard-mode offering data rates up to 100 kbps, and fast-
+mode offering data rates up to 400 kbps.
+
+Signed-off-by: Shinya Kuribayashi <shinya.kuribayashi@necel.com>
+---
+ drivers/i2c/busses/i2c-emma.c |  601 +++++++++++++++++++++++++++++++++++++++++
+ drivers/i2c/busses/i2c-emma.h |  273 +++++++++++++++++++
+ 2 files changed, 874 insertions(+), 0 deletions(-)
+ create mode 100644 drivers/i2c/busses/i2c-emma.c
+ create mode 100644 drivers/i2c/busses/i2c-emma.h
+
+diff --git a/drivers/i2c/busses/i2c-emma.c b/drivers/i2c/busses/i2c-emma.c
+new file mode 100644
+index 0000000..1cc3329
+--- /dev/null
++++ b/drivers/i2c/busses/i2c-emma.c
+@@ -0,0 +1,601 @@
++/*
++ * i2c-emma.c
++ *
++ * I2C adapter for the EMMA I2C bus access.
++ *
++ * Author: NEC Electronics Corporation
++ *
++ * Copyright (C) NEC Electronics Corporation 2007-2009
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ */
++
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/i2c.h>
++#include <linux/i2c-id.h>
++#include <linux/init.h>
++#include <linux/time.h>
++#include <linux/sched.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/interrupt.h>
++#include <linux/platform_device.h>
++#include "i2c-emma.h"
++
++#include <linux/io.h>
++
++#define MAX_NUM_DEVS	1
++#define TOGGLE_NUM	9
++
++#define NOACK		0x1
++#define T_ABRT		0x2
++#define I2C_ABRT_LOST	0x4
++#define I2C_ERROR	0x8
++
++/* Following are the default values for the module parameters */
++/* I2C#0 default Fast Mode = 400 KHz,Standard Mode = 100 KHz */
++int clock0 = 1;
++/* I2C#1 default Fast Mode = 400 KHz,Standard Mode = 100 KHz */
++int clock1 = 1;
++static u32 clock[2] = {STANDARD_MODE, FAST_MODE};
++
++struct i2c_msg_desc {
++	__u16   num;
++	__u16   pos;
++};
++
++struct emma_i2c {
++	struct i2c_msg		*msgs;
++	int			msg_num;
++	struct i2c_msg_desc	tx_desc;
++	struct i2c_msg_desc	rx_desc;
++	unsigned short		rx_remainder;
++	int			completed;
++
++	wait_queue_head_t	wait;
++
++	struct i2c_adapter	adap;
++	u32			ptop_base;
++	u32			pbrd_base;
++	u32			clock;
++	u32			state;
++	int			id;
++	unsigned int		irq;
++};
++
++static void i2c_emma_setreg(struct emma_i2c *i2c, u32 ctl, u32 val)
++{
++	u32 addr;
++
++	addr = i2c->ptop_base + ctl;
++	writel(val, (void *)addr);
++}
++
++static u32 i2c_emma_getreg(struct emma_i2c *i2c, u32 ctl)
++{
++	u32 addr;
++
++	addr = i2c->ptop_base + ctl;
++	return readl((void *)addr);
++}
++
++static void i2c_emma_enable(struct emma_i2c *i2c)
++{
++	i2c_emma_setreg(i2c, IC_ENABLE, ENABLE);
++}
++
++static int i2c_emma_disable(struct emma_i2c *i2c)
++{
++	int ret = 0;
++
++	if (i2c_emma_getreg(i2c, IC_STATUS) & ACTIVITY_STATUS)
++		/*
++		 * I2C disabled while Activity Status.
++		 */
++		BUG_ON((i2c->state & I2C_ABRT_LOST) == 0);
++
++	i2c_emma_setreg(i2c, IC_ENABLE, 0);
++
++	if (i2c_emma_getreg(i2c, IC_ENABLE_STATUS) & IC_EN) {
++		i2c->state |= I2C_ERROR;
++		ret = 1;
++	}
++
++	return ret;
++}
++
++static void i2c_emma_recover(struct emma_i2c *i2c)
++{
++	int i;
++	int delay;
++	u32 speed;
++	u32 fail_safe;
++	u32 reg[2];
++
++	BUG_ON(i2c->id >= MAX_NUM_DEVS);
++
++	speed = i2c_emma_getreg(i2c, IC_CON) & IC_SPEED;
++	switch (speed) {
++	case STANDARD_MODE:
++		delay = 5;
++		break;
++	case FAST_MODE:
++		delay = 3;
++		break;
++	default:
++		delay = 1;
++	}
++
++	reg[0] = readl((void *)(i2c->pbrd_base + I2C_FAIL_SAFE));
++	reg[1] = readl((void *)(i2c->pbrd_base + I2C_SDA_DELAY));
++
++	/* toggle mode set */
++	fail_safe = 1 << (i2c->id * 8);
++	writel(fail_safe, (void *)(i2c->pbrd_base + I2C_FAIL_SAFE));
++
++	/* SCL toggle */
++	for (i = 0; i < TOGGLE_NUM; i++) {
++		writel(reg[1] & ~fail_safe,
++		       (void *)(i2c->pbrd_base + I2C_SDA_DELAY));
++		udelay(delay);
++		writel(reg[1] | fail_safe,
++		       (void *)(i2c->pbrd_base + I2C_SDA_DELAY));
++		udelay(delay);
++	}
++
++	/* SDA toggle */
++	writel(reg[1] & ~(fail_safe << 1),
++	       (void *)(i2c->pbrd_base + I2C_SDA_DELAY));
++	writel(reg[1] | (fail_safe << 1),
++	       (void *)(i2c->pbrd_base + I2C_SDA_DELAY));
++	writel(reg[1] & ~(fail_safe << 1),
++	       (void *)(i2c->pbrd_base + I2C_SDA_DELAY));
++
++	if (i2c_emma_disable(i2c))
++		printk(KERN_ERR "I2C disable error\n");
++
++	/* regular mode set */
++	writel(reg[0], (void *)(i2c->pbrd_base + I2C_FAIL_SAFE));
++	writel(reg[1], (void *)(i2c->pbrd_base + I2C_SDA_DELAY));
++
++	i2c_emma_enable(i2c);
++}
++
++static void i2c_emma_set_slaveaddr(struct emma_i2c *i2c, struct i2c_msg *msg)
++{
++	u32 addr;
++
++	if (msg->flags & I2C_M_TEN) {
++		addr = 0xf0 | ((msg->addr >> 7) & 0x03);
++		printk(KERN_ERR
++		       "10 bit addresses are not supported in this driver.\n");
++	} else
++		addr = msg->addr & 0x7f;
++
++	i2c_emma_setreg(i2c, IC_TAR, addr);
++}
++
++static void i2c_emma_set_clock(struct emma_i2c *i2c, u32 val)
++{
++	u32 icr;
++
++	icr = i2c_emma_getreg(i2c, IC_CON) & ~IC_SPEED;
++	i2c_emma_setreg(i2c, IC_CON, icr | val);
++}
++
++static u32 i2c_emma_getclearints(struct emma_i2c *i2c)
++{
++	u32 intr_stat;
++
++	intr_stat = i2c_emma_getreg(i2c, IC_INTR_STAT);
++
++	if (intr_stat & INTR_RX_UNDER)
++		i2c_emma_getreg(i2c, IC_CLR_RX_UNDER);
++	if (intr_stat & INTR_RX_OVER)
++		i2c_emma_getreg(i2c, IC_CLR_RX_OVER);
++	if (intr_stat & INTR_TX_OVER)
++		i2c_emma_getreg(i2c, IC_CLR_TX_OVER);
++	if (intr_stat & INTR_RD_REQ)
++		i2c_emma_getreg(i2c, IC_CLR_RD_REQ);
++	if (intr_stat & INTR_TX_ABRT)
++		i2c_emma_getreg(i2c, IC_CLR_TX_ABRT);
++	if (intr_stat & INTR_RX_DONE)
++		i2c_emma_getreg(i2c, IC_CLR_RX_DONE);
++	if (intr_stat & INTR_ACTIVITY)
++		i2c_emma_getreg(i2c, IC_CLR_ACTIVITY);
++	if (intr_stat & INTR_STOP_DET)
++		i2c_emma_getreg(i2c, IC_CLR_STOP_DET);
++	if (intr_stat & INTR_START_DET)
++		i2c_emma_getreg(i2c, IC_CLR_START_DET);
++	if (intr_stat & INTR_GEN_CALL)
++		i2c_emma_getreg(i2c, IC_CLR_GEN_CALL);
++
++	return intr_stat;
++}
++
++/*
++ * We are protected by the adapter bus semaphore.
++ */
++static int i2c_emma_do_xfer(struct emma_i2c *i2c, struct i2c_msg *msgs, int num)
++{
++	long timeout;
++	int i;
++	u32 intrmask;
++
++	i2c->msgs = msgs;
++	i2c->msg_num = num;
++	i2c->completed = 0;
++
++	/*
++	 * Search for the 1st read msg.
++	 * Even if there is no read msg, just leave it.
++	 */
++	for (i = 0; i < i2c->msg_num; i++)
++		if (i2c->msgs[i].flags & I2C_M_RD)
++			break;
++
++	/* rx descriptor */
++	i2c->rx_desc.num = i;
++	i2c->rx_desc.pos = 0;
++	i2c->rx_remainder = 0;
++
++	/* tx descriptor */
++	i2c->tx_desc.num = 0;
++	i2c->tx_desc.pos = 0;
++
++	/* RX_FULL,TX_EMPTY interrupt mask clear */
++	intrmask = i2c_emma_getreg(i2c, IC_INTR_MASK);
++	intrmask &= ~(INTR_RX_FULL | INTR_TX_EMPTY);
++	i2c_emma_setreg(i2c, IC_INTR_MASK, intrmask);
++
++	/* interrupt status clear */
++	i2c_emma_getclearints(i2c);
++
++	/* target address set */
++	i2c_emma_set_slaveaddr(i2c, i2c->msgs);
++
++	i2c_emma_enable(i2c);
++
++	intrmask = i2c_emma_getreg(i2c, IC_INTR_MASK);
++	intrmask |= (INTR_STOP_DET | INTR_RX_FULL |
++		     INTR_TX_EMPTY | INTR_TX_ABRT);
++	i2c_emma_setreg(i2c, IC_INTR_MASK, intrmask);
++
++	/*
++	 * The rest of the processing occurs in the interrupt handler.
++	 */
++	timeout = wait_event_timeout(i2c->wait, i2c->completed == 1, HZ * 5);
++
++	if (timeout == 0) {
++		printk(KERN_DEBUG "### timeout\n");
++		return -EREMOTEIO;
++	}
++
++	if (i2c_emma_disable(i2c))
++		printk(KERN_ERR "I2C disable error\n");
++
++	if (((i2c->tx_desc.num < i2c->msg_num) || (i2c->rx_remainder)) &&
++	    ((i2c->state & T_ABRT) == 0)) {
++		printk(KERN_DEBUG "Tx FIFO underrun\n");
++		i2c->state |= I2C_ERROR;
++		return -EAGAIN;
++	}
++
++	if (i2c->state & (NOACK | T_ABRT))
++		return 0;
++
++	return i2c->tx_desc.num;
++}
++
++/*
++ * i2c_emma_master_complete - complete the message and wake up.
++ */
++static inline void i2c_emma_master_complete(struct emma_i2c *i2c)
++{
++	i2c_emma_setreg(i2c, IC_INTR_MASK, 0);
++	wake_up(&i2c->wait);
++}
++
++/*
++ * EMMA3PF I2C adapter handler
++ */
++static irqreturn_t i2c_emma_handler(int this_irq, void *dev_id)
++{
++	struct emma_i2c *i2c = dev_id;
++	u32 abrtsource;
++	u32 intrstatus;
++	u32 intrmask;
++	struct i2c_msg *tx_msg = NULL, *rx_msg = NULL;
++	int i;
++
++	abrtsource = i2c_emma_getreg(i2c, IC_TX_ABRT_SOURCE);
++	intrstatus = i2c_emma_getclearints(i2c);
++
++	/* Transmit Abort */
++	if (intrstatus & INTR_TX_ABRT) {
++
++		if (abrtsource & (ABRT_GCALL_NOACK | ABRT_TXDATA_NOACK |
++				  ABRT_10ADDR2_NOACK | ABRT_10ADDR1_NOACK |
++				  ABRT_7B_ADDR_NOACK))
++			i2c->state |= NOACK;
++
++		/* Master has lost arbitrat */
++		if (abrtsource & ABR_LOST) {
++			i2c->state |= I2C_ABRT_LOST;
++			i2c_emma_recover(i2c);
++		}
++		i2c->state |= T_ABRT;
++		goto out;
++	}
++
++	if (i2c->rx_desc.num < i2c->msg_num)
++		rx_msg = &i2c->msgs[i2c->rx_desc.num];
++	if (i2c->tx_desc.num < i2c->msg_num)
++		tx_msg = &i2c->msgs[i2c->tx_desc.num];
++
++	while (rx_msg && i2c->rx_remainder &&
++	       (i2c_emma_getreg(i2c, IC_STATUS) & RFNE)) {
++
++		rx_msg->buf[i2c->rx_desc.pos] =
++			(u8)(i2c_emma_getreg(i2c, IC_DATA_CMD) & IC_DAT);
++		/*
++		 * Update rx_desc
++		 */
++		i2c->rx_desc.pos++;
++		i2c->rx_remainder--;
++
++		if (i2c->rx_desc.pos >= rx_msg->len) {
++			i2c->rx_desc.num++;
++			i2c->rx_desc.pos = 0;
++			if (i2c->rx_desc.num < i2c->msg_num) {
++				/* Search the next read msg */
++				for (i = i2c->rx_desc.num;
++					i < i2c->msg_num; i++)
++					if (i2c->msgs[i].flags & I2C_M_RD)
++						break;
++				i2c->rx_desc.num = i;
++				rx_msg = &i2c->msgs[i2c->rx_desc.num];
++			} else
++				rx_msg = NULL; /* quit data reception */
++		}
++	}
++
++	while (tx_msg && (i2c->tx_desc.pos < tx_msg->len) &&
++	       (i2c_emma_getreg(i2c, IC_STATUS) & TFNF)) {
++
++		if (tx_msg->flags & I2C_M_RD) {
++			i2c_emma_setreg(i2c, IC_DATA_CMD, IC_CMD);
++			i2c->rx_remainder++;
++		} else
++			i2c_emma_setreg(i2c, IC_DATA_CMD,
++					tx_msg->buf[i2c->tx_desc.pos]);
++		/*
++		 * Update tx_desc
++		 * 1. increment tx_desc.pos
++		 * 2. check tx_desc.pos wrap around
++		 * 3. check msg num
++		 */
++		i2c->tx_desc.pos++;
++		if (i2c->tx_desc.pos >= tx_msg->len) {
++			i2c->tx_desc.num++;
++			i2c->tx_desc.pos = 0;
++			/*
++			 * Move onto the next msg, or quit transmission
++			 */
++			if (i2c->tx_desc.num < i2c->msg_num)
++				tx_msg = &i2c->msgs[i2c->tx_desc.num];
++			else {
++				/*
++				 * Now all data have been written into Tx FIFO.
++				 * There is no need to care about the TX_EMPTY
++				 * interrupt, let's disable it.
++				 */
++				intrmask = i2c_emma_getreg(i2c, IC_INTR_MASK);
++				intrmask &= ~INTR_TX_EMPTY;
++				i2c_emma_setreg(i2c, IC_INTR_MASK, intrmask);
++				break;
++			}
++		}
++	}
++
++ out:
++	if (intrstatus & INTR_STOP_DET) {
++		i2c->completed = 1;
++		i2c_emma_master_complete(i2c);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int i2c_emma_xfer(
++		struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
++{
++	struct emma_i2c *i2c;
++	int ret = 0;
++	int i;
++
++	i2c = adap->algo_data;
++
++	for (i = adap->retries; i >= 0; i--) {
++		i2c->state = 0;
++		ret = i2c_emma_do_xfer(i2c, msgs, num);
++		if (ret == 0) {
++			ret = -EREMOTEIO;
++			goto out;
++		} else if ((i2c->state & I2C_ERROR) == 0)
++			goto out;
++	}
++out:
++	return ret;
++}
++
++static void i2c_emma_hwinit(struct emma_i2c *i2c)
++{
++	u32 reg;
++	u32 delay;
++
++	i2c_emma_disable(i2c);
++	if (i2c->id < MAX_NUM_DEVS) {
++		reg = readl((void *)(i2c->pbrd_base + I2C_SDA_DELAY));
++		delay = 1 << (i2c->id * 8 + 2);
++		writel(reg | delay, (void *)(i2c->pbrd_base + I2C_SDA_DELAY));
++	}
++	i2c_emma_setreg(i2c, IC_RX_TL, 0x0000003F);
++	i2c_emma_setreg(i2c, IC_TX_TL, 0x0000003F);
++	i2c_emma_setreg(i2c, IC_CON, 0x00000065);
++	i2c_emma_set_clock(i2c, i2c->clock);
++	i2c_emma_setreg(i2c, IC_SS_SCL_HCNT, 0x000001D9);
++	i2c_emma_setreg(i2c, IC_SS_SCL_LCNT, 0x00000212);
++	i2c_emma_setreg(i2c, IC_FS_SCL_HCNT, 0x00000045);
++	i2c_emma_setreg(i2c, IC_FS_SCL_LCNT, 0x0000007A);
++	i2c_emma_setreg(i2c, IC_INTR_MASK, 0);
++}
++
++static u32 i2c_emma_func(struct i2c_adapter *adap)
++{
++	return	I2C_FUNC_I2C |
++		I2C_FUNC_SMBUS_WRITE_BYTE |
++		I2C_FUNC_SMBUS_READ_BYTE |
++		I2C_FUNC_SMBUS_WRITE_BYTE_DATA |
++		I2C_FUNC_SMBUS_READ_BYTE_DATA |
++		I2C_FUNC_SMBUS_WRITE_WORD_DATA |
++		I2C_FUNC_SMBUS_READ_WORD_DATA |
++		I2C_FUNC_SMBUS_READ_BLOCK_DATA |
++		I2C_FUNC_SMBUS_WRITE_BLOCK_DATA |
++		I2C_FUNC_SMBUS_READ_I2C_BLOCK  |
++		I2C_FUNC_SMBUS_WRITE_I2C_BLOCK |
++		I2C_FUNC_SMBUS_READ_I2C_BLOCK_2 |
++		I2C_FUNC_SMBUS_WRITE_I2C_BLOCK_2;
++}
++
++static struct i2c_algorithm i2c_emma_algorithm = {
++	.master_xfer	= i2c_emma_xfer,
++	.functionality	= i2c_emma_func,
++};
++
++static int __devinit i2c_emma_probe(struct platform_device *pdev)
++{
++	int ret;
++	int cl;
++	struct resource *r;
++	struct emma_i2c *i2c;
++
++	i2c = kzalloc(sizeof(struct emma_i2c), GFP_KERNEL);
++	if (i2c == NULL) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	strcpy(i2c->adap.name, pdev->dev.bus_id);
++	i2c->adap.algo = &i2c_emma_algorithm;
++	i2c->adap.owner = THIS_MODULE;
++	i2c->adap.class = I2C_CLASS_HWMON | I2C_CLASS_SPD;
++	i2c->adap.nr = pdev->id;
++	i2c->adap.retries = 5;
++
++	i2c->adap.dev.parent = &pdev->dev;
++	i2c->adap.algo_data = i2c;
++
++	init_waitqueue_head(&i2c->wait);
++
++	platform_set_drvdata(pdev, i2c);
++	r = platform_get_resource(pdev, 0, 0);
++	i2c->ptop_base = r->start;
++	i2c->irq = platform_get_irq(pdev, 0);
++	i2c->id = pdev->id;
++	r = platform_get_resource_byname(pdev, 0, "pbrd");
++	i2c->pbrd_base = r->start;
++
++	BUG_ON(i2c->id >= MAX_NUM_DEVS);
++
++	switch (i2c->id) {
++	case 0:
++		cl = clock0;
++		break;
++	case 1:
++		cl = clock1;
++		break;
++	}
++
++	if (cl == 0)
++		i2c->clock = clock[0];
++	else if (cl == 1)
++		i2c->clock = clock[1];
++	else {
++		printk(KERN_INFO "I2C: Failed to set clock\n");
++		return -1;
++	}
++
++	ret = request_irq(i2c->irq, i2c_emma_handler, 0, pdev->name, i2c);
++	if (ret < 0)
++		goto out_free;
++	ret = i2c_add_numbered_adapter(&i2c->adap);
++	if (ret < 0) {
++		printk(KERN_INFO "I2C: Failed to add bus\n");
++		free_irq(i2c->irq, i2c);
++		goto out_free;
++	}
++	printk(KERN_INFO "I2C: %s: EMMA I2C adapter\n", i2c->adap.dev.bus_id);
++	i2c_emma_hwinit(i2c);
++
++	return 0;
++
++ out_free:
++	kfree(i2c);
++
++ out:
++	return ret;
++}
++
++static int __devexit i2c_emma_remove(struct platform_device *pdev)
++{
++	struct emma_i2c *i2c = platform_get_drvdata(pdev);
++
++	if (i2c) {
++		disable_irq(i2c->irq);
++		free_irq(i2c->irq, i2c);
++		i2c_del_adapter(&i2c->adap);
++		kfree(i2c);
++	}
++	return 0;
++}
++
++static struct platform_driver i2c_emma_driver = {
++	.probe		= i2c_emma_probe,
++	.remove		= i2c_emma_remove,
++	.driver = {
++		.name	= "emma-iic",
++		.owner	= THIS_MODULE,
++	},
++};
++
++static int __init i2c_adap_emma_init(void)
++{
++	return platform_driver_register(&i2c_emma_driver);
++}
++
++static void i2c_adap_emma_exit(void)
++{
++	platform_driver_unregister(&i2c_emma_driver);
++}
++
++MODULE_AUTHOR("NEC Electronics Corporation <www.necel.com>");
++MODULE_DESCRIPTION("I2C-Bus adapter routines for EMMA I2C bus adapter");
++MODULE_LICENSE("GPL v2");
++MODULE_PARM_DESC(clock0, "I2C#0 CLOCK - 0 STANDARD_MODE; 1 FAST_MODE");
++module_param(clock0, int, S_IRUGO);
++
++module_init(i2c_adap_emma_init);
++module_exit(i2c_adap_emma_exit);
+diff --git a/drivers/i2c/busses/i2c-emma.h b/drivers/i2c/busses/i2c-emma.h
+new file mode 100644
+index 0000000..59f96e8
+--- /dev/null
++++ b/drivers/i2c/busses/i2c-emma.h
+@@ -0,0 +1,273 @@
++/*
++ * i2c-emma.h: NEC EMMA3PF global defines
++ *
++ * Author: NEC Electronics Corporation
++ *
++ * Copyright (C) NEC Electronics Corporation 2007-2008
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ */
++
++#ifndef I2C_EMMA_H
++#define I2C_EMMA_H
++
++/**
++ * PBRD Register Map
++ **/
++#define I2C_SDA_DELAY		(0x00000004)
++#define I2C_FAIL_SAFE		(0x00000008)
++
++/**
++ * IIC registers map
++ **/
++
++/*---------------------------------------------------------------------------*/
++/* CNT - I2C Control register (000h R/W)                                     */
++/*---------------------------------------------------------------------------*/
++#define MASTER_MODE		(0x00000001)
++#define STANDARD_MODE		(0x00000002)
++#define FAST_MODE		(0x00000004)
++#define IC_MAX_SPEED_MODE	(FAST_MODE)
++#define IC_SPEED		(0x00000006)
++#define IC_10BITADDR_SLAVE	(0x00000008)
++#define IC_10BITADDR_MASTER_RD	(0x00000010)
++#define IC_RESTART_EN		(0x00000020)
++#define IC_SLAVE_DISABLE	(0x00000040)
++
++/*---------------------------------------------------------------------------*/
++/* IC_TAR - I2C Target Address (004h R/W)                                    */
++/*---------------------------------------------------------------------------*/
++#define IC_TAR_ADDR		(0x000003FF)
++#define GC_OR_START		(0x00000400)
++#define IC_SPECIAL		(0x00000800)
++#define IC_10BITADDR_MASTER	(0x00001000)
++
++/*---------------------------------------------------------------------------*/
++/* IC_SAR - I2C Slave Address (008h R/W)                                     */
++/*---------------------------------------------------------------------------*/
++#define IC_SAR_ADDR		(0x000003FF)
++
++/*---------------------------------------------------------------------------*/
++/* IC_DATA_CMD - I2C RX/TX Data Buffer and Command (010h R/W)                */
++/*---------------------------------------------------------------------------*/
++#define IC_DAT			(0x000000FF)
++#define IC_CMD			(0x00000100)
++
++/*---------------------------------------------------------------------------*/
++/* IC_SS_SCL_HCNT - Standard Speed I2C Clock SCL High Count (014h R/W)       */
++/*---------------------------------------------------------------------------*/
++#define SS_SCL_HCNT		(0x0000FFFF)
++
++/*---------------------------------------------------------------------------*/
++/* IC_SS_SCL_LCNT - Standard Speed I2C Clock SCL LOW Count (018h R/W)        */
++/*---------------------------------------------------------------------------*/
++#define SS_SCL_LCNT		(0x0000FFFF)
++
++/*---------------------------------------------------------------------------*/
++/* IC_FS_SCL_HCNT - Fast Speed I2C Clock SCL High Count (01Ch R/W)           */
++/*---------------------------------------------------------------------------*/
++#define FS_SCL_HCNT		(0x0000FFFF)
++
++/*---------------------------------------------------------------------------*/
++/* IC_FS_SCL_LCNT - Fast Speed I2C Clock Low High Count (020h R/W)           */
++/*---------------------------------------------------------------------------*/
++#define FS_SCL_LCNT		(0x0000FFFF)
++
++/*---------------------------------------------------------------------------*/
++/* IC_INTR_STAT - I2C Interrupt Status (002Ch R)                             */
++/*---------------------------------------------------------------------------*/
++/*---------------------------------------------------------------------------*/
++/* IC_INTR_MASK - I2C Interrupt Mask (030h R/W)                              */
++/*---------------------------------------------------------------------------*/
++/*---------------------------------------------------------------------------*/
++/* IC_RAW_INTR_STAT - I2C Raw Interrupt Stasus (034h R/W)                    */
++/*---------------------------------------------------------------------------*/
++#define INTR_RX_UNDER		(0x00000001)
++#define INTR_RX_OVER		(0x00000002)
++#define INTR_RX_FULL		(0x00000004)
++#define INTR_TX_OVER		(0x00000008)
++#define INTR_TX_EMPTY		(0x00000010)
++#define INTR_RD_REQ		(0x00000020)
++#define INTR_TX_ABRT		(0x00000040)
++#define INTR_RX_DONE		(0x00000080)
++#define INTR_ACTIVITY		(0x00000100)
++#define INTR_STOP_DET		(0x00000200)
++#define INTR_START_DET		(0x00000400)
++#define INTR_GEN_CALL		(0x00000800)
++#define INTR_STAT_MASK		(0x00000FFF)
++
++/*---------------------------------------------------------------------------*/
++/* IC_RX_TL - I2C Receive FIFO Threshold (038h R/W)                          */
++/*---------------------------------------------------------------------------*/
++#define RX_TL			(0x000000FF)
++
++/*---------------------------------------------------------------------------*/
++/* IC_TX_TL - I2C Transmit FIFO Threshold (03Ch R/W)                         */
++/*---------------------------------------------------------------------------*/
++#define TX_TL			(0x000000FF)
++
++/*---------------------------------------------------------------------------*/
++/* IC_CLR_INTR - Clear Combined and Individual Interrupts (040h R)           */
++/*---------------------------------------------------------------------------*/
++#define CLR_INTR		(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_CLR_RX_UNDER - Clear RX_UNDER Interrupt (044h R)                       */
++/*---------------------------------------------------------------------------*/
++#define CLR_RX_UNDER		(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_CLR_RX_OVER - Clear RX_OVER Interrupt (048h R)                         */
++/*---------------------------------------------------------------------------*/
++#define CLR_RX_OVER		(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_CLR_TX_OVER - Clear TX_OVER Interrupt (04Ch R)                         */
++/*---------------------------------------------------------------------------*/
++#define CLR_TX_OVER		(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_CLR_RD_REQ - Clear RD_REQ Interrupt (050h R)                           */
++/*---------------------------------------------------------------------------*/
++#define CLR_RD_REQ		(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_CLR_TX_ABRT - Clear TX_ABRT Interrupt (054h R)                         */
++/*---------------------------------------------------------------------------*/
++#define CLR_TX_ABR		(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_CLR_RX_DONE - Clear RX_DONE Interrupt (058h R)                         */
++/*---------------------------------------------------------------------------*/
++#define CLR_RX_DONE		(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_CLR_ACTIVITY - Clear ACTIVITY Interrupt (05Ch R)                       */
++/*---------------------------------------------------------------------------*/
++#define CLR_ACTIVITY		(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_CLR_STOP_DET - Clear STOP_DET Interrupt (060h R)                       */
++/*---------------------------------------------------------------------------*/
++#define CLR_STOP_DET		(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_CLR_START_DET - Clear START_DET Interrupt (064h R)                     */
++/*---------------------------------------------------------------------------*/
++#define CLR_START_DET		(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_CLR_GEN_CALL - Clear GEN_CALL Interrupt (068h R)                       */
++/*---------------------------------------------------------------------------*/
++#define CLR_GEN_CALL		(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_ENABLE - I2C Enable (06Ch R/W)                                         */
++/*---------------------------------------------------------------------------*/
++#define ENABLE			(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_STATUS - I2C Status Register (070h R)                                  */
++/*---------------------------------------------------------------------------*/
++#define ACTIVITY_STATUS		(0x00000001)
++#define TFNF			(0x00000002)
++#define TFE			(0x00000004)
++#define RFNE			(0x00000008)
++#define RFF			(0x00000010)
++#define MST_ACTIVITY		(0x00000020)
++#define SLV_ACTIVITY		(0x00000040)
++
++/*---------------------------------------------------------------------------*/
++/* IC_TXFLR - Transmit FIFO Level Register (074h R)                          */
++/*---------------------------------------------------------------------------*/
++#define TXFLR			(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_RXFLR - Receive FIFO Level Register (078h R)                           */
++/*---------------------------------------------------------------------------*/
++#define RXFLR			(0x00000001)
++
++/*---------------------------------------------------------------------------*/
++/* IC_TX_ABRT_SOURCE - I2C Transmit Abort Status Register (080h R/W)         */
++/*---------------------------------------------------------------------------*/
++#define ABRT_7B_ADDR_NOACK	(0x00000001)
++#define ABRT_10ADDR1_NOACK	(0x00000002)
++#define ABRT_10ADDR2_NOACK	(0x00000004)
++#define ABRT_TXDATA_NOACK	(0x00000008)
++#define ABRT_GCALL_NOACK	(0x00000010)
++#define ABRT_GCALL_READ		(0x00000020)
++#define ABRT_HS_ACKDET		(0x00000040)
++#define ABRT_SBYTE_ACKDET	(0x00000080)
++#define ABRT_HS_NORSTRT		(0x00000100)
++#define ABRT_SBYTE_NORSTRT	(0x00000200)
++#define ABRT_10B_RD_NORSTRT	(0x00000400)
++#define ABR_MASTER_DIS		(0x00000800)
++#define ABR_LOST		(0x00001000)
++#define ABRT_SLVFLUSH_TXFIFO	(0x00002000)
++#define ABRT_SLV_ARBLOST	(0x00004000)
++#define ABRT_SLVRD_INTX		(0x00008000)
++
++/*---------------------------------------------------------------------------*/
++/* IC_ENABLE_STATUS - I2C Enable Status Register (09Ch R/W)                  */
++/*---------------------------------------------------------------------------*/
++#define IC_EN				(0x00000001)
++#define SLV_RX_ABORTED			(0x00000002)
++#define SLV_FIFO_FILLED_AND_FLUSHED	(0x00000004)
++
++/***********************************************************************
++ * I2C registers
++ ***********************************************************************
++ */
++#define IC_CON			(0x000) /* I2C Control */
++#define IC_TAR			(0x004) /* I2C Target Address */
++#define IC_SAR			(0x008) /* I2C Slave Address */
++#define IC_DATA_CMD		(0x010) /* I2C RX/TX Data Buffer and Command */
++
++/* Standard Speed I2C Clock SCL High Count */
++#define IC_SS_SCL_HCNT		(0x014)
++
++/* Standard Speed I2C Clock SCL Low Count */
++#define IC_SS_SCL_LCNT		(0x018)
++
++/* Fast Speed I2C Clock SCL High Count */
++#define IC_FS_SCL_HCNT		(0x01C)
++
++#define IC_FS_SCL_LCNT		(0x020) /* Fast Speed I2C Clock SCL Low Count */
++#define IC_INTR_STAT		(0x02C) /* I2C Interrupt Status */
++#define IC_INTR_MASK		(0x030) /* I2C Interrupt Mask */
++#define IC_RAW_INTR_STAT	(0x034) /* I2C Raw Interrupt Status */
++#define IC_RX_TL		(0x038) /* I2C Receive FIFO Threshold */
++#define IC_TX_TL		(0x03C) /* I2C Transmit FIFO Threshold */
++
++/* Clear Combined and Individual Interrupts */
++#define IC_CLR_INT		(0x040)
++
++#define IC_CLR_RX_UNDER		(0x044) /* Clear RX_UNDER Interrupt */
++#define IC_CLR_RX_OVER		(0x048) /* Clear RX_OVER Interrupt */
++#define IC_CLR_TX_OVER		(0x04C) /* Clear TX_OVER Interrupt */
++#define IC_CLR_RD_REQ		(0x050) /* Clear RD_REQ Interrupt */
++#define IC_CLR_TX_ABRT		(0x054) /* Clear TX_ABRT Interrupt */
++#define IC_CLR_RX_DONE		(0x058) /* Clear RX_DONE Interrupt */
++#define IC_CLR_ACTIVITY		(0x05C) /* Clear ACTIVITY Interrupt */
++#define IC_CLR_STOP_DET		(0x060) /* Clear STOP_DET Interrupt */
++#define IC_CLR_START_DET	(0x064) /* Clear START_DET Interrupt */
++#define IC_CLR_GEN_CALL		(0x068) /* Clear GEN_CALL Interrupt */
++#define IC_ENABLE		(0x06C) /* I2C Enable */
++#define IC_STATUS		(0x070) /* I2C Status Register */
++#define IC_TXFLR		(0x074) /* Transmit FIFO Level Register */
++#define IC_RXFLR		(0x078) /* Receive FIFO Level Register */
++#define IC_TX_ABRT_SOURCE	(0x080) /* I2C Transmit Abort Status Register */
++#define IC_ENABLE_STATUS	(0x09C) /* I2C Enable Status Register */
++
++#endif /* I2C_EMMA_H */
+-- 
+1.6.0.4
+
