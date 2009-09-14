@@ -1,0 +1,717 @@
+From dcc0da45f022253051c08c16b46be7a6ce13ea81 Mon Sep 17 00:00:00 2001
+From: Greg Moffatt <greg.moffatt@windriver.com>
+Date: Thu, 9 Jul 2009 16:31:51 -0400
+Subject: [PATCH 1/2] cavium: kernel hooks to support kexec
+
+Areas of kernel code specific to the Cavium MIPS variant are
+modified to enable kexec.  Specifically:
+- new functions created to cleanup bootloader-reserved memory segments
+  and shutdown networking devices gracefully during kexec shutdown
+- new cavium-specific target functions for kexec prepare/shutdown
+  functions that trigger cavium-specific actions during kexec
+- SMP support for kexec graceful and crash shutdowns
+
+Signed-off-by: Greg Moffatt <greg.moffatt@windriver.com>
+---
+ arch/mips/cavium-octeon/hal.c   |  383 +++++++++++++++++++++++++++++++++++++++
+ arch/mips/cavium-octeon/hal.h   |    6 +
+ arch/mips/cavium-octeon/setup.c |  187 +++++++++++++++++---
+ arch/mips/cavium-octeon/smp.c   |    1 +
+ 4 files changed, 553 insertions(+), 24 deletions(-)
+
+diff --git a/arch/mips/cavium-octeon/hal.c b/arch/mips/cavium-octeon/hal.c
+index a2e7e9c..8c2205d 100644
+--- a/arch/mips/cavium-octeon/hal.c
++++ b/arch/mips/cavium-octeon/hal.c
+@@ -8,8 +8,12 @@
+ #include <linux/kernel.h>
+ #include <linux/string.h>
+ #include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/mii.h>
+ #include <asm/time.h>
+ #include <octeon-app-init.h>
++#include <asm-generic/sections.h>
++#include <linux/kexec.h>
+ 
+ #ifndef CONFIG_CAVIUM_RESERVE32
+ #define CONFIG_CAVIUM_RESERVE32 0
+@@ -22,6 +26,10 @@
+ #include "cvmx-sysinfo.h"
+ #include "cvmx-l2c.h"
+ #include "cvmx-spinlock.h"
++#include "cvmx-csr-addresses.h"
++#include "octeon-model.h"
++#include "cvmx-pow.h"
++#include "cvmx-fpa.h"
+ 
+ extern void add_wired_entry(unsigned long entrylo0,
+ 			    unsigned long entrylo1,
+@@ -41,6 +49,12 @@ spinlock_t octeon_led_lock;
+ uint64_t octeon_reserve32_memory;
+ #endif
+ 
++#ifdef CONFIG_KEXEC
++/* machine-specific function pointers for kexec */
++extern int (*_machine_kexec_prepare)(struct kimage *);
++extern void (*_machine_kexec_shutdown)(void);
++extern void (*_machine_crash_shutdown)(struct pt_regs *);
++#endif
+ 
+ /**
+  * Write to the LCD display connected to the bootbus. This display
+@@ -124,6 +138,25 @@ int octeon_is_pci_host(void)
+ 
+ 
+ /**
++ * This function returns if the USB clock uses 12/24/48MHz 3.3V
++ * reference clock at the USB_REF_CLK pin. Result is non zero
++ * if it does, If it uses 12MHz crystal as clock source at USB_XO
++ * and USB_XI, then the return value is zero. This function will
++ * need update for new boards.
++ *
++ * @return True is USB is using a reference clock
++ */
++int octeon_usb_is_ref_clk(void)
++{
++	switch (octeon_bootinfo->board_type) {
++	case CVMX_BOARD_TYPE_BBGW_REF:
++		return 0;
++	}
++	return 1;
++}
++
++
++/**
+  * Get the clock rate of Octeon
+  *
+  * @return Clock rate in HZ
+@@ -523,3 +556,353 @@ EXPORT_SYMBOL(octeon_reserve32_memory);
+ #endif
+ 
+ EXPORT_SYMBOL(octeon_get_clock_rate);
++
++#ifdef CONFIG_KEXEC
++/* externs for network shutdown during kexec */
++extern struct net_device *cvm_oct_device[];
++typedef struct {
++	int                     port;
++	int                     queue;
++	int                     imode;
++	struct sk_buff_head     tx_free_list[16];
++	struct net_device_stats stats;
++	struct mii_if_info      mii_info;
++	int (*intercept_cb)(void);
++	uint64_t                link_info;
++	void (*poll)(struct net_device *dev);
++} cvm_oct_private_t;
++
++typedef struct {
++	uint8_t now_serving;
++	uint64_t unused1:24;
++	uint64_t fpa_pool:3;
++	uint64_t base_ptr_div128:29;
++	uint64_t unused2:6;
++	uint64_t pool_size_m1:13;
++	uint64_t index:13;
++} __cvmx_cmd_queue_state_t;
++
++static inline void cvmx_helper_free_packet_data(cvmx_wqe_t * work) {
++	uint64_t number_buffers;
++	cvmx_buf_ptr_t buffer_ptr;
++	cvmx_buf_ptr_t next_buffer_ptr;
++	uint64_t start_of_buffer;
++
++	buffer_ptr = work->packet_ptr;
++	number_buffers = work->word2.s.bufs;
++
++	while (number_buffers--) {
++		/* Remember the back pointer is in cache lines, not 64bit words */
++		start_of_buffer =
++		    ((buffer_ptr.s.addr >> 7) - buffer_ptr.s.back) << 7;
++		/* Read pointer to next buffer before we free the current buffer. */
++		next_buffer_ptr =
++		    *(cvmx_buf_ptr_t *) cvmx_phys_to_ptr(buffer_ptr.s.addr - 8);
++		cvmx_fpa_free(cvmx_phys_to_ptr(start_of_buffer),
++			      buffer_ptr.s.pool, 0);
++		buffer_ptr = next_buffer_ptr;
++	}
++}
++
++#define CVMX_CMD_QUEUE_END 0x50000
++typedef struct {
++	uint64_t ticket[(CVMX_CMD_QUEUE_END >> 16) * 256];
++	__cvmx_cmd_queue_state_t state[(CVMX_CMD_QUEUE_END >> 16) * 256];
++} __cvmx_cmd_queue_all_state_t;
++
++typedef union {
++	uint64_t u64;
++	struct {
++		uint64_t reserved_20_63:44;
++		uint64_t link_up:1; /**< Is the physical link up? */
++		uint64_t full_duplex:1;
++				    /**< 1 if the link is full duplex */
++		uint64_t speed:18;  /**< Speed of the link in Mbps */
++	} s;
++} cvmx_helper_link_info_t;
++
++#define CVMX_FPA_WQE_POOL (1)
++#define CVMX_HELPER_INTERFACE_MODE_RGMII (1)
++#define CVMX_HELPER_INTERFACE_MODE_GMII (2)
++
++extern void cvmx_pko_disable(void);
++extern void cvmx_pko_shutdown(void);
++extern void cvmx_cmd_queue_shutdown(int);
++extern void* cvmx_cmd_queue_buffer(int);
++extern int cvmx_helper_get_number_of_interfaces(void);
++extern int cvmx_helper_interface_get_mode(int interface);
++extern int cvmx_helper_interface_probe(int interface);
++extern int cvmx_helper_ports_on_interface(int interface);
++extern cvmx_helper_link_info_t cvmx_helper_link_get(int ipd_port);
++extern int cvmx_helper_get_ipd_port(int interface, int port);
++extern int cvmx_helper_link_set(int ipd_port, cvmx_helper_link_info_t link_info);
++
++void octeon_shutdown_network_hw(void)
++{
++	cvmx_helper_link_info_t link_info;
++	cvmx_wqe_t *work = NULL;
++	int ipd_port = 0;
++	int num_ints = 0;
++	int interface = 0;
++	int num_ports = 0;
++	int port = 0;
++	cvmx_pko_reg_flags_t pko_reg_flags;
++	cvmx_fpa_ctl_status_t fpa_status;
++	cvmx_smix_en_t smix_en;
++	cvmx_ipd_ctl_status_t ipd_ctl_status;
++	cvmx_pip_sft_rst_t pip_sft_rst;
++
++	/* free up the work queue associated with this core */
++	work = cvmx_pow_get_current_wqp();
++	if (NULL != work) {
++		/* drain the work queue and free it */
++		cvmx_helper_free_packet_data(work);
++		cvmx_fpa_free(work, CVMX_FPA_WQE_POOL, 0);
++	}
++
++	/* halt the interfaces */
++	num_ints = cvmx_helper_get_number_of_interfaces();
++	if (num_ints > 2)
++		num_ints = 2;
++
++	/* Check to see what interface and ports we should use */
++	for (interface = 0; interface < num_ints; interface++) {
++		if ((CVMX_HELPER_INTERFACE_MODE_RGMII ==
++			cvmx_helper_interface_get_mode(interface)) ||
++			(CVMX_HELPER_INTERFACE_MODE_GMII ==
++				cvmx_helper_interface_get_mode(interface))) {
++			/* get the ports for this interface */
++			cvmx_helper_interface_probe(interface);
++			num_ports = cvmx_helper_ports_on_interface(interface);
++
++			for (port = 0; port < num_ports; port++) {
++				ipd_port = cvmx_helper_get_ipd_port(interface, port);
++
++				link_info = cvmx_helper_link_get(ipd_port);
++				link_info.s.link_up = 0;
++				cvmx_helper_link_set(ipd_port, link_info);
++			}
++		}
++	}
++
++	/* disable the SMI */
++	smix_en.u64 = cvmx_read_csr(CVMX_SMIX_EN(0));
++	if (smix_en.s.en) {
++		smix_en.s.en = 0;
++		cvmx_write_csr(CVMX_SMIX_EN(0), smix_en.u64);
++	}
++
++	/* Newer chips actually have two SMI/MDIO interfaces */
++	if (!OCTEON_IS_MODEL(OCTEON_CN3XXX) &&
++		!OCTEON_IS_MODEL(OCTEON_CN58XX) &&
++		!OCTEON_IS_MODEL(OCTEON_CN50XX)) {
++		smix_en.u64 = cvmx_read_csr(CVMX_SMIX_EN(1));
++		if (smix_en.s.en) {
++			smix_en.s.en = 0;
++			cvmx_write_csr(CVMX_SMIX_EN(1), smix_en.u64);
++		}
++	}
++
++	/* Reset the IPD to get all buffers out of it */
++	ipd_ctl_status.u64 = cvmx_read_csr(CVMX_IPD_CTL_STATUS);
++	ipd_ctl_status.s.reset = 1;
++	cvmx_write_csr(CVMX_IPD_CTL_STATUS, ipd_ctl_status.u64);
++
++	/* Reset the PIP */
++	pip_sft_rst.u64 = cvmx_read_csr(CVMX_PIP_SFT_RST);
++	pip_sft_rst.s.rst = 1;
++	cvmx_write_csr(CVMX_PIP_SFT_RST, pip_sft_rst.u64);
++
++	/* disable the PKO */
++	pko_reg_flags.u64 = cvmx_read_csr(CVMX_PKO_REG_FLAGS);
++	pko_reg_flags.s.ena_pko = 0;
++	cvmx_write_csr(CVMX_PKO_REG_FLAGS, pko_reg_flags.u64);
++
++	/* reset the PKO */
++	pko_reg_flags.u64 = cvmx_read_csr(CVMX_PKO_REG_FLAGS);
++	pko_reg_flags.s.reset = 1;
++	cvmx_write_csr(CVMX_PKO_REG_FLAGS, pko_reg_flags.u64);
++
++	/* disable the FPA */
++	fpa_status.u64 = cvmx_read_csr(CVMX_FPA_CTL_STATUS);
++	fpa_status.s.enb = 0;
++	cvmx_write_csr(CVMX_FPA_CTL_STATUS, fpa_status.u64);
++
++	/* reset the FPA */
++	fpa_status.u64 = cvmx_read_csr(CVMX_FPA_CTL_STATUS);
++	fpa_status.s.reset = 1;
++	cvmx_write_csr(CVMX_FPA_CTL_STATUS, fpa_status.u64);
++
++	/* free the cvmx_cmd_queues from bootmemory */
++	cvmx_bootmem_free_named("cvmx_cmd_queues");
++}
++
++#ifdef CONFIG_SMP
++static cpumask_t kexec_cpus = CPU_MASK_NONE;
++
++static void octeon_kexec_shutdown_other_cpus(void *ignore)
++{
++	/* for each CPU except CPU0 go into a loop until we've relocated
++	 * the kernel and then jump to that page
++	 */
++	int cpu = smp_processor_id();
++	if (!cpu_online(cpu))
++		return;
++
++	local_irq_disable();
++
++	cpu_set(cpu, kexec_cpus);
++
++	while (!atomic_read(&kexec_ready_to_reboot)) {
++		cpu_relax();
++	}
++	relocated_kexec_smp_wait(NULL);
++}
++#endif /* CONFIG_SMP */
++
++void octeon_kexec_shutdown(void)
++{
++#ifdef CONFIG_SMP
++	unsigned int msecs;
++	unsigned int ncpus;
++
++	/* proceed to shutdown the other CPUs */
++	ncpus = num_online_cpus() - 1; /* exclude this CPU */
++	cpus_clear(kexec_cpus);
++
++	printk(KERN_EMERG "Sending IPI to other cpus...\n");
++	if (smp_call_function(&octeon_kexec_shutdown_other_cpus, NULL, 0))
++		printk(KERN_EMERG "failed to send IPI\n");
++	smp_wmb();
++
++	msecs = 10000;
++	while ((cpus_weight(kexec_cpus) < ncpus) && (--msecs > 0)) {
++		cpu_relax();
++		mdelay(1);
++	}
++#endif /* CONFIG_SMP */
++}
++
++void octeon_crash_shutdown(struct pt_regs *regs)
++{
++#ifdef CONFIG_SMP
++	/* just use the normal shutdown() mechanism */
++	octeon_kexec_shutdown();
++#endif /* CONFIG_SMP */
++}
++
++/*
++ * the arguments passed into the new kernel
++ * kexec_args[0] = register a0 = argc
++ * kexec_args[1] = register a1 = argv at a kseg0 compatible address
++ * kexec_args[2] = register a2 = 1 if init core, zero otherwise
++ * kexec_args[3] = register a3 = address of boot descriptor block
++ */
++extern unsigned long kexec_args[4];
++#ifdef CONFIG_SMP
++extern unsigned long secondary_kexec_args[4];
++#endif /* CONFIG_SMP */
++
++int octeon_kexec_prepare(struct kimage *kimage)
++{
++	unsigned long argv = 0;
++	int i = 0;
++	char *kbuf = NULL;
++	const unsigned long KBUF_SIZE = 1024;
++	int buflen = 0;
++	void *userbuf = NULL;
++	char *kexec = "kexec";
++
++	/* setup the boot descriptor pointer */
++	for (i=0; i < OCTEON_ARGV_MAX_ARGS; i++) {
++		/* invalidate all entries in the boot ptr */
++		octeon_boot_desc_ptr->argv[i] = 0;
++	}
++	octeon_boot_desc_ptr->argc = 0;
++
++	/* get the argc and argv */
++	/* search through the source pages looking for a page that starts
++	 * with the string "kexec"
++	 */
++	kbuf = kmalloc(KBUF_SIZE, GFP_KERNEL);
++
++	/* find the cmdline buffer in the kimage */
++	for (i=0; (!argv) && (i < kimage->nr_segments); i++) {
++		memset(kbuf, 0, KBUF_SIZE);
++		copy_from_user(kbuf, kimage->segment[i].buf,
++			(kimage->segment[i].bufsz > KBUF_SIZE ?
++			KBUF_SIZE :  kimage->segment[i].bufsz));
++
++		/* see if this buffer starts with "kexec" */
++		if (memcmp(kbuf, kexec, 5) == 0) {
++			/* this is the buffer */
++			userbuf = kimage->segment[i].buf;
++			argv = (unsigned long)kimage->segment[i].mem;
++		}
++	}
++
++	if (argv) {
++		/* argv is the location of argv at a kseg0 address */
++		kexec_args[1] = argv;
++
++		/* parse the buffer and copy into the boot descriptor */
++		char *p = kbuf;
++		int looking_for_space = 0;
++		while (*p) {
++			if (1 == looking_for_space) {
++				if (*p == ' ') {
++					looking_for_space = 0;
++					*p='\0';
++				}
++			} else {
++				if (*p != ' ') {
++					/* found another token */
++					octeon_boot_desc_ptr->argv[(octeon_boot_desc_ptr->argc)++] = argv;
++					looking_for_space = 1;
++				} else {
++					*p = '\0';
++				}
++			}
++			p++;
++			argv++;
++		}
++
++		buflen = (int)(p - kbuf);
++		kexec_args[0] = octeon_boot_desc_ptr->argc;
++	}
++
++	/* now copy the modified cmdline buffer back to userspace */
++	copy_to_user(userbuf, kbuf, buflen);
++
++	if (kbuf)
++		kfree(kbuf);
++
++	/* setup the rest of the args */
++	kexec_args[2] = 1;
++	kexec_args[3] = (unsigned long)octeon_boot_desc_ptr;
++
++#ifdef CONFIG_SMP
++	/* copy the kexec_args to the secondary_args for the secondary
++	 * CPUs
++	 */
++	secondary_kexec_args[0] = kexec_args[0];
++	secondary_kexec_args[1] = kexec_args[1];
++	secondary_kexec_args[2] = 0; /* this is NOT the init core */
++	secondary_kexec_args[3] = kexec_args[3];
++#endif /* CONFIG_SMP */
++
++	return 0;
++}
++
++/*
++ * Perform any setup actions necessary to setup this unit for kexec
++ * Currently this primarily means registering the cavium-specific targets
++ * for the kexec functions
++ */
++void octeon_kexec_setup(void)
++{
++	_machine_kexec_shutdown = &octeon_kexec_shutdown;
++	_machine_kexec_prepare = &octeon_kexec_prepare;
++	_machine_crash_shutdown = &octeon_crash_shutdown;
++}
++#endif /* CONFIG_KEXEC */
+diff --git a/arch/mips/cavium-octeon/hal.h b/arch/mips/cavium-octeon/hal.h
+index 9fe7902..162e952 100644
+--- a/arch/mips/cavium-octeon/hal.h
++++ b/arch/mips/cavium-octeon/hal.h
+@@ -40,6 +40,7 @@ extern void octeon_bootmem_unlock(void);
+ 
+ extern int octeon_is_simulation(void);
+ extern int octeon_is_pci_host(void);
++extern int octeon_usb_is_ref_clk(void);
+ extern uint64_t octeon_get_clock_rate(void);
+ extern const char *octeon_board_type_string(void);
+ extern const char *octeon_get_pci_interrupts(void);
+@@ -134,5 +135,10 @@ extern void octeon_hal_init(void);
+ extern int octeon_get_boot_uart(void);
+ extern int octeon_get_boot_debug_flag(void);
+ extern void octeon_poweroff(void);
++extern void octeon_shutdown_network_hw(void);
++#ifdef CONFIG_KEXEC
++extern void octeon_kexec_shutdown(void);
++extern void octeon_kexec_setup(void);
++#endif
+ 
+ #endif
+diff --git a/arch/mips/cavium-octeon/setup.c b/arch/mips/cavium-octeon/setup.c
+index 759a74a..b6b5f83 100644
+--- a/arch/mips/cavium-octeon/setup.c
++++ b/arch/mips/cavium-octeon/setup.c
+@@ -34,6 +34,7 @@
+ #include "hal.h"
+ #include "cvmx-l2c.h"
+ #include "cvmx-bootmem.h"
++#include <asm-generic/sections.h>
+ 
+ extern void cvmx_interrupt_rsl_decode(void);
+ extern int __cvmx_interrupt_ecc_report_single_bit_errors;
+@@ -163,10 +164,18 @@ void __init prom_init(void)
+ 	cvmx_read_csr(CVMX_CIU_INTX_SUM0((coreid * 2)));
+ 
+ #ifdef CONFIG_SMP
++#ifdef CONFIG_CRASH_DUMP
++	octeon_write_lcd("CrashSMP");
++#else
+ 	octeon_write_lcd("LinuxSMP");
++#endif
++#else
++#ifdef CONFIG_CRASH_DUMP
++	octeon_write_lcd("Crash");
+ #else
+ 	octeon_write_lcd("Linux");
+ #endif
++#endif
+ 
+ #ifdef CONFIG_CAVIUM_GDB
+ 	/* When debugging the linux kernel, force the cores to enter the debug
+@@ -195,13 +204,7 @@ void __init prom_init(void)
+ 	argc = octeon_get_boot_num_arguments();
+ 	for (i = 0; i < argc; i++) {
+ 		const char *arg = octeon_get_boot_argument(i);
+-		if ((strncmp(arg, "MEM=", 4) == 0) ||
+-		    (strncmp(arg, "mem=", 4) == 0)) {
+-			sscanf(arg + 4, "%llu", &MAX_MEMORY);
+-			MAX_MEMORY <<= 20;
+-			if (MAX_MEMORY == 0)
+-				MAX_MEMORY = 32ull << 30;
+-		} else if (strcmp(arg, "ecc_verbose") == 0) {
++		if (strcmp(arg, "ecc_verbose") == 0) {
+ 			__cvmx_interrupt_ecc_report_single_bit_errors = 1;
+ 			pr_notice("Reporting of single bit ECC errors is turned on\n");
+ 		} else if (strlen(arcs_cmdline) + strlen(arg) + 1 <
+@@ -284,30 +287,165 @@ void __init prom_init(void)
+ 
+ 	octeon_user_io_init();
+ 	register_smp_ops(&octeon_smp_ops);
++#ifdef CONFIG_KEXEC
++	octeon_kexec_setup();
++	octeon_shutdown_network_hw();
++#endif
+ }
+ 
++/* constants for memory initialization */
++#define OCTEON_DDR0_BASE    (0x0ULL)
++#define OCTEON_DDR0_SIZE    (0x010000000ULL)
++#define OCTEON_DDR1_BASE    (0x410000000ULL)
++#define OCTEON_DDR1_SIZE    (0x010000000ULL)
++#define OCTEON_DDR2_BASE    (0x020000000ULL)
++#define OCTEON_DDR2_SIZE    (0x3e0000000ULL)
++#define OCTEON_MAX_PHY_MEM_SIZE (16*1024*1024*1024ULL)
++#define OCTEON_LINUX_RESERVED_MEM_NAME    "__tmp_reserved_linux"
++
++void cleanup_phy_mem(void)
++{
++	/* Ensure all memory is cleaned up.
++	 * Assume nothing has been put before the kernel
++	 * and assume that the kernel lands in the DDR0 region
++	 */
++	uint64_t 	freemem;
++	cvmx_sysinfo_t 	*sysinfo;
++	uint64_t 	memory;
++	uint64_t 	kernel_size;
++	uint64_t 	delta;
++	uint64_t 	curr_addr;
++
++	/* get the amount of DRAM on the board */
++	sysinfo = cvmx_sysinfo_get();
++	memory = sysinfo->system_dram_size;
++
++	/* do a few calculations */
++	kernel_size = (uint64_t)__bss_stop - (uint64_t)_text;
++	freemem = cvmx_bootmem_phy_available_mem(0x100000);
++	delta = (memory > freemem ? (memory - freemem) : (freemem - memory));
++
++	if (delta < MAX_MEMORY) {
++		/* we haven't allocated any memory yet = no need to
++		 * continue free'ing
++		 */
++		printk(KERN_NOTICE "...no need to free any memory\n");
++		return;
++	}
+ 
++	/* calculate the current address which is the next address after
++	 * the end of the kernel, on a boundary of 0x100000 (1MB)
++	 * the shift needs to match the value used in plat_mem_setup()
++	 */
++	curr_addr = (uint64_t)__bss_stop;
++	curr_addr &= 0x7fffffffULL;
++	curr_addr = curr_addr >> 20;
++	curr_addr += 1;
++	curr_addr = curr_addr << 20;
++
++	memory -= kernel_size;
++
++	if (memory <= (OCTEON_DDR0_SIZE - curr_addr)) {
++		__cvmx_bootmem_phy_free(curr_addr, memory, 0);
++	} else {
++		__cvmx_bootmem_phy_free(curr_addr,
++			OCTEON_DDR0_SIZE - curr_addr, 0);
++
++		memory -= (OCTEON_DDR0_SIZE - curr_addr);
++
++		if (memory > OCTEON_DDR1_SIZE) {
++			__cvmx_bootmem_phy_free(OCTEON_DDR1_BASE,
++				OCTEON_DDR1_SIZE, 0);
++			__cvmx_bootmem_phy_free(OCTEON_DDR2_BASE,
++				memory - OCTEON_DDR1_SIZE, 0);
++		} else {
++			__cvmx_bootmem_phy_free(OCTEON_DDR1_BASE, memory, 0);
++		}
++	}
++}
+ 
+ void __init plat_mem_setup(void)
+ {
+ 	uint64_t mem_alloc_size;
+-	uint64_t total;
+-
+-	/* The Mips memory init uses the first memory location for some memory
+-	   vectors. When SPARSEMEM is in use, it doesn't verify that the size
+-	   is big enough for the final vectors. Making the smallest chuck 4MB
+-	   seems to be enough to consistantly work. This needs to be debugged
+-	   more */
+-	mem_alloc_size = 4 << 20;
+-	total = 0;
+-	if (mem_alloc_size > MAX_MEMORY)
+-		mem_alloc_size = MAX_MEMORY;
+-
+-	/* When allocating memory, we want incrementing addresses from
+-	   bootmem_alloc so the code in add_memory_region can merge regions
+-	   next to each other */
+-	cvmx_bootmem_lock();
+-	while ((boot_mem_map.nr_map < BOOT_MEM_MAP_MAX) && (total < MAX_MEMORY)) {
++	uint64_t total = 0;
++	int      i;
++
++	/* see if a memory map was already specified */
++	if (boot_mem_map.nr_map > 0) {
++		/* a pre-defined (probably from the user) memory
++		 * map has been already specified
++		 * allocate the memory from those segments
++		 */
++
++		/* determine where the kernel is */
++		uint64_t kernel_start = __pa_symbol(_text);
++		uint64_t kernel_end = __pa_symbol(__bss_stop);
++
++		/* round the end of the kernel up to the next 1MB boundary
++		 * since that is what we allocate as the
++		 * minimum size
++		 */
++		kernel_end = kernel_end >> 20;
++		kernel_end += 1;
++		kernel_end = kernel_end << 20;
++		kernel_end -= 1;
++
++		cvmx_bootmem_lock();
++		for (i=0; i < boot_mem_map.nr_map; i++) {
++			if (boot_mem_map.map[i].type == BOOT_MEM_RAM) {
++				/* see if this segment will fall
++				 * somewhere on the kernel.  If so, attempt
++				 * to resize it so it fits after the
++				 * kernel
++				 */
++				uint64_t pa = __pa(boot_mem_map.map[i].addr);
++				uint64_t sz = boot_mem_map.map[i].size;
++				if (((pa+sz) < kernel_start) ||
++					(pa > kernel_end)) {
++					/* this segment lies outside */
++				} else if ((pa+sz) > kernel_end) {
++					/* this segment goes past the kernel
++					 * just resize it
++					 */
++					boot_mem_map.map[i].addr =
++						kernel_end + 1;
++					boot_mem_map.map[i].size =
++						pa + sz - kernel_end + 1;
++					sz = boot_mem_map.map[i].size;
++				} else {
++					/* this segment cannot be managed */
++					octeon_write_lcd("BAD_MEM=");
++					panic("Unable to allocate memory for " \
++					    "bad segment (%lu @ 0x%08lx)\n",
++					    sz, pa);
++				}
++				total += sz;
++			}
++		}
++		cvmx_bootmem_unlock();
++	} else {
++		cleanup_phy_mem();
++
++		/*
++		 * The Mips memory init uses the first memory location for some memory
++		 * vectors. When SPARSEMEM is in use, it doesn't verify that the size
++		 * is big enough for the final vectors. Making the smallest chuck 4MB
++		 * seems to be enough to consistantly work. This needs to be debugged
++		 * more
++		 */
++		mem_alloc_size = 4 << 20;
++		total = 0;
++		if (mem_alloc_size > MAX_MEMORY)
++			mem_alloc_size = MAX_MEMORY;
++
++		/*
++		 * When allocating memory, we want incrementing addresses from
++		 * bootmem_alloc so the code in add_memory_region can merge regions
++		 * next to each other
++		 */
++
++		cvmx_bootmem_lock();
++		while ((boot_mem_map.nr_map < BOOT_MEM_MAP_MAX) && (total < MAX_MEMORY)) {
+ #if defined(CONFIG_64BIT) || defined(CONFIG_64BIT_PHYS_ADDR)
+ 		int64_t memory =
+ 			cvmx_bootmem_phy_alloc(mem_alloc_size,
+@@ -333,6 +471,7 @@ void __init plat_mem_setup(void)
+ 			total += mem_alloc_size;
+ 		} else
+ 			break;
++		}
+ 	}
+ 	cvmx_bootmem_unlock();
+ 
+diff --git a/arch/mips/cavium-octeon/smp.c b/arch/mips/cavium-octeon/smp.c
+index 0dcc781..d3ada4f 100644
+--- a/arch/mips/cavium-octeon/smp.c
++++ b/arch/mips/cavium-octeon/smp.c
+@@ -144,6 +144,7 @@ static void octeon_boot_secondary(int cpu, struct task_struct *idle)
+ 	pr_info("SMP: Booting CPU%02d (CoreId %2d)...", cpu,
+ 		cpu_logical_map(cpu));
+ 
++	__sync();
+ 	octeon_processor_sp = __KSTK_TOS(idle);
+ 	octeon_processor_gp = (unsigned long)(task_thread_info(idle));
+ 	__sync();		/* Use sync so all ops are done. This makes the
+-- 
+1.6.3.1
+
