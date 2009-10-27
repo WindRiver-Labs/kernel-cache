@@ -1,0 +1,664 @@
+From 62a41aba2ff0440786d1ec6cefa1a68fd924f101 Mon Sep 17 00:00:00 2001
+From: auto commit <unknown@unknown>
+Date: Fri, 24 Oct 2008 12:23:17 -0700
+Subject: [PATCH] cavium: optimized TLB handler
+
+Optimized version of the TLB handler.
+DISCLAIMER: This still requires massive amounts of polish.
+
+Signed-off-by: Tomaso Paoletti <tpaoletti@caviumnetworks.com>
+---
+ arch/mips/mm/init.c             |    2 +-
+ arch/mips/mm/tlb-r4k.c          |    8 +-
+ arch/mips/mm/tlbex.c            |  329 ++++++++++++++++++++++++++++++++++++---
+ arch/mips/mm/uasm.c             |    4 +-
+ include/asm-mips/pgtable-64.h   |    8 +-
+ include/asm-mips/pgtable-bits.h |   43 ++++--
+ 6 files changed, 352 insertions(+), 42 deletions(-)
+
+diff --git a/arch/mips/mm/init.c b/arch/mips/mm/init.c
+index e581283..c1f971f 100644
+--- a/arch/mips/mm/init.c
++++ b/arch/mips/mm/init.c
+@@ -146,7 +146,7 @@ void *kmap_coherent(struct page *page, unsigned long addr)
+ #if defined(CONFIG_64BIT_PHYS_ADDR) && defined(CONFIG_CPU_MIPS32)
+ 	entrylo = pte.pte_high;
+ #else
+-	entrylo = pte_val(pte) >> 6;
++	entrylo = pte_to_entrylo(pte_val(pte));
+ #endif
+ 
+ 	ENTER_CRITICAL(flags);
+diff --git a/arch/mips/mm/tlb-r4k.c b/arch/mips/mm/tlb-r4k.c
+index 5ce2fa7..a3050a5 100644
+--- a/arch/mips/mm/tlb-r4k.c
++++ b/arch/mips/mm/tlb-r4k.c
+@@ -304,8 +304,8 @@ void __update_tlb(struct vm_area_struct * vma, unsigned long address, pte_t pte)
+ 	ptep++;
+ 	write_c0_entrylo1(ptep->pte_high);
+ #else
+-	write_c0_entrylo0(pte_val(*ptep++) >> 6);
+-	write_c0_entrylo1(pte_val(*ptep) >> 6);
++	write_c0_entrylo0(pte_to_entrylo(pte_val(*ptep++)));
++	write_c0_entrylo1(pte_to_entrylo(pte_val(*ptep)));
+ #endif
+ 	mtc0_tlbw_hazard();
+ 	if (idx < 0)
+@@ -339,8 +339,8 @@ static void r4k_update_mmu_cache_hwbug(struct vm_area_struct * vma,
+ 	pmdp = pmd_offset(pgdp, address);
+ 	idx = read_c0_index();
+ 	ptep = pte_offset_map(pmdp, address);
+-	write_c0_entrylo0(pte_val(*ptep++) >> 6);
+-	write_c0_entrylo1(pte_val(*ptep) >> 6);
++	write_c0_entrylo0(pte_to_entrylo(pte_val(*ptep++)));
++	write_c0_entrylo1(pte_to_entrylo(pte_val(*ptep)));
+ 	mtc0_tlbw_hazard();
+ 	if (idx < 0)
+ 		tlb_write_random();
+diff --git a/arch/mips/mm/tlbex.c b/arch/mips/mm/tlbex.c
+index 0b86ed9..fa29598 100644
+--- a/arch/mips/mm/tlbex.c
++++ b/arch/mips/mm/tlbex.c
+@@ -29,6 +29,35 @@
+ 
+ #include "uasm.h"
+ 
++#if defined(CONFIG_CPU_CAVIUM_OCTEON) && defined(CONFIG_TEMPORARY_SCRATCHPAD_FOR_KERNEL) && defined(CONFIG_SMP) && defined(CONFIG_64BIT)
++#if !defined(CONFIG_MIPS_MT_SMTC) && CONFIG_TEMPORARY_SCRATCHPAD_FOR_KERNEL
++#define OCTEON_FAST_PATH_TLB_REFILL_HANDLER
++#endif
++#endif
++
++#ifdef OCTEON_FAST_PATH_TLB_REFILL_HANDLER
++#define USER_REGISTER_TO_USE 1 // $1 saved, used, restored during refill handler
++#if (defined(MODULE_START) && (MODULE_START & 0x000000FFFFFFFFFFULL)) || (VMALLOC_START & 0x000000FFFFFFFFFFULL)
++#define OCTEON_FAST_PATH_TLB_REFILL_HANDLER_SAVEK0
++#endif
++#endif
++
++// stick this here for now
++#define PGDIR_BITS 10 // PTRS_PER_PGD = 1 << PGDIR_BITS
++#if defined(CONFIG_CPU_CAVIUM_OCTEON)
++#define TLB_SEGBITS 49
++#else
++#define TLB_SEGBITS (PGDIR_SHIFT+PGDIR_BITS) // really is just 40
++#endif
++#if TLB_SEGBITS > (PGDIR_SHIFT+PGDIR_BITS)
++#define CHECK_FOR_HIGH_SEGBITS_ADDRESSES
++#endif
++
++extern void tlb_do_page_fault_0(void);
++extern void tlb_do_page_fault_1(void);
++
++#define insn_is_eret(inst) (((inst) & 0xFE00003F) == 0x42000018)
++
+ static inline int r45k_bvahwbug(void)
+ {
+ 	/* XXX: We should probe for the presence of this bug, but we don't. */
+@@ -85,6 +114,9 @@ enum label_id {
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	label_tlb_huge_update,
+ #endif
++#ifdef CHECK_FOR_HIGH_SEGBITS_ADDRESSES
++	label_large_segbits_fault,
++#endif
+ };
+ 
+ UASM_L_LA(_second_part)
+@@ -104,6 +136,9 @@ UASM_L_LA(_r3000_write_probe_fail)
+ #ifdef CONFIG_HUGETLB_PAGE
+ UASM_L_LA(_tlb_huge_update)
+ #endif
++#ifdef CHECK_FOR_HIGH_SEGBITS_ADDRESSES
++UASM_L_LA(_large_segbits_fault)
++#endif
+ 
+ /*
+  * For debug purposes.
+@@ -588,11 +623,29 @@ build_get_pmde64(u32 **p, struct uasm_label **l, struct uasm_reloc **r,
+ 	 * The vmalloc handling is not in the hotpath.
+ 	 */
+ 	uasm_i_dmfc0(p, tmp, C0_BADVADDR);
++
++#ifdef CHECK_FOR_HIGH_SEGBITS_ADDRESSES
++        //
++        // The kernel currently implicitely assumes that the MIPS SEGBITS
++        // parameter for the processor is (PGDIR_SHIFT+PGDIR_BITS) or less, and will never allocate virtual
++        // addresses outside the maximum range for SEGBITS = (PGDIR_SHIFT+PGDIR_BITS). But that
++        // doesn't prevent user code from accessing the higher xuseg addresses.
++        // Here, we make sure that everything but the lower xuseg addresses
++        // goes down the module_alloc/vmalloc path.
++        //
++        uasm_i_dsrl32(p, ptr, tmp, PGDIR_SHIFT+PGDIR_BITS-32);
++#ifdef MODULE_START
++        uasm_il_bnez(p, r, ptr, label_module_alloc);
++#else
++        uasm_il_bnez(p, r, ptr, label_vmalloc);
++#endif
++#else // CHECK_FOR_HIGH_SEGBITS_ADDRESSES
+ #ifdef MODULE_START
+ 	uasm_il_bltz(p, r, tmp, label_module_alloc);
+ #else
+ 	uasm_il_bltz(p, r, tmp, label_vmalloc);
+ #endif
++#endif // CHECK_FOR_HIGH_SEGBITS_ADDRESSES
+ 	/* No uasm_i_nop needed here, since the next insn doesn't touch TMP. */
+ 
+ #ifdef CONFIG_SMP
+@@ -641,7 +694,7 @@ build_get_pmde64(u32 **p, struct uasm_label **l, struct uasm_reloc **r,
+  */
+ static void __cpuinit
+ build_get_pgd_vmalloc64(u32 **p, struct uasm_label **l, struct uasm_reloc **r,
+-			unsigned int bvaddr, unsigned int ptr)
++			unsigned int bvaddr, unsigned int ptr, unsigned int is_refill)
+ {
+ 	long swpd = (long)swapper_pg_dir;
+ 
+@@ -649,6 +702,21 @@ build_get_pgd_vmalloc64(u32 **p, struct uasm_label **l, struct uasm_reloc **r,
+ 	long modd = (long)module_pg_dir;
+ 
+ 	uasm_l_module_alloc(l, *p);
++#else
++	uasm_l_vmalloc(l, *p);
++#endif
++
++        if(is_refill) {
++#ifdef CHECK_FOR_HIGH_SEGBITS_ADDRESSES
++           // branch to large_segbits_fault if xuseg or xsseg address
++           uasm_il_bgez(p, r, bvaddr, label_large_segbits_fault);
++#endif
++#ifdef OCTEON_FAST_PATH_TLB_REFILL_HANDLER_SAVEK0
++           uasm_i_move(p, USER_REGISTER_TO_USE, bvaddr);
++#endif
++        }
++
++#ifdef MODULE_START
+ 	/*
+ 	 * Assumption:
+ 	 * VMALLOC_START >= 0xc000000000000000UL
+@@ -687,7 +755,6 @@ build_get_pgd_vmalloc64(u32 **p, struct uasm_label **l, struct uasm_reloc **r,
+ 	else
+ 		UASM_i_LA(p, ptr, VMALLOC_START);
+ #else
+-	uasm_l_vmalloc(l, *p);
+ 	UASM_i_LA(p, ptr, VMALLOC_START);
+ #endif
+ 	uasm_i_dsubu(p, bvaddr, bvaddr, ptr);
+@@ -703,6 +770,23 @@ build_get_pgd_vmalloc64(u32 **p, struct uasm_label **l, struct uasm_reloc **r,
+ 		else
+ 			uasm_i_daddiu(p, ptr, ptr, uasm_rel_lo(swpd));
+ 	}
++#ifdef CHECK_FOR_HIGH_SEGBITS_ADDRESSES
++        if(is_refill) {
++           l_large_segbits_fault(l, *p);
++           //
++           // We get here if we are an xsseg address, or if we are
++           // an xuseg address above (PGDIR_SHIFT+PGDIR_BITS) boundary.
++           //
++           // Ignoring xsseg (assume disabled so would generate address
++           // errors?), the only remaining possibility is the upper xuseg addresses.
++           // On processors with TLB_SEGBITS <= PGDIR_SHIFT+PGDIR_BITS, these addresses
++           // would have taken an address error. We try to mimic that
++           // here by taking a load/istream page fault.
++           //
++           uasm_i_j(p, (unsigned long)tlb_do_page_fault_0 & 0x0fffffff);
++           uasm_i_nop(p);
++        }
++#endif
+ }
+ 
+ #else /* !CONFIG_64BIT */
+@@ -797,6 +881,34 @@ static void __cpuinit build_get_ptep(u32 **p, unsigned int tmp, unsigned int ptr
+ 	UASM_i_ADDU(p, ptr, ptr, tmp); /* add in offset */
+ }
+ 
++static __init void build_convert_pte_to_entrylo(u32 **p, unsigned int reg)
++{
++#if defined(CONFIG_USE_RI_XI_PAGE_BITS)
++	uasm_i_dsrl(p, reg, reg, __ilog2(_PAGE_NO_EXEC));
++	uasm_i_drotr(p, reg, reg, __ilog2(_PAGE_GLOBAL) - __ilog2(_PAGE_NO_EXEC));
++#elif defined(CONFIG_64BIT_PHYS_ADDR)
++	uasm_i_dsrl(p, reg, reg, 6);
++#else
++	uasm_i_SRL(p, reg, reg, 6);
++#endif
++}
++
++static __init void build_convert_pte_to_entrylo2(u32 **p, unsigned int e0, unsigned int e1)
++{
++#if defined(CONFIG_USE_RI_XI_PAGE_BITS)
++	uasm_i_dsrl(p, e0, e0, __ilog2(_PAGE_NO_EXEC));
++	uasm_i_dsrl(p, e1, e1, __ilog2(_PAGE_NO_EXEC));
++	uasm_i_drotr(p, e0, e0, __ilog2(_PAGE_GLOBAL) - __ilog2(_PAGE_NO_EXEC));
++	uasm_i_drotr(p, e1, e1, __ilog2(_PAGE_GLOBAL) - __ilog2(_PAGE_NO_EXEC));
++#elif defined(CONFIG_64BIT_PHYS_ADDR)
++	uasm_i_dsrl(p, e0, e0, 6);
++	uasm_i_dsrl(p, e1, e1, 6);
++#else
++	uasm_i_SRL(p, e0, e0, 6);
++	uasm_i_SRL(p, e1, e1, 6);
++#endif
++}
++
+ static void __cpuinit build_update_entries(u32 **p, unsigned int tmp,
+ 					unsigned int ptep)
+ {
+@@ -808,9 +920,8 @@ static void __cpuinit build_update_entries(u32 **p, unsigned int tmp,
+ 	if (cpu_has_64bits) {
+ 		uasm_i_ld(p, tmp, 0, ptep); /* get even pte */
+ 		uasm_i_ld(p, ptep, sizeof(pte_t), ptep); /* get odd pte */
+-		uasm_i_dsrl(p, tmp, tmp, 6); /* convert to entrylo0 */
++		build_convert_pte_to_entrylo2(p, tmp, ptep);
+ 		uasm_i_mtc0(p, tmp, C0_ENTRYLO0); /* load it */
+-		uasm_i_dsrl(p, ptep, ptep, 6); /* convert to entrylo1 */
+ 		uasm_i_mtc0(p, ptep, C0_ENTRYLO1); /* load it */
+ 	} else {
+ 		int pte_off_even = sizeof(pte_t) / 2;
+@@ -827,11 +938,10 @@ static void __cpuinit build_update_entries(u32 **p, unsigned int tmp,
+ 	UASM_i_LW(p, ptep, sizeof(pte_t), ptep); /* get odd pte */
+ 	if (r45k_bvahwbug())
+ 		build_tlb_probe_entry(p);
+-	UASM_i_SRL(p, tmp, tmp, 6); /* convert to entrylo0 */
++	build_convert_pte_to_entrylo2(p, tmp, ptep);
+ 	if (r4k_250MHZhwbug())
+ 		uasm_i_mtc0(p, 0, C0_ENTRYLO0);
+ 	uasm_i_mtc0(p, tmp, C0_ENTRYLO0); /* load it */
+-	UASM_i_SRL(p, ptep, ptep, 6); /* convert to entrylo1 */
+ 	if (r45k_bvahwbug())
+ 		uasm_i_mfc0(p, tmp, C0_INDEX);
+ 	if (r4k_250MHZhwbug())
+@@ -873,7 +983,7 @@ static __init void build_huge_update_entries(u32 **p, struct label **l,
+ 	 * address space.
+ 	 */
+ 	UASM_i_LW(p, tmp, 0, pmd);
+-	uasm_i_SRL(p, tmp, tmp, 6); /* convert to entrylo0 */
++	build_convert_pte_to_entrylo(p, tmp);
+ 	uasm_i_mtc0(p, tmp, C0_ENTRYLO0); /* load it */
+ 	if (HPAGE_SIZE>>7 < 0x10000)
+ 		uasm_i_ADDIU(p, tmp, tmp, HPAGE_SIZE >> 7); /* convert to entrylo1 */
+@@ -888,6 +998,149 @@ static __init void build_huge_update_entries(u32 **p, struct label **l,
+ 
+ #endif
+ 
++#ifdef OCTEON_FAST_PATH_TLB_REFILL_HANDLER
++
++static void __init build_octeon_fast_tlb_refill_handler (u32 **p,
++                 struct label **l,
++                 struct reloc **r,
++		 unsigned int tmp, // K0
++                 unsigned int ptr // K1
++                 )
++{
++//
++// This function is an optimized refill handler for OCTEON. It will work for
++// the case CONFIG_SMP && CONFIG_64BIT && !CONFIG_MIPS_MT_SMTC.
++// It gets part of it's speedup from moving
++// the instructions around. But most of its speedup comes from
++// the use of a CVMSEG LM scratch register
++// (i.e. CONFIG_TEMPORARY_SCRATCHPAD_FOR_KERNEL > 0). The speedup is
++// about 18 cycles over the unoptimized version.
++//
++// this function is a replacement for these functions:
++//	build_get_pmde64(&p, &l, &r, K0, K1); /* get pmd in K1 */
++//#ifdef CONFIG_HUGETLB_PAGE
++//	build_is_huge_pte(&p, &r, K0, K1, label_tlb_huge_update);
++//#endif
++//	build_get_ptep(&p, K0, K1);
++//	build_update_entries(&p, K0, K1);
++//	build_tlb_write_entry(&p, &l, &r, tlb_random);
++//	l_leave(&l, p);
++//#ifdef CONFIG_FAST_ACCESS_TO_THREAD_POINTER
++//	UASM_i_LW(&p, K0, FAST_ACCESS_THREAD_OFFSET, 0);  /* K0 = thread pointer */
++//#endif
++//	uasm_i_eret(&p); /* return from trap */
++//
++
++        u32 *initial_p = *p;
++	long pgdc = (long)pgd_current;                                                         // build_get_pmde64
++
++#ifdef CHECK_FOR_HIGH_SEGBITS_ADDRESSES
++
++	uasm_i_dmfc0(p, tmp, C0_BADVADDR);                                                          // build_get_pmde64
++
++	uasm_i_dmfc0(p, ptr, C0_CONTEXT);                                                           // build_get_pmde64
++
++	UASM_i_SW(p, USER_REGISTER_TO_USE, TEMPORARY_SCRATCHPAD_FOR_KERNEL_OFFSET(0), 0);           // NEW
++
++	uasm_i_dsrl32(p, USER_REGISTER_TO_USE, tmp, PGDIR_SHIFT+PGDIR_BITS-32);                     // build_get_pmde64
++
++#ifdef MODULE_START
++	uasm_il_bnez(p, r, USER_REGISTER_TO_USE, label_module_alloc);                               // build_get_pmde64
++#else
++	uasm_il_bnez(p, r, USER_REGISTER_TO_USE, label_vmalloc);                                    // build_get_pmde64
++#endif
++	UASM_i_LA_mostly(p, USER_REGISTER_TO_USE, pgdc);                                            // build_get_pmde64
++
++	uasm_i_dsrl(p, ptr, ptr, 23);                                                               // build_get_pmde64
++
++#else // CHECK_FOR_HIGH_SEGBITS_ADDRESSES
++
++	uasm_i_dmfc0(p, ptr, C0_CONTEXT);                                                           // build_get_pmde64
++
++	uasm_i_dmfc0(p, tmp, C0_BADVADDR);                                                          // build_get_pmde64
++
++	UASM_i_SW(p, USER_REGISTER_TO_USE, TEMPORARY_SCRATCHPAD_FOR_KERNEL_OFFSET(0), 0);           // NEW
++	UASM_i_LA_mostly(p, USER_REGISTER_TO_USE, pgdc);                                            // build_get_pmde64
++
++	uasm_i_dsrl(p, ptr, ptr, 23);                                                               // build_get_pmde64
++
++#ifdef MODULE_START
++	uasm_il_bltz(p, r, tmp, label_module_alloc);                                                // build_get_pmde64
++#else
++	uasm_il_bltz(p, r, tmp, label_vmalloc);                                                     // build_get_pmde64
++#endif
++
++#endif // CHECK_FOR_HIGH_SEGBITS_ADDRESSES
++
++	uasm_i_daddu(p, ptr, ptr, USER_REGISTER_TO_USE);                                            // build_get_pmde64
++
++	// uasm_i_dmfc0(p, tmp, C0_BADVADDR);                                                       // build_get_pmde64
++	uasm_i_ld(p, ptr, rel_lo(pgdc), ptr);                                                       // build_get_pmde64
++
++#ifdef OCTEON_FAST_PATH_TLB_REFILL_HANDLER_SAVEK0
++        // the module_alloc and/or vmalloc routines may mangle K0/tmp, so need to copy K0 to USER_REGISTER_TO_USE
++        uasm_i_move(p, USER_REGISTER_TO_USE, tmp);                                                  // NEW
++#define LOC_REG_TMP USER_REGISTER_TO_USE
++#define LOC_REG_USER tmp
++#else
++#define LOC_REG_TMP tmp
++#define LOC_REG_USER USER_REGISTER_TO_USE
++#endif
++
++	l_vmalloc_done(l, *p);                                                                 // build_get_pmde64
++
++        // fall-through case =   K0 has badvaddr                K1 has *pgd_current       USER may have badvaddr
++        // vmalloc case      =   K0 has badvaddr-VMALLOC_START  K1 has swapper_pg_dir     USER may have badvaddr
++        // module case       =   K0 has badvaddr-MODULE_START   K1 has module_pg_dir      USER may have badvaddr
++
++	if (PGDIR_SHIFT - 3 < 32)		/* get pgd offset in bytes */                  // build_get_pmde64
++		uasm_i_dsrl(p, LOC_REG_USER, tmp, PGDIR_SHIFT-3);                                   // build_get_pmde64
++	else                                                                                   // build_get_pmde64
++		uasm_i_dsrl32(p, LOC_REG_USER, tmp, PGDIR_SHIFT - 3 - 32);                          // build_get_pmde64
++
++	uasm_i_andi(p, LOC_REG_USER, LOC_REG_USER, (PTRS_PER_PGD - 1)<<3);                          // build_get_pmde64
++
++	uasm_i_daddu(p, ptr, ptr, LOC_REG_USER); /* add in pgd offset */                            // build_get_pmde64
++	// uasm_i_dmfc0(p, LOC_REG_TMP, C0_BADVADDR); /* get faulting address */                    // build_get_pmde64
++	uasm_i_dsrl(p, LOC_REG_USER, LOC_REG_TMP, PMD_SHIFT-3); /* get pmd offset in bytes */       // build_get_pmde64
++
++	uasm_i_ld(p, ptr, 0, ptr); /* get pmd pointer */                                            // build_get_pmde64
++	uasm_i_andi(p, LOC_REG_USER, LOC_REG_USER, (PTRS_PER_PMD - 1)<<3);                          // build_get_pmde64
++
++	GET_CONTEXT(p, LOC_REG_TMP); /* get context reg */                                     // build_get_ptep
++
++	uasm_i_daddu(p, ptr, ptr, LOC_REG_USER); /* add in pmd offset */                            // build_get_pmde64
++
++#ifdef CONFIG_HUGETLB_PAGE
++	build_is_huge_pte(p, r, LOC_REG_USER, ptr, label_tlb_huge_update);
++	// UASM_i_LW(p, ptr, 0, ptr);                                                               // build_get_ptep
++#else // CONFIG_HUGETLB_PAGE
++	UASM_i_LW(p, LOC_REG_USER, 0, ptr);                                                         // build_get_ptep
++#endif // CONFIG_HUGETLB_PAGE
++
++        build_adjust_context(p, LOC_REG_TMP);                                                  // build_get_ptep
++
++	UASM_i_ADDU(p, ptr, LOC_REG_USER, LOC_REG_TMP); /* add in offset */                         // build_get_ptep
++
++	build_update_entries(p, LOC_REG_TMP, ptr);
++	build_tlb_write_entry(p, l, r, tlb_random);
++	l_leave(l, *p);
++
++	UASM_i_LW(p, USER_REGISTER_TO_USE, TEMPORARY_SCRATCHPAD_FOR_KERNEL_OFFSET(0), 0);           // NEW
++
++#ifdef CONFIG_FAST_ACCESS_TO_THREAD_POINTER
++	UASM_i_LW(p, K0, FAST_ACCESS_THREAD_OFFSET, 0);  /* K0 = thread pointer */
++#endif
++
++	uasm_i_eret(p); /* return from trap */
++
++        while(*p - initial_p < 31) i_nop(p); // make the total instruction count be 31 or more
++}
++#undef LOC_REG_TMP
++#undef LOC_REG_USER
++
++#endif // OCTEON_FAST_PATH_TLB_REFILL_HANDLER
++
+ static void __cpuinit build_r4000_tlb_refill_handler(void)
+ {
+ 	u32 *p = tlb_handler;
+@@ -904,6 +1157,10 @@ static void __cpuinit build_r4000_tlb_refill_handler(void)
+ 	/*
+ 	 * create the plain linear handler
+ 	 */
++#ifdef OCTEON_FAST_PATH_TLB_REFILL_HANDLER
++	build_octeon_fast_tlb_refill_handler(&p, &l, &r, K0, K1);
++#else // OCTEON_FAST_PATH_TLB_REFILL_HANDLER
++
+ 	if (bcm1250_m3_war())
+ 		build_bcm1250_m3_war(&p, &r);
+ 
+@@ -926,13 +1183,15 @@ static void __cpuinit build_r4000_tlb_refill_handler(void)
+ #endif
+ 	uasm_i_eret(&p); /* return from trap */
+ 
++#endif // OCTEON_FAST_PATH_TLB_REFILL_HANDLER
++
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	build_huge_update_entries(&p, &l, K0, K1);
+ 	build_huge_tlb_write_entry(&p, &l, &r, K0, tlb_random);
+ #endif
+ 
+ #ifdef CONFIG_64BIT
+-	build_get_pgd_vmalloc64(&p, &l, &r, K0, K1);
++	build_get_pgd_vmalloc64(&p, &l, &r, K0, K1, 1 /*is_refill*/);
+ #endif
+ 
+ 	/*
+@@ -972,26 +1231,55 @@ static void __cpuinit build_r4000_tlb_refill_handler(void)
+ 	} else {
+ 		u32 *split = tlb_handler + 30;
+ 
++		int split_on_eret = insn_is_eret(*split);
++		int next_is_eret = 0;
+ 		/*
+ 		 * Find the split point.
+ 		 */
+-		if (uasm_insn_has_bdelay(relocs, split - 1))
++		if(split_on_eret) {
++			// the original split choice pointed to an eret
++			// no need to insert a branch in this case, code does not flow past an eret
++			// for cleanliness, we will add a NOP instruction below, which will be the 32nd instruction
++			split++;
++		}
++		else {
++			if (uasm_insn_is_eret(split[1])) {
++				// the instruction following the original split choice is an eret
++				// no need to insert a branch in this case, code does not flow past an eret
++				// existing eret instruction will be the 32nd
++				split_on_eret = 1;
++				next_is_eret = 1;
++				split += 2;
++			}
++			else {
++				// the normal case - not an eret
++				if (uasm_insn_has_bdelay(relocs, split - 1))
+ 			split--;
++			}
++		}
+ 
+ 		/* Copy first part of the handler. */
+ 		uasm_copy_handler(relocs, labels, tlb_handler, split, f);
+ 		f += split - tlb_handler;
+ 
+-		/* Insert branch. */
+-		uasm_l_split(&l, final_handler);
+-		uasm_il_b(&f, &r, label_split);
+-		if (uasm_insn_has_bdelay(relocs, split))
+-			uasm_i_nop(&f);
++		if(split_on_eret) {
++			if(!next_is_eret) {
++				// probably not necessary, but seems cleanly to insert a NOP as the 32nd instruction
++				uasm_i_nop(&f);
++			}
++		}
+ 		else {
+-			uasm_copy_handler(relocs, labels, split, split + 1, f);
+-			uasm_move_labels(labels, f, f + 1, -1);
+-			f++;
+-			split++;
++			/* Insert branch. */
++			uasm_l_split(&l, final_handler);
++			uasm_il_b(&f, &r, label_split);
++			if (uasm_insn_has_bdelay(relocs, split))
++				uasm_i_nop(&f);
++			else {
++				uasm_copy_handler(relocs, labels, split, split + 1, f);
++				uasm_move_labels(labels, f, f + 1, -1);
++				f++;
++				split++;
++			}
+ 		}
+ 
+ 		/* Copy the rest of the handler. */
+@@ -1015,9 +1303,6 @@ static void __cpuinit build_r4000_tlb_refill_handler(void)
+  * Only the fastpath gets synthesized at runtime, the slowpath for
+  * do_page_fault remains normal asm.
+  */
+-extern void tlb_do_page_fault_0(void);
+-extern void tlb_do_page_fault_1(void);
+-
+ /*
+  * 128 instructions for the fastpath handler is generous and should
+  * never be exceeded.
+@@ -1386,7 +1671,7 @@ build_r4000_tlbchange_handler_tail(u32 **p, struct uasm_label **l,
+ 	uasm_i_eret(p); /* return from trap */
+ 
+ #ifdef CONFIG_64BIT
+-	build_get_pgd_vmalloc64(p, l, r, tmp, ptr);
++	build_get_pgd_vmalloc64(p, l, r, tmp, ptr, 0 /*is_refill*/);
+ #endif
+ }
+ 
+diff --git a/arch/mips/mm/uasm.c b/arch/mips/mm/uasm.c
+index 23bef79..de5866d 100644
+--- a/arch/mips/mm/uasm.c
++++ b/arch/mips/mm/uasm.c
+@@ -60,7 +60,7 @@ enum opcode {
+ 	insn_beql, insn_bgez, insn_bgezl, insn_bltz, insn_bltzl,
+ 	insn_bne, insn_cache, insn_daddu, insn_daddiu, insn_dmfc0,
+ 	insn_dmtc0, insn_dsll, insn_dsll32, insn_dsra, insn_dsrl,
+-	insn_dsrl32, insn_dsubu, insn_eret, insn_j, insn_jal, insn_jr,
++	insn_drotr, insn_dsrl32, insn_dsubu, insn_eret, insn_j, insn_jal, insn_jr,
+ 	insn_ld, insn_ll, insn_lld, insn_lui, insn_lw, insn_mfc0,
+ 	insn_mtc0, insn_or, insn_ori, insn_pref, insn_rfe, insn_sc,
+ 	insn_scd, insn_sd, insn_sll, insn_sra, insn_srl, insn_subu,
+@@ -108,6 +108,7 @@ static struct insn insn_table[] __cpuinitdata = {
+ 	{ insn_dsll32, M(spec_op, 0, 0, 0, 0, dsll32_op), RT | RD | RE },
+ 	{ insn_dsra, M(spec_op, 0, 0, 0, 0, dsra_op), RT | RD | RE },
+ 	{ insn_dsrl, M(spec_op, 0, 0, 0, 0, dsrl_op), RT | RD | RE },
++	{ insn_drotr, M(spec_op, 1, 0, 0, 0, dsrl_op), RT | RD | RE },
+ 	{ insn_dsrl32, M(spec_op, 0, 0, 0, 0, dsrl32_op), RT | RD | RE },
+ 	{ insn_dsubu, M(spec_op, 0, 0, 0, 0, dsubu_op), RS | RT | RD },
+ 	{ insn_eret,  M(cop0_op, cop_op, 0, 0, 0, eret_op),  0 },
+@@ -387,6 +388,7 @@ I_u2u1u3(_dsll)
+ I_u2u1u3(_dsll32)
+ I_u2u1u3(_dsra)
+ I_u2u1u3(_dsrl)
++I_u2u1u3(_drotr)
+ I_u2u1u3(_dsrl32)
+ I_u3u1u2(_dsubu)
+ I_0(_eret)
+diff --git a/include/asm-mips/pgtable-64.h b/include/asm-mips/pgtable-64.h
+index 912b5c9..6c25f84 100644
+--- a/include/asm-mips/pgtable-64.h
++++ b/include/asm-mips/pgtable-64.h
+@@ -186,14 +186,14 @@ static inline void pud_clear(pud_t *pudp)
+ #define pfn_pte(pfn, prot)	__pte(((pfn) << (PAGE_SHIFT + 2)) | pgprot_val(prot))
+ #else
+ #ifdef _PAGE_NO_EXEC
+-/* The NO_READ and NO_EXEC bits are in the top two bits. We need to remove these
+-	before giving anyone the underlying address */
+-#define pte_pfn(x)		((unsigned long)(((x).pte << 28) >> (PAGE_SHIFT+28)))
++/* The NO_READ and NO_EXEC added an extra two bits */
++#define pte_pfn(x)		((unsigned long)((x).pte >> (PAGE_SHIFT+2)))
++#define pfn_pte(pfn, prot)	__pte(((pfn) << (PAGE_SHIFT+2)) | pgprot_val(prot))
+ #else
+ #define pte_pfn(x)		((unsigned long)((x).pte >> PAGE_SHIFT))
+-#endif
+ #define pfn_pte(pfn, prot)	__pte(((pfn) << PAGE_SHIFT) | pgprot_val(prot))
+ #endif
++#endif
+ 
+ #define __pgd_offset(address)	pgd_index(address)
+ #define __pud_offset(address)	(((address) >> PUD_SHIFT) & (PTRS_PER_PUD-1))
+diff --git a/include/asm-mips/pgtable-bits.h b/include/asm-mips/pgtable-bits.h
+index b1e0fcd..6fdb5af 100644
+--- a/include/asm-mips/pgtable-bits.h
++++ b/include/asm-mips/pgtable-bits.h
+@@ -52,23 +52,39 @@
+ 
+ #elif defined(CONFIG_USE_RI_XI_PAGE_BITS)
+ 
++/* When using the RI/XI bit support, we have 14 bits of flags below the physical
++	address. The RI/XI bits are places such that a SRL 8 can strip off the software
++	bits, then a ROTR 2 can move the RI/XI into bits [63:62]. This also limits
++	physical address to 56 bits, which is more than we need right now. Octeon
++	CSRs use 48 bits */
+ #define _PAGE_PRESENT               (1<<0)  /* implemented in software */
+ #define _PAGE_WRITE                 (1<<2)  /* implemented in software */
+ #define _PAGE_ACCESSED              (1<<3)  /* implemented in software */
+ #define _PAGE_MODIFIED              (1<<4)  /* implemented in software */
+ #define _PAGE_FILE                  (1<<4)  /* set:pagecache unset:swap */
+ #define _PAGE_HUGE                  (1<<5)  /* huge tlb page */
+-#define _PAGE_GLOBAL                (1<<6)
+-#define _PAGE_VALID                 (1<<7)
+-#define _PAGE_SILENT_READ           (1<<7)  /* synonym                 */
+-#define _PAGE_DIRTY                 (1<<8)  /* The MIPS dirty bit      */
+-#define _PAGE_SILENT_WRITE          (1<<8)
+-#define _CACHE_MASK                 (7<<9)
+-#define _PAGE_NO_EXEC               (1ul<<36)
+-#define _PAGE_NO_READ               (1ul<<37)
++#define _PAGE_NO_EXEC               (1<<6)  /* Page cannot be executed */
++#define _PAGE_NO_READ               (1<<7)  /* Page cannot be read */
++#define _PAGE_GLOBAL                (1<<8)
++#define _PAGE_VALID                 (1<<9)
++#define _PAGE_SILENT_READ           (1<<9)  /* synonym                 */
++#define _PAGE_DIRTY                 (1<<10) /* The MIPS dirty bit      */
++#define _PAGE_SILENT_WRITE          (1<<10)
++#define _CACHE_MASK                 (7<<11)
++#ifndef __ASSEMBLY__
++/* pte_to_entrylo converts a page table entry (PTE) into a Mips entrylo0/1 value. This
++	is an inline function instead of a macro since the kenrel code tends to pass
++	expressions with ++ in them */
++static inline uint64_t pte_to_entrylo(unsigned long pte_val)
++{
++	/* C has no way to express that this is a DSRL 8 followed by a ROTR 2.
++		Luckily in the fast path this is done in assembly */
++	return (pte_val>>8)|((pte_val&(_PAGE_NO_EXEC|_PAGE_NO_READ))<<56);
++}
++#endif
+ 
+-#define _CACHE_UNCACHED             (0<<9)  /* Memory is always cached on Octeon */
+-#define _CACHE_UNCACHED_ACCELERATED (7<<9)  /* Write buffer entries are marked special */
++#define _CACHE_UNCACHED             (0<<11) /* Memory is always cached on Octeon */
++#define _CACHE_UNCACHED_ACCELERATED (7<<11) /* Write buffer entries are marked special */
+ 
+ #else /* CONFIG_USE_RI_XI_PAGE_BITS */
+ 
+@@ -78,6 +94,13 @@
+ #define _PAGE_ACCESSED              (1<<3)  /* implemented in software */
+ #define _PAGE_MODIFIED              (1<<4)  /* implemented in software */
+ #define _PAGE_FILE                  (1<<4)  /* set:pagecache unset:swap */
++#ifndef __ASSEMBLY__
++/* pte_to_entrylo converts a page table entry (PTE) into a Mips entrylo0/1 value */
++static inline uint64_t pte_to_entrylo(unsigned long pte_val)
++{
++	return pte_val>>6;
++}
++#endif
+ 
+ #if defined(CONFIG_CPU_R3000) || defined(CONFIG_CPU_TX39XX)
+ 
+-- 
+1.5.5.1
+
