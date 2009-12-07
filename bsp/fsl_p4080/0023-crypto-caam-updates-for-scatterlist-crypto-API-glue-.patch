@@ -1,0 +1,1052 @@
+From 8dd0effc706e888da17cc07f0e530bad5da8911b Mon Sep 17 00:00:00 2001
+From: Kim Phillips <kim.phillips@freescale.com>
+Date: Tue, 22 Sep 2009 16:30:15 +0800
+Subject: [PATCH 23/77] crypto: caam - updates for scatterlist crypto API glue code
+
+-  use h/w scatter-gather descriptors for algapi
+
+this removes software copying and flattening of discontiguous i/o
+buffers for crypto, and instructs the h/w to do the scatter-gather
+directly.
+
+- reduce encap vs decap shared descs to single directionless
+
+Security Associations (SAs) are unidirectional; we don't need shared
+descriptor pointer space for both directions.
+
+- support IPsec ESP transport mode
+
+including support for fragmented (scatter-gather) packets.
+
+also enable supported scatterlist API operations in P4080 default
+configuration so our users might use our hardware to do the crypto.
+
+Signed-off-by: Kim Phillips <kim.phillips@freescale.com>
+[KevinHao: Original patch taken from Freescale rev 1.2 board support
+ISO image for p4080]
+Integrated-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/crypto/caam/algapi.c |  666 ++++++++++++++++++++++++------------------
+ drivers/crypto/caam/compat.h |    1 +
+ 2 files changed, 381 insertions(+), 286 deletions(-)
+
+diff --git a/drivers/crypto/caam/algapi.c b/drivers/crypto/caam/algapi.c
+index 03c86a1..0a18a32 100644
+--- a/drivers/crypto/caam/algapi.c
++++ b/drivers/crypto/caam/algapi.c
+@@ -72,9 +72,6 @@
+ /* max IV is max of AES_BLOCK_SIZE, DES3_EDE_BLOCK_SIZE */
+ #define CAAM_MAX_IV_LENGTH		16
+ 
+-/* hardcoded for now, should probably get from packet data IHL field */
+-#define ALGAPI_IP_HDR_LEN 20
+-
+ #ifdef DEBUG
+ /* for print_hex_dumps with line references */
+ #define xstr(s) str(s)
+@@ -96,15 +93,55 @@ struct caam_ctx {
+ 	unsigned int enckeylen;
+ 	unsigned int authkeylen;
+ 	unsigned int authsize;
+-	u32 *shared_desc_encap;
+-	u32 *shared_desc_decap;
+-	u32 shared_desc_encap_phys;
+-	u32 shared_desc_decap_phys;
+-	int shared_desc_encap_len;
+-	int shared_desc_decap_len;
++	u32 *shared_desc;
++	u32 shared_desc_phys;
++	int shared_desc_len;
+ 	spinlock_t first_lock;
+ };
+ 
++/*
++ * IPSec shared protocol descriptor/PDB - encapsulation
++ */
++struct pdb_proto_ipsec_cbc_encap {
++	__be32 desc_hdr;
++	u8 res1;
++	u8 ip_nh; /* next header */
++	u8 ip_nh_offset; /* its offset within packet */
++	u8 options;
++	__be32 seq_num_ext_hi;
++	__be32 seq_num;
++	__be32 iv[4];
++	__be32 spi;
++	__be16 res2;
++	__be16 ip_hdr_len;
++	__be32 ip_hdr[0]; /* optional IP Header content */
++} __packed;
++
++/*
++ * IPSec shared protocol descriptor/PDB- decapsulation
++ */
++struct pdb_proto_ipsec_cbc_decap {
++	__be32 desc_hdr;
++	__be16 ip_hdr_len;
++	u8 ip_nh_offset;
++	u8 options;
++	__be32 res1[2];
++	__be32 seq_num_ext_hi;
++	__be32 seq_num;
++	__be32 anti_replay[2]; /* anti-replay scorecard */
++	__be32 end_index[0];
++} __packed;
++
++/*
++ * IPSec ESP Datapath Protocol Override Register (DPOVRD)
++ */
++struct ipsec_deco_dpovrd {
++#define IPSEC_ENCAP_DECO_DPOVRD_USE cpu_to_be16(0x8000)
++	__be16 ip_hdr_len;
++	u8 nh_offset;
++	u8 next_header;	/* reserved if decap */
++} __packed;
++
+ static int aead_authenc_setauthsize(struct crypto_aead *authenc,
+ 				    unsigned int authsize)
+ {
+@@ -129,98 +166,96 @@ static int build_protocol_desc_ipsec_decap(struct caam_ctx *ctx,
+ {
+ 	gfp_t flags = req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP ? GFP_KERNEL :
+ 		      GFP_ATOMIC;
+-	u32 *shdesc, *shdescptr;
+-	int startidx, endidx;
++	struct crypto_async_request *req_base = &req->base;
++	struct sk_buff *skb = req_base->data;
++	struct xfrm_state *x = xfrm_input_state(skb);
++
++	struct pdb_proto_ipsec_cbc_decap *sh_desc;
++	void *sh_desc_pos;
++	int endidx;
++	int seq_no_offset = offsetof(struct ip_esp_hdr, seq_no);
+ 
+ 	/* build shared descriptor for this session */
+-	shdesc = kzalloc(36 /* minimum for this protocol */ +
++	sh_desc = kzalloc(sizeof(struct pdb_proto_ipsec_cbc_decap) +
+ 			 (sizeof(u32) + CAAM_MAX_KEY_SIZE) * 2 +
+-			 ALGAPI_IP_HDR_LEN, GFP_DMA | flags);
+-	if (!shdesc) {
++			 sizeof(struct iphdr), GFP_DMA | flags);
++	if (!sh_desc) {
+ 		dev_err(ctx->dev, "could not allocate shared descriptor\n");
+ 		return -ENOMEM;
+ 	}
+ 
+-	shdescptr = shdesc;
++	/* ip hdr len currently fixed */
++	sh_desc->ip_hdr_len = cpu_to_be16(sizeof(struct iphdr));
+ 
+-	/* skip shared header (filled in last) */
+-	shdescptr++;
++	/* next hdr offset (9 bytes in) */
++	sh_desc->ip_nh_offset = 9;
+ 
+ 	/*
+-	 * options byte:
+-	 * ipv4
+-	 * ip hdr len: fixed 20.
+-	 * next hdr offset: fixed 9.
++	 * options: ipv4, only the decapsulated output if tunnel mode
+ 	 * linux doesn't support Extended Sequence Numbers
+-	 * as of time of writing: PDBOPTS_ESPCBC_ESN not set.
++	 * as of time of writing: thus PDBOPTS_ESPCBC_ESN not set.
+ 	 */
+-	*shdescptr++ = ALGAPI_IP_HDR_LEN << 16 |
+-		       9 << 8 | /* next hdr offset (9 bytes in) */
+-		       PDBOPTS_ESPCBC_OUTFMT | /* decapsulated output only */
+-		       PDBOPTS_ESPCBC_TUNNEL; /* transport not supported yet */
+-	/*
+-	 * our choice of protocol operation descriptor command
+-	 * requires we pretend we have a full-fledged, 36-byte pdb
++	debug("xfrm is in %s mode\n", x->props.mode == XFRM_MODE_TUNNEL ?
++	      "tunnel" : "transport");
++	sh_desc->options = ((x->props.mode == XFRM_MODE_TUNNEL) ?
++			    (PDBOPTS_ESPCBC_TUNNEL | PDBOPTS_ESPCBC_OUTFMT) : 0);
++	/* copy Sequence Number
++	 * equivalent to:
++	 * *spi = *(__be32*)(skb_transport_header(skb) + offset);
+ 	 */
+-
+-	/* Skip reserveds */
+-	shdescptr += 2;
+-
+-	/* Skip optional ESN */
+-	shdescptr++;
+-
+-	/* copy Seq. Num */
+-	*shdescptr++ = (u32 *)((u32 *)sg_virt(req->assoc) + 1);
+-
+-	/* Skip ARS */
+-	shdescptr += 2;
++	sh_desc->seq_num = *(__be32 *)((char *)sg_virt(req->assoc) +
++			    seq_no_offset);
+ 
+ 	/* Save current location for computing start index */
+-	startidx = shdescptr - shdesc;
++	sh_desc_pos = &sh_desc->end_index[0];
+ 
+ 	/*
+ 	 * process keys, starting with class 2/authentication
+ 	 * This is assuming keys are immediate for sharedesc
+ 	 */
+-	shdescptr = cmd_insert_key(shdescptr, ctx->key,
+-				   ctx->authkeylen * 8, PTR_DIRECT,
+-				   KEYDST_KEYREG, KEY_CLEAR, ITEM_INLINE,
+-				   ITEM_CLASS2);
++	sh_desc_pos = cmd_insert_key(sh_desc_pos, ctx->key, ctx->authkeylen * 8,
++				     PTR_DIRECT, KEYDST_KEYREG, KEY_CLEAR,
++				     ITEM_INLINE, ITEM_CLASS2);
+ 
+ 	/* class 1/cipher key */
+-	shdescptr = cmd_insert_key(shdescptr, ctx->key + ctx->authkeylen,
+-				   ctx->enckeylen * 8, PTR_DIRECT,
+-				   KEYDST_KEYREG, KEY_CLEAR, ITEM_INLINE,
+-				   ITEM_CLASS1);
++	sh_desc_pos = cmd_insert_key(sh_desc_pos, ctx->key + ctx->authkeylen,
++				     ctx->enckeylen * 8, PTR_DIRECT,
++				     KEYDST_KEYREG, KEY_CLEAR, ITEM_INLINE,
++				     ITEM_CLASS1);
+ 
+ 	/* insert the operation command */
+-	shdescptr = cmd_insert_proto_op_ipsec(shdescptr, ctx->class1_alg_type,
+-					      ctx->class2_alg_type, DIR_DECAP);
++	sh_desc_pos = cmd_insert_proto_op_ipsec(sh_desc_pos,
++						ctx->class1_alg_type,
++						ctx->class2_alg_type,
++						DIR_DECAP);
+ 
+ 	/* update the header with size/offsets */
+-	endidx = shdescptr - shdesc + 1; /* add 1 to include header */
++	endidx = (sh_desc_pos - (void *)sh_desc ) / sizeof(char *) + 1;
++	/* add 1 to include header */
+ 
+-	cmd_insert_shared_hdr(shdesc, startidx, endidx, CTX_ERASE, SHR_SERIAL);
++	cmd_insert_shared_hdr((u_int32_t *)sh_desc,
++			      sizeof(struct pdb_proto_ipsec_cbc_decap) /
++			      sizeof(u32), endidx, CTX_ERASE, SHR_SERIAL);
+ 
+ #ifdef DEBUG
+ 	print_hex_dump(KERN_ERR, "shrdesc@"xstr(__LINE__)": ",
+-		       DUMP_PREFIX_ADDRESS, 16, 4, shdesc,
+-		       (shdescptr - shdesc + 1) * 4, 1);
+-	caam_desc_disasm(shdesc);
++		       DUMP_PREFIX_ADDRESS, 16, 4, sh_desc,
++		       (sh_desc_pos - (void *)sh_desc ) * 4+ 1, 1);
++	caam_desc_disasm((u_int32_t *)sh_desc);
+ #endif
+ 
+-	ctx->shared_desc_decap_len = endidx * sizeof(u32);
++	ctx->shared_desc_len = endidx * sizeof(u32);
+ 
+-	/* now we know the length, stop wasting preallocated shdesc space */
+-	ctx->shared_desc_decap = krealloc(shdesc, ctx->shared_desc_decap_len,
++	/* now we know the length, stop wasting preallocated sh_desc space */
++	ctx->shared_desc = krealloc(sh_desc, ctx->shared_desc_len,
+ 					  GFP_DMA | flags);
+ 
+-	ctx->shared_desc_decap_phys = dma_map_single(ctx->dev, shdesc,
++	ctx->shared_desc_phys = dma_map_single(ctx->dev, sh_desc,
+ 						     endidx * sizeof(u32),
+ 						     DMA_BIDIRECTIONAL);
+-	if (dma_mapping_error(ctx->dev, ctx->shared_desc_decap_phys)) {
++	if (dma_mapping_error(ctx->dev, ctx->shared_desc_phys)) {
+ 		dev_err(ctx->dev, "unable to map shared descriptor\n");
+-		kfree(ctx->shared_desc_decap);
++		kfree(ctx->shared_desc);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -232,13 +267,17 @@ static int build_protocol_desc_ipsec_encap(struct caam_ctx *ctx,
+ {
+ 	gfp_t flags = areq->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP ? GFP_KERNEL :
+ 		      GFP_ATOMIC;
++	struct crypto_async_request *req_base = &areq->base;
++	struct sk_buff *skb = req_base->data;
++	struct dst_entry *dst = skb->dst;
++	struct xfrm_state *x = dst->xfrm;
+ 	int  startidx, endidx;
+ 	u32 *shdesc, *shdescptr;
+ 
+ 	/* build shared descriptor for this session */
+-	shdesc = kzalloc(36 /* minimum for this protocol */ +
+-			 (sizeof(u32) + CAAM_MAX_KEY_SIZE) * 2 +
+-			 ALGAPI_IP_HDR_LEN, GFP_DMA | flags);
++	shdesc = kzalloc(sizeof(struct pdb_proto_ipsec_cbc_encap) +
++			  (sizeof(u32) + CAAM_MAX_KEY_SIZE) * 2 +
++			  sizeof(struct iphdr), GFP_DMA | flags);
+ 	if (!shdesc) {
+ 		dev_err(ctx->dev, "could not allocate shared descriptor\n");
+ 		return -ENOMEM;
+@@ -250,17 +289,21 @@ static int build_protocol_desc_ipsec_encap(struct caam_ctx *ctx,
+ 	shdescptr++;
+ 
+ 	/*
+-	 * next header is IPv4 (fixed for tunnel mode)
+ 	 * options byte: IVsrc is RNG
+-         * we do not Prepend IP header to output frame
++	 * we do not Prepend IP header to output frame
+ 	 */
+-	*shdescptr++ = 4 << 16 | /* next hdr = IPv4 */
+-		       9 << 8 | /* next hdr offset (9 bytes in) */
+-		       PDBOPTS_ESPCBC_IPHDRSRC | /* IP header comes from PDB */
+ #if !defined(DEBUG)
+-		       PDBOPTS_ESPCBC_IVSRC  | /* IV src is RNG */
++	*shdescptr |= PDBOPTS_ESPCBC_IVSRC; /* IV src is RNG */
+ #endif
+-		       PDBOPTS_ESPCBC_TUNNEL; /* transport not supported yet */
++	debug("xfrm is in %s mode\n", x->props.mode== XFRM_MODE_TUNNEL ?
++	      "tunnel" : "transport");
++
++	if (x->props.mode == XFRM_MODE_TUNNEL)
++		*shdescptr |= 4 << 16 | /* next hdr = IPv4 */
++			      9 << 8 | /* next hdr offset (9 bytes in) */
++			      PDBOPTS_ESPCBC_TUNNEL;
++	shdescptr++;
++
+ 	/*
+ 	 * need to pretend we have a full fledged pdb, otherwise get:
+ 	 * [caam error] IPsec encapsulation: PDB is only 4 bytes, \
+@@ -280,9 +323,9 @@ static int build_protocol_desc_ipsec_encap(struct caam_ctx *ctx,
+ 	shdescptr++;
+ 
+ 	/* fixed IP header length */
+-	*shdescptr++ = ALGAPI_IP_HDR_LEN;
++	*shdescptr++ = sizeof(struct iphdr);
+ 
+-	shdescptr += ALGAPI_IP_HDR_LEN / sizeof(u32);
++	shdescptr += sizeof(struct iphdr) / sizeof(u32);
+ 
+ 	/* </pretention> */
+ 
+@@ -321,18 +364,18 @@ static int build_protocol_desc_ipsec_encap(struct caam_ctx *ctx,
+ 	caam_desc_disasm(shdesc);
+ #endif
+ 
+-	ctx->shared_desc_encap_len = endidx * sizeof(u32);
++	ctx->shared_desc_len = endidx * sizeof(u32);
+ 
+ 	/* now we know the length, stop wasting preallocated shdesc space */
+-	ctx->shared_desc_encap = krealloc(shdesc, ctx->shared_desc_encap_len,
+-					  GFP_DMA | flags);
++	ctx->shared_desc = krealloc(shdesc, ctx->shared_desc_len,
++				    GFP_DMA | flags);
+ 
+-	ctx->shared_desc_encap_phys = dma_map_single(ctx->dev, shdesc,
+-						     endidx * sizeof(u32),
+-						     DMA_BIDIRECTIONAL);
+-	if (dma_mapping_error(ctx->dev, ctx->shared_desc_encap_phys)) {
++	ctx->shared_desc_phys = dma_map_single(ctx->dev, shdesc,
++					       endidx * sizeof(u32),
++					       DMA_BIDIRECTIONAL);
++	if (dma_mapping_error(ctx->dev, ctx->shared_desc_phys)) {
+ 		dev_err(ctx->dev, "unable to map shared descriptor\n");
+-		kfree(ctx->shared_desc_encap);
++		kfree(ctx->shared_desc);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -383,16 +426,24 @@ badkey:
+ 	return -EINVAL;
+ }
+ 
++struct link_tbl_entry {
++	__be64 ptr;
++	__be32 len;
++	u8 reserved;
++	u8 buf_pool_id;
++	__be16 offset;
++};
++
+ /*
+  * ipsec_esp_edesc - s/w-extended ipsec_esp descriptor
+  * @src_nents: number of segments in input scatterlist
+  * @dst_nents: number of segments in output scatterlist
+  * @assoc_nents: number of segments in associated data (SPI+Seq) scatterlist
+  * @desc: h/w descriptor (variable length; must not exceed MAX_CAAM_DESCSIZE)
+- * @flatbed_phys: bus physical mapped address of flatbed
+- * @flatbed: space for flattened i/o data (if {src,dst}_nents > 1)
++ * @dma_len: length of dma mapped link_tbl space
++ * @link_tbl_phys: bus physical mapped address of h/w link table
++ * @link_tbl: space for flattened i/o data (if {src,dst}_nents > 1)
+  *           (until s-g support added)
+- * @dma_len: length of dma mapped flatbed space
+  */
+ struct ipsec_esp_edesc {
+ 	int src_nents;
+@@ -400,8 +451,8 @@ struct ipsec_esp_edesc {
+ 	int assoc_nents;
+ 	u32 desc[MAX_CAAM_DESCSIZE];
+ 	int dma_len;
+-	u32 *flatbed_phys;
+-	u8 flatbed[0];
++	dma_addr_t link_tbl_phys;
++	struct link_tbl_entry link_tbl[0];
+ };
+ 
+ static void ipsec_esp_unmap(struct device *dev,
+@@ -414,85 +465,50 @@ static void ipsec_esp_unmap(struct device *dev,
+ 		     DMA_BIDIRECTIONAL);
+ 
+ 	if (edesc->dma_len)
+-		dma_unmap_single(dev, edesc->flatbed_phys, edesc->dma_len,
++		dma_unmap_single(dev, edesc->link_tbl_phys, edesc->dma_len,
+ 				 DMA_BIDIRECTIONAL);
+ }
+ 
+ /*
+  * ipsec_esp descriptor callbacks
+  */
+-static void ipsec_esp_encrypt_done(struct device *dev, void *desc,
+-				   int err, void *context)
++static void ipsec_esp_encrypt_done(struct device *dev, u32 *desc,
++				   u32 err, void *context)
+ {
+ 	struct ipsec_esp_edesc *edesc =
+ 		 container_of(desc, struct ipsec_esp_edesc, desc);
+ 	struct aead_request *areq = context;
+-	struct crypto_aead *aead = crypto_aead_reqtfm(areq);
+-	struct caam_ctx *ctx = crypto_aead_ctx(aead);
+-	int ivsize = crypto_aead_ivsize(aead);
+ 
+ 	ipsec_esp_unmap(dev, edesc, areq);
+ 
+-	if (!err && edesc->dma_len) {
+-#ifdef DEBUG
+-		print_hex_dump(KERN_ERR, "flatbed@"xstr(__LINE__)": ",
+-			       DUMP_PREFIX_ADDRESS, 16, 4, &edesc->flatbed[0],
+-			       areq->assoclen + 36 + areq->cryptlen +
+-			       ctx->authsize, 1);
+-#endif
+-		/* copy IV to giv */
+-		memcpy(sg_virt(areq->assoc) + areq->assoclen,
+-		       &edesc->flatbed[areq->assoclen], ivsize);
+-
+-		/* copy ciphertext and generated ICV to dst */
+-		sg_copy_from_buffer(areq->dst, edesc->dst_nents ? : 1,
+-				    &edesc->flatbed[areq->assoclen + ivsize],
+-				    areq->cryptlen + ctx->authsize);
+ #ifdef DEBUG
+-		print_hex_dump(KERN_ERR, "assocout@"xstr(__LINE__)": ",
+-			       DUMP_PREFIX_ADDRESS, 16, 4, sg_virt(areq->assoc),
+-			       areq->assoclen + areq->cryptlen +
+-			       ctx->authsize + 36, 1);
+-#endif
++	print_hex_dump(KERN_ERR, "iphdrout@"xstr(__LINE__)": ",
++		       DUMP_PREFIX_ADDRESS, 16, 4,
++		       ((char *)sg_virt(areq->assoc) - sizeof(struct iphdr)),
++		       sizeof(struct iphdr) + areq->assoclen + areq->cryptlen +
++		       ctx->authsize + 36, 1);
++	if (!err && edesc->dma_len) {
++		struct scatterlist *sg = sg_last(areq->src, edesc->src_nents);
++		print_hex_dump(KERN_ERR, "sglastout"xstr(__LINE__)": ",
++			       DUMP_PREFIX_ADDRESS, 16, 4, sg_virt(sg),
++				sg->length + ctx->authsize + 16, 1);
+ 	}
++#endif
+ 
+ 	kfree(edesc);
+ 
+ 	aead_request_complete(areq, err);
+ }
+ 
+-static void ipsec_esp_decrypt_done(struct device *dev, void *desc, int err,
++static void ipsec_esp_decrypt_done(struct device *dev, u32 *desc, u32 err,
+ 				   void *context)
+ {
+ 	struct ipsec_esp_edesc *edesc =
+ 		 container_of(desc, struct ipsec_esp_edesc, desc);
+ 	struct aead_request *areq = context;
+-	struct crypto_aead *aead = crypto_aead_reqtfm(areq);
+-	struct caam_ctx *ctx = crypto_aead_ctx(aead);
+-	int ivsize = crypto_aead_ivsize(aead);
+ 
+ 	ipsec_esp_unmap(dev, edesc, areq);
+ 
+-	if (!err && edesc->dma_len) {
+-#ifdef DEBUG
+-		print_hex_dump(KERN_ERR, "flatbed@"xstr(__LINE__)": ",
+-			       DUMP_PREFIX_ADDRESS, 16, 4, &edesc->flatbed[0],
+-			       areq->assoclen + 36 + areq->cryptlen +
+-			       ctx->authsize, 1);
+-#endif
+-		/* copy ciphertext and generated ICV to dst */
+-		sg_copy_from_buffer(areq->dst, edesc->dst_nents ? : 1,
+-				    &edesc->flatbed[ALGAPI_IP_HDR_LEN +
+-				                    areq->assoclen + ivsize],
+-				    areq->cryptlen + ctx->authsize);
+-#ifdef DEBUG
+-		print_hex_dump(KERN_ERR, "assocout@"xstr(__LINE__)": ",
+-			       DUMP_PREFIX_ADDRESS, 16, 4, sg_virt(areq->assoc),
+-			       areq->assoclen + areq->cryptlen +
+-			       ctx->authsize + 36, 1);
+-#endif
+-	}
+-
+ 	/*
+ 	 * verify hw auth check passed else return -EBADMSG
+ 	 */
+@@ -500,45 +516,84 @@ static void ipsec_esp_decrypt_done(struct device *dev, void *desc, int err,
+ 	if ((err & JQSTA_CCBERR_ERRID_MASK) == JQSTA_CCBERR_ERRID_ICVCHK)
+ 		err = -EBADMSG;
+ 
+-
+ 	kfree(edesc);
+ 
++#ifdef DEBUG
++	print_hex_dump(KERN_ERR, "iphdrout@"xstr(__LINE__)": ",
++		       DUMP_PREFIX_ADDRESS, 16, 4,
++		       ((char *)sg_virt(areq->assoc) - sizeof(struct iphdr)),
++		       sizeof(struct iphdr) + areq->assoclen + areq->cryptlen +
++		       ctx->authsize + 36, 1);
++	if (!err && edesc->dma_len) {
++		struct scatterlist *sg = sg_last(areq->src, edesc->src_nents);
++		print_hex_dump(KERN_ERR, "sglastin@"xstr(__LINE__)": ",
++			       DUMP_PREFIX_ADDRESS, 16, 4, sg_virt(sg),
++			sg->length + ctx->authsize + 16, 1);
++	}
++#endif
+ 	aead_request_complete(areq, err);
+ }
+ 
+ /*
++ * convert scatterlist to h/w link table format
++ * scatterlist must have been previously dma mapped
++ */
++static void sg_to_link_tbl(struct scatterlist *sg, int sg_count,
++                           struct link_tbl_entry *link_tbl_ptr, int offset)
++{
++	while (sg_count) {
++		link_tbl_ptr->ptr = sg_dma_address(sg);
++		link_tbl_ptr->len = sg_dma_len(sg);
++		link_tbl_ptr->reserved = 0;
++		link_tbl_ptr->buf_pool_id = 0;
++		link_tbl_ptr->offset = offset;
++		link_tbl_ptr++;
++		sg = sg_next(sg);
++		sg_count--;
++	}
++
++	/* set Final bit (marks end of link table) */
++	link_tbl_ptr--;
++	link_tbl_ptr->len |= 0x40000000;
++}
++
++/*
+  * fill in and submit ipsec_esp job descriptor
+  */
+ static int ipsec_esp(struct ipsec_esp_edesc *edesc, struct aead_request *areq,
+ 		     u8 *giv, enum protdir direction,
+-		     void (*callback) (struct device *dev, void *desc, int err,
++		     void (*callback) (struct device *dev, u32 *desc, u32 err,
+ 				       void *context))
+ {
+ 	struct crypto_aead *aead = crypto_aead_reqtfm(areq);
+ 	struct caam_ctx *ctx = crypto_aead_ctx(aead);
+ 	struct device *dev = ctx->dev;
++	struct scatterlist *sg;
+ 	u32 *desc = &edesc->desc[0];
+ 	u32 *descptr = desc;
++	struct link_tbl_entry *link_tbl_ptr = &edesc->link_tbl[0];
+ 	int startidx, endidx, ret, sg_count, assoc_sg_count, len, padlen;
+-	int nbytes, pos, ivsize = crypto_aead_ivsize(aead);
+-	u8 *ptr;
++	int ivsize = crypto_aead_ivsize(aead);
++	dma_addr_t ptr;
++	/* defaults; may be overwritten */
++	struct ipsec_deco_dpovrd dpovrd = { sizeof(struct iphdr), 9,
++					    IPPROTO_IPIP};
+ 
+ #ifdef DEBUG
+ 	debug("assoclen %d cryptlen %d authsize %d\n",
+ 	      areq->assoclen, areq->cryptlen,ctx->authsize);
+-	print_hex_dump(KERN_ERR, "ipv4hdr@"xstr(__LINE__)": ",
++	print_hex_dump(KERN_ERR, "iphdrin@"xstr(__LINE__)": ",
+ 		       DUMP_PREFIX_ADDRESS, 16, 4,
+-		       ((char *)sg_virt(areq->assoc) - ALGAPI_IP_HDR_LEN),
+-		       ALGAPI_IP_HDR_LEN, 1);
+-	print_hex_dump(KERN_ERR, "inassoc@"xstr(__LINE__)": ",
+-		       DUMP_PREFIX_ADDRESS, 16, 4, sg_virt(areq->assoc),
+-		       areq->assoclen + ivsize + areq->cryptlen + ctx->authsize, 1);
++		       ((char *)sg_virt(areq->assoc) - sizeof(struct iphdr)),
++		       sizeof(struct iphdr) + areq->assoclen + ivsize +
++		       areq->cryptlen + ctx->authsize  + 16, 1);
+ #endif
+ 
+ 	/* skip job header (filled in last) */
+ 	descptr++;
+ 
+-	/* skip shared descriptor pointer (filled in later) */
++	/* insert shared descriptor pointer */
++	*descptr = ctx->shared_desc_phys;
+ 	descptr++;
+ 
+ 	/* Save current location for computing start index later */
+@@ -547,7 +602,7 @@ static int ipsec_esp(struct ipsec_esp_edesc *edesc, struct aead_request *areq,
+ 	/*
+ 	 * insert the SEQ IN (data in) command
+ 	 * assoc is bidirectional because we're using the protocol descriptor
+-	 * and encap takes SPI + seq from PDB.
++	 * and encap takes SPI + seq.num from PDB.
+ 	 */
+ 	assoc_sg_count = dma_map_sg(dev, areq->assoc, edesc->assoc_nents ? : 1,
+ 				    DMA_BIDIRECTIONAL);
+@@ -559,122 +614,181 @@ static int ipsec_esp(struct ipsec_esp_edesc *edesc, struct aead_request *areq,
+ 				      DMA_TO_DEVICE);
+ 	if (direction == DIR_ENCAP) {
+ 		if (!edesc->dma_len) {
+-			ptr = (u8 *)sg_dma_address(areq->src);
++			ptr = sg_dma_address(areq->src);
+ 			padlen = *(u8 *)((u8 *)sg_virt(areq->src)
+ 					 + areq->cryptlen - 2);
++			/* cryptlen includes padlen / is blocksize aligned */
++			len = areq->cryptlen - padlen - 2;
++
++			if (!(ctx->shared_desc[1] & PDBOPTS_ESPCBC_TUNNEL)) {
++				len += sizeof(struct iphdr);
++				ptr -= sizeof(struct iphdr);
++				dpovrd.next_header = *(u8 *)((u8 *)sg_virt
++							     (areq->src) +
++							     areq->cryptlen -1);
++			}
+ 		} else {
+-			/* we might want to cp this to the PDB instead */
+-			nbytes = sg_copy_to_buffer(areq->assoc,
+-						   assoc_sg_count,
+-						   &edesc->flatbed[0 /*pos*/],
+-						   areq->assoclen);
+-			BUG_ON(nbytes != areq->assoclen);
+-			pos = nbytes;
+-			pos += ivsize; /* leave in-place space for output IV */
+-			nbytes = sg_copy_to_buffer(areq->src,
+-						   sg_count,
+-						   &edesc->flatbed[pos],
+-						   areq->cryptlen +
+-						   ctx->authsize);
+-			BUG_ON(nbytes != areq->cryptlen + ctx->authsize);
++			sg_to_link_tbl(areq->src, sg_count, link_tbl_ptr, 0);
+ #ifdef DEBUG
+-			print_hex_dump(KERN_ERR, "flatbed@"xstr(__LINE__)": ",
+-				       DUMP_PREFIX_ADDRESS, 16, 4,
+-				       &edesc->flatbed[0], areq->assoclen +
+-				       ivsize + areq->cryptlen + ctx->authsize
+-				       + 16, 1);
++			print_hex_dump(KERN_ERR, "link_tbl@"xstr(__LINE__)": ",
++			       DUMP_PREFIX_ADDRESS, 16, 4, &edesc->link_tbl[0],
++			       edesc->dma_len, 1);
+ #endif
+-			ptr = (u8 *)dma_map_single(dev,
+-						   &edesc->flatbed[areq->
+-							assoclen + ivsize],
++			ptr = dma_map_single(dev, link_tbl_ptr,
+ 						   edesc->dma_len,
+ 						   DMA_BIDIRECTIONAL);
+-			edesc->flatbed_phys = ptr;
+-			padlen = edesc->flatbed[pos + areq->cryptlen - 2];
++			edesc->link_tbl_phys = ptr;
++			sg = sg_last(areq->src, edesc->src_nents);
++			padlen = *(u8 *)(((u8 *)sg_virt(sg)) + sg->length -
++				 ctx->authsize - 2);
++			/* cryptlen includes padlen / is blocksize aligned */
++			len = areq->cryptlen - padlen - 2;
++			if (!(ctx->shared_desc[1] & PDBOPTS_ESPCBC_TUNNEL)) {
++				len += sizeof(struct iphdr);
++				link_tbl_ptr->ptr -= sizeof(struct iphdr);
++				link_tbl_ptr->len += cpu_to_be32
++						     (sizeof(struct iphdr));
++				dpovrd.next_header = *(u8 *)((u8 *)sg_virt(sg) +
++							     sg->length -
++							     ctx->authsize - 1);
++			}
++#ifdef DEBUG
++			print_hex_dump(KERN_ERR, "sglastin@"xstr(__LINE__)": ",
++				       DUMP_PREFIX_ADDRESS, 16, 4, sg_virt(sg),
++				sg->length + ctx->authsize + 16, 1);
++#endif
+ 		}
+-		debug("padlen is %d\n",padlen);
+-		/* cryptlen includes padlen / is blocksize aligned */
+-		len = areq->cryptlen - padlen - 2;
+-	} else {
++
++		debug("pad length is %d\n", padlen);
++		if (!(ctx->shared_desc[1] & PDBOPTS_ESPCBC_TUNNEL))
++			debug("next header is %d\n", dpovrd.next_header);
++	} else { /* DECAP */
+ 		debug("seq.num %d\n",
+ 		      *(u32 *)((u32 *)sg_virt(areq->assoc) + 1));
+-#undef INJECT_ICV_CHECK_FAILURE
++/* #define INJECT_ICV_CHECK_FAILURE to verify ICV check correctness */
+ #ifdef INJECT_ICV_CHECK_FAILURE
++		{
++		u32 *foil_ptr;
+ 		/*
+ 		 * intentionally tamper with every 13th packet's data
+ 		 * to verify proper ICV check result propagation
+ 		 */
+-		if((*(u32 *)((u32 *)sg_virt(areq->assoc) + 1)) &&
+-		   (((*(u32 *)((u32 *)sg_virt(areq->assoc) + 1) % 13) == 0))) {
+-			dev_warn(dev, "foiling packet data\n");
+-			(*(u32 *)((u32 *)sg_virt(areq->assoc) + 13))++;
++		foil_ptr = sg_virt(areq->assoc) + 1;
++		if (*foil_ptr && (((*foil_ptr % 13) == 0))) {
++			struct scatterlist *foil_sg;
++			foil_sg = sg_last(areq->src, edesc->assoc_nents ? : 1);
++			foil_ptr = sg_virt(foil_sg) +
++				   (areq->src->length - 26) / 4;
++
++			dev_warn(dev, "BEFORE FOILING PACKET DATA: addr 0x%p"
++				 "  data 0x%x\n", foil_ptr, *foil_ptr);
++			(*foil_ptr)++;
++			dev_warn(dev, " AFTER FOILING PACKET DATA: addr 0x%p"
++				 "  data 0x%x\n", foil_ptr, *foil_ptr);
++		}
+ 		}
+ #endif
++		/* h/w wants ip hdr + assoc + iv data in input */
+ 		if (!edesc->dma_len) {
+-			ptr = (u8 *)sg_dma_address(areq->src) - ivsize -
+-			      areq->assoclen - ALGAPI_IP_HDR_LEN;
++			ptr = sg_dma_address(areq->src) - ivsize -
++			      areq->assoclen - sizeof(struct iphdr);
+ 		} else {
+-			/* manually copy input skb to flatbed */
+-			memcpy(&edesc->flatbed[0], sg_virt(areq->assoc)
+-			       - ALGAPI_IP_HDR_LEN, ALGAPI_IP_HDR_LEN);
+-			pos = ALGAPI_IP_HDR_LEN;
+-			/* SPI and sequence number */
+-			nbytes = sg_copy_to_buffer(areq->assoc,
+-						   assoc_sg_count,
+-						   &edesc->flatbed[pos],
+-						   areq->assoclen);
+-			BUG_ON(nbytes != areq->assoclen);
+-			pos += nbytes;
+-			/* the IV */
+-			memcpy(&edesc->flatbed[pos], (u8 *)sg_virt(areq->assoc)
+-			       + areq->assoclen, ivsize);
+-			pos += ivsize;
+-			/* and the payload */
+-			nbytes = sg_copy_to_buffer(areq->src,
+-						   sg_count,
+-						   &edesc->flatbed[pos],
+-						   areq->cryptlen +
+-						   ctx->authsize);
+-			BUG_ON(nbytes != areq->cryptlen + ctx->authsize);
++			sg_to_link_tbl(areq->src, sg_count, link_tbl_ptr, 0);
++			link_tbl_ptr->ptr = cpu_to_be64(link_tbl_ptr->ptr
++							- sizeof(struct iphdr)
++							- areq->assoclen
++							- ivsize);
++			link_tbl_ptr->len += cpu_to_be32(sizeof(struct iphdr)
++							 + areq->assoclen
++							 + ivsize);
+ #ifdef DEBUG
+-			print_hex_dump(KERN_ERR, "flatbed@"xstr(__LINE__)": ",
+-				       DUMP_PREFIX_ADDRESS, 16, 4,
+-				       &edesc->flatbed[0], areq->assoclen + ivsize +
+-				       areq->cryptlen + ctx->authsize + 16, 1);
++			print_hex_dump(KERN_ERR, "link_tbl@"xstr(__LINE__)": ",
++			       DUMP_PREFIX_ADDRESS, 16, 4, &edesc->link_tbl[0],
++			       edesc->dma_len, 1);
+ #endif
+-			ptr = (u8 *)dma_map_single(dev, &edesc->flatbed[0],
+-						   edesc->dma_len,
++			ptr = dma_map_single(dev, link_tbl_ptr, edesc->dma_len,
+ 						   DMA_BIDIRECTIONAL);
+-			edesc->flatbed_phys = ptr;
++			edesc->link_tbl_phys = ptr;
+ 		}
+-		len =  ALGAPI_IP_HDR_LEN + areq->assoclen + ivsize +
++		len =  sizeof(struct iphdr) + areq->assoclen + ivsize +
+ 		       areq->cryptlen + ctx->authsize;
+ 	}
+-	descptr = cmd_insert_seq_in_ptr(descptr, ptr, len, PTR_DIRECT);
++	descptr = cmd_insert_seq_in_ptr(descptr, (u_int32_t *)ptr, len,
++					edesc->dma_len ?
++					PTR_SGLIST : PTR_DIRECT);
+ 
+ 	/* insert the SEQ OUT (data out) command */
+ 	sg_count = dma_map_sg(dev, areq->dst, edesc->dst_nents ? : 1,
+ 			      DMA_BIDIRECTIONAL);
+ 
+-	if (direction == DIR_ENCAP) {
+-		len = areq->assoclen + ivsize + areq->cryptlen + ctx->authsize;
++	if (edesc->dma_len) {
+ 		/*
+-		 * if flattening, adjust phys addr to offset of iv data
+-		 * within same flatbed
++		 * write output sg list after input sg list
++		 * just without assigning offsets
+ 		 */
+-		if (!edesc->dma_len)
+-			ptr = (u8 *) sg_dma_address(areq->assoc);
+-		else
+-			ptr -= areq->assoclen + ivsize;
+-	} else {
++		link_tbl_ptr = &edesc->link_tbl[sg_count];
++		memcpy(link_tbl_ptr, &edesc->link_tbl[0],
++		       sg_count * sizeof(struct link_tbl_entry));
++	}
++
++	if (direction == DIR_ENCAP) {
++		/* h/w writes assoc + iv data to output */
++		len = areq->assoclen + ivsize + areq->cryptlen + ctx->authsize;
++		if (!edesc->dma_len) {
++			ptr = sg_dma_address(areq->assoc);
++		} else {
++			link_tbl_ptr->ptr -= areq->assoclen + ivsize;
++			link_tbl_ptr->len += areq->assoclen + ivsize;
++			if (!(ctx->shared_desc[1] & PDBOPTS_ESPCBC_TUNNEL)) {
++				link_tbl_ptr->ptr += sizeof(struct iphdr);
++				link_tbl_ptr->len -= sizeof(struct iphdr);
++			}
++#ifdef DEBUG
++			print_hex_dump(KERN_ERR, "link_tbl@"xstr(__LINE__)": ",
++			       DUMP_PREFIX_ADDRESS, 16, 4, &edesc->link_tbl[0],
++			       edesc->dma_len, 1);
++#endif
++			ptr += sg_count * sizeof(struct link_tbl_entry);
++		}
++	} else { /* DECAP */
+ 		len = areq->cryptlen + ctx->authsize;
+-		if (!edesc->dma_len)
+-			ptr = (u8 *) sg_dma_address(areq->dst);
+-		else
+-			ptr += ALGAPI_IP_HDR_LEN + areq->assoclen + ivsize;
++		if (!edesc->dma_len) {
++			ptr = sg_dma_address(areq->dst);
++			if (!(ctx->shared_desc[1] & PDBOPTS_ESPCBC_TUNNEL)) {
++				ptr -= sizeof(struct iphdr) + areq->assoclen +
++				       ivsize;
++				len += sizeof(struct iphdr) + areq->assoclen +
++				       ivsize;
++			}
++		} else {
++			if (ctx->shared_desc[1] & PDBOPTS_ESPCBC_TUNNEL) {
++				link_tbl_ptr->ptr += sizeof(struct iphdr) +
++						     areq->assoclen + ivsize;
++				link_tbl_ptr->len -= sizeof(struct iphdr) +
++						     areq->assoclen + ivsize;
++			}
++			else { /* transport mode */
++				len += sizeof(struct iphdr) + areq->assoclen +
++				       ivsize + ctx->authsize;
++			}
++			ptr += sg_count * sizeof(struct link_tbl_entry);
++			/* FIXME: need dma_sync since post-map adjustments? */
++		}
+ 	}
+ 
+-	descptr = cmd_insert_seq_out_ptr(descptr, ptr, len ,PTR_DIRECT);
++	descptr = cmd_insert_seq_out_ptr(descptr, (u_int32_t *)ptr, len,
++					 edesc->dma_len ?
++					 PTR_SGLIST : PTR_DIRECT);
++
++	if ((direction == DIR_ENCAP) &&
++	    (!(ctx->shared_desc[1] & PDBOPTS_ESPCBC_TUNNEL))) {
++		/* insert the LOAD command */
++		dpovrd.ip_hdr_len |= IPSEC_ENCAP_DECO_DPOVRD_USE;
++		/* DECO class, no s-g, 7 == DPROVRD, 0 offset */
++		descptr = cmd_insert_load(descptr, &dpovrd, LDST_CLASS_DECO,
++					  0, 0x07 << 16, 0, sizeof(dpovrd),
++					  ITEM_INLINE);
++	}
+ 
+ 	/*
+ 	 * write the job descriptor header with shared descriptor length,
+@@ -682,9 +796,7 @@ static int ipsec_esp(struct ipsec_esp_edesc *edesc, struct aead_request *areq,
+ 	 */
+ 	endidx = descptr - desc;
+ 
+-	len = (direction == DIR_ENCAP) ? ctx->shared_desc_encap_len
+-				       : ctx->shared_desc_decap_len;
+-	cmd_insert_hdr(desc, len / sizeof(u32),
++	cmd_insert_hdr(desc, ctx->shared_desc_len / sizeof(u32),
+ 		       endidx, SHR_SERIAL, SHRNXT_SHARED /* has_shared */,
+ 		       ORDER_REVERSE, DESC_STD /*don't make trusted*/);
+ #ifdef DEBUG
+@@ -730,42 +842,32 @@ static struct ipsec_esp_edesc *ipsec_esp_edesc_alloc(struct aead_request *areq,
+ {
+ 	struct crypto_aead *aead = crypto_aead_reqtfm(areq);
+ 	struct caam_ctx *ctx = crypto_aead_ctx(aead);
+-	int ivsize = crypto_aead_ivsize(aead);
+ 	gfp_t flags = areq->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP ? GFP_KERNEL :
+ 		      GFP_ATOMIC;
+-	int assoc_nents, src_nents, dst_nents, alloc_len, dma_len = 0;
++	int assoc_nents, src_nents, dst_nents, dma_len = 0;
+ 	struct ipsec_esp_edesc *edesc;
+ 
++	BUG_ON(areq->dst != areq->src);
++
+ 	assoc_nents = sg_count(areq->assoc, areq->assoclen);
+ 	assoc_nents = (assoc_nents == 1) ? 0 : assoc_nents;
+ 
+ 	src_nents = sg_count(areq->src, areq->cryptlen + ctx->authsize);
+ 	src_nents = (src_nents == 1) ? 0 : src_nents;
+ 
+-	if (areq->dst == areq->src) {
+-		dst_nents = src_nents;
+-	} else {
+-		dev_err(ctx->dev, "src!=dst case not handled\n");
+-		BUG();
+-		dst_nents = sg_count(areq->dst, areq->cryptlen + ctx->authsize);
+-		dst_nents = (dst_nents == 1) ? 0 : dst_nents;
+-	}
++	/* + 1 for the IV, which is not included in assoc data */
++	if (assoc_nents || src_nents)
++		dma_len = ((assoc_nents ? : 1) + 1 + (src_nents ? : 1))
++			  * sizeof(struct link_tbl_entry);
++
++	dst_nents = src_nents;
++	dma_len *= 2;
+ 
+ 	/*
+-	 * allocate space for base edesc plus the link tables,
+-	 * allowing for two separate entries for ICV and generated ICV (+ 2),
+-	 * and the ICV data itself
++	 * allocate space for base edesc plus the two link tables
+ 	 */
+-	alloc_len = sizeof(struct ipsec_esp_edesc);
+-	if (assoc_nents || src_nents || dst_nents) {
+-		/* size for worst case (encap/decap) */
+-		dma_len = ALGAPI_IP_HDR_LEN + areq->assoclen + ivsize +
+-			  areq->cryptlen + ivsize /* no max - we know the pad */
+-			  + ctx->authsize;
+-	}
+-
+-	edesc = kmalloc(sizeof(struct ipsec_esp_edesc) + dma_len,
+-		        GFP_DMA | flags);
++	edesc = kzalloc(sizeof(struct ipsec_esp_edesc) + dma_len,
++			GFP_DMA | flags);
+ 	if (!edesc) {
+ 		dev_err(ctx->dev, "could not allocate extended descriptor\n");
+ 		return ERR_PTR(-ENOMEM);
+@@ -806,9 +908,6 @@ static int aead_authenc_decrypt(struct aead_request *req)
+ 	if (IS_ERR(edesc))
+ 		return PTR_ERR(edesc);
+ 
+-	/* insert shared descriptor pointer */
+-	edesc->desc[1] = ctx->shared_desc_decap_phys;
+-
+ 	return ipsec_esp(edesc, req, NULL, DIR_DECAP, ipsec_esp_decrypt_done);
+ }
+ 
+@@ -818,9 +917,9 @@ static int aead_authenc_decrypt_first(struct aead_request *req)
+ 	struct caam_ctx *ctx = crypto_aead_ctx(aead);
+ 	int err;
+ 
+-        spin_lock_bh(&ctx->first_lock);
+-        if (crypto_aead_crt(aead)->decrypt != aead_authenc_decrypt_first)
+-                goto unlock;
++	spin_lock_bh(&ctx->first_lock);
++	if (crypto_aead_crt(aead)->decrypt != aead_authenc_decrypt_first)
++		goto unlock;
+ 
+ 	err = build_protocol_desc_ipsec_decap(ctx, req);
+ 	if (err) {
+@@ -829,12 +928,12 @@ static int aead_authenc_decrypt_first(struct aead_request *req)
+ 	}
+ 
+ 	/* copy sequence number to PDB */
+-	*(u32 *)(ctx->shared_desc_decap + 5) =
++	*(u32 *)(ctx->shared_desc + 5) =
+ 		*(u32 *)((u32 *)sg_virt(req->assoc) + 1);
+ 
+-        crypto_aead_crt(aead)->decrypt = aead_authenc_decrypt;
++	crypto_aead_crt(aead)->decrypt = aead_authenc_decrypt;
+ unlock:
+-        spin_unlock_bh(&ctx->first_lock);
++	spin_unlock_bh(&ctx->first_lock);
+ 
+ 	return aead_authenc_decrypt(req);
+ }
+@@ -842,8 +941,6 @@ unlock:
+ static int aead_authenc_givencrypt(struct aead_givcrypt_request *req)
+ {
+ 	struct aead_request *areq = &req->areq;
+-	struct crypto_aead *aead = crypto_aead_reqtfm(areq);
+-	struct caam_ctx *ctx = crypto_aead_ctx(aead);
+ 	struct ipsec_esp_edesc *edesc;
+ 
+ 	/* allocate extended descriptor */
+@@ -851,9 +948,6 @@ static int aead_authenc_givencrypt(struct aead_givcrypt_request *req)
+ 	if (IS_ERR(edesc))
+ 		return PTR_ERR(edesc);
+ 
+-	/* insert shared descriptor pointer */
+-	edesc->desc[1] = ctx->shared_desc_encap_phys;
+-
+ 	return ipsec_esp(edesc, areq, req->giv, DIR_ENCAP,
+ 			 ipsec_esp_encrypt_done);
+ }
+@@ -865,9 +959,9 @@ static int aead_authenc_givencrypt_first(struct aead_givcrypt_request *req)
+ 	struct caam_ctx *ctx = crypto_aead_ctx(aead);
+ 	int err;
+ 
+-        spin_lock_bh(&ctx->first_lock);
+-        if (crypto_aead_crt(aead)->givencrypt != aead_authenc_givencrypt_first)
+-                goto unlock;
++	spin_lock_bh(&ctx->first_lock);
++	if (crypto_aead_crt(aead)->givencrypt != aead_authenc_givencrypt_first)
++		goto unlock;
+ 
+ 	err = build_protocol_desc_ipsec_encap(ctx, areq);
+ 	if (err) {
+@@ -876,14 +970,14 @@ static int aead_authenc_givencrypt_first(struct aead_givcrypt_request *req)
+ 	}
+ 
+ 	/* copy sequence number to PDB */
+-	*(u64 *)(ctx->shared_desc_encap + 2) = req->seq;
++	*(u64 *)(ctx->shared_desc + 2) = req->seq;
+ 
+ 	/* and the SPI */
+-	*(ctx->shared_desc_encap + 8) = *((u32 *)sg_virt(areq->assoc));
++	*(ctx->shared_desc + 8) = *((u32 *)sg_virt(areq->assoc));
+ 
+-        crypto_aead_crt(aead)->givencrypt = aead_authenc_givencrypt;
++	crypto_aead_crt(aead)->givencrypt = aead_authenc_givencrypt;
+ unlock:
+-        spin_unlock_bh(&ctx->first_lock);
++	spin_unlock_bh(&ctx->first_lock);
+ 
+ 	return aead_authenc_givencrypt(req);
+ }
+@@ -967,15 +1061,15 @@ static void caam_cra_exit(struct crypto_tfm *tfm)
+ {
+ 	struct caam_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+-	if (!dma_mapping_error(ctx->dev, ctx->shared_desc_encap_phys))
+-		dma_unmap_single(ctx->dev, ctx->shared_desc_encap_phys,
+-				 ctx->shared_desc_encap_len, DMA_BIDIRECTIONAL);
+-	kfree(ctx->shared_desc_encap);
++	if (!dma_mapping_error(ctx->dev, ctx->shared_desc_phys))
++		dma_unmap_single(ctx->dev, ctx->shared_desc_phys,
++				 ctx->shared_desc_len, DMA_BIDIRECTIONAL);
++	kfree(ctx->shared_desc);
+ 
+-	if (!dma_mapping_error(ctx->dev, ctx->shared_desc_decap_phys))
+-		dma_unmap_single(ctx->dev, ctx->shared_desc_decap_phys,
+-				 ctx->shared_desc_decap_len, DMA_BIDIRECTIONAL);
+-	kfree(ctx->shared_desc_decap);
++	if (!dma_mapping_error(ctx->dev, ctx->shared_desc_phys))
++		dma_unmap_single(ctx->dev, ctx->shared_desc_phys,
++				 ctx->shared_desc_len, DMA_BIDIRECTIONAL);
++	kfree(ctx->shared_desc);
+ }
+ 
+ void caam_algapi_remove(struct device *dev)
+diff --git a/drivers/crypto/caam/compat.h b/drivers/crypto/caam/compat.h
+index b44d0ec..b4d33c1 100644
+--- a/drivers/crypto/caam/compat.h
++++ b/drivers/crypto/caam/compat.h
+@@ -51,6 +51,7 @@
+ #include <linux/in.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
++#include <net/xfrm.h>
+ 
+ #include <crypto/algapi.h>
+ #include <crypto/aes.h>
+-- 
+1.6.5.2
+
