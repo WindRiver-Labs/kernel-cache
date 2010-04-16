@@ -1,0 +1,667 @@
+From b39011944cc0142c02a4729c5fa40e03676fb8d2 Mon Sep 17 00:00:00 2001
+From: Sven-Thorsten Dietrich <s...@thebigcorporation.com>
+Date: Thu, 15 Apr 2010 12:42:58 -0700
+Subject: [PATCH] genirq threading for ehci, ohci and uhci USB hosts.
+
+This is a functional POC for partitioning of the USB interrupt handlers into
+a quickcheck function and a threaded main-handler function.
+
+The quickcheck performs the following actions only:
+
+        1. read status and stores.
+        2. check if the device is asserting, disable device assert
+        3. wake irq thread or return IRQ_NONE (shared IRQ not this USB)
+
+The handler thread performs all other operations, and is conditionally
+invoked via return code from quickcheck.
+
+A function pointer *quickcheck() has been added, as well as a status
+cache, which remembers the status reported by the chip. The status must
+be passed to the threaded handler, since it is cleared by the quickcheck
+function.
+
+Currently, non-reentrancy is assumed, i.e. the chip will not assert another
+IRQ until the thread has completed running.
+
+In contrast with that, I have tightened up the locking between the
+quickcheck handler and the main thread, this may be overly conservative.
+
+The WARN_ONCE notes when status reported by the chip does not match
+cached status, although this is expected. Its to be removed.
+
+Note, that locking is not explicitly used for ohci as it is
+in uhci and ehci.
+
+The ieee1394/ohci1394.c is a bit more problematic, since it does not use
+struct usb_hcd, and therefore another place for the status cache must be found,
+in struct ti_ohci presumably.
+I will send a separate patch for ieee1394/ohci1394.c after looking at it more.
+
+The patch increases the code size by 100 lines, but there are some cleanups
+that account for maybe a dozen lines, which can be broken-out.
+
+Infrastructure:
+
+This hack in kernel/irq/handle.c needs to be looked at, set_bit failed to work
+properly on my AMD x86_64 machine, not further investigated and the code path
+is currently not triggered by this patch.
++			//set_bit(IRQF_WARNED_THREADED, &action->flags);
++			action->flags |= IRQF_WARNED_THREADED;
+
+Testing:
+
+I have copied hundreds of gigs over ohci and ehci threads to and from USB disk.
+In addition, I have written to USB flash, and mouse, keyboard work.
+
+I have only tested on x86_64 so far, but will start on i386 ASAP.
+
+I encountered some hangs at shutdown, that I attributed to racing, and have
+not reproduced it after the locking changes, and when always using the cached
+chip status in the threaded handler.
+
+A tarball of all required genirq patches and series against 2.6.27 can
+be downloaded:
+
+http://www.thebigcorporation.com/Sven/genirq-usb/
+
+The patch series also applied fine against Linus's git as well as linux-tip
+as of Saturday.
+
+Signed-off-by: Sven-Thorsten Dietrich <sdietrich@novell.com>
+[cleanup + apply to 2.6.34 + fix missed unlock in
+ uhci-hcd.c uhci_irq_quickcheck() shared irq path]
+Signed-off-by: Mark Asselstine <mark.asselstine@windriver.com>
+---
+ drivers/usb/core/hcd.c          |   50 ++++++++++++++++++++++++++------------
+ drivers/usb/core/hcd.h          |    3 ++
+ drivers/usb/host/ehci-au1xxx.c  |    1 +
+ drivers/usb/host/ehci-fsl.c     |    1 +
+ drivers/usb/host/ehci-hcd.c     |   38 +++++++++++++++++++++--------
+ drivers/usb/host/ehci-ixp4xx.c  |    1 +
+ drivers/usb/host/ehci-orion.c   |    1 +
+ drivers/usb/host/ehci-pci.c     |    1 +
+ drivers/usb/host/ehci-ppc-of.c  |    1 +
+ drivers/usb/host/ehci-ps3.c     |    1 +
+ drivers/usb/host/ohci-at91.c    |    1 +
+ drivers/usb/host/ohci-au1xxx.c  |    1 +
+ drivers/usb/host/ohci-ep93xx.c  |    1 +
+ drivers/usb/host/ohci-hcd.c     |   18 ++++++++++++-
+ drivers/usb/host/ohci-lh7a404.c |    1 +
+ drivers/usb/host/ohci-omap.c    |    1 +
+ drivers/usb/host/ohci-pci.c     |    1 +
+ drivers/usb/host/ohci-pnx4008.c |    1 +
+ drivers/usb/host/ohci-pnx8550.c |    1 +
+ drivers/usb/host/ohci-ppc-of.c  |    1 +
+ drivers/usb/host/ohci-ppc-soc.c |    1 +
+ drivers/usb/host/ohci-ps3.c     |    1 +
+ drivers/usb/host/ohci-pxa27x.c  |    1 +
+ drivers/usb/host/ohci-s3c2410.c |    1 +
+ drivers/usb/host/ohci-sa1111.c  |    1 +
+ drivers/usb/host/ohci-sh.c      |    1 +
+ drivers/usb/host/ohci-sm501.c   |    1 +
+ drivers/usb/host/ohci-ssb.c     |    1 +
+ drivers/usb/host/uhci-hcd.c     |   21 ++++++++++++++-
+ 29 files changed, 123 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index dd710d7..97456f7 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1937,15 +1937,7 @@ EXPORT_SYMBOL_GPL(usb_bus_start_enum);
+ 
+ /*-------------------------------------------------------------------------*/
+ 
+-/**
+- * usb_hcd_irq - hook IRQs to HCD framework (bus glue)
+- * @irq: the IRQ being raised
+- * @__hcd: pointer to the HCD whose IRQ is being signaled
+- *
+- * If the controller isn't HALTed, calls the driver's irq handler.
+- * Checks whether the controller is now dead.
+- */
+-irqreturn_t usb_hcd_irq (int irq, void *__hcd)
++irqreturn_t usb_hcd_irq_quickcheck(int irq, void *__hcd)
+ {
+ 	struct usb_hcd		*hcd = __hcd;
+ 	unsigned long		flags;
+@@ -1960,20 +1952,44 @@ irqreturn_t usb_hcd_irq (int irq, void *__hcd)
+ 	if (unlikely(hcd->state == HC_STATE_HALT ||
+ 		     !test_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags))) {
+ 		rc = IRQ_NONE;
+-	} else if (hcd->driver->irq(hcd) == IRQ_NONE) {
+-		rc = IRQ_NONE;
+-	} else {
++	} else if ((rc = hcd->driver->irq_quickcheck(hcd)) != IRQ_NONE) {
++
+ 		set_bit(HCD_FLAG_SAW_IRQ, &hcd->flags);
+ 
+ 		if (unlikely(hcd->state == HC_STATE_HALT))
+ 			usb_hc_died(hcd);
+-		rc = IRQ_HANDLED;
+ 	}
+ 
+ 	local_irq_restore(flags);
+ 	return rc;
+ }
+ 
++/**
++ * usb_hcd_irq - hook IRQs to HCD framework (bus glue)
++ * @irq: the IRQ being raised
++ * @__hcd: pointer to the HCD whose IRQ is being signaled
++ *
++ * If the controller isn't HALTed, calls the driver's irq handler.
++ * Checks whether the controller is now dead.
++ */
++irqreturn_t usb_hcd_irq (int irq, void *__hcd)
++{
++	struct usb_hcd		*hcd = __hcd;
++	unsigned long		flags;
++	irqreturn_t		rc;
++
++	/* Remaining artifact from non-threaded. Is it needed? */
++	local_irq_save(flags);
++
++	rc = hcd->driver->irq(hcd);
++	
++	if (unlikely(hcd->state == HC_STATE_HALT))
++		usb_hc_died(hcd);
++	
++	local_irq_restore(flags);
++	return rc;
++}
++
+ /*-------------------------------------------------------------------------*/
+ 
+ /**
+@@ -2158,10 +2174,12 @@ int usb_add_hcd(struct usb_hcd *hcd,
+ 
+ 		snprintf(hcd->irq_descr, sizeof(hcd->irq_descr), "%s:usb%d",
+ 				hcd->driver->description, hcd->self.busnum);
+-		if ((retval = request_irq(irqnum, &usb_hcd_irq, irqflags,
+-				hcd->irq_descr, hcd)) != 0) {
++		retval = request_threaded_irq(irqnum, &usb_hcd_irq_quickcheck, 
++					     &usb_hcd_irq, irqflags,
++					     hcd->irq_descr, hcd);
++		if (retval != 0) {
+ 			dev_err(hcd->self.controller,
+-					"request interrupt %d failed\n", irqnum);
++				"request interrupt %d failed\n", irqnum);
+ 			goto err_request_irq;
+ 		}
+ 		hcd->irq = irqnum;
+diff --git a/drivers/usb/core/hcd.h b/drivers/usb/core/hcd.h
+index a3cdb09..cd1625a 100644
+--- a/drivers/usb/core/hcd.h
++++ b/drivers/usb/core/hcd.h
+@@ -129,6 +129,8 @@ struct usb_hcd {
+ 	struct dma_pool		*pool [HCD_BUFFER_POOLS];
+ 
+ 	int			state;
++	unsigned short		status_cache;  /* saved by irq quickcheck */
++
+ #	define	__ACTIVE		0x01
+ #	define	__SUSPEND		0x04
+ #	define	__TRANSIENT		0x80
+@@ -180,6 +182,7 @@ struct hc_driver {
+ 	size_t		hcd_priv_size;	/* size of private data */
+ 
+ 	/* irq handler */
++	irqreturn_t	(*irq_quickcheck) (struct usb_hcd *hcd);
+ 	irqreturn_t	(*irq) (struct usb_hcd *hcd);
+ 
+ 	int	flags;
+diff --git a/drivers/usb/host/ehci-au1xxx.c b/drivers/usb/host/ehci-au1xxx.c
+index e3a74e7..81bbdde 100644
+--- a/drivers/usb/host/ehci-au1xxx.c
++++ b/drivers/usb/host/ehci-au1xxx.c
+@@ -77,6 +77,7 @@ static const struct hc_driver ehci_au1xxx_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck		= ehci_irq_quickcheck,
+ 	.irq			= ehci_irq,
+ 	.flags			= HCD_MEMORY | HCD_USB2,
+ 
+diff --git a/drivers/usb/host/ehci-fsl.c b/drivers/usb/host/ehci-fsl.c
+index 0e26aa1..b73a677 100644
+--- a/drivers/usb/host/ehci-fsl.c
++++ b/drivers/usb/host/ehci-fsl.c
+@@ -368,6 +368,7 @@ static const struct hc_driver ehci_fsl_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = ehci_irq_quickcheck,
+ 	.irq = ehci_irq,
+ 	.flags = HCD_USB2,
+ 
+diff --git a/drivers/usb/host/ehci-hcd.c b/drivers/usb/host/ehci-hcd.c
+index 207e7a8..6c35e3e 100644
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -703,15 +703,39 @@ static int ehci_run (struct usb_hcd *hcd)
+ 
+ /*-------------------------------------------------------------------------*/
+ 
++static irqreturn_t ehci_irq_quickcheck (struct usb_hcd *hcd)
++{
++       struct ehci_hcd         *ehci = hcd_to_ehci (hcd);
++       u32                     status;
++
++       spin_lock (&ehci->lock);
++       
++       status = ehci_readl(ehci, &ehci->regs->status);
++       hcd->status_cache = status; 
++
++       if (!status & INTR_MASK) {      /* irq sharing? */
++               spin_unlock(&ehci->lock);
++               return IRQ_NONE;
++       }
++
++       /* clear (just) interrupts */
++       ehci_writel(ehci, status, &ehci->regs->status);
++       hcd->status_cache = status; 
++       spin_unlock (&ehci->lock);
++
++       return IRQ_WAKE_THREAD;
++}
++
+ static irqreturn_t ehci_irq (struct usb_hcd *hcd)
+ {
+ 	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
+ 	u32			status, masked_status, pcd_status = 0, cmd;
+ 	int			bh;
++	unsigned long           flags;
+ 
+-	spin_lock (&ehci->lock);
++	spin_lock_irqsave(&ehci->lock, flags);
+ 
+-	status = ehci_readl(ehci, &ehci->regs->status);
++	status = hcd->status_cache;
+ 
+ 	/* e.g. cardbus physical eject */
+ 	if (status == ~(u32) 0) {
+@@ -719,14 +743,6 @@ static irqreturn_t ehci_irq (struct usb_hcd *hcd)
+ 		goto dead;
+ 	}
+ 
+-	masked_status = status & INTR_MASK;
+-	if (!masked_status) {		/* irq sharing? */
+-		spin_unlock(&ehci->lock);
+-		return IRQ_NONE;
+-	}
+-
+-	/* clear (just) interrupts */
+-	ehci_writel(ehci, masked_status, &ehci->regs->status);
+ 	cmd = ehci_readl(ehci, &ehci->regs->command);
+ 	bh = 0;
+ 
+@@ -813,7 +829,7 @@ dead:
+ 
+ 	if (bh)
+ 		ehci_work (ehci);
+-	spin_unlock (&ehci->lock);
++	spin_unlock_irqrestore(&ehci->lock, flags);
+ 	if (pcd_status)
+ 		usb_hcd_poll_rh_status(hcd);
+ 	return IRQ_HANDLED;
+diff --git a/drivers/usb/host/ehci-ixp4xx.c b/drivers/usb/host/ehci-ixp4xx.c
+index 89b7c70..c2a6d15 100644
+--- a/drivers/usb/host/ehci-ixp4xx.c
++++ b/drivers/usb/host/ehci-ixp4xx.c
+@@ -42,6 +42,7 @@ static const struct hc_driver ixp4xx_ehci_hc_driver = {
+ 	.description		= hcd_name,
+ 	.product_desc		= "IXP4XX EHCI Host Controller",
+ 	.hcd_priv_size		= sizeof(struct ehci_hcd),
++	.irq_quickcheck		= ehci_irq_quickcheck,
+ 	.irq			= ehci_irq,
+ 	.flags			= HCD_MEMORY | HCD_USB2,
+ 	.reset			= ixp4xx_ehci_init,
+diff --git a/drivers/usb/host/ehci-orion.c b/drivers/usb/host/ehci-orion.c
+index 0f87dc7..8522ecd 100644
+--- a/drivers/usb/host/ehci-orion.c
++++ b/drivers/usb/host/ehci-orion.c
+@@ -132,6 +132,7 @@ static const struct hc_driver ehci_orion_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = ehci_irq_quickcheck,
+ 	.irq = ehci_irq,
+ 	.flags = HCD_MEMORY | HCD_USB2,
+ 
+diff --git a/drivers/usb/host/ehci-pci.c b/drivers/usb/host/ehci-pci.c
+index ead5f4f..95a402f 100644
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -373,6 +373,7 @@ static const struct hc_driver ehci_pci_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck =	ehci_irq_quickcheck,
+ 	.irq =			ehci_irq,
+ 	.flags =		HCD_MEMORY | HCD_USB2,
+ 
+diff --git a/drivers/usb/host/ehci-ppc-of.c b/drivers/usb/host/ehci-ppc-of.c
+index 8df33b8..472b88c 100644
+--- a/drivers/usb/host/ehci-ppc-of.c
++++ b/drivers/usb/host/ehci-ppc-of.c
+@@ -44,6 +44,7 @@ static const struct hc_driver ehci_ppc_of_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck		= ehci_irq_quickcheck,
+ 	.irq			= ehci_irq,
+ 	.flags			= HCD_MEMORY | HCD_USB2,
+ 
+diff --git a/drivers/usb/host/ehci-ps3.c b/drivers/usb/host/ehci-ps3.c
+index 1dee33b..870ea11 100644
+--- a/drivers/usb/host/ehci-ps3.c
++++ b/drivers/usb/host/ehci-ps3.c
+@@ -56,6 +56,7 @@ static const struct hc_driver ps3_ehci_hc_driver = {
+ 	.description		= hcd_name,
+ 	.product_desc		= "PS3 EHCI Host Controller",
+ 	.hcd_priv_size		= sizeof(struct ehci_hcd),
++	.irq_quickcheck		= ehci_irq_quickcheck,
+ 	.irq			= ehci_irq,
+ 	.flags			= HCD_MEMORY | HCD_USB2,
+ 	.reset			= ps3_ehci_hc_reset,
+diff --git a/drivers/usb/host/ohci-at91.c b/drivers/usb/host/ohci-at91.c
+index 68b83ab..454fbad 100644
+--- a/drivers/usb/host/ohci-at91.c
++++ b/drivers/usb/host/ohci-at91.c
+@@ -233,6 +233,7 @@ static const struct hc_driver ohci_at91_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = 	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-au1xxx.c b/drivers/usb/host/ohci-au1xxx.c
+index 17a6043..0d9b386 100644
+--- a/drivers/usb/host/ohci-au1xxx.c
++++ b/drivers/usb/host/ohci-au1xxx.c
+@@ -136,6 +136,7 @@ static const struct hc_driver ohci_au1xxx_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = 	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-ep93xx.c b/drivers/usb/host/ohci-ep93xx.c
+index 4e68161..2468911 100644
+--- a/drivers/usb/host/ohci-ep93xx.c
++++ b/drivers/usb/host/ohci-ep93xx.c
+@@ -128,6 +128,7 @@ static struct hc_driver ohci_ep93xx_hc_driver = {
+ 	.description		= hcd_name,
+ 	.product_desc		= "EP93xx OHCI",
+ 	.hcd_priv_size		= sizeof(struct ohci_hcd),
++	.irq_quickcheck 	= ohci_irq_quickcheck,
+ 	.irq			= ohci_irq,
+ 	.flags			= HCD_USB11 | HCD_MEMORY,
+ 	.start			= ohci_ep93xx_start,
+diff --git a/drivers/usb/host/ohci-hcd.c b/drivers/usb/host/ohci-hcd.c
+index afe59be..11da4d4 100644
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -28,6 +28,7 @@
+ #include <linux/slab.h>
+ #include <linux/errno.h>
+ #include <linux/init.h>
++#include <linux/irqreturn.h>
+ #include <linux/timer.h>
+ #include <linux/list.h>
+ #include <linux/usb.h>
+@@ -748,8 +749,7 @@ retry:
+ /*-------------------------------------------------------------------------*/
+ 
+ /* an interrupt happens */
+-
+-static irqreturn_t ohci_irq (struct usb_hcd *hcd)
++static irqreturn_t ohci_irq_quickcheck(struct usb_hcd *hcd)
+ {
+ 	struct ohci_hcd		*ohci = hcd_to_ohci (hcd);
+ 	struct ohci_regs __iomem *regs = ohci->regs;
+@@ -777,6 +777,20 @@ static irqreturn_t ohci_irq (struct usb_hcd *hcd)
+ 	if (ints == 0)
+ 		return IRQ_NOTMINE;
+ 
++	ohci_writel (ohci, OHCI_INTR_MIE, &ohci->regs->intrdisable);
++	hcd->status_cache = ints;
++
++	return IRQ_WAKE_THREAD;
++}
++
++static irqreturn_t ohci_irq (struct usb_hcd *hcd)
++{
++	struct ohci_hcd		*ohci = hcd_to_ohci (hcd);
++	struct ohci_regs __iomem *regs = ohci->regs;
++	int			ints;
++
++	ints = hcd->status_cache;
++
+ 	if (ints & OHCI_INTR_UE) {
+ 		// e.g. due to PCI Master/Target Abort
+ 		if (quirk_nec(ohci)) {
+diff --git a/drivers/usb/host/ohci-lh7a404.c b/drivers/usb/host/ohci-lh7a404.c
+index 18d39f0..2924cde 100644
+--- a/drivers/usb/host/ohci-lh7a404.c
++++ b/drivers/usb/host/ohci-lh7a404.c
+@@ -165,6 +165,7 @@ static const struct hc_driver ohci_lh7a404_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = 	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-omap.c b/drivers/usb/host/ohci-omap.c
+index 5645f70..5ffa8d8 100644
+--- a/drivers/usb/host/ohci-omap.c
++++ b/drivers/usb/host/ohci-omap.c
+@@ -451,6 +451,7 @@ static const struct hc_driver ohci_omap_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = 	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-pci.c b/drivers/usb/host/ohci-pci.c
+index b8a1148..45d8e24 100644
+--- a/drivers/usb/host/ohci-pci.c
++++ b/drivers/usb/host/ohci-pci.c
+@@ -447,6 +447,7 @@ static const struct hc_driver ohci_pci_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck =	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_MEMORY | HCD_USB11,
+ 
+diff --git a/drivers/usb/host/ohci-pnx4008.c b/drivers/usb/host/ohci-pnx4008.c
+index cd74bbd..aa295bd 100644
+--- a/drivers/usb/host/ohci-pnx4008.c
++++ b/drivers/usb/host/ohci-pnx4008.c
+@@ -218,6 +218,7 @@ static const struct hc_driver ohci_pnx4008_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = ohci_irq_quickcheck,
+ 	.irq = ohci_irq,
+ 	.flags = HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-pnx8550.c b/drivers/usb/host/ohci-pnx8550.c
+index 28467e2..ee18f4a 100644
+--- a/drivers/usb/host/ohci-pnx8550.c
++++ b/drivers/usb/host/ohci-pnx8550.c
+@@ -175,6 +175,7 @@ static const struct hc_driver ohci_pnx8550_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = 	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-ppc-of.c b/drivers/usb/host/ohci-ppc-of.c
+index 103263c..769ee07 100644
+--- a/drivers/usb/host/ohci-ppc-of.c
++++ b/drivers/usb/host/ohci-ppc-of.c
+@@ -45,6 +45,7 @@ static const struct hc_driver ohci_ppc_of_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck =	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-ppc-soc.c b/drivers/usb/host/ohci-ppc-soc.c
+index 89e670e..ccfb44b 100644
+--- a/drivers/usb/host/ohci-ppc-soc.c
++++ b/drivers/usb/host/ohci-ppc-soc.c
+@@ -145,6 +145,7 @@ static const struct hc_driver ohci_ppc_soc_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = 	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-ps3.c b/drivers/usb/host/ohci-ps3.c
+index 7009504..69fab1b 100644
+--- a/drivers/usb/host/ohci-ps3.c
++++ b/drivers/usb/host/ohci-ps3.c
+@@ -56,6 +56,7 @@ static const struct hc_driver ps3_ohci_hc_driver = {
+ 	.description		= hcd_name,
+ 	.product_desc		= "PS3 OHCI Host Controller",
+ 	.hcd_priv_size		= sizeof(struct ohci_hcd),
++	.irq_quickcheck 	= ohci_irq_quickcheck,
+ 	.irq			= ohci_irq,
+ 	.flags			= HCD_MEMORY | HCD_USB11,
+ 	.reset			= ps3_ohci_hc_reset,
+diff --git a/drivers/usb/host/ohci-pxa27x.c b/drivers/usb/host/ohci-pxa27x.c
+index a18debd..4daee4b 100644
+--- a/drivers/usb/host/ohci-pxa27x.c
++++ b/drivers/usb/host/ohci-pxa27x.c
+@@ -426,6 +426,7 @@ static const struct hc_driver ohci_pxa27x_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck	= 	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-s3c2410.c b/drivers/usb/host/ohci-s3c2410.c
+index a68af2d..43c18fb 100644
+--- a/drivers/usb/host/ohci-s3c2410.c
++++ b/drivers/usb/host/ohci-s3c2410.c
+@@ -437,6 +437,7 @@ static const struct hc_driver ohci_s3c2410_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = 	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-sa1111.c b/drivers/usb/host/ohci-sa1111.c
+index d8eb3bd..aeebc89 100644
+--- a/drivers/usb/host/ohci-sa1111.c
++++ b/drivers/usb/host/ohci-sa1111.c
+@@ -205,6 +205,7 @@ static const struct hc_driver ohci_sa1111_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = 	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-sh.c b/drivers/usb/host/ohci-sh.c
+index 60f03cc..625bb29 100644
+--- a/drivers/usb/host/ohci-sh.c
++++ b/drivers/usb/host/ohci-sh.c
+@@ -41,6 +41,7 @@ static const struct hc_driver ohci_sh_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck = 	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+diff --git a/drivers/usb/host/ohci-sm501.c b/drivers/usb/host/ohci-sm501.c
+index cff2363..c1a0b6b 100644
+--- a/drivers/usb/host/ohci-sm501.c
++++ b/drivers/usb/host/ohci-sm501.c
+@@ -47,6 +47,7 @@ static const struct hc_driver ohci_sm501_hc_driver = {
+ 	/*
+ 	 * generic hardware linkage
+ 	 */
++	.irq_quickcheck =	ohci_irq_quickcheck,
+ 	.irq =			ohci_irq,
+ 	.flags =		HCD_USB11 | HCD_MEMORY | HCD_LOCAL_MEM,
+ 
+diff --git a/drivers/usb/host/ohci-ssb.c b/drivers/usb/host/ohci-ssb.c
+index 23fd6a8..5b3ab3c 100644
+--- a/drivers/usb/host/ohci-ssb.c
++++ b/drivers/usb/host/ohci-ssb.c
+@@ -65,6 +65,7 @@ static const struct hc_driver ssb_ohci_hc_driver = {
+ 	.product_desc		= "SSB OHCI Controller",
+ 	.hcd_priv_size		= sizeof(struct ssb_ohci_device),
+ 
++	.irq_quickcheck 	= ohci_irq_quickcheck,
+ 	.irq			= ohci_irq,
+ 	.flags			= HCD_MEMORY | HCD_USB11,
+ 
+diff --git a/drivers/usb/host/uhci-hcd.c b/drivers/usb/host/uhci-hcd.c
+index 0919706..2778a96 100644
+--- a/drivers/usb/host/uhci-hcd.c
++++ b/drivers/usb/host/uhci-hcd.c
+@@ -406,20 +406,36 @@ __acquires(uhci->lock)
+ 	mod_timer(&uhci_to_hcd(uhci)->rh_timer, jiffies);
+ }
+ 
+-static irqreturn_t uhci_irq(struct usb_hcd *hcd)
++static irqreturn_t uhci_irq_quickcheck(struct usb_hcd *hcd)
+ {
+ 	struct uhci_hcd *uhci = hcd_to_uhci(hcd);
+ 	unsigned short status;
+ 
++	spin_lock(&uhci->lock);
+ 	/*
+ 	 * Read the interrupt status, and write it back to clear the
+ 	 * interrupt cause.  Contrary to the UHCI specification, the
+ 	 * "HC Halted" status bit is persistent: it is RO, not R/WC.
+ 	 */
+ 	status = inw(uhci->io_addr + USBSTS);
+-	if (!(status & ~USBSTS_HCH))	/* shared interrupt, not mine */
++	if (!(status & ~USBSTS_HCH)) {	/* shared interrupt, not mine */
++                spin_unlock(&uhci->lock);
+ 		return IRQ_NONE;
++	}
+ 	outw(status, uhci->io_addr + USBSTS);		/* Clear it */
++	hcd->status_cache = status;
++	spin_unlock(&uhci->lock);
++
++	return IRQ_WAKE_THREAD;
++}
++
++static irqreturn_t uhci_irq(struct usb_hcd *hcd)
++{
++	struct uhci_hcd *uhci = hcd_to_uhci(hcd);
++	unsigned short status;
++	unsigned long flags;
++
++	status = hcd->status_cache;
+ 
+ 	if (status & ~(USBSTS_USBINT | USBSTS_ERROR | USBSTS_RD)) {
+ 		if (status & USBSTS_HSE)
+@@ -913,6 +929,7 @@ static const struct hc_driver uhci_driver = {
+ 	.hcd_priv_size =	sizeof(struct uhci_hcd),
+ 
+ 	/* Generic hardware linkage */
++	.irq_quickcheck =	uhci_irq_quickcheck,
+ 	.irq =			uhci_irq,
+ 	.flags =		HCD_USB11,
+ 
+-- 
+1.6.5.2
+
