@@ -1,0 +1,418 @@
+From a02977a8ab8119ba1893378fea5f3c82bd40d5ff Mon Sep 17 00:00:00 2001
+From: Jason HU <yongqi.hu@windriver.com>
+Date: Thu, 29 Apr 2010 03:15:08 -0700
+Subject: [PATCH] PMEM: Enhancement
+
+The following enhancement was added to PMEM:
+
+1. Default PMEM blocks number was set as 3. The default blocks
+   number for a PMEM partition should be no less than 3 so that
+   current active block could be locked during rotation on
+   reboot.
+
+2. Introduce two new POSIX read functions, pmem_read_region_data
+   and pmem_read_log_desc, to PMEM to encapsulate the data
+   organization differences between regions that contain fixed
+   size logs or unfixed size logs, so that PMEM users won't
+   have to bother with PMEM internals when reading from PMEM.
+
+   Both the two functions have read() semantics. They would try
+   to read from a specified offset within the current logical
+   range of valid data in a region area, return the number of
+   bytes actually read, and 0 if reaching the end of all valid
+   data.
+
+3. Supply a new PMEM function to return the exact number of
+   fixed-size logs a PMEM region could accommodate. This number
+   could be slightly different from that requested by user due to
+   PMEM partition and block size alignment to the PAGE_SIZE.
+
+4. Free the parameter sanity check from the control of the
+   CONFIG_PMEM_DEBUG macro in the pmem_write_data() since there is
+   a window between pmem is enabled and a region's handler is
+   installed (by pmem_reg_users()), the system may hang if we
+   try to do a printk() during this window.
+
+Signed-off-by: Harry Ciao <qingtao.cao@windriver.com
+Signed-off-by: Jason HU <yongqi.hu@windriver.com>
+---
+ include/linux/pmem.h |    9 ++
+ mm/pmem/Kconfig      |    5 +-
+ mm/pmem/io.c         |  257 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ mm/pmem/reg.c        |   33 +++++++
+ 4 files changed, 298 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/pmem.h b/include/linux/pmem.h
+index 4eaa1ab..3c04407 100644
+--- a/include/linux/pmem.h
++++ b/include/linux/pmem.h
+@@ -843,6 +843,15 @@ extern void pmem_prepare_region(struct pmem_part_hdr *part_hdr,
+ extern void pmem_default_create_partition(pmem_handle_t handle);
+ extern void pmem_default_create_region(pmem_handle_t parent, pmem_handle_t region);
+ 
++/* Read data from a region area for a particular CPU, using read() semantics */
++extern int pmem_read_region_per_cpu(pmem_handle_t handle, char *buffer,
++			int size, int cpu_index);
++
++/* For a region that contains fixed size logs, get the real data size of
++ * a range specified for one CPU. This is necessary because it may
++ * contain different number of logs than requested by user */
++extern int pmem_get_region_size_per_cpu(pmem_handle_t handle);
++
+ #endif /* __KERNEL__ */
+ 
+ #endif
+diff --git a/mm/pmem/Kconfig b/mm/pmem/Kconfig
+index 5f59564..641b454 100644
+--- a/mm/pmem/Kconfig
++++ b/mm/pmem/Kconfig
+@@ -62,9 +62,12 @@ config PMEM_LOG_PART_SIZE
+ config PMEM_LOG_PART_SEGMENTS
+ 	int "Log partition segments"
+ 	depends on PMEM
+-	default 2
++	range 3 10
++	default 3
+ 	help
+ 	  Divide the logging partition into this many segments.
++	  Note, this should never be less than three so the previous active
++	  block can be locked during rotation.
+ 
+ config PMEM_LOG_REG
+ 	bool "General log region"
+diff --git a/mm/pmem/io.c b/mm/pmem/io.c
+index 294534c..bab1ba0 100644
+--- a/mm/pmem/io.c
++++ b/mm/pmem/io.c
+@@ -35,7 +35,7 @@
+ #include <asm/types.h>
+ #include <asm/uaccess.h>	/* copy_to_user */
+ 
+-
++#define IPMI_SEL_DATA_LENGTH	16
+ 
+ /* static int is_locked {{{
+  *
+@@ -106,12 +106,10 @@ int pmem_read_data(pmem_handle_t handle, char *buffer, int size)
+ 	if (!handle)
+ 		goto done;
+ 
+-#ifdef CONFIG_PMEM_DEBUG
+ 	if (!buffer || (size < 0)) {
+ 		PMEM_DPRINT("read: invalid arguments\n");
+ 		goto done;
+ 	}
+-#endif
+ 
+ 	if (hdl->offset > hdl->size) {
+ 		PMEM_DPRINT("read: invalid offset %d with size %d\n",
+@@ -467,10 +465,9 @@ int pmem_write_data(pmem_handle_t handle, const char *buffer, int size)
+ 	 * string in the kcore input buffer.  Bad. */
+ 	if (!pmem.enabled)
+ 		goto done;
+-#ifdef CONFIG_PMEM_DEBUG
++
+ 	if (!handle || !buffer || (size < 0))
+ 		goto done;
+-#endif
+ 
+ 	data_start = pmem_get_data_ptr(hdl);
+ 	if (!data_start)
+@@ -634,3 +631,253 @@ int pmem_seek(pmem_handle_t handle, int offset, int whence)
+ } 
+ EXPORT_SYMBOL(pmem_seek);
+ 
++static int pmem_read_region_data(struct region_handle *reg_hdl,
++		void *region_data, char *buffer, int size, int cpu)
++{
++	struct pmem_handle *hdl = (struct pmem_handle *)reg_hdl;
++	struct pmem_region_data_hdr *data_hdr;
++	struct pmem_region_hdr *region_hdr = reg_hdl->elem->hdr;
++	int log_size, start_byte, last_byte, left_size;
++	spinlock_t *lock;
++	unsigned long flags;
++
++	/* Get the pmem_region_data_hdr strucutre for the specified CPU. */
++	if (region_hdr->data.flags & PMEM_REGION_FLAG_PERPROC) {
++		if (cpu > PMEM_NUM_SUPPORT_CPUS)
++			return -EINVAL;
++		data_hdr = (struct pmem_region_data_hdr *)
++				(region_data + PMEM_DESC_MAX) + cpu;
++		lock = NULL;
++	} else {
++		data_hdr = (struct pmem_region_data_hdr *)
++				(region_data + PMEM_DESC_MAX);
++		lock = &reg_hdl->elem->data_lock;
++	}
++
++	log_size = region_hdr->data.fixed_size;
++
++	if (lock)
++		spin_lock_irqsave(lock, flags);
++
++	/*
++	 * Decide the range of effective data, which starts from
++	 * start_offset and ends at either current_offset or
++	 * end_offset when data wrapped around at least once.
++	 */
++	if (log_size > 0) {
++		int i, tmp = 0, paddings;
++		char last_log[IPMI_SEL_DATA_LENGTH];
++
++		/* Read the first 16 bytes on the last data slot */
++		paddings = (data_hdr->end_offset -
++				data_hdr->start_offset) % log_size;
++		__pmem_memcpy_fromio(last_log,
++				region_data + data_hdr->end_offset -
++				paddings - log_size,
++				IPMI_SEL_DATA_LENGTH);
++
++		/* Test if the last data slot is ever used */
++		for (i = 0; i < IPMI_SEL_DATA_LENGTH; i++)
++			tmp += last_log[i];
++
++		last_byte = (tmp > 0) ? data_hdr->end_offset - paddings :
++					data_hdr->current_offset;
++	} else {
++		/*
++		 * Since we can't tell exactly the size of the paddings
++		 * skipped by the lastest data wraparound, fall back on
++		 * the end_offset to ensure all logs could be dumped.
++		 */
++		if (region_hdr->data.flags & PMEM_REGION_FLAG_STOPFULL)
++			last_byte = data_hdr->current_offset;
++		else
++			last_byte = data_hdr->end_offset;
++	}
++
++	start_byte = data_hdr->start_offset + hdl->offset;
++
++	if (lock)
++		spin_unlock_irqrestore(lock, flags);
++
++	if (start_byte >= last_byte)
++		return 0;
++
++	left_size = last_byte - start_byte;
++
++	if (size > left_size)
++		size = left_size;
++
++	pmem_memcpy_fromio(buffer, region_data + start_byte, size);
++
++	hdl->offset += size;
++	return size;
++}
++
++static int pmem_read_log_desc(struct region_handle *reg_hdl,
++		void *region_data, char *buffer, int size)
++{
++	struct pmem_log_desc_index *desc_index =
++				(struct pmem_log_desc_index *)region_data;
++	struct pmem_handle *hdl = (struct pmem_handle *)reg_hdl;
++	struct pmem_region_hdr *region_hdr = reg_hdl->elem->hdr;
++	int curr_index, oldest_index;
++	int desc_arr_size;
++	int index, stop_index;
++	struct pmem_log_desc *log_desc, *curr_desc, *oldest_desc;
++	int start_byte, last_byte, left_size, paddings;
++	int tail_size, head_size, current_last;
++	unsigned long flags;
++
++	spin_lock_irqsave(&reg_hdl->elem->data_lock, flags);
++
++	curr_index = desc_index->data.curr_index;
++	oldest_index = desc_index->data.oldest_index;
++	curr_desc = region_data + sizeof(struct pmem_log_desc_index) +
++			curr_index * sizeof(struct pmem_log_desc);
++	oldest_desc = region_data + sizeof(struct pmem_log_desc_index) +
++			oldest_index * sizeof(struct pmem_log_desc);
++	desc_arr_size = sizeof(struct pmem_log_desc_index) +
++		region_hdr->data.num_log_desc * sizeof(struct pmem_log_desc);
++
++	/*
++	 * When pmem has not been written into once,
++	 * curr_desc->data.offset==oldest_desc->data.offset==0.
++	 */
++	if (curr_desc->data.offset < desc_arr_size) {
++		spin_unlock_irqrestore(&reg_hdl->elem->data_lock, flags);
++		return 0;
++	}
++
++	if (oldest_desc->data.offset <= curr_desc->data.offset) {
++		/* The logical range of valid data is successive */
++		start_byte = oldest_desc->data.offset + hdl->offset;
++		last_byte = curr_desc->data.offset + curr_desc->data.size;
++
++		spin_unlock_irqrestore(&reg_hdl->elem->data_lock, flags);
++
++		if (start_byte >= last_byte)
++			return 0;
++		else {
++			left_size = last_byte - start_byte;
++			if (size > left_size)
++				size = left_size;
++		}
++
++		pmem_memcpy_fromio(buffer, region_data + start_byte, size);
++
++		hdl->offset += size;
++		return size;
++	}
++
++	/*
++	 * The logical range of valid data is comprised of two parts:
++	 * [oldest_desc->data.offset, region end - paddings] and
++	 * [desc_arr_size, curr_desc's end].
++	 *
++	 * Note, we need loop over all log descriptors in order to
++	 * decide current paddings skipped by lastest data wraparound.
++	 */
++	if (curr_index >= region_hdr->data.num_log_desc - 1)
++		stop_index = 0;
++	else
++		stop_index = curr_index + 1;
++
++	index = oldest_index;
++	last_byte = desc_arr_size;
++	do {
++		log_desc = region_data + sizeof(struct pmem_log_desc_index) +
++			index * sizeof(struct pmem_log_desc);
++
++		if (log_desc->data.size) {
++			current_last = log_desc->data.offset +
++					log_desc->data.size;
++			if (current_last > last_byte)
++				last_byte = current_last;
++		}
++
++		if (index >= region_hdr->data.num_log_desc - 1)
++			index = 0;
++		else
++			index++;
++	} while (index != stop_index);
++	paddings = region_hdr->data.size - last_byte;
++
++	PMEM_DPRINT("paddings = %d bytes skipped by last wraparound\n",
++		paddings);
++
++	tail_size = last_byte - oldest_desc->data.offset;
++	head_size = curr_desc->data.offset + curr_desc->data.size -
++			desc_arr_size;
++	start_byte = oldest_desc->data.offset + hdl->offset;
++
++	spin_unlock_irqrestore(&reg_hdl->elem->data_lock, flags);
++
++	if (hdl->offset >= tail_size + head_size)
++		return 0;
++
++	if (start_byte <= last_byte) {
++		tail_size = last_byte - start_byte;
++		left_size = tail_size + head_size;
++		if (size > left_size)
++			size = left_size;
++
++		if (size <= tail_size) {
++			pmem_memcpy_fromio(buffer,
++				region_data + start_byte, size);
++		} else {
++			pmem_memcpy_fromio(buffer,
++				region_data + start_byte, tail_size);
++			pmem_memcpy_fromio(buffer + tail_size,
++				region_data + desc_arr_size,
++				size - tail_size);
++		}
++	} else {
++		start_byte %= last_byte - desc_arr_size;
++		left_size = head_size - (start_byte - desc_arr_size);
++		if (size > left_size)
++			size = left_size;
++		pmem_memcpy_fromio(buffer, region_data + start_byte, size);
++	}
++
++	hdl->offset += size;
++	return size;
++}
++
++/*
++ * This function has read() semantics - try to read size bytes data
++ * since pmem_handle->offset within the logical range of valid data
++ * in the region.
++ * Return the number of bytes actually read, and 0 if reaching the
++ * end of all valid data.
++ */
++int pmem_read_region_per_cpu(pmem_handle_t handle, char *buffer, int size,
++				int cpu_index)
++{
++	struct pmem_handle *hdl = (struct pmem_handle *)handle;
++	struct region_handle *reg_hdl = (struct region_handle *)handle;
++	int ret = -EINVAL;
++	void *data_start;
++
++	if (!pmem.enabled)
++		goto done;
++
++	if (!handle || !buffer || (size < 0) || (cpu_index < 0))
++		goto done;
++
++	if (hdl->type != PMEM_HANDLE_TYPE_REG) {
++		printk(KERN_ERR "only supports reading from region!\n");
++		goto done;
++	}
++
++	data_start = pmem_get_data_ptr(hdl);
++
++	if (reg_hdl->elem->hdr->data.num_log_desc > 0)
++		ret = pmem_read_log_desc(reg_hdl, data_start, buffer, size);
++	else
++		ret = pmem_read_region_data(reg_hdl, data_start, buffer, size,
++						cpu_index);
++done:
++	return ret;
++}
++EXPORT_SYMBOL(pmem_read_region_per_cpu);
++
+diff --git a/mm/pmem/reg.c b/mm/pmem/reg.c
+index 5fe2f6e..4fb0cb5 100644
+--- a/mm/pmem/reg.c
++++ b/mm/pmem/reg.c
+@@ -748,3 +748,36 @@ void pmem_update_ptr_block(struct part_list_elem *part_elem,
+ 		}
+ 	}
+ }
++
++int pmem_get_region_size_per_cpu(pmem_handle_t handle)
++{
++	struct pmem_handle *hdl = (struct pmem_handle *)handle;
++	struct region_handle *reg_hdl = (struct region_handle *)handle;
++	struct pmem_region_hdr *region_hdr = reg_hdl->elem->hdr;
++	struct pmem_region_data_hdr *data_hdr;
++	int cpu;
++	void *region_data;
++
++	if (hdl->type != PMEM_HANDLE_TYPE_REG)
++		return -EINVAL;
++
++	if (region_hdr->data.num_log_desc > 0)
++		return -EINVAL;
++
++	region_data = pmem_get_data_ptr(hdl);
++
++	/* Get the pmem_region_data_hdr strucutre for the specified CPU. */
++	if (region_hdr->data.flags & PMEM_REGION_FLAG_PERPROC) {
++		cpu = get_cpu();
++		data_hdr = (struct pmem_region_data_hdr *)
++				(region_data + PMEM_DESC_MAX) + cpu;
++		put_cpu();
++	} else {
++		data_hdr = (struct pmem_region_data_hdr *)
++			(region_data + PMEM_DESC_MAX);
++	}
++
++	return data_hdr->end_offset - data_hdr->start_offset;
++}
++EXPORT_SYMBOL(pmem_get_region_size_per_cpu);
++
+-- 
+1.6.5.2
+
