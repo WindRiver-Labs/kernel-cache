@@ -1,0 +1,3200 @@
+From 0c46c298386dc354d4255f7b4437eba0d5d3cae7 Mon Sep 17 00:00:00 2001
+From: Jason HU <yongqi.hu@windriver.com>
+Date: Fri, 30 Apr 2010 02:46:01 -0700
+Subject: [PATCH 4/4] pmem: pmemfs filesystem
+
+A file system interface is provided by the PMEMFS pseudo-filesystem.
+
+This filesystem will not be visible in menuconfig or xconfig unless PMEM
+is enabled. When PMEM is enabled, PMEMFS is included as a module by default.
+
+Signed-off-by: Jason HU <yongqi.hu@windriver.com>
+---
+ fs/Kconfig         |    8 +
+ fs/Makefile        |    1 +
+ fs/pmemfs/Makefile |   10 +
+ fs/pmemfs/inode.c  | 3124 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 3143 insertions(+), 0 deletions(-)
+ create mode 100644 fs/pmemfs/Makefile
+ create mode 100644 fs/pmemfs/inode.c
+
+diff --git a/fs/Kconfig b/fs/Kconfig
+index fee39a6..f6a3715 100644
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -157,6 +157,14 @@ config HUGETLB_PAGE
+ 
+ source "fs/configfs/Kconfig"
+ 
++config PMEMFS
++	tristate "Persistent Memory filesystem"
++	depends on PMEM
++	default m
++	help
++	  The persistent memory filesystem provides userspace access to 
++	  the kernel's persistent memory subsystem.
++
+ endmenu
+ 
+ menuconfig MISC_FILESYSTEMS
+diff --git a/fs/Makefile b/fs/Makefile
+index 8f33917..d7b1339 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -122,6 +122,7 @@ obj-$(CONFIG_NILFS2_FS)		+= nilfs2/
+ obj-$(CONFIG_BEFS_FS)		+= befs/
+ obj-$(CONFIG_HOSTFS)		+= hostfs/
+ obj-$(CONFIG_HPPFS)		+= hppfs/
++obj-$(CONFIG_PMEM)		+= pmemfs/
+ obj-$(CONFIG_CACHEFILES)	+= cachefiles/
+ obj-$(CONFIG_DEBUG_FS)		+= debugfs/
+ obj-$(CONFIG_OCFS2_FS)		+= ocfs2/
+diff --git a/fs/pmemfs/Makefile b/fs/pmemfs/Makefile
+new file mode 100644
+index 0000000..ca9b052
+--- /dev/null
++++ b/fs/pmemfs/Makefile
+@@ -0,0 +1,10 @@
++#
++# Makefile for the pmemfs-filesystem routines.
++#
++
++#ifeq ($(CONFIG_PMEM),y)
++#    obj-m += pmemfs.o
++#endif
++
++obj-$(CONFIG_PMEMFS)	+= pmemfs.o
++pmemfs-objs := inode.o
+diff --git a/fs/pmemfs/inode.c b/fs/pmemfs/inode.c
+new file mode 100644
+index 0000000..51f9438
+--- /dev/null
++++ b/fs/pmemfs/inode.c
+@@ -0,0 +1,3124 @@
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/vmalloc.h>
++#include <linux/pagemap.h> 	/* PAGE_CACHE_SIZE */
++#include <linux/backing-dev.h>	/* struct backing_dev_info */
++#include <linux/fs.h>		/* This is where libfs stuff is declared */
++#include <linux/mount.h>
++#include <linux/ioport.h>		
++#include <linux/pmem.h>		
++#include <asm/atomic.h>
++#include <asm/uaccess.h>	/* copy_to_user */
++#include <linux/slab.h>
++
++#ifdef CONFIG_PMEM_PCI_DRIVER
++#include <linux/pci.h>
++#endif
++
++
++/*
++ * Persistent Memory filesystem.
++ *
++ * A simple filesystem that provides userspace access to the persistent
++ * memory area in CGL.
++ *
++ * Loosely based on the following filesystem samples :
++ * 	- lwnfs (Copyright 2002 Jonathan Corbet <corbet@lwn.net>)
++ * 	- ramfs, tmpfs
++ * 	- smbfs for the readpage and writepage templates
++ *
++ * WindRiver 
++ * May 2005
++ */
++
++MODULE_LICENSE("Dual BSD/GPL");
++MODULE_AUTHOR("WindRiver");
++
++/* pmemfs globals, constants and types {{{ */
++
++#define PMEMFS_MAGIC 0x82640149  /* random magic for superblock */
++/* Number of bytes to read before calling schedule() */
++#define PMEMFS_RAW_CHUNK 16384
++
++/* This makes a dentry parent/child name pair. Useful for debugging printk's */
++#define DENTRY_PATH(dentry) \
++	(dentry)->d_parent->d_name.name,(dentry)->d_name.name
++
++/* file permissions */
++const int PMEMFS_PERM_NONE =		0000;
++const int PMEMFS_PERM_RO =		0444;
++const int PMEMFS_PERM_RW =	 	0644;
++
++
++/* different types of 'files' that pmemfs exports */
++typedef enum {
++	PMEMFS_RAW_PMEM=1,	/* Raw access to all of pmem */
++	PMEMFS_RAW_PART,	/* Raw access to a pmem partition */
++	PMEMFS_RAW_SEG,		/* Deprecated: Raw access to a pmem segment */
++	PMEMFS_RAW_REG,		/* Deprecated: Raw access to a pmem region */
++	PMEMFS_REG_RECORD,	/* Access to a log descriptor based region */
++	PMEMFS_REG_BYTE,	/* Access to fixed length region */
++	PMEMFS_BACKUP,		/* In kernel backup of corrupted pmem */
++	PMEMFS_HW_INDICATOR,	/* Indicator file for Hardware backed pmem */
++	/* "Control" file types after here */
++	PMEMFS_NEW_PART,	/* Create a new partition */
++	PMEMFS_PART_NEW_REG,	/* Create a new region on a partition */ 
++	PMEMFS_LOCK_PMEM,	/* Lock or unlock all of pmem */
++	PMEMFS_LOCK_ALL_ACTIVE,	/* Lock or unlock all active segments in pmem */
++	PMEMFS_LOCK_PART,	/* Lock or unlock a pmem partition */
++	PMEMFS_LOCK_SEG,	/* Lock of unlock a pmem segment */
++	PMEMFS_PMEM_ROTATE,	/* Rotate on all partitions in pmem */
++	PMEMFS_PART_ROTATE,	/* Rotate on a pmem partition */
++	PMEMFS_ACTIVE_SEGMENT,	/* Read a partitions active segment  */
++	PMEMFS_RESET_PMEM,	/* Access to the Reset pmem flag */
++	/* Extended logical file types */
++	PMEMFS_PART_HEADER,	/* Access to a pmem partition header area */
++	PMEMFS_PART_DATA,	/* Access to a pmem partition data area */
++	PMEMFS_SEG_HEADER,	/* Access to a pmem segment header area */
++	PMEMFS_SEG_DATA,	/* Access to a pmem segment data area */
++	PMEMFS_REG_HEADER,	/* Access to a pmem region header area */
++	PMEMFS_REG_RAW_DATA,	/* Raw access to a pmem region data area */
++	PMEMFS_REG_DATA,	/* Access to a pmem region data area */
++} pmemfs_file_t;
++
++/* typedefs for the read and write function handlers used for access to files
++ * on pmemfs.  typedefs are "evil",but we need a type for pmemfs_alloc_finfo 
++ * Notice that theses routines differ from the standard libfs read/write 
++ * signarutes by having the pmem_handle and the offset is not changed by
++ * these routines (not a ptr) */
++typedef ssize_t (*pmem_read_fn) (pmem_handle_t, char *, size_t, loff_t);
++typedef ssize_t (*pmem_write_fn) (pmem_handle_t, const char *, size_t, loff_t);
++
++/* private file handle for pmemfs 'files'.  We attach this to a inode's
++ * private data field so that we know what kind of file the user is 
++ * attempting to access and any data we need to access the appropriate
++ * section of pmem. read and write functions are also defined for each 
++ * file. The function pointers for read/write can be null if this file 
++ * doesnt support read or write. */
++struct pmemfs_file_info {
++	pmemfs_file_t	type;		/* type of pmemfs file this is */
++	pmem_handle_t	handle;		/* pmem handle for this file */
++	pmem_read_fn	read;		/* read function for this file */
++	pmem_write_fn	write;		/* write function */
++};
++
++/********************************************************************
++ *
++ * Persistent memory filesystem globals (not globally visible)
++ *
++ *******************************************************************/
++/* the pmemfs superblock ptr  - it is cached so we can create inodes 
++ * when the kernel callbacks are called (not a VFS call, so no VFS
++ * context) */
++static struct super_block *pmemfs_super = NULL;
++
++
++
++/********************************************************************
++ *
++ * VFS structure pre-declarations
++ *
++ *******************************************************************/
++static struct file_system_type pmemfs_type;
++static struct super_operations pmemfs_sb_ops;
++static struct file_operations pmemfs_file_ops;
++static struct inode_operations pmemfs_inode_ops;
++static struct backing_dev_info pmemfs_backing_dev_info;
++static struct address_space_operations pmemfs_aops;
++static struct vm_operations_struct pmemfs_file_vm_ops;
++
++
++/********************************************************************
++ *
++ * pmemfs miscellaneous routines
++ *
++ *******************************************************************/
++#ifdef pgprot_noncached
++/*
++ * Architectures vary in how they handle caching for addresses
++ * outside of main memory.
++ * The definition is moved to  mm/pmem/cmds.c since page_is_ram is no
++ * longer exported.
++ */
++extern int pmem_uncached_access(unsigned long addr);
++
++#endif /* pgprot_noncached */
++
++/* pmemfs_get_pmem_addr
++ *     This inline function calculates the pmem_addr given the
++ *     the following args:
++ *     pmemfs file type - uses the enum type pmemfs_file_t
++ *     offset
++ *     pmem_handle
++ *     pmem_addr - on success, this contains the calculate pmem_addr which
++ *                 can either be the partition header or the partition data
++ *
++ * Returns 0 on failure, 1 on success
++ */
++inline int pmemfs_get_pmem_addr(int, loff_t, struct pmem_handle *, unsigned long *);
++
++/********************************************************************
++ *
++ * pmemfs filesystem routines
++ *
++ *******************************************************************/
++/* static struct dentry *pmemfs_find_dentry {{{
++ *
++ * Find the child dentry of the given parent, with the specified name.  
++ * Returns a pointer to the dentry for the requested partition, or 
++ * NULL if the child node does not exist
++ * 
++ * NOTE: Since this routine calls d_lookup to find the resulting 
++ * dentry, the caller must call d_put on the result once they are done
++ * using it to decrement the refcount.
++ */
++static struct dentry *pmemfs_find_dentry(struct dentry *parent,
++		const char *name)
++{
++	struct dentry *result = NULL;
++	struct qstr qname;
++
++	qname.name = name;
++	qname.len = strlen(name);
++	qname.hash = full_name_hash(name, qname.len);
++
++	result = d_lookup(parent, &qname);
++	//PMEM_DPRINT("INFO: find_dentry returns %p\n", result);
++	return result;
++}
++
++/* static struct inode *pmemfs_create_inode {{{
++ * This function creates an inode to represent the structure of
++ * pmem to the VFS layer.  It is called for each directory and file
++ * that exists in the filesystem.
++ */
++static struct inode *pmemfs_create_inode(struct super_block *sb, int mode,
++                const loff_t size)
++{
++	struct inode *ret = new_inode(sb);
++
++	if (ret) {
++		ret->i_mode = mode;
++		ret->i_uid = current_fsuid();
++		ret->i_gid = current_fsgid();;
++		ret->i_size = size;
++		ret->i_blocks = (long)(size / PAGE_CACHE_SIZE);
++		if (size % PAGE_CACHE_SIZE)
++			ret->i_blocks += 1;
++
++		ret->i_mapping->a_ops = &pmemfs_aops;
++		ret->i_mapping->backing_dev_info = &pmemfs_backing_dev_info;
++		/* FIXME: Do we want to have true values for a_time/c_time ? */
++		ret->i_atime = ret->i_mtime = ret->i_ctime = CURRENT_TIME;
++	}
++	return ret;
++} 
++
++/* static struct dentry *pmemfs_create_file {{{
++ * Create a file mapping a name to a partition/segment/region/log entry.
++ * Attach the given file info to the file's inode
++ */
++static struct dentry *pmemfs_create_file(struct super_block *sb,
++		struct dentry *dir, const char *name,
++		struct pmemfs_file_info *f_info, const int mode,
++		const loff_t size)
++{
++	struct dentry *dentry;
++	struct inode *inode;
++	struct qstr qname;
++	
++	/* Make a hashed version of the name to go with the dentry. */
++	qname.name = name;
++	qname.len = strlen(name);
++	qname.hash = full_name_hash(name, qname.len);
++	/* Now we can create our dentry and the inode to go with it.  */
++	dentry = d_alloc(dir, &qname);
++	if (!dentry) {
++		PMEM_DPRINT("ERROR: Failed to alloc dentry for [%s]\n", name);
++		return NULL;
++	}
++	inode = pmemfs_create_inode(sb, S_IFREG | mode, size);
++	if (!inode) {
++		PMEM_DPRINT("ERROR: Failed to create inode for [%s]\n", name);
++		dput(dentry);
++		return NULL;
++	}
++	inode->i_fop = &pmemfs_file_ops;
++	/* assign the magic private inode data so that later we know what kind
++	 * of pmemfs file this is */
++	inode->i_private = f_info;
++	/* Put it all into the dentry cache and we're done. */
++	d_add(dentry, inode);
++
++	//PMEM_DPRINT("INFO: CF [%s] dentry=%p, inode=%p\n", name, dentry, dentry->d_inode);
++	return dentry;
++} 
++
++/* static struct dentry *pmemfs_create_dir {{{
++ * Create a directory which can be used to hold files.  This code is
++ * almost identical to the "create file" logic, except that we create
++ * the inode with a different mode, and use the libfs "simple" operations.
++ */
++static struct dentry *pmemfs_create_dir(struct super_block *sb,
++		struct dentry *parent, const char *name)
++{
++	struct dentry *dentry;
++	struct inode *inode;
++	struct qstr qname;
++
++	qname.name = name;
++	qname.len = strlen(name);
++	qname.hash = full_name_hash(name, qname.len);
++	dentry = d_alloc(parent, &qname);
++	if (!dentry) {
++		PMEM_DPRINT("ERROR: Failed to alloc dentry for [%s]\n", name);
++		return 0;
++	}
++	inode = pmemfs_create_inode(sb, S_IFDIR | 0644, 0);
++	if (!inode) {
++		PMEM_DPRINT("ERROR: Failed to create inode for [%s]\n", name);
++		dput(dentry);
++		return 0;
++	}
++	/* use the default inode ops here since we dont support unlink other
++	 * than the top level dir */
++	inode->i_op = &simple_dir_inode_operations;
++	inode->i_fop = &simple_dir_operations;
++
++	d_add(dentry, inode);
++	return dentry;
++}
++
++/********************************************************************
++ *
++ * Pmemfs internal I/O routines. 
++ *
++ *******************************************************************/
++/* static ssize_t pmemfs_read_ptr {{{
++ *
++ * Read from an in kernel pointer.  Abstraction funciton used
++ * by pmemfs_read_raw_pmem and pmemfs_read_shadow.
++ *
++ * Returns number of bytes read on success, -errno on error
++ */
++   
++static ssize_t pmemfs_read_ptr(void *start, int len, char *buf,
++                size_t count, const loff_t offset)
++{
++	ssize_t	bytes_read;
++	ssize_t	bytes_left;
++	void *_start;
++
++	bytes_read = count;
++	bytes_left = count;
++	_start = start + offset;
++
++	if (offset + count > len) {
++		bytes_read = len - offset;
++		bytes_left = len - offset;
++	}
++
++	/* Read just PMEMFS_RAW_CHUNK bytes at a time. This should
++	 * reduce the scheduling latency.
++	 */
++	for (;;) {
++		if (bytes_left > PMEMFS_RAW_CHUNK) {
++			__pmem_memcpy_fromio(buf, _start, PMEMFS_RAW_CHUNK);
++			buf += PMEMFS_RAW_CHUNK;
++			bytes_left -= PMEMFS_RAW_CHUNK;
++			_start += PMEMFS_RAW_CHUNK;
++			schedule();
++		} else {
++			__pmem_memcpy_fromio(buf, _start, bytes_left);
++			break;
++		}
++	}
++
++	return bytes_read;
++} 
++
++/* static ssize_t pmemfs_write_ptr {{{
++ *
++ * Write directly to a location in kernel memory.  Abstraction function
++ * used by pmemfs_write_raw_pmem.
++ *
++ * Returns number of bytes read on success, -errno on error
++ */
++static ssize_t pmemfs_write_ptr(void *start, int len, const char *buf,
++                size_t count, const loff_t offset)
++{
++	ssize_t	bytes_written;
++
++	bytes_written = count;
++	if (offset + count > len) {
++		bytes_written = len - offset;
++	}
++
++	__pmem_memcpy_toio(start + offset, buf, bytes_written);
++
++	return bytes_written;
++} 
++
++/* static ssize_t pmemfs_read_raw_pmem {{{
++ *
++ * Read from the raw persistent memory
++ * Returns number of bytes read on success, -errno on error
++ */
++   
++static ssize_t pmemfs_read_raw_pmem(pmem_handle_t handle, char *buf,
++                size_t count, const loff_t offset)
++{
++	/* nothing fancy here - start at the beginning and allow the user
++	 * to read all the way to the end of pmem */
++	return pmemfs_read_ptr((void*)pmem.pmem, pmem.size, buf, count, offset);
++} 
++
++/* 
++ *
++ * Read from the raw shadow copy.
++ *
++ * Returns number of bytes read on success, -errno on error
++ */
++static ssize_t pmemfs_read_raw_shadow(pmem_handle_t handle, char *buf,
++                size_t count, const loff_t offset)
++{
++	/* nothing fancy here - start at the beginning and allow the user
++	 * to read all the way to the end of pmem */
++	return pmemfs_read_ptr((void*)pmem.shadow, pmem.size, buf, count,
++	                       offset);
++} 
++
++/* static ssize_t pmemfs_read_raw_partition 
++ *
++ * Read from the raw partition memory
++ * Returns number of bytes read on success, -errno on error
++ */
++   
++static ssize_t pmemfs_read_raw_partition(pmem_handle_t handle, char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++	struct part_handle	*part_hdl;
++	struct pmem_part_hdr	*part_hdr;
++
++	if (PMEM_HANDLE_TYPE_PART != hdl->type) {
++		/* handle should always be null here */
++		PMEM_DPRINT("ERROR: Invalid handle type %d for raw partition\n",
++		            hdl->type);
++		return -EINVAL;
++	}
++	part_hdl = (struct part_handle*)hdl;
++	part_hdr = (struct pmem_part_hdr*) pmem_get_hdr_ptr(hdl);
++
++	PMEM_DPRINT(KERN_INFO "%s:%d start %lx, offset %lx, size %lx, count %lx\n",
++	                  __func__, __LINE__, (unsigned long)part_hdl->elem->hdr,
++	                  part_hdr->data.size + PMEM_PART_HDR_MAX_SIZE, (unsigned long)offset, (unsigned long)count);
++
++	/* nothing fancy here - start at the beginning and allow the user
++	 * to read all the way to the end of pmem */
++	return pmemfs_read_ptr((void*)part_hdl->elem->hdr, part_hdr->data.size + PMEM_PART_HDR_MAX_SIZE, buf, count, offset);
++} 
++
++/* static ssize_t pmemfs_write_raw_pmem 
++ *
++ * Write directly to raw persistent memory.  Headers and all.  
++ * This routine wont stop you from doing somethind bad, so use caution.
++ * Returns number of bytes read on success, -errno on error
++ */
++static ssize_t pmemfs_write_raw_pmem(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	int rc = -EINVAL;
++
++	/* WARNING:  Removing this return code check may cause a compiler
++	 * bug on Xscale.  Observed on October 25, 2005
++	 * Adding the rc variable and using it removes the bad register
++	 * optimization
++	 */
++	rc = pmemfs_write_ptr((void*)pmem.pmem, pmem.size, buf, count, offset);
++	if (rc < 0) {
++		PMEM_DPRINT("ERROR: Failed to write to raw pmem\n");
++	}
++	return rc;
++} 
++
++/* static ssize_t pmemfs_write_raw_partition 
++ *
++ * Write directly to raw partition memory.  Headers and all.  
++ * This routine wont stop you from doing somethind bad, so use caution.
++ * Returns number of bytes read on success, -errno on error
++ */
++static ssize_t pmemfs_write_raw_partition(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++	struct part_handle	*part_hdl;
++	struct pmem_part_hdr	*part_hdr;
++	int rc = -EINVAL;
++
++	/* WARNING:  Removing this return code check may cause a compiler
++	 * bug on Xscale.  Observed on October 25, 2005
++	 * Adding the rc variable and using it removes the bad register
++	 * optimization
++	 */
++	part_hdl = (struct part_handle*)hdl;
++	part_hdr = (struct pmem_part_hdr*) pmem_get_hdr_ptr(hdl);
++
++	rc = pmemfs_write_ptr((void*)part_hdl->elem->hdr, part_hdr->data.size + PMEM_PART_HDR_MAX_SIZE, buf, count, offset);
++	if (rc < 0) {
++		PMEM_DPRINT("ERROR: Failed to write to raw pmem partition\n");
++	}
++	return rc;
++} 
++
++/* static ssize_t pmemfs_read_header {{{
++ * Read from a header area of pmem.  This covers partitions, segments and
++ * regions.  Returns the number of bytes read into buf on success and
++ * -errno on error.
++ */
++static ssize_t pmemfs_read_header(pmem_handle_t handle, char *buf,
++                size_t count, const loff_t offset)
++{
++	ssize_t			bytes_read = 0;
++	int			hdr_size;
++	int 			rc;
++
++	hdr_size = pmem_get_hdr_size(handle);
++	if (hdr_size < 0) {
++		PMEM_DPRINT("ERROR: Cant get header size\n");
++		return -EINVAL;
++	}
++
++	/* read any parts of the header that are requested */
++	if ((int)offset <= hdr_size) {
++		bytes_read = min((int)((int)hdr_size - (int)offset),
++				  (int)count);
++		rc = pmem_read_header(handle, buf, bytes_read, offset);
++		if (rc < 0) {
++			PMEM_DPRINT("ERROR: read %d bytes from hdr rc=%d\n",
++			               (int)bytes_read, rc);
++			return rc;
++		}
++	}
++	return bytes_read;
++} 
++
++/* static ssize_t pmemfs_read_data 
++ * Read from a data area of pmem.  This covers partitions, segments and
++ * regions.  Returns the number of bytes read into buf on success and
++ * -errno on error.
++ */
++static ssize_t pmemfs_read_data(pmem_handle_t handle, char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++
++	/* update the offset in the opaque handle since pmem_write_data_user()
++	 * relies on it being properly set */
++	hdl->offset = offset;
++
++	return pmem_read_data(handle, buf, count);
++} 
++
++/* static ssize_t pmemfs_read_region 
++ *
++ * Read data from a regions data space.  This function handles both 
++ * record based and byte based regions by calling pmem_read_user()
++ * Returns number of bytes read into buf, -errno on error.
++ */
++static ssize_t pmemfs_read_region(pmem_handle_t handle, char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++
++	if (PMEM_HANDLE_TYPE_REG != hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", hdl->type);
++		return -EINVAL;
++	}
++
++	/* update the offset in the opaque handle since pmem_read_data_user()
++	 * relies on it being properly set */
++	hdl->offset = offset;
++
++	return pmem_read_data(handle, buf, count);
++} 
++
++/* static ssize_t pmemfs_write_header 
++ *
++ * Write header to a pmem element.
++ *
++ * Returns number of bytes written to the pmem element on success and
++ * -errno on error.
++ */
++static ssize_t pmemfs_write_header(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	return pmem_write_header(handle, buf, count, offset);
++} 
++
++/* static ssize_t pmemfs_write_data 
++ *
++ * Write data to a pmem element.
++ *
++ * Returns number of bytes written to the pmem element on success and
++ * -errno on error.
++ */
++static ssize_t pmemfs_write_data(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++
++	/* update the offset in the opaque handle since pmem_write_data_user()
++	 * relies on it being properly set */
++	hdl->offset = offset;
++
++	return pmem_write_data(handle, buf, count);
++} 
++
++
++/* static ssize_t pmemfs_write_raw_region
++ *
++ * Write to a region in "raw" mode.  This call will not call the pmem io.c
++ * write implementation since that method interprets the write as a log
++ * data append write, which is not what would be desired when the user thinks
++ * they are manipulating the region in raw mode.
++ *
++ * Returns the number of bytes written on success and -errno on 
++ * error.
++ */
++static ssize_t pmemfs_write_raw_region(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++	void			*data_start;
++	int 			rc;
++
++	/* This routine shares a common set of code with 
++	 * pmemfs_write_split_area() - just the data segment write
++	 * doesnt go through pmem_write_data() */
++
++	if (PMEM_HANDLE_TYPE_REG != hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", hdl->type);
++		return -EINVAL;
++	}
++
++	data_start = pmem_get_data_ptr(handle);
++	if (!data_start)  {
++		PMEM_DPRINT("ERROR: Cant get data ptr for region!\n");
++		return -EINVAL;
++	}
++
++	rc = pmemfs_write_ptr(data_start, hdl->size, buf, count, offset);
++
++	if (rc < 0) {
++		PMEM_DPRINT("ERROR: write %d bytes to data rc=%d\n",
++		            (int) count, rc);
++		return rc;
++	}
++
++	return rc;
++} 
++
++/* static ssize_t pmemfs_write_region 
++ *
++ * Write to a regions file - this will pass the call onto the 
++ * pmem_write_data call that knows how to write to both types of
++ * regions.
++ * Returns the number of bytes written on success and -errno on 
++ * error.
++ */
++static ssize_t pmemfs_write_region(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++
++	if (PMEM_HANDLE_TYPE_REG != hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", hdl->type);
++		return -EINVAL;
++	}
++
++	/* update the offset in the opaque handle since pmem_write_data_user()
++	 * relies on it being properly set */
++	hdl->offset = offset;
++
++	return pmem_write_data(handle, buf, count);
++} 
++
++/* static ssize_t pmemfs_write_new_part 
++ *
++ * User is writing in a pmem_reg_part structure in binary mode to the
++ * file.  Will create a new partition with the given data.  This routine
++ * will accept only an exact write of sizeof(struct pmem_reg_part).
++ *
++ * Returns the number of bytes written on success and -errno on 
++ * error.
++ */
++static ssize_t pmemfs_write_new_part(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	pmem_handle_t		temp_hdl = NULL;    /* needed for pmem_partition_reg */
++	ssize_t			rc = -EINVAL;
++
++	if (NULL != handle) {
++		/* handle should always be null here */
++		PMEM_DPRINT("ERROR: Invalid handle found \n");
++		return rc;
++	}
++	/* only accept _exactly_ one struct of input */
++	if (count != sizeof(struct pmem_reg_part)) {
++		PMEM_DPRINT("ERROR: Invalid size %d for new partition\n",
++		            (int)count);
++		return rc;
++	}
++	/* and only accept write calls starting at offset 0 */
++	if (0 != offset) {
++		PMEM_DPRINT("ERROR: Invalid offset %d for new partition\n",
++		            (int)offset);
++		return rc;
++	}
++
++	/*
++	PMEM_DPRINT("INFO: New part, name=[%s], size=%d, blocks=%d, ver=%d\n",
++	            input.desc, input.size, input.num_blocks, input.version);
++	*/
++	rc = pmem_partition_reg((struct pmem_reg_part*)buf, &temp_hdl);
++	if (0 != rc) {
++		PMEM_DPRINT("ERROR: Unable to register new partition\n");
++		return rc;
++	}
++
++	/* success - but we need to dispose of this kernel handle now */
++	pmem_release_handle(&temp_hdl);
++			
++	return count;	
++} 
++
++/* static ssize_t pmemfs_write_new_region 
++ *
++ * User is writing in a pmem_reg_region structure in binary mode to the
++ * file.  Will create a new region with the given data.  This routine
++ * will accept only an exact write of sizeof(struct pmem_reg_region) at 
++ * offset 0.
++ *
++ * Returns the number of bytes written on success and -errno on 
++ * error.
++ */
++static ssize_t pmemfs_write_new_region(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++	pmem_handle_t		temp_hdl = NULL;    /* needed for pmem_region_reg */
++	ssize_t			rc = -EINVAL;
++#ifdef CONFIG_PMEM_DEBUG
++	struct pmem_reg_region	*reg_ptr;
++#endif
++
++	if (PMEM_HANDLE_TYPE_PART != hdl->type) {
++		/* handle must be partition handle type */
++		PMEM_DPRINT("ERROR: Invalid handle type %d for new_region\n",
++		             hdl->type);
++		return rc;
++	}
++	/* only accept _exactly_ one struct of input */
++	if (count != sizeof(struct pmem_reg_region)) {
++		PMEM_DPRINT("ERROR: Invalid size %d for new region\n",
++		            (int)count);
++		return rc;
++	}
++	/* and only accept write calls starting at offset 0 */
++	if (0 != offset) {
++		PMEM_DPRINT("ERROR: Invalid offset %d for new region\n",
++		            (int)offset);
++		return rc;
++	}
++
++#ifdef CONFIG_PMEM_DEBUG
++	reg_ptr = (struct pmem_reg_region*) buf;
++
++	PMEM_DPRINT("INFO: New region, name=[%s], size=%d, flags=%d, "
++	            "fixed_size=%d, num_log_desc=%d, ver=%d, block_id=%d\n",
++	            reg_ptr->desc, reg_ptr->size, reg_ptr->flags, reg_ptr->fixed_size,
++	            (int)reg_ptr->num_log_desc, (int)reg_ptr->version,
++	            (int)reg_ptr->block_id);
++#endif
++
++	rc = pmem_region_reg(handle, (struct pmem_reg_region*)buf, &temp_hdl);
++	if (0 != rc) {
++		PMEM_DPRINT("ERROR: Unable to register new region\n");
++		return rc;
++	}
++
++	/* success - but we need to dispose of this kernel handle now */
++	pmem_release_handle(&temp_hdl);
++			
++	return count;	
++} 
++
++/* static ssize_t pmemfs_write_lock_pmem
++ *
++ * User will write a text string  to this control file that will
++ * either lock or unlock all of pmem.  Write a "0\n" (character zero, ascii 48)
++ * to unlock, or a "1\n" to lock.  Anything else will be rejected. 
++ *
++ * Returns the number of bytes written on success and -errno on 
++ * error.
++ */
++static ssize_t pmemfs_write_lock_pmem(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	ssize_t		rc = -EINVAL;
++	unsigned char	input[3];
++
++	if (NULL != handle) {
++		/* handle should always be null here */
++		PMEM_DPRINT("ERROR: Invalid handle found \n");
++		return rc;
++	}
++	/* only accept one char of input, plus one trailing \n */
++	if (count != sizeof(unsigned char) + 1) {
++		PMEM_DPRINT("ERROR: Invalid size %d for lock pmem\n", 
++		            (int)count);
++		return rc;
++	}
++	/* and only accept write calls starting at offset 0 */
++	if (0 != offset) {
++		PMEM_DPRINT("ERROR: Invalid offset %d for write pmem lock\n",
++		            (int)offset);
++		return rc;
++	}
++
++	/* pull in the input string */
++	memset(input, '\0', 3);
++	memcpy(&input, buf, count);
++
++
++	/* test input against the unlock constant */
++	if (0 == strncmp("1\n", input, 3)) {
++		//PMEM_DPRINT("INFO: User asked to lock global pmem.\n");
++		rc = pmem_lock();
++	} else if (0 == strncmp("0\n", input, 3)){
++		//PMEM_DPRINT("INFO: User asked to unlock global pmem.\n");
++		rc = pmem_unlock();
++	} else {
++		PMEM_DPRINT("ERROR: Unrecognized input for global lock [%s]\n",
++		            input);
++	}
++
++	if (rc < 0) {
++		PMEM_DPRINT("ERROR: lock/unlock failed rc=%d\n", (int)rc);
++		return rc;
++	}
++	
++	return count;	
++} 
++
++/* static ssize_t pmemfs_write_lock_all_active 
++ *
++ * User will write a single text character to this control file that will
++ * either lock or unlock all active segments in pmem. 
++ * Write a 0 (character zero, ascii 48) to unlock, anything else will be
++ * taken as a lock command. A newline character at the end of the input 
++ * will be ignored.
++ *
++ * Returns the number of bytes written on success and -errno on 
++ * error.
++ */
++static ssize_t pmemfs_write_lock_all_active(pmem_handle_t handle,
++		const char *buf, size_t count, const loff_t offset)
++{
++	ssize_t		rc = -EINVAL;
++	unsigned char	input[3];
++
++	if (NULL != handle) {
++		/* handle should always be null here */
++		PMEM_DPRINT("ERROR: Invalid handle found \n");
++		return rc;
++	}
++	/* only accept one char of input +  a trailing \n  */
++	if (count != sizeof(unsigned char) + 1) {
++		PMEM_DPRINT("ERROR: Invalid size %d for lock active pmem\n",
++		            (int)count);
++		return rc;
++	}
++	/* and only accept write calls starting at offset 0 */
++	if (0 != offset) {
++		PMEM_DPRINT("ERROR: Invalid offset %d for write active locks\n",
++		            (int)offset);
++		return rc;
++	}
++
++	/* pull in the input string */
++	memset(input, '\0', 3);
++	memcpy(&input, buf, 2);
++
++	/* test input against the unlock constant */
++	if (0 == strncmp("0\n", input, 3)) {
++		//PMEM_DPRINT("INFO: asked to unlock all active segments.\n");
++		rc = pmem_unlock_all_active_segments();
++	} else if (0 == strncmp("1\n", input, 3)) {
++		//PMEM_DPRINT("INFO: asked to lock all active segments.\n");
++		rc = pmem_lock_all_active_segments();
++	} else {
++		PMEM_DPRINT("ERROR: Invalid lock active segments input [%s]\n",
++		            input);
++	}
++
++	if (rc < 0) {
++		PMEM_DPRINT("ERROR:(un)lock active segments failed rc=%d\n",
++		            (int)rc);
++		return rc;
++	}
++	
++	return count;	
++} 
++
++/* static ssize_t pmemfs_write_rotate_pmem 
++ *
++ * Write the text string "1\n" to this file to rotate all partitions in
++ * pmem and lock the previously active segment. Write the text string 
++ * "0\n" to this file to rotate without locking the currently active segments.
++ * Any other input will be rejected. 
++ *
++ * Returns the number of bytes written on success (2) and -errno on 
++ * error.
++ */
++static ssize_t pmemfs_write_rotate_pmem(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	ssize_t		rc = -EINVAL;
++	unsigned char	input[3];
++
++	if (NULL != handle) {
++		/* handle should always be null here */
++		PMEM_DPRINT("ERROR: Invalid handle found \n");
++		return rc;
++	}
++
++	/* "0\n" or "1\n" */	
++	if (count != sizeof(unsigned char) + 1) {
++		PMEM_DPRINT("ERROR: Invalid size %d for all part rotate\n",
++		            (int)count);
++		return rc;
++	}
++	/* and only accept write calls starting at offset 0 */
++	if (0 != offset) {
++		PMEM_DPRINT("ERROR: Invalid offset %d for write rotate pmem\n",
++		            (int)offset);
++		return rc;
++	}
++
++	/* grab the input string */
++	memset(&input, '\0', 3);
++	memcpy(&input, buf, 2);
++
++	/* test input against the constant */
++	if (0 == strncmp("1\n", input, 3)) {
++		//PMEM_DPRINT("INFO: asked to rotate all parts with lock.\n");
++		rc = pmem_rotate(1);
++	} else if (0 == strncmp("0\n", input, 3)){
++		//PMEM_DPRINT("INFO: asked to rotate all parts with lock.\n");
++		rc = pmem_rotate(0);
++	} else {
++		PMEM_DPRINT("ERROR: unknown rotate command [%s].\n", input);
++		return rc;
++	}
++
++	if (rc < 0) {
++		PMEM_DPRINT("ERROR: pmem_rotate() failed\n");
++		return rc;
++	}
++	
++	return count;	
++} 
++
++/* static ssize_t pmemfs_write_reset_pmem
++ *
++ * Write the text string "1\n" to this file to set the pmem 'reset' flag
++ * and "0\n" to clear the reset flag.
++ * Any other input will be rejected. 
++ *
++ * Returns the number of bytes written on success (2) and -errno on 
++ * error.
++ */
++static ssize_t pmemfs_write_reset_pmem(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	const char	*valid = "1\n";		/* valid input string */
++	unsigned char	input[3];
++
++	if (NULL != handle) {
++		/* handle should always be null here */
++		PMEM_DPRINT("ERROR: Invalid handle found \n");
++		return -EINVAL;
++	}
++
++	/* only accept the exact input we are looking for */	
++	if (count != strlen(valid)) {
++		PMEM_DPRINT("ERROR: Invalid size %d for reset pmem.\n",
++		            (int)count);
++		return -EINVAL;
++	}
++	if (0 != offset) {
++		PMEM_DPRINT("ERROR: Invalid offset %d for write reset pmem\n",
++		            (int)offset);
++		return -EINVAL;
++	}
++
++	memset(&input, '\0', 3);
++	memcpy(&input, buf, 2);
++
++	/* test input against the constant */
++	if (0 == strncmp("1\n", input, 3)) {
++		//PMEM_DPRINT("INFO: asked to set reset flag.\n");
++		pmem_set_cb_reset_flag();
++	} else if (0 == strncmp("0\n", input, 3)) {
++		//PMEM_DPRINT("INFO: asked to un-set reset flag.\n");
++		/* Clear the reset flag */
++		pmem_clear_cb_reset_flag();
++	} else {
++		PMEM_DPRINT("ERROR: unknown reset command [%s].\n", input);
++	}
++	
++	return count;	
++} 
++
++/* static ssize_t pmemfs_write_part_lock 
++ *
++ * User will write a text string  to this control file that will
++ * either lock or unlock the partition associated with handle.
++ * Write a "0\n" (character zero, ascii 48) to unlock, or a "1\n" to lock.
++ * Anything else will be rejected. 
++ *
++ * Returns the number of bytes written on success (2) and -errno on 
++ * error.
++ */
++static ssize_t pmemfs_write_part_lock(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++	struct part_handle	*part;
++	ssize_t			rc = -EINVAL;
++	unsigned char		input[3];
++
++	if (PMEM_HANDLE_TYPE_PART != hdl->type) {
++		/* handle should always be null here */
++		PMEM_DPRINT("ERROR: Invalid handle type %d for lock_part\n",
++		            hdl->type);
++		return rc;
++	}
++	part = (struct part_handle*)hdl;
++
++	/* only accept one char of input, plus one trailing \n */
++	if (count != sizeof(unsigned char) + 1) {
++		PMEM_DPRINT("ERROR: Invalid size %d for lock part\n",
++		            (int)count);
++		return rc;
++	}
++	/* and only accept write calls starting at offset 0 */
++	if (0 != offset) {
++		PMEM_DPRINT("ERROR: Invalid offset %d for write lock part\n",
++		            (int)offset);
++		return rc;
++	}
++
++	/* pull in the input string */
++	memset(input, '\0', 3);
++	memcpy(&input, buf, count);
++
++	/* test input against the unlock constant */
++	if (0 == strncmp("1\n", input, 3)) {
++		//PMEM_DPRINT("INFO: User asked to lock part.\n");
++		rc = pmem_lock_part(handle);
++	} else if (0 == strncmp("0\n", input, 3)){
++		//PMEM_DPRINT("INFO: User asked to unlock part.\n");
++		rc = pmem_unlock_part(handle);
++	} else {
++		PMEM_DPRINT("ERROR: Unrecognized input for part lock [%s]\n",
++		            input);
++	}
++
++	if (rc < 0) {
++		PMEM_DPRINT("ERROR: lock/unlock part failed rc=%d\n", (int)rc);
++		return rc;
++	}
++	
++	return count;	
++} 
++
++/* static ssize_t pmemfs_write_part_rotate 
++ *
++ * Write the text string "1\n" to this file to rotate the partition 
++ * represented by handle and lock the previously active segment.
++ * Write the text string "0\n" to this file to rotate without locking
++ * the currently active segments.
++ * Any other input will be rejected. 
++ *
++ * Returns the number of bytes written on success (2) and -errno on 
++ * error.
++ */
++static ssize_t pmemfs_write_part_rotate(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++	struct part_handle	*part;
++	ssize_t			rc = -EINVAL;
++	unsigned char		input[3];
++
++	if (PMEM_HANDLE_TYPE_PART != hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", hdl->type);
++		return rc;
++	}
++	part = (struct part_handle*)hdl;
++
++	/* "0\n" or "1\n" */
++	if (count != sizeof(unsigned char) + 1) {
++		PMEM_DPRINT("ERROR: Invalid size %d for all part rotate\n",
++		            (int)count);
++		return rc;
++	}
++	/* only accept write calls starting at offset 0 */
++	if (0 != offset) {
++		PMEM_DPRINT("ERROR: Invalid offset %d for write rotate part\n",
++		            (int)offset);
++		return rc;
++	}
++
++	/* grab the input string */
++	memset(&input, '\0', 3);
++	memcpy(&input, buf, 2);
++
++	/* test input against the constant */
++	if (0 == strncmp("1\n", input, 3)) {
++		//PMEM_DPRINT("INFO: asked to rotate part with lock.\n");
++		rc = pmem_part_rotate(handle, 1);
++	} else if (0 == strncmp("0\n", input, 3)){
++		//PMEM_DPRINT("INFO: asked to rotate part without lock.\n");
++		rc = pmem_part_rotate(handle, 0);
++	} else {
++		PMEM_DPRINT("ERROR: unknown rotate command [%s].\n", input);
++		return rc;
++	}
++
++	if (rc < 0) {
++		PMEM_DPRINT("ERROR: pmem_rotate() failed = %d\n", (int)rc);
++		return rc;
++	}
++	
++	return count;	
++} 
++
++/* static ssize_t pmemfs_read_active_segment 
++ *
++ * Deposit the currently active segment in text format into the supplied 
++ * kernel space buffer.
++ *
++ * Returns number of bytes read into buf (3) on success, -errno on error.
++ */
++static ssize_t pmemfs_read_active_segment(pmem_handle_t handle, char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++	struct part_handle	*part;
++	char 			id[32];
++	ssize_t			len;
++	ssize_t			bytes_read = -EINVAL;
++
++	if (PMEM_HANDLE_TYPE_PART != hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", hdl->type);
++		return bytes_read;
++	}
++	part = (struct part_handle*)hdl;
++
++	len = snprintf(id, 31, "%d\n",
++	               pmem_get_active_block_index(part->elem->hdr));
++	id[len++] = '\0'; 		/* ensure null termination */
++
++	if (offset > len) {
++		return 0;
++	}
++	
++	bytes_read = count;
++	if (offset + count > len) {
++		bytes_read = len - offset;
++	}
++
++	memcpy(buf, id + offset, bytes_read);
++
++	return bytes_read;
++} 
++
++/* static ssize_t pmemfs_write_seg_lock 
++ *
++ * User will write a text string  to this control file that will
++ * either lock or unlock the segment associated with handle.
++ * Write a "0\n" (character zero, ascii 48) to unlock, or a "1\n" to lock.
++ * Anything else will be rejected. 
++ *
++ * Returns the number of bytes written on success (2) and -errno on 
++ * error.
++ */
++static ssize_t pmemfs_write_seg_lock(pmem_handle_t handle, const char *buf,
++                size_t count, const loff_t offset)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++	ssize_t			rc = -EINVAL;
++	unsigned char		input[3];
++
++	if (PMEM_HANDLE_TYPE_BLK != hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d for seg_lock\n",
++		            hdl->type);
++		return rc;
++	}
++
++	/* only accept one char of input, plus one trailing \n */
++	if (count != sizeof(unsigned char) + 1) {
++		PMEM_DPRINT("ERROR: Invalid size %d for lock segment\n",
++		            (int)count);
++		return rc;
++	}
++	/* and only accept write calls starting at offset 0 */
++	if (0 != offset) {
++		PMEM_DPRINT("ERROR: Invalid offset %d for write segment lock\n",
++		            (int)offset);
++		return rc;
++	}
++
++	/* pull in the input string */
++	memset(input, '\0', 3);
++	memcpy(&input, buf, count);
++
++	/* test input against the unlock constant */
++	if (0 == strncmp("1\n", input, 3)) {
++		//PMEM_DPRINT("INFO: User asked to lock segment.\n");
++		rc = pmem_lock_block(handle);
++	} else if (0 == strncmp("0\n", input, 3)){
++		//PMEM_DPRINT("INFO: User asked to unlock segment.\n");
++		rc = pmem_unlock_block(handle);
++	} else {
++		PMEM_DPRINT("ERROR: Unrecognized input for segment lock [%s]\n",
++		            input);
++		return rc;
++	}
++
++	if (rc < 0) {
++		PMEM_DPRINT("ERROR: lock/unlock segment failed\n");
++		return rc;
++	}
++	
++	return count;	
++} 
++
++/********************************************************************
++ *
++ * pmemfs internal 'worker' functions
++ *
++ *******************************************************************/
++/* static void *pmemfs_alloc_mem 
++ * Allocate memory with kmalloc if possible. This speeds up 
++ * driver operations immensely */
++static void *pmemfs_alloc_mem(ssize_t size)
++{
++	void *p;
++
++	if (size > PAGE_SIZE)
++		p = vmalloc(size);
++	else
++		p = kmalloc(size, GFP_KERNEL);
++	//PMEM_DPRINT("ALLOC_MEM: alloc %p with size %d\n", p, size);
++	return p;
++} 
++
++/* static void pmemfs_free_mem 
++ * Free the memory with the appropriate function */
++static void pmemfs_free_mem(void *mem, ssize_t size)
++{
++	//PMEM_DPRINT("ALLOC_MEM: Freeing %p with size %d\n", mem, size);
++	if (size > PAGE_SIZE)
++		vfree(mem);
++	else
++		kfree(mem);
++} 
++
++/* static void *pmemfs_alloc_finfo 
++ *
++ * Allocate and fill a pmemfs_file_info structure given the values for
++ * handle, type, read and write.  Arguments may be NULL.  The caller has
++ * the responsibility to kfree() the returned structure.
++ * Returns a pointer to the allocated structure on sucess and NULL on 
++ * error. */
++static struct pmemfs_file_info *pmemfs_alloc_finfo(pmem_handle_t handle,
++                pmemfs_file_t type, pmem_read_fn read, pmem_write_fn write)
++{
++	struct pmemfs_file_info	*f_info;
++	
++	f_info = (struct pmemfs_file_info*)kmalloc(
++	                sizeof(struct pmemfs_file_info), GFP_KERNEL);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Failed to kmalloc pmemfs_file_info\n");
++		return NULL;
++	}
++	f_info->handle = handle;
++	f_info->type = type;
++	f_info->read = read;
++	f_info->write = write;
++
++	/* Don't let anything else hold on to this handle */
++	handle = NULL;
++
++	return f_info;
++} 
++
++/* static void pmemfs_free_finfo 
++ *
++ * Destroy a pmemfs_file_info structure and release all resources
++ * associated with it.  */
++static void pmemfs_free_finfo(struct pmemfs_file_info *f_info)
++{
++	if (likely(f_info)) {
++		if (likely(f_info->handle)) {
++			pmem_release_handle((pmem_handle_t *) &f_info->handle);
++		}
++		kfree(f_info);
++		f_info = NULL;
++	}
++} 
++
++/*  static char *pmemfs_build_segment_name 
++ *
++ *  Build a string that will be the name of the directory for the given 
++ *  segment id.
++ *  The string that is returned is allocated by kmalloc() and it is the 
++ *  responsibility of the caller to the free the memory when finished.
++ */
++static char *pmemfs_build_segment_name(int segno)
++{
++	char *buf = NULL;
++	int len = 0;
++
++	if (segno >= 0) {
++		/* FIXME: WR - dont need to allocate this much ram - wastage */
++		buf = (char*)kmalloc(NAME_MAX + 1, GFP_KERNEL);
++		if (!buf) {
++			printk(KERN_ERR "pmemfs_build_segment_name: Unable to\
++					allocate memory\n");
++			return buf;
++		}
++		len = snprintf(buf, NAME_MAX, "%s%d", PMEMFS_SEGMENT_PREFIX,
++				segno);
++		buf[len] = '\0';   /* ensure NULL termination */
++	}
++	else {
++		printk(KERN_ERR "ERROR: pmemfs_build_segment_name invalid \
++				segment=%d\n", segno);
++	}
++	return buf;
++} 
++
++/* static int pmemfs_add_region_to_segment 
++ *
++ * Adds the given region to the given segment.  Registers the appropriate
++ * VFS directories and files for the region in the filesystem location that
++ * belongs to the given segment.
++ * Returns 0 upon successful setup, -ERRNO on error
++ *
++ * sb - superblock of the filesystem to create inodes on
++ * seg_dentry - directory of the parent segment this region lives in
++ * parent_handle - opaque pmem handle to the partition the segment lives in
++ *                 this handle is needed to call pmem_region_get() to get
++ *                 the opaque pmem_handle_t for the inode private data
++ * region_name - name of the region to create
++ * block_id - block_id of the segment that this region is being added to.
++ *
++ */
++static int pmemfs_add_region_to_segment(struct super_block *sb,
++                struct dentry *seg_dentry,
++                pmem_handle_t parent_handle,
++                const char *region_name,
++                int block_id)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)parent_handle;
++	struct pmemfs_file_info	*f_info;
++	struct region_handle	*region_handle;
++	struct dentry		*file_dentry, *reg_dentry;
++	pmem_handle_t		handle = NULL;
++	int 			rc = -EINVAL;
++
++	if (PMEM_HANDLE_TYPE_PART != hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", hdl->type);
++		return rc;
++	}
++
++	/* create the directory for the region inside this segment */
++	reg_dentry = pmemfs_create_dir(sb, seg_dentry, region_name);
++	if (!reg_dentry) {
++		PMEM_DPRINT("ERROR: Failed to create dir for [%s]\n",
++		            region_name);
++		return rc;
++	}
++	
++	/* create the raw data access file for this region */ 
++	if (pmem_region_get(parent_handle, (char*)region_name, block_id,
++	                    &handle)) {
++		PMEM_DPRINT("ERROR: Cant get region handle [%s]\n",region_name);
++		return rc;
++	}
++	f_info = pmemfs_alloc_finfo(handle, PMEMFS_REG_RAW_DATA,
++	                            pmemfs_read_region,
++				    pmemfs_write_raw_region);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Failed to allocate file_info\n");
++		return rc;
++	}
++
++	file_dentry = pmemfs_create_file(sb, reg_dentry,
++	                                 PMEMFS_REGION_PREFIX PMEMFS_RAW_DATA_SUFFIX, f_info,
++					 PMEMFS_PERM_RW,
++					 ((struct pmem_handle*)(handle))->size);
++	if (!file_dentry) {
++		PMEM_DPRINT("ERROR: Failed to create raw access file for region [%s]\n", region_name);
++		kfree(f_info);
++		return rc;
++	}
++
++	handle = NULL; /* let VFS reclaim memory on umount */
++
++	/* need to know what kind of region this is.  Convert the opaque
++	 * handle to let us look at the region_info */
++	region_handle = (struct region_handle*)f_info->handle;
++
++	/* WARNING: percpu regions */
++	
++	/* call pmem_region_get() twice to get 2 copies of the 'same' handle
++	 * for the 2 inodes.  Can't use the same handle twice since inode
++	 * destroy will dispose of the handle */
++	if (pmem_region_get(parent_handle, (char*)region_name, block_id,
++	                    &handle)) {
++		PMEM_DPRINT("ERROR: Cant get region handle [%s]\n",region_name);
++		return rc;
++	}
++
++	/* create the access to the region data / log data  - defaults to byte
++	 * access. */
++	f_info = pmemfs_alloc_finfo(handle, PMEMFS_REG_BYTE, pmemfs_read_region,
++	                            pmemfs_write_region);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Failed kmalloc for file_info\n");
++		return rc;
++	}
++
++	if (region_handle->elem->hdr->data.num_log_desc) {
++		/* override default type and name for a log descriptor region */
++		f_info->type = PMEMFS_REG_RECORD;
++	}
++	file_dentry = pmemfs_create_file(sb, reg_dentry, PMEMFS_REGION_PREFIX PMEMFS_DATA_SUFFIX,
++	                                 f_info, PMEMFS_PERM_RW,
++	                                 ((struct pmem_handle*)(handle))->size);
++	if (!file_dentry) {
++		PMEM_DPRINT("ERROR: Failed to create region data access file for region [%s]\n", region_name);
++		kfree(f_info);
++		return rc;
++	}
++
++	handle = NULL; /* let VFS reclaim memory on umount */
++
++	/* call pmem_region_get() a third time to get 3 copies of the 'same' handle
++	 * for the 3 inodes.  Can't use the same handle repeatedly since inode
++	 * destroy will dispose of the handle */
++	if (pmem_region_get(parent_handle, (char*)region_name, block_id,
++	                    &handle)) {
++		PMEM_DPRINT("ERROR: Cant get region handle [%s]\n",region_name);
++		return rc;
++	}
++
++	/* create the access to the region header */
++	f_info = pmemfs_alloc_finfo(handle, PMEMFS_REG_HEADER, pmemfs_read_header,
++	                            pmemfs_write_header);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Failed kmalloc for file_info\n");
++		return rc;
++	}
++
++	file_dentry = pmemfs_create_file(sb, reg_dentry, PMEMFS_REGION_PREFIX PMEMFS_HEADER_SUFFIX,
++	                                 f_info, PMEMFS_PERM_RW,
++	                                 pmem_get_hdr_size((struct pmem_handle*) handle));
++	if (!file_dentry) {
++		PMEM_DPRINT("ERROR: Failed to create region header access file for region [%s]\n", region_name);
++		kfree(f_info);
++		return rc;
++	}
++
++	handle = NULL; /* let VFS reclaim memory on umount */
++
++	return 0;		/* if we get this far, its a green light */
++} 
++
++/* static int pmemfs_add_region_to_part 
++ * Install the subtree that represents a region into the proper place in 
++ * the filesystem tree.  The parent partition is given so that we know
++ * where the regions belong.
++ * Assumes that the directories for the segments have already been created
++ * for the parent partition.
++ * Returns 0 on success, and -errno on error.
++ *
++ * sb - superblock of the filesystem where inodes will be created
++ * parent_hdl - opaque pmem handle for the partition this region lives in
++ * region_hdl - opaque pmem handle that represents the region to represent
++ */
++static int pmemfs_add_region_to_part(struct super_block *sb,
++                pmem_handle_t parent_hdl,
++                pmem_handle_t region_hdl)
++{
++	struct pmem_handle	*p_hdl = (struct pmem_handle*)parent_hdl;
++	struct pmem_handle	*r_hdl = (struct pmem_handle*)region_hdl;
++	struct part_handle	*parent_handle;
++	struct region_handle	*region_handle;
++	struct dentry		*part_dentry, *seg_dentry;
++	int			i;
++	char			*seg_name;
++	char			desc[PMEM_DESC_MAX];
++	int			rc = -EINVAL;
++
++	if (PMEM_HANDLE_TYPE_PART != p_hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", p_hdl->type);
++		return rc;
++	}
++	if (PMEM_HANDLE_TYPE_REG != r_hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", r_hdl->type);
++		return rc;
++	}
++
++	parent_handle = (struct part_handle*)p_hdl;
++	region_handle = (struct region_handle*)r_hdl;
++
++	part_dentry = pmemfs_find_dentry(sb->s_root,
++	                  parent_handle->elem->hdr->data.desc);
++	if (!part_dentry) {
++		PMEM_DPRINT("ERROR: Failed to find dentry for part [%s]\n",
++		            parent_handle->elem->hdr->data.desc);
++		return rc;
++	}
++	if (parent_handle->elem->hdr->data.num_blocks <= 0) {
++		PMEM_DPRINT("ERROR: Can't add region to partition without blocks\n");
++		return rc;
++	}
++
++	/* the region goes in every segment in the parent partition, and
++	 * the active segment  - this is done by cycling over the block id's
++	 * starting at the PMEM_ACTIVE_BLOCK (-1).
++	 *
++	 * HACK: This is dirty since we are abusing the fact that 
++	 * PMEM_ACTIVE_BLOCK is set to -1.  If this changes in the future,
++	 * then this code will need to be updated */
++#if ( -1 != PMEM_ACTIVE_BLOCK )
++#error PMEM_ACTIVE_BLOCK changed value: code must be updated
++#endif
++	for (i = -1; i < parent_handle->elem->hdr->data.num_blocks; i++) {
++		/* generate the 'path' for this segment */
++		if (i < 0) {
++			/* this is 'active' segment */
++			seg_name = (char*)PMEMFS_ACTIVE_REGION_DIR;
++		} else {
++			seg_name = pmemfs_build_segment_name(i);
++			if (!seg_name) {
++				printk(KERN_ERR "ERROR: unable to get segment "
++				       "name\n");
++				dput(part_dentry);
++				return rc;
++			}
++		}
++	
++		seg_dentry = pmemfs_find_dentry(part_dentry, seg_name);
++		if (!seg_dentry) {
++			PMEM_DPRINT("ERROR: failed to find dentry for segment [%s]\n", seg_name);
++			if (i >= 0) {
++				kfree(seg_name);
++			}
++			dput(part_dentry);
++			return rc;
++		}
++		if (i >= 0) {
++			/* seg_name is kmallocd for non-active seg */
++			kfree(seg_name);
++		}
++
++		/* make a local copy from pmem of the name of this
++		 * directory - the dcache uses plain old memcpy() */
++		memset(desc, '\0', PMEM_DESC_MAX);
++		__pmem_memcpy_fromio(desc, region_handle->elem->hdr->data.desc, PMEM_DESC_MAX);
++
++		rc = pmemfs_add_region_to_segment(sb, seg_dentry, parent_hdl, desc, i);
++		dput(seg_dentry); 	/* dont need dentry anymore */
++		if (rc) {
++			PMEM_DPRINT("ERROR: Failed to add region to segment \
++			             [%s]\n", seg_name);
++			break;
++		}
++	}
++	dput(part_dentry);	/* done with part dentry, decrement refcount */
++	return rc;
++} 
++
++/* static int pmemfs_part_populate_segments 
++ *
++ * Popluate the VFS tree for the segments that belong under the given
++ * partition.  This is a helper routine used by pmemfs_add_partition
++ * Assumes that there is at least _one_ segment in the given partition.
++ * Returns 0 on success, -errno on error
++ *
++ * sb - superblock of the pmemfs filesystem (needed for inode creation)
++ * part_handle - opaque handle for parent partition
++ * root - dentry for the parent, where this subtree will be rooted in VFS
++ */
++static int pmemfs_part_populate_segments(struct super_block *sb,
++           pmem_handle_t handle, struct dentry *root)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++	struct part_handle	*part_handle = NULL;
++	struct pmem_region_hdr	*reg_hdr;
++	struct pmemfs_file_info	*f_info;
++	struct dentry		*seg_dir, *ctrl_dir;
++	pmem_handle_t		seg_hdl = NULL;
++	unsigned char		*seg_name;
++	char			desc[PMEM_DESC_MAX];
++	int			i, j, fsize;
++	int			rc = -EINVAL;
++
++	if (PMEM_HANDLE_TYPE_PART != hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", hdl->type);
++		return rc;
++	}
++
++	part_handle = (struct part_handle*)hdl;
++	/* ensure that there is at least 1 segment on this part */
++	if (part_handle->elem->hdr->data.num_blocks <= 0) {
++		PMEM_DPRINT("ERROR: No segments in partition\n");
++		return rc;
++	}
++
++	/* create directories and files for the segments level inside 
++	 * this partition
++	 * NOTE: This loop does one extra iteration to generate the dir
++	 * for the 'active' segment.*/
++	for (i = -1; i < part_handle->elem->hdr->data.num_blocks; i++) {
++		if (i < 0) {
++			seg_name = (char*)PMEMFS_ACTIVE_REGION_DIR;
++		} else {
++			seg_name = pmemfs_build_segment_name(i);
++			if (!seg_name) {
++				PMEM_DPRINT("ERROR: unable to get segment name\n");
++				return rc;
++			}
++		}
++		/* create the directory for the segment on this part */
++		seg_dir = pmemfs_create_dir(sb, root, seg_name);
++		if (!seg_dir) {
++			PMEM_DPRINT("ERROR: failed to create dir [%s/%s]\n",
++			            part_handle->elem->hdr->data.desc,
++			            seg_name);
++			return rc;
++		}
++		
++		ctrl_dir = pmemfs_create_dir(sb, seg_dir, PMEMFS_CONTROL_DIR);
++		if (!ctrl_dir) {
++			PMEM_DPRINT("ERROR: Failed to create control dir for "
++			            "segment [%s]\n",
++			            part_handle->elem->hdr->data.desc);
++			return rc;
++		}
++		/* get a pmem handle for this segment - need it for the 
++		 * internal inode private data structure */
++		if (pmem_block_get(handle, i, &seg_hdl)) {
++			PMEM_DPRINT("ERROR: Unable to get handle for block"
++			            "[%s]\n", seg_name);
++			return rc;
++		}
++		
++		/* control file to lock/unlock this segment */
++		f_info = pmemfs_alloc_finfo(seg_hdl, PMEMFS_LOCK_SEG, NULL,
++		                            pmemfs_write_seg_lock);
++		if (!f_info) {
++			PMEM_DPRINT("ERROR: Cant allocate f_info\n");
++			pmem_release_handle(&seg_hdl);
++			return rc;
++		}
++		fsize = 0; //((struct pmem_handle*)(seg_hdl))->size;
++		if (!pmemfs_create_file(sb, ctrl_dir, CTRL_LOCK_FILE, f_info,
++		                        PMEMFS_PERM_RW, fsize )) {
++			PMEM_DPRINT("ERROR: Unable to create lock control file "
++			            "for segment [%s]\n", seg_name);
++			kfree(f_info);
++			return rc;
++		}
++
++		seg_hdl = NULL; /* let VFS reclaim memory on umount */
++
++		/* WARNING: only pass each pmem_handle_t to pmemfs_alloc_finfo
++		 * once.  It will be free()d when shutting down the fs */
++		if (pmem_block_get(handle, i, &seg_hdl)) {
++			PMEM_DPRINT("ERROR: Unable to get handle for block"
++			            "[%s]\n", seg_name);
++			return rc;
++		}
++		/* create the 'access to a segment header' file */
++		f_info = pmemfs_alloc_finfo(seg_hdl, PMEMFS_SEG_HEADER,
++		                            pmemfs_read_header,
++					    pmemfs_write_header);
++		if (!f_info) {
++			PMEM_DPRINT("ERROR: Cant allocate f_info\n");
++			pmem_release_handle(&seg_hdl);
++			return rc;
++		}
++	        fsize = pmem_get_hdr_size((struct pmem_handle*) seg_hdl);
++		if (!pmemfs_create_file(sb, seg_dir, 
++		        PMEMFS_SEGMENT_PREFIX PMEMFS_HEADER_SUFFIX,
++		        f_info, PMEMFS_PERM_RW, fsize)) {
++			PMEM_DPRINT("ERROR: Unable to create access to "
++			            "segment header [%s]\n", seg_name);
++			kfree(f_info);
++			return rc;
++		}
++		seg_hdl = NULL; /* let VFS reclaim memory on umount */
++
++		/* WARNING: only pass each pmem_handle_t to pmemfs_alloc_finfo
++		 * once.  It will be free()d when shutting down the fs */
++		if (pmem_block_get(handle, i, &seg_hdl)) {
++			PMEM_DPRINT("ERROR: Unable to get handle for block"
++			            "[%s]\n", seg_name);
++			return rc;
++		}
++		/* create the 'access to a segment data' file */
++		f_info = pmemfs_alloc_finfo(seg_hdl, PMEMFS_SEG_DATA,
++		                            pmemfs_read_data,
++					    pmemfs_write_data);
++		if (!f_info) {
++			PMEM_DPRINT("ERROR: Cant allocate f_info\n");
++			pmem_release_handle(&seg_hdl);
++			return rc;
++		}
++
++		fsize = ((struct pmem_handle*) (seg_hdl))->size;
++		if (!pmemfs_create_file(sb, seg_dir, 
++		        PMEMFS_SEGMENT_PREFIX PMEMFS_DATA_SUFFIX,
++		        f_info, PMEMFS_PERM_RW, fsize)) {
++			PMEM_DPRINT("ERROR: Unable to create access to "
++			            "segment data [%s]\n", seg_name);
++			kfree(f_info);
++			return rc;
++		}
++
++		if (i >= 0) {
++			/* seg_name is only kmallocd for non-active seg */
++			kfree(seg_name);
++		}
++
++		seg_hdl = NULL; /* let VFS reclaim memory on umount */
++
++		/* now we have the segment dirs, fill in the 
++		 * region dirs/files for this segment*/
++		for (j = 0; j < part_handle->elem->hdr->data.num_regions; j++) {
++			reg_hdr = PMEM_GET_REGION_HDR(part_handle->elem->hdr,
++			                              j);
++			/* make a local copy from pmem of the name of this
++			 * directory - the dcache uses plain old memcpy() */
++			memset(desc, '\0', PMEM_DESC_MAX);
++			__pmem_memcpy_fromio(desc, reg_hdr->data.desc, PMEM_DESC_MAX);
++			if (pmemfs_add_region_to_segment(sb, seg_dir, handle,
++			                                 desc, i)) {
++				PMEM_DPRINT("ERROR: Unable to add region [%s] to partition.\n", desc);
++				return rc;
++			}
++		}
++	}
++
++	/* if we get to here, everything is fine */
++	return 0;
++} 
++
++/* static int pmemfs_add_partition 
++ *
++ * Install the 'subtree' that represent a partition into the VFS tree.
++ * This routine will recursively add all the files and directories that 
++ * belong under the parition - current segments and regions will be added
++ * to the tree.
++ * Returns 0 on success, -errno on error.
++ *
++ * sb - superblock for the pmemfs filesystem
++ * handle - opaque pmem handle representing the partition to be added
++ */
++static int pmemfs_add_partition(struct super_block *sb,
++		pmem_handle_t handle)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle *) handle;
++	struct part_handle	*part_handle;
++	struct pmem_part_hdr	*part_hdr;
++	struct dentry		*part_dir, *ctrl_dir;
++	struct pmemfs_file_info	*f_info;
++	pmem_handle_t		inode_hdl = NULL;
++	int			fsize;
++	static char		desc[PMEM_DESC_MAX];
++	int			rc = -EINVAL;
++
++	if (PMEM_HANDLE_TYPE_PART != hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", hdl->type);
++		return rc;
++	}
++
++	/* convenience handles */
++	part_handle = (struct part_handle *) hdl;
++	part_hdr = part_handle->elem->hdr;
++
++	/* Need to copy the name of the partition into a local buffer
++	 * so that the memcpy() inside d_alloc() in pmemfs_create_dir()
++	 * will be able to read the string. */
++	memset(desc, '\0', PMEM_DESC_MAX);
++	__pmem_memcpy_fromio(desc, part_hdr->data.desc, PMEM_DESC_MAX);
++
++	/* create the top level partition dir */
++	part_dir = pmemfs_create_dir(sb, sb->s_root, desc);
++	if (!part_dir) {
++		PMEM_DPRINT("ERROR: failed to create directory [%s]\n",
++		            desc);
++		return rc;
++	}
++	
++	/* create the "control" dir and its contents for this part */
++	ctrl_dir = pmemfs_create_dir(sb, part_dir, PMEMFS_CONTROL_DIR);
++	if (!ctrl_dir) {
++		PMEM_DPRINT("ERROR: Cant create control dir on part [%s]\n",
++				part_hdr->data.desc);
++		return rc;
++	}
++
++	/* new region control file. */
++	if (pmem_partition_get(part_hdr->data.desc, &inode_hdl)) {
++		PMEM_DPRINT("ERROR: Failed to get handle for part [%s]\n",
++		             part_hdr->data.desc);
++		return rc;
++	}
++	f_info = pmemfs_alloc_finfo(inode_hdl, PMEMFS_PART_NEW_REG, NULL,
++	                            pmemfs_write_new_region);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Failed to create new region file\n");
++		return rc;
++	}
++	if (!pmemfs_create_file(sb, ctrl_dir, CTRL_NEW_REGION_FILE,
++	               f_info, PMEMFS_PERM_RW, 0)) {
++		PMEM_DPRINT("ERROR: new region control file failure\n");
++		kfree(f_info);
++		return rc;
++	}
++
++	inode_hdl = NULL; /* let VFS reclaim memory on umount */
++
++	/* WARNING: only pass each pmem_handle_t to pmemfs_alloc_finfo
++	 * once.  It will be free()d when shutting down the fs */
++
++	/* lock file for this partition */
++	if (pmem_partition_get(part_hdr->data.desc, &inode_hdl)) {
++		PMEM_DPRINT("ERROR: Failed to get handle for part [%s]\n",
++		            part_hdr->data.desc);
++		return rc;
++	}
++
++	f_info = pmemfs_alloc_finfo(inode_hdl, PMEMFS_LOCK_PART, NULL,
++	                            pmemfs_write_part_lock);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: failed to allocate inode data\n");
++		return rc;
++	}
++	if (!pmemfs_create_file(sb, ctrl_dir, CTRL_LOCK_FILE, f_info,
++	                        PMEMFS_PERM_RW, 0)) {
++		PMEM_DPRINT("ERROR: Unable to create lock file for part [%s]\n",
++		             part_hdr->data.desc);
++		kfree(f_info);
++		return rc;
++	}
++
++	inode_hdl = NULL; /* let VFS reclaim memory on umount */
++
++	/* rotate file for this partition */
++	if (pmem_partition_get(part_hdr->data.desc, &inode_hdl)) {
++		PMEM_DPRINT("ERROR: Failed to get handle for part [%s]\n",
++		             part_hdr->data.desc);
++		return rc;
++	}
++
++	f_info = pmemfs_alloc_finfo(inode_hdl, PMEMFS_PART_ROTATE, NULL,
++	                            pmemfs_write_part_rotate);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: failed to allocate inode data\n");
++		return rc;
++	}
++	if (!pmemfs_create_file(sb, ctrl_dir, CTRL_ROTATE_FILE, f_info,
++	                        PMEMFS_PERM_RW, 0)) {
++		PMEM_DPRINT("ERROR: Unable to create rotate file for"
++		            "part [%s]\n", part_hdr->data.desc);
++		kfree(f_info);
++		return rc;
++	}
++	
++	inode_hdl = NULL; /* let VFS reclaim memory on umount */
++
++	/* finish the control dir with the active_segment file  */
++	if (pmem_partition_get(part_hdr->data.desc, &inode_hdl)) {
++		PMEM_DPRINT("ERROR: Failed to get handle for part [%s]\n",
++		             part_hdr->data.desc);
++		return rc;
++	}
++
++	f_info = pmemfs_alloc_finfo(inode_hdl, PMEMFS_ACTIVE_SEGMENT,
++	                            pmemfs_read_active_segment, NULL);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: failed to allocate inode data\n");
++		return rc;
++	}
++	if (!pmemfs_create_file(sb, ctrl_dir, CTRL_ACTIVE_SEGMENT_FILE,
++	                        f_info, PMEMFS_PERM_RO, 0)) {
++		PMEM_DPRINT("ERROR: Unable to create active segment file for"
++		            "part [%s]\n", part_hdr->data.desc);
++		kfree(f_info);
++		return rc;
++	}
++	
++	inode_hdl = NULL; /* let VFS reclaim memory on umount */
++
++	/* create the raw partition access file */
++	if (pmem_partition_get(part_hdr->data.desc, &inode_hdl)) {
++		PMEM_DPRINT("ERROR: Failed to get handle for part [%s]\n",
++		            part_hdr->data.desc);
++		return rc;
++	}
++	f_info = pmemfs_alloc_finfo(inode_hdl, PMEMFS_RAW_PART,
++	                            pmemfs_read_raw_partition,
++				    pmemfs_write_raw_partition);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: failed to allocate inode data\n");
++		return rc;
++	}
++
++	fsize = part_hdr->data.size + PMEM_PART_HDR_MAX_SIZE;
++	if (!pmemfs_create_file(sb, part_dir, PMEMFS_RAW_ACCESS_FILE, f_info,
++	                        PMEMFS_PERM_RW, fsize)) {
++		PMEM_DPRINT("ERROR: Unable to create raw access to part [%s]\n",
++		            part_hdr->data.desc);
++		kfree(f_info);
++		return rc;
++	}
++
++	inode_hdl = NULL; /* let VFS reclaim memory on umount */
++
++	/* create the partiton header access file */
++	if (pmem_partition_get(part_hdr->data.desc, &inode_hdl)) {
++		PMEM_DPRINT("ERROR: Failed to get handle for part [%s]\n",
++		            part_hdr->data.desc);
++		return rc;
++	}
++	f_info = pmemfs_alloc_finfo(inode_hdl, PMEMFS_PART_HEADER,
++	                            pmemfs_read_header,
++				    pmemfs_write_header);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: failed to allocate inode data\n");
++		return rc;
++	}
++	fsize = pmem_get_hdr_size(inode_hdl);
++	if (!pmemfs_create_file(sb, part_dir, PMEMFS_PARTITION_PREFIX PMEMFS_HEADER_SUFFIX, f_info,
++	                        PMEMFS_PERM_RW, fsize)) {
++		PMEM_DPRINT("ERROR: Unable to create header access to part [%s]\n",
++		            part_hdr->data.desc);
++		kfree(f_info);
++		return rc;
++	}
++
++	inode_hdl = NULL; /* let VFS reclaim memory on umount */
++
++	/* create the partiton data access file */
++	if (pmem_partition_get(part_hdr->data.desc, &inode_hdl)) {
++		PMEM_DPRINT("ERROR: Failed to get handle for part [%s]\n",
++		            part_hdr->data.desc);
++		return rc;
++	}
++	f_info = pmemfs_alloc_finfo(inode_hdl, PMEMFS_PART_DATA,
++	                            pmemfs_read_data,
++				    pmemfs_write_data);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: failed to allocate inode data\n");
++		return rc;
++	}
++
++	fsize = ((struct pmem_handle*)(inode_hdl))->size;
++	if (!pmemfs_create_file(sb, part_dir, PMEMFS_PARTITION_PREFIX PMEMFS_DATA_SUFFIX, f_info,
++	                        PMEMFS_PERM_RW, fsize)) {
++		PMEM_DPRINT("ERROR: Unable to create data access to part [%s]\n",
++		            part_hdr->data.desc);
++		kfree(f_info);
++		return rc;
++	}
++
++	inode_hdl = NULL; /* let VFS reclaim memory on umount */
++
++	/* if there are no segments, then we are done.  Dont want to present
++	 * an active segment since there isnt any */
++	if (part_hdr->data.num_blocks <= 0) {
++		return 0;
++	}
++	/* populate the segments under this partition */
++	rc = pmemfs_part_populate_segments(sb, f_info->handle, part_dir);
++	
++	return rc;
++} 
++
++/* static int pmemfs_create_top_control_dir 
++*
++* Create the top level directory that holds the files that are used to 
++* configure/control pmem from userspace.  Creates the directory and
++* populates it with the appropriate files.
++* Returns 0 on success, -errno on error.
++*/
++static int pmemfs_create_top_control_dir(struct super_block *sb)
++{
++	int 			rc = -EINVAL;
++	struct dentry		*control_dir, *dentry;
++	struct pmemfs_file_info	*f_info;
++
++
++	/* create the top level "control" directory */
++	control_dir = pmemfs_create_dir(sb, sb->s_root, PMEMFS_CONTROL_DIR);
++	if (!control_dir) {
++		PMEM_DPRINT("ERROR: failed to create directory [%s]\n",
++		            PMEMFS_CONTROL_DIR);
++		return rc;
++	}
++
++	/* new partition control file. */
++	f_info = pmemfs_alloc_finfo(NULL, PMEMFS_NEW_PART, NULL,
++	                            pmemfs_write_new_part);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Failed to create new partition file\n");
++		return rc;
++	}
++	dentry = pmemfs_create_file(sb, control_dir, CTRL_NEW_PART_FILE,
++	               f_info, PMEMFS_PERM_RW, 0);
++	if (!dentry) {
++		PMEM_DPRINT("ERROR: new part control file failure\n");
++		kfree(f_info);
++		return rc;
++	}
++
++	/* global pmem lock control file - locks all of pmem */
++	f_info = pmemfs_alloc_finfo(NULL, PMEMFS_LOCK_PMEM, NULL,
++	                            pmemfs_write_lock_pmem);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Failed to create global lock file\n");
++		return rc;
++	}
++	dentry = pmemfs_create_file(sb, control_dir, CTRL_LOCK_FILE,
++	                            f_info, PMEMFS_PERM_RW, 0);
++	if (!dentry) {
++		PMEM_DPRINT("ERROR: global lock control file failure\n");
++		kfree(f_info);
++		return rc;
++	}
++	
++	/* active segments lock control file - locks all active segments */
++	f_info = pmemfs_alloc_finfo(NULL, PMEMFS_LOCK_ALL_ACTIVE, NULL,
++	                            pmemfs_write_lock_all_active);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Failed to create global lock file\n");
++		return rc;
++	}
++	dentry = pmemfs_create_file(sb, control_dir, CTRL_LOCK_ACTIVE_SEG_FILE,
++	                            f_info, PMEMFS_PERM_RW, 0);
++	if (!dentry) {
++		PMEM_DPRINT("ERROR: global lock control file failure\n");
++		kfree(f_info);
++		return rc;
++	}
++
++	/* global rotate control file. */
++	f_info = pmemfs_alloc_finfo(NULL, PMEMFS_PMEM_ROTATE, NULL,
++	                            pmemfs_write_rotate_pmem);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Failed to create global rotate node\n");
++		return rc;
++	}
++	dentry = pmemfs_create_file(sb, control_dir, CTRL_ROTATE_FILE,
++	                            f_info, PMEMFS_PERM_RW, 0);
++	if (!dentry) {
++		PMEM_DPRINT("ERROR: global rotate control file failure\n");
++		kfree(f_info);
++		return rc;
++	}
++	
++	/* reset flag manipulation control file. */
++	f_info = pmemfs_alloc_finfo(NULL, PMEMFS_RESET_PMEM, NULL,
++	                            pmemfs_write_reset_pmem);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Failed to create reset node\n");
++		return rc;
++	}
++	dentry = pmemfs_create_file(sb, control_dir, CTRL_RESET_FILE, f_info,
++	                            PMEMFS_PERM_RW, 0);
++	if (!dentry) {
++		PMEM_DPRINT("ERROR: reset control file failure\n");
++		kfree(f_info);
++		return rc;
++	}
++
++	/* success if we get all the way through */
++	return 0;
++}
++
++/* static int pmemfs_create_initial_files 
++ * Create the initial file tree structure that we export  */
++static int pmemfs_create_initial_files(struct super_block *sb)
++{
++	struct part_list_elem	*part_elem;
++	struct list_head	*elem, *temp;
++	pmem_handle_t		handle = NULL;
++	struct pmemfs_file_info	*f_info;
++	struct dentry		*dentry;
++
++	/* NOTE:  There is some handle conversion magic happening here
++	 * that seems a waste, but is required by the pmemfs_add_partition()
++	 * subroutine to properly setup the internal private data ptr on the
++	 * files
++	 */
++
++	f_info = pmemfs_alloc_finfo(NULL, PMEMFS_RAW_PMEM,
++	                            pmemfs_read_raw_pmem,
++	                            pmemfs_write_raw_pmem);
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Failed to kmalloc file info node\n");
++		return -EINVAL;
++	}
++
++	/* create the global top level, access to all of pmem raw file */
++	dentry = pmemfs_create_file(sb, sb->s_root, PMEMFS_RAW_ACCESS_FILE,
++	               f_info, PMEMFS_PERM_RW, pmem.size);
++	if (!dentry) {
++		PMEM_DPRINT("ERROR: Failed to create pmem raw access file\n");
++		kfree(f_info);
++		return -EINVAL;
++	}
++	/* add the top level pmem control directory and files */
++	if (0 != pmemfs_create_top_control_dir(sb)) {
++		PMEM_DPRINT("ERROR: Failed to create top level control dir\n");
++		return -EINVAL;
++	}
++	/* show the shadow copy if it exists */
++	if (pmem.shadow) {
++		if (0 != pmem_shadow_get(&handle)) {
++			PMEM_DPRINT("ERROR: Cant get shadow handle\n");
++			return -EINVAL;
++		}
++		f_info = pmemfs_alloc_finfo(handle, PMEMFS_BACKUP,
++		                            pmemfs_read_raw_shadow, NULL);
++		if (!f_info) {
++			PMEM_DPRINT("ERROR: failed to create shadow finfo\n");
++			return -EINVAL;
++		}
++		handle = NULL; /* let VFS reclaim memory on umount */
++
++		dentry = pmemfs_create_file(sb, sb->s_root,
++				            PMEMFS_BACKUP_FILE, f_info,
++					    PMEMFS_PERM_RW, pmem.size);
++		if (!dentry) {
++			PMEM_DPRINT("ERROR: Cant add shadow file to VFS\n");
++			return -EINVAL;
++		}
++	}
++	/* If pmem is stored in hardware, create a file to indicate this */
++	if (pmem.using_hardware) {
++		f_info = pmemfs_alloc_finfo(NULL, PMEMFS_HW_INDICATOR,
++		                            NULL, NULL);
++		if (!f_info) {
++			PMEM_DPRINT("ERROR: failed to create hw indicator file\n");
++			return -EINVAL;
++		}
++		dentry = pmemfs_create_file(sb, sb->s_root,
++		                            PMEMFS_HW_INDICATOR_FILE, f_info,
++					    PMEMFS_PERM_NONE, 0);
++		if (!dentry) {
++			PMEM_DPRINT("ERROR: Cant add backup indicator file to VFS\n");
++			return -EINVAL;
++		}
++	}
++
++	/* for each pmem partition */
++	list_for_each_safe(elem, temp, &pmem.part_list) {
++		part_elem = list_entry(elem, struct part_list_elem, list_elem);
++		handle = NULL; /* make pmem_partition_get kmalloc new memory */
++		if (pmem_partition_get(part_elem->hdr->data.desc, &handle)) {
++			PMEM_DPRINT("ERROR: Cant get handle for part [%s]\n",
++			            part_elem->hdr->data.desc);
++			pmem_release_handle(&handle);
++			continue;
++		}
++		/* recursively registers the VFS tree for the partition. */
++		pmemfs_add_partition(sb, (struct part_handle*) handle);
++		pmem_release_handle(&handle);
++	}
++
++	return 0;
++} 
++
++
++/********************************************************************
++ *
++ * Pmem callbacks and registration functions
++ *
++ *******************************************************************/
++/* static void pmemfs_on_new_partition 
++ * Add a new partition to the pmemfs tree layout.
++ * Callback that is installed to receive notifications from the main 
++ * pmem code about added partitions */
++static void pmemfs_on_new_partition(pmem_handle_t handle)
++{
++	struct pmem_handle	*hdl = (struct pmem_handle*)handle;
++	struct part_handle	*part_handle;
++	int			rc;
++
++	if (PMEM_HANDLE_TYPE_PART != hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n",
++		            hdl->type);
++		return;
++	}
++	if (!pmemfs_super) {
++		PMEM_DPRINT("ERROR: Callback called before full pmemfs init\n");
++		return;
++	}
++
++	part_handle = (struct part_handle*)hdl;
++	rc = pmemfs_add_partition(pmemfs_super, part_handle);
++} 
++
++/* static void pmemfs_on_new_region 
++ * Add a new region to the given partition's pmemfs tree layout.
++ * This code is called when a new region is added to pmem */
++static void pmemfs_on_new_region(pmem_handle_t part_hdl,
++                pmem_handle_t region_hdl)
++{
++	struct pmem_handle	*p_hdl = (struct pmem_handle*)part_hdl;
++	struct pmem_handle	*r_hdl = (struct pmem_handle*)region_hdl;
++	int			rc;
++
++	PMEM_DPRINT("pmemfs_on_new_region callback\n");
++
++	if (PMEM_HANDLE_TYPE_PART != p_hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", p_hdl->type);
++		return;
++	}
++	if (PMEM_HANDLE_TYPE_REG != r_hdl->type) {
++		PMEM_DPRINT("ERROR: Invalid handle type %d\n", r_hdl->type);
++		return;
++	}
++	if (!pmemfs_super) {
++		PMEM_DPRINT("ERROR: Callback called before full pmemfs init\n");
++		return;
++	}
++
++	rc = pmemfs_add_region_to_part(pmemfs_super, part_hdl, region_hdl);
++
++} 
++
++/* static void pmemfs_install_pmem_hooks 
++ * Install the notification callbacks into the main pmem code */
++static void pmemfs_install_pmem_hooks(void)
++{
++	pmem_events.create_partition = &pmemfs_on_new_partition;
++	pmem_events.create_region = &pmemfs_on_new_region;
++
++	PMEM_DPRINT("INFO: Installed callbacks part=%p, reg=%p\n",
++			pmem_events.create_partition,
++			pmem_events.create_region);
++} 
++
++/* static void pmemfs_uninstall_pmem_hooks {{{ 
++ * Remove the notification callbacks from pmem */
++static void pmemfs_uninstall_pmem_hooks(void)
++{
++	pmem_events.create_partition = &pmem_default_create_partition;
++	pmem_events.create_region = &pmem_default_create_region;
++
++	PMEM_DPRINT("INFO: Removed callbacks part=%p, reg=%p\n",
++			pmem_events.create_partition,
++			pmem_events.create_region);
++} 
++
++/********************************************************************
++ *
++ * Filesystem operations functions - see pmemfs_file_ops struct
++ *
++ *******************************************************************/
++/* static int pmemfs_open {{{
++ * Open a "file".  This basically provides a handle to the desired piece
++ * of pmem.
++ */
++static int pmemfs_open(struct inode *inode, struct file *filp)
++{
++	filp->f_ra.ra_pages = 0; /* No read-ahead */
++	filp->private_data = inode->i_private;
++	//PMEM_DPRINT("INFO: open flags are %d\n", (int)filp->f_mode);
++	return generic_file_open(inode, filp);
++	// return 0;
++} 
++
++/* static ssize_t pmemfs_read_file {{{
++ * Read a file. This is how a user can access the various parts of pmem.
++ */
++static ssize_t pmemfs_read_file(struct file *filp, char __user *buf,
++                size_t count, loff_t *offset)
++{
++	struct pmemfs_file_info	*f_info;
++	struct pmem_handle	*hdl;
++	char			*local_buf;
++	int			rc;
++	ssize_t			bytes_read = -EINVAL;
++
++	if (NULL == filp->private_data) {
++		PMEM_DPRINT("ERROR: Attempt to read from bad file handle %p\n",
++				filp);
++		return bytes_read;
++	}
++
++	f_info = (struct pmemfs_file_info*)filp->private_data;
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Invalid private data\n");
++		return bytes_read;
++	}
++	if (!f_info->read) {
++		/* no read capabiltites on this file */
++		return bytes_read;
++	}
++
++	hdl = (struct pmem_handle*)f_info->handle;
++	
++	local_buf = pmemfs_alloc_mem(count);
++	if (!local_buf) {
++		PMEM_DPRINT("ERROR: Failed to alloc %d bytes\n", (int)count);
++		return -ENOMEM;
++	}
++	
++	bytes_read = f_info->read(hdl, local_buf, count, *offset);
++
++
++	if (bytes_read > 0) {
++		rc = copy_to_user(buf, local_buf, bytes_read);
++		if (rc)	{
++			PMEM_DPRINT("ERROR: copy_to_user of %d failed rc=%d\n",
++		                    (int)bytes_read, rc);
++			bytes_read = -EFAULT;
++		} else {
++			/* update current filep offset */
++			*offset += bytes_read;
++		}
++	}
++	pmemfs_free_mem(local_buf, count);
++	
++	return bytes_read;
++} 
++
++/* static ssize_t pmemfs_write_file {{{
++ * Write a file.  Put data into pmem at the appropriate spot ..
++ */
++static ssize_t pmemfs_write_file(struct file *filp, const char __user *buf,
++		size_t count, loff_t *offset)
++{
++	struct inode		*inode = filp->f_dentry->d_inode;
++	struct pmemfs_file_info	*f_info;
++	struct pmem_handle	*hdl;
++	char			*local_buf;
++	int 			rc;
++	ssize_t			bytes_written = -EINVAL;
++
++
++	if (unlikely(!inode)) {
++		printk(KERN_ERR "%s: inode is NULL", __FUNCTION__);
++		dump_stack();
++		return bytes_written;
++	}
++
++	if (NULL == filp->private_data) {
++		PMEM_DPRINT("ERROR: Attempt to write to bad file handle %p\n",
++				filp);
++		return bytes_written;
++	}
++
++	f_info = (struct pmemfs_file_info*)filp->private_data;
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Invalid private data\n");
++		return bytes_written;
++	}
++	if (!f_info->write) {	/* no write capabilities */
++		PMEM_DPRINT("ERROR: Attempt to write to r/o file\n");
++		return bytes_written;
++	}
++
++	hdl = (struct pmem_handle*)f_info->handle;
++
++	local_buf = pmemfs_alloc_mem(count);
++	if (!local_buf) {
++		PMEM_DPRINT("ERROR: Failed to alloc %d bytes\n", (int)count);
++		return -ENOMEM;
++	}
++	rc = copy_from_user(local_buf, buf, count);
++	if (rc) {
++		PMEM_DPRINT("ERROR: copy_from_user of %d failed rc=%d\n",
++		            (int)count, rc);
++		pmemfs_free_mem(local_buf, count);
++		return -EFAULT;
++	}
++		
++	//PMEM_DPRINT("INFO: Got request to write to %p, offset=%d, len=%d\n",
++	//		filp, (int)*offset, (int)count);
++	
++	mutex_lock(&inode->i_mutex);
++	bytes_written = f_info->write(hdl, local_buf, count, *offset);
++	/* update modification times in pmemfs for mmap() to see the change */
++	inode->i_mtime = CURRENT_TIME;
++	mutex_unlock(&inode->i_mutex);	/* done writing to pmem, release lock */
++
++	pmemfs_free_mem(local_buf, count);
++
++	if (bytes_written > 0) {
++		*offset += bytes_written;
++	} else {
++		PMEM_DPRINT("ERROR: write failed with rc=%d\n",
++		            (int)bytes_written);
++	}
++	return bytes_written;
++} 
++
++/* pmemfs_get_pmem_addr
++ *     This inline function calculates the pmem_addr given the
++ *     the following args:
++ *     pmemfs file type - uses the enum type pmemfs_file_t
++ *     offset
++ *     pmem_handle
++ *     pmem_addr - on success, this contains the calculate pmem_addr which
++ *                 can either be the partition header or the partition data
++ *
++ * Returns 0 on failure, 1 on success
++ */
++inline int pmemfs_get_pmem_addr(int pmemfs_type, loff_t offset,
++  struct pmem_handle *hdl, unsigned long *pmem_addr) {
++	int rc = 1;
++	switch (pmemfs_type) {
++	case PMEMFS_RAW_PMEM:
++		*pmem_addr = (unsigned long)pmem.pmem;
++		break;
++	case PMEMFS_RAW_PART:
++	case PMEMFS_PART_HEADER:
++		*pmem_addr = (unsigned long)pmem_get_hdr_ptr(hdl);
++		break;
++	case PMEMFS_REG_RECORD:
++	case PMEMFS_REG_BYTE:
++	case PMEMFS_PART_DATA:
++	case PMEMFS_SEG_DATA:
++	case PMEMFS_REG_RAW_DATA:
++	case PMEMFS_REG_DATA:
++		*pmem_addr = (unsigned long)pmem_get_data_ptr(hdl);
++		break;
++	case PMEMFS_BACKUP:
++		if (pmem.shadow) {
++			*pmem_addr = (unsigned long)pmem.shadow;
++		} else {
++			PMEM_DPRINT("ERROR: PMEM shadow copy not present\n");
++			rc = 0;
++		}
++		break;
++	case PMEMFS_RAW_SEG:
++	case PMEMFS_RAW_REG:
++	case PMEMFS_SEG_HEADER:
++	case PMEMFS_REG_HEADER:
++		/* Segment and region headers are not page aligned.
++		 * libpmem uses raw pmem to obtain these headers. */
++	default:
++		PMEM_DPRINT("ERROR: mmap not supported on type %d\n",
++		            pmemfs_type);
++		rc = 0;
++	}
++	return rc;
++}
++
++/* pmemfs_get_pmem_size
++ *     This inline function calculates the size of the memory area for the
++ *     PMEM handle given the the following args:
++ *     pmemfs file type - uses the enum type pmemfs_file_t
++ *     pmem_handle
++ *     size - on success, this contains the calculate pmem_addr which
++ *                 can either be the partition header or the partition data
++ *
++ * Returns 0 on failure, 1 on success
++ */
++inline int pmemfs_get_pmem_size(int pmemfs_type, struct pmem_handle *hdl, unsigned long *size) {
++	int rc = 1;
++	switch (pmemfs_type) {
++	case PMEMFS_RAW_PMEM:
++		*size = (unsigned long)pmem.size;
++		break;
++	case PMEMFS_RAW_PART:
++		*size = (unsigned long)hdl->size + PMEM_PART_HDR_MAX_SIZE;
++		break;
++	case PMEMFS_PART_HEADER:
++		*size = (unsigned long)pmem_get_hdr_size((void *)hdl);
++	case PMEMFS_REG_RECORD:
++	case PMEMFS_REG_BYTE:
++	case PMEMFS_PART_DATA:
++	case PMEMFS_SEG_DATA:
++	case PMEMFS_REG_RAW_DATA:
++	case PMEMFS_REG_DATA:
++		*size = (unsigned long)hdl->size;
++		break;
++	case PMEMFS_BACKUP:
++		if (pmem.shadow) {
++			*size = (unsigned long)pmem.size;
++		} else {
++			PMEM_DPRINT("ERROR: PMEM shadow copy not present\n");
++			rc = 0;
++		}
++		break;
++	case PMEMFS_RAW_SEG:
++	case PMEMFS_RAW_REG:
++	case PMEMFS_SEG_HEADER:
++	case PMEMFS_REG_HEADER:
++	default:
++		PMEM_DPRINT("ERROR: mmap not supported on type %d\n",
++		            pmemfs_type);
++		rc = 0;
++	}
++	return rc;
++}
++
++/* static struct page* pmemfs_filemap_fault {{{
++ *
++ * Access a page for mmap() processes.
++ */
++int pmemfs_filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++{
++	struct page *page = NULL;
++	struct file		*filp = vma->vm_file;
++	struct pmemfs_file_info	*f_info;
++	struct pmem_handle	*hdl;
++	unsigned long		 pmem_addr, offset, size;
++	int ret = 0;
++
++	if (NULL == filp->private_data) {
++		PMEM_DPRINT("ERROR: Attempt to read from bad file handle %p\n",
++				filp);
++		return VM_FAULT_SIGBUS;
++	}
++
++	f_info = (struct pmemfs_file_info*)filp->private_data;
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Invalid private data\n");
++		return VM_FAULT_SIGBUS;
++	}
++	hdl = (struct pmem_handle*)f_info->handle;
++
++	if (!hdl) {
++		char *fn = "?";
++		char *path;
++
++		path = (char*)kmalloc(PATH_MAX, GFP_KERNEL);
++		if (path) {
++			fn = d_path(&filp->f_path, path, PATH_MAX);
++			if (IS_ERR(fn))
++				fn = "?";
++		}
++
++		/* This is a valid condition for files like the raw partition file and control files */
++		PMEM_DPRINT("Requested file has no PMEM handle: %s, using filemap_fault\n", fn);
++		kfree(path);
++
++		return filemap_fault(vma, vmf);
++	}
++
++	offset = vmf->pgoff * PAGE_SIZE;
++
++	if (!pmemfs_get_pmem_addr(f_info->type, offset, hdl, &pmem_addr))
++		return VM_FAULT_SIGBUS;
++
++	if (!pmemfs_get_pmem_size(f_info->type, hdl, &size))
++		return VM_FAULT_SIGBUS;
++
++	/* Check if we are still inside the data structure */
++	if ( (offset + PAGE_SIZE) > size) {
++		PMEM_DPRINT("ERROR: offset %p and size %lu out of range\n",
++		            (void *)offset,
++		            (unsigned long)(vma->vm_end - vma->vm_start));
++		return VM_FAULT_SIGBUS;
++	}
++
++	PMEM_DPRINT(KERN_INFO "%s:%d pmem_addr %lx, offset %lx, size %lx\n",
++	                  __func__, __LINE__, pmem_addr, offset, (unsigned long)(vma->vm_end - vma->vm_start));
++
++	PMEM_DPRINT(KERN_INFO "vmf->pgoff %lx, vmf->virtual_address %lx, vma->vm_start %lx\n",
++	                  vmf->pgoff, (unsigned long) vmf->virtual_address, vma->vm_start);
++
++	/* Return the requested page within PMEM */
++	page = vmalloc_to_page((void *)(pmem_addr + offset));
++	get_page(page);
++
++	vmf->page = page;
++	return ret;
++} 
++
++/* static ssize_t pmemfs_file_mmap {{{
++ *
++ * Dont allow mmap() access to files on the active partition
++ */
++static int pmemfs_file_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	struct pmemfs_file_info	*f_info;
++	struct block_handle	*seg_hdl;
++	struct region_handle	*region_hdl;
++	int			block_id = 0;
++	int 			rc = -EINVAL;
++#ifdef CONFIG_PMEM_PCI_DRIVER
++	struct pci_dev 		*pmem_pci_dev = NULL;
++	enum			pci_mmap_state mmap_state = pci_mmap_mem;
++	unsigned long		pmem_pci_start = 0;
++	int			write_combine = 1;
++#endif
++	unsigned long		pmem_offset = 0;
++	struct pmem_handle	*hdl = NULL;
++
++	if (NULL == filp->private_data) {
++		PMEM_DPRINT("ERROR: Attempt to read from bad file handle %p\n",
++				filp);
++		return rc;
++	}
++
++	f_info = (struct pmemfs_file_info*)filp->private_data;
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Invalid private data\n");
++		return rc;
++	}
++	
++	hdl = (struct pmem_handle*)f_info->handle;
++
++	/* no mmap access to elements on active segment */
++	switch (f_info->type) {
++	/* always allow mmap here */
++	case PMEMFS_RAW_PMEM:
++		pmem_offset = 0;
++		break;
++	case PMEMFS_RAW_PART:
++	case PMEMFS_PART_HEADER:
++		pmem_offset = (unsigned long)pmem_get_hdr_ptr(hdl) - 
++		              (unsigned long)pmem.pmem;
++		break;
++	case PMEMFS_REG_RECORD:
++	case PMEMFS_REG_BYTE:
++	case PMEMFS_REG_RAW_DATA:
++	case PMEMFS_REG_DATA:
++		pmem_offset = (unsigned long)pmem_get_data_ptr(hdl) - 
++		              (unsigned long)pmem.pmem;
++		region_hdl = (struct region_handle*)hdl;
++		block_id = region_hdl->block_id;
++		break;
++	case PMEMFS_PART_DATA:
++		pmem_offset = (unsigned long)pmem_get_data_ptr(hdl) - 
++		              (unsigned long)pmem.pmem;
++		break;
++	case PMEMFS_SEG_DATA:
++		pmem_offset = (unsigned long)pmem_get_data_ptr(hdl) - 
++		              (unsigned long)pmem.pmem;
++		seg_hdl = (struct block_handle*)hdl;
++		block_id = seg_hdl->block_id;
++		break;
++	case PMEMFS_BACKUP:
++		/* vmalloc'd pages */
++		PMEM_DPRINT("ERROR: Cannot calculate offset of shadow"
++	                    " pages relative to PMEM area\n");
++		return -EINVAL;
++	case PMEMFS_SEG_HEADER:
++	case PMEMFS_REG_HEADER:
++		/* Segment and region headers are not page aligned.
++		 * libpmem uses raw pmem to obtain these headers. */
++	default:
++		PMEM_DPRINT("ERROR: mmap not supported on type %d\n",
++		            f_info->type);
++		return -EINVAL;
++	}
++
++	/* deny mmap access to elements on the active segment */
++	if (PMEM_ACTIVE_BLOCK != block_id) {
++#ifdef pgprot_noncached
++		/* Treat all access to PMEM as O_SYNC, if supported by the
++		   hardware. */
++		if (pmem_uncached_access(vma->vm_pgoff << PAGE_SHIFT)) {
++			vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
++		}
++#endif
++
++#if 0
++		if (offset >= __pa(high_memory) || (filp->f_flags & O_SYNC))
++			vma->vm_flags |= VM_IO;
++#endif
++
++		file_accessed(filp);
++
++		vma->vm_flags |= VM_RESERVED;
++
++		if ((pmem.using_hardware) && (f_info->type != PMEMFS_BACKUP)) {
++			/* Shadow PMEM is in VMALLOC space */
++			if (pmem.using_io_mem) {
++#if defined(CONFIG_PMEM_PCI_DRIVER)
++				PMEM_DPRINT("Using pci_mmap_page_range\n");
++				/* vma->vm_flags |= VM_IO; */
++
++				pmem_pci_dev = pmem_arch_get_pci_dev(pmem_pci_dev);
++				pmem_pci_start = (unsigned long) pmem_arch_get_pci_start_ptr();
++
++				/* Add the physical address of the PCI device to the requested offset */
++				vma->vm_pgoff += (pmem_pci_start + PERSISTENT_CONTROL_SIZE + pmem_offset) >> PAGE_SHIFT;
++
++				PMEM_DPRINT("vma->vm_pgoff %lx, pmem_pci_start %lx, pmem_offset %lx\n",
++				            vma->vm_pgoff, pmem_pci_start, pmem_offset);
++
++				rc = pci_mmap_page_range(pmem_pci_dev,
++				                         vma,
++				                         mmap_state,
++				                         write_combine);
++#else
++				/* using_io_mem should never be true without an ioremap driver enabled */
++				printk(KERN_CRIT "ERROR: PMEM HW using_io_mem set without built-in support\n"); 
++#endif /* CONFIG_PCI_DRIVER */
++			} else {
++				/* Not all HW PMEM uses io_mem */
++				/* using_hardware should never be true without HW PMEM support enabled */
++				printk(KERN_CRIT "ERROR: PMEM HW using_hardware set without built-in support\n"); 
++			}
++		} else {
++			PMEM_DPRINT("Using pmemfs_filemap_fault\n");
++			/* Simulated PMEM, Shadow PMEM, and non-ioremap HW PMEM uses
++			 * vmalloc pages.  Use the nopage method to fault them in. */
++			vma->vm_ops = &pmemfs_file_vm_ops;
++			rc = 0;
++		}
++	} else {
++		/* FIXME: Remove printk here */
++		PMEM_DPRINT("ERROR: Cant mmap on the active segment\n");
++	}
++	return rc;
++} 
++
++/* static int pmemfs_readpage_sync {{{
++ *
++ * Read a single page syncronously.
++ */
++static int pmemfs_readpage_sync(struct pmemfs_file_info *f_info,
++                                struct page *page)
++{
++	struct pmem_handle	*hdl;
++	char			*buf = kmap(page);
++	int			count = PAGE_SIZE;
++	int			rc = - EINVAL;
++	loff_t			offset;
++
++	offset = (loff_t)page->index << PAGE_CACHE_SHIFT;
++	hdl = (struct pmem_handle*)f_info->handle;
++
++	rc = f_info->read(hdl, buf, count, offset);
++	if (rc < 0) {	/* read error */
++		PMEM_DPRINT("ERROR: readpage cant read count. rc=%d\n", rc);
++		kunmap(page);
++		unlock_page(page);
++		return rc;
++	} else if (rc != count) {
++		PMEM_DPRINT("WARNING: short read in readpage.rc=%d,count=%d\n",
++		            rc, count);
++	}
++	
++	/* if we didnt read enough data, fill in the rest of the page with
++	 * NULLs */
++	memset(buf + rc, 0, count - rc);
++
++	kunmap(page);
++	flush_dcache_page(page);
++	SetPageUptodate(page);
++	unlock_page(page);
++	
++	/* success */
++	return 0;
++} 
++
++/* static int pmemfs_readpage {{{
++ *
++ * read a page of data from a file to fill a page for mmap
++ */
++static int pmemfs_readpage(struct file *filp, struct page *page)
++{
++	int			rc = -EINVAL;
++	struct pmemfs_file_info	*f_info;
++
++	if (NULL == filp->private_data) {
++		PMEM_DPRINT("ERROR: readpage from bad file handle %p\n", filp);
++		return rc;
++	}
++
++	f_info = (struct pmemfs_file_info*)filp->private_data;
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Invalid readpage private data\n");
++		return rc;
++	}
++
++	if (NULL == f_info->read) {
++		PMEM_DPRINT("ERROR: Attempt to readpage w/o perms\n");
++		return rc;
++	}
++
++	page_cache_get(page);
++	rc = pmemfs_readpage_sync(f_info, page);
++	page_cache_release(page);
++
++	return rc;
++} 
++
++/* static int pmemfs_writepage_sync {{{
++ *
++ * Write a page synchronously.
++ * Offset is the data offset within the page.
++ */
++static int pmemfs_writepage_sync(struct pmemfs_file_info *f_info,
++                struct page *page, unsigned long pgoffset, unsigned int count)
++{
++	struct pmem_handle	*hdl;
++	loff_t			offset;
++	char			*buf = kmap(page) + pgoffset;
++	int			rc = -EFAULT;
++
++	offset = ((loff_t)page->index << PAGE_CACHE_SHIFT) + pgoffset;
++
++	hdl = (struct pmem_handle*)f_info->handle;
++
++	rc = f_info->write(hdl, buf, count, offset);
++	if (rc < 0) {	/* read error */
++		PMEM_DPRINT("ERROR: readpage cant read count. rc=%d\n", rc);
++		kunmap(page);
++		unlock_page(page);
++		return rc;
++	} else if (rc != count) {
++		PMEM_DPRINT("WARNING: short write on writepage_sync, count=%d"
++		            " rc=%d\n", count, rc);
++	}
++	
++	kunmap(page);
++	return 0;	/* success */
++} 
++
++/* static int pmemfs_writepage {{{
++ *
++ * Write a mmap()d page with changes back to its appropriate file.
++ */
++static int pmemfs_writepage(struct page *page, struct writeback_control *wbc)
++{
++	struct address_space 	*mapping = page->mapping;
++	struct inode 		*inode;
++	unsigned long 		end_index;
++	unsigned 		offset = PAGE_CACHE_SIZE;
++	int 			rc = -EFAULT;
++	struct pmemfs_file_info	*f_info;
++
++
++	if (!mapping)
++		BUG();
++	inode = mapping->host;
++
++	if (!inode)
++		BUG();
++
++	if (NULL == inode->i_private) {
++		PMEM_DPRINT("ERROR: writepage from bad file handle\n");
++		return rc;
++	}
++
++	f_info = (struct pmemfs_file_info*)inode->i_private;
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Invalid writepage private data\n");
++		return rc;
++	}
++
++	if (NULL == f_info->write) {
++		PMEM_DPRINT("ERROR: Attempt to writepage w/o perms\n");
++		return rc;
++	}
++
++	end_index = inode->i_size >> PAGE_CACHE_SHIFT;
++
++	/* check if the page-index is kosher */
++	if (page->index >= end_index) {
++		offset = inode->i_size & (PAGE_CACHE_SIZE-1);
++		/* are we completely out? */
++		if (page->index >= end_index+1 || !offset)
++			return 0; /* truncated - don't care */
++	}
++
++	page_cache_get(page);
++	
++	rc = pmemfs_writepage_sync(f_info, page, 0, offset);
++
++	flush_dcache_page(page);
++	SetPageUptodate(page);
++	unlock_page(page);
++	page_cache_release(page);
++	
++	return rc;
++} 
++
++/* static int pmemfs_updatepage 
++ *
++ * update a single page bak to its backing store.
++ */
++static int pmemfs_updatepage(struct file *filp, struct page *page,
++                unsigned long offset, unsigned int count)
++{
++	struct pmemfs_file_info	*f_info;
++	int			rc = -EFAULT;
++
++	if (NULL == filp->private_data) {
++		PMEM_DPRINT("ERROR: updatepage from bad file handle %p\n", filp);
++		return rc;
++	}
++
++	f_info = (struct pmemfs_file_info*)filp->private_data;
++	if (!f_info) {
++		PMEM_DPRINT("ERROR: Invalid updatepage private data\n");
++		return rc;
++	}
++
++	if (NULL == f_info->write) {
++		PMEM_DPRINT("ERROR: Attempt to updatepage w/o perms\n");
++		return rc;
++	}
++
++	return pmemfs_writepage_sync(f_info, page, offset, count);
++} 
++
++/* static int pmemfs_write_begin 
++ *
++ * Dummy method - we dont need to do anythying to prepare for a write.
++ */
++static int pmemfs_write_begin(struct file *filp, struct address_space *mapping,
++		 loff_t pos, unsigned len, unsigned flags,
++		 struct page **pagep, void **fsdata)
++{
++	return 0;
++}
++
++/* static int pmemfs_write_end 
++ *
++ * Flush a page back to the file it belongs to
++ */
++static int pmemfs_write_end(struct file *filp, struct address_space *mapping,
++		loff_t pos, unsigned len, unsigned copied,
++		struct page *page, void *fsdata)
++{
++	return pmemfs_updatepage(filp, page, pos, len);
++}
++
++/* static int pmemfs_unlink 
++ *
++ * Delete a "file".  The only file that can be deleted is the shadow file.
++ * Attempt to delete any other file will result in an error.  */
++static int pmemfs_unlink(struct inode *dir, struct dentry *dentry)
++{
++	struct inode		*inode = dentry->d_inode;
++	struct pmemfs_file_info *f_info = inode->i_private;
++	struct pmem_handle*	hdl;
++	int			rc;
++
++	//PMEM_DPRINT("INFO: Calling unlink on pmemfs with f_info = %p\n", f_info);
++	if ((!f_info) || (!f_info->handle)) {
++		return -EPERM;
++	}
++	hdl = (struct pmem_handle*)f_info->handle;
++
++	if (PMEM_HANDLE_TYPE_SHADOW != hdl->type) {
++		//PMEM_DPRINT("INFO: Attempt to delete file of type %d\n",
++		 //           hdl->type);
++		return -EPERM;
++	}
++
++	/* clean up the inode in the VFS for the pmem shadow copy */	
++	inode->i_ctime = dir->i_ctime = dir->i_mtime = CURRENT_TIME;
++	inode->i_nlink--;
++	dput(dentry);
++	
++	/* and actually dispose of the pmem_shadow copy */
++	rc = pmem_clear_shadow();
++	if (0 != rc) {
++		PMEM_DPRINT("ERROR: Clear shadow failed with rc=%d\n", rc);
++		return rc;
++	}
++
++	return 0;
++} 
++
++/* static int pmemfs_fill_super 
++ * "Fill" a superblock with mundane stuff.
++ */
++static int pmemfs_fill_super(struct super_block *sb, void *data, int silent)
++{
++	struct inode *root;
++	struct dentry *root_dentry;
++	
++	/* make sure that pmem is availiable */
++	if (!pmem.enabled) {
++		printk(KERN_ERR "FATAL ERROR: pmem not enabled - pmemfs cant "
++		                "mount.\n");
++		return -ENODEV;
++	}
++
++	/*  Basic parameters.  */
++	sb->s_blocksize = PAGE_CACHE_SIZE;
++	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
++	sb->s_magic = PMEMFS_MAGIC;
++	sb->s_op = &pmemfs_sb_ops;
++	/*
++	 * We need to conjure up an inode to represent the root directory
++	 * of this filesystem.  Its operations all come from libfs, so we
++	 * don't have to mess with actually *doing* things inside this
++	 * directory.
++	 */
++	root = pmemfs_create_inode(sb, S_IFDIR | 0755, 0);
++	if (!root) {
++		PMEM_DPRINT("ERROR: Failed to create root inode\n");
++		return -ENOMEM;
++	}
++	root->i_op = &pmemfs_inode_ops;
++	root->i_fop = &simple_dir_operations;
++	/* Get a root dentry to represent root of the fs */
++	root_dentry = d_alloc_root(root);
++	if (!root_dentry) {
++		PMEM_DPRINT("ERROR: Failed to alloc root dentry\n");
++		iput(root);
++		return -ENOMEM;
++	}
++	sb->s_root = root_dentry;
++	/*  Make up the initial "files" which are in pmemfs */
++	pmemfs_create_initial_files(sb);
++	
++	return 0;
++} 
++
++/* static void pmemfs_destroy_inode 
++ *
++ * Called when the filesystem is done with the given inode.
++ * Use this routine to clean up for the fact that this inode is 
++ * about to tossed into the brink.
++ */
++static void pmemfs_destroy_inode(struct inode *inode)
++{
++	//PMEM_DPRINT("INFO: Running pmemfs_destroy_inode\n");
++	/* destroy the pmem opaque handle attached for the inode i_private */
++	if (inode->i_private) {
++		pmemfs_free_finfo((struct pmemfs_file_info*)inode->i_private);
++		inode->i_private = NULL;
++	}
++} 
++
++/********************************************************************
++ *
++ * Filesystem registration and instantiation
++ *
++ *******************************************************************/
++/* static struct super_block *pmemfs_get_super {{{ 
++ * Called by the VFS layer to fetch the superblock for pmemfs
++ * After the superblock is populated, this routine installs the 
++ * pmem event handlers.  Also caches the location of the superblock 
++ * for events that are triggered from kernel space (which wont have
++ * the needed context)
++ */
++static int pmemfs_get_super(struct file_system_type *fst,
++		int flags, const char *devname, void *data, struct vfsmount *mnt)
++{
++	int ret;
++	/* cache the superblock that we return to the VFS layer
++	 * for use during the pmem event calls */
++	ret = get_sb_single(fst, flags, data, pmemfs_fill_super, mnt);
++	if (ret)
++		return ret;
++	pmemfs_super = (struct super_block *)mnt->mnt_sb;
++	return ret;
++} 
++
++/* pmemfs VFS callback structure defintions */
++static struct file_system_type pmemfs_type = {
++	.owner 		= THIS_MODULE,
++	.name		= "pmemfs",
++	.get_sb		= pmemfs_get_super,
++	.kill_sb	= kill_litter_super,
++};
++
++static struct super_operations pmemfs_sb_ops = {
++	.destroy_inode	= pmemfs_destroy_inode,
++	.statfs		= simple_statfs,
++	.drop_inode	= generic_delete_inode,
++};
++
++/* pmemfs file operations structure  */
++static struct file_operations pmemfs_file_ops = {
++	.open		= pmemfs_open,
++	.read 		= pmemfs_read_file,
++	.write		= pmemfs_write_file,
++	.mmap		= pmemfs_file_mmap,
++};
++
++static struct inode_operations pmemfs_inode_ops = {
++	.lookup		= simple_lookup,
++	.unlink		= pmemfs_unlink,
++};
++
++/* this structure def lifted from ramfs */
++static struct backing_dev_info pmemfs_backing_dev_info = {
++	.ra_pages	= 0,  /* no read-ahead */
++};
++	//.memory_backed	= 1,  /* doesnt contribute to dirty memory
++	//				 and wont be written out ! */
++
++static struct address_space_operations pmemfs_aops = {
++	.readpage	= pmemfs_readpage,
++	.writepage 	= pmemfs_writepage,
++	.write_begin	= pmemfs_write_begin,
++	.write_end	= pmemfs_write_end,
++};
++
++/* used to support mmap() */
++static struct vm_operations_struct pmemfs_file_vm_ops = {
++	.fault		= pmemfs_filemap_fault,
++};
++
++
++
++/********************************************************************
++ *
++ * Module initialization section
++ *
++ *******************************************************************/
++
++int __init pmemfs_init(void)
++{
++	int rc;
++
++	rc = register_filesystem(&pmemfs_type);
++	pmemfs_install_pmem_hooks();
++	printk("PMEMFS with MEL changes.\n");
++	return rc;
++}
++
++void __exit pmemfs_exit(void)
++{
++	pmemfs_uninstall_pmem_hooks();
++	unregister_filesystem(&pmemfs_type);
++}
++
++module_init(pmemfs_init);
++module_exit(pmemfs_exit)
++
++/* 
++ vim:ft=c:fdm=marker:ff=unix:ts=8
++ */
+-- 
+1.6.5.2
+
