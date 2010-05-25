@@ -1,0 +1,2809 @@
+From 1eefaf840b557344a20045ca02498f0ac20ac6de Mon Sep 17 00:00:00 2001
+From: Mark Pauna <mark.pauna@windriver.com>
+Date: Thu, 6 Nov 2008 13:49:43 -0600
+Subject: [PATCH 14/21] oprofile: enhanced MIPS stack crawl algorithm
+
+Add the Wind River Systems, Inc MIPS stack crawl routines to
+oprofile.  This allows oprofile to create full stack traces for user
+applications.
+
+Signed-off-by: Mark Pauna <mark.pauna@windriver.com>
+Signed-off-by: Dave Lerner <dave.lerner@windriver.com>
+---
+ arch/mips/oprofile/Makefile       |    2 +-
+ arch/mips/oprofile/backtrace.c    |  126 +++
+ arch/mips/oprofile/backtrace.h    |   25 +
+ arch/mips/oprofile/common.c       |   20 +-
+ arch/mips/oprofile/context.c      |  236 ++++++
+ arch/mips/oprofile/context.h      |   73 ++
+ arch/mips/oprofile/mem_validate.h |  155 ++++
+ arch/mips/oprofile/mips_context.h |  232 ++++++
+ arch/mips/oprofile/mips_crawl.c   | 1597 +++++++++++++++++++++++++++++++++++++
+ arch/mips/oprofile/stack_crawl.h  |  223 ++++++
+ 10 files changed, 2679 insertions(+), 10 deletions(-)
+ create mode 100644 arch/mips/oprofile/backtrace.c
+ create mode 100644 arch/mips/oprofile/backtrace.h
+ create mode 100644 arch/mips/oprofile/context.c
+ create mode 100644 arch/mips/oprofile/context.h
+ create mode 100644 arch/mips/oprofile/mem_validate.h
+ create mode 100644 arch/mips/oprofile/mips_context.h
+ create mode 100644 arch/mips/oprofile/mips_crawl.c
+ create mode 100644 arch/mips/oprofile/stack_crawl.h
+
+diff --git a/arch/mips/oprofile/Makefile b/arch/mips/oprofile/Makefile
+index 02cc65e..0d69f04 100644
+--- a/arch/mips/oprofile/Makefile
++++ b/arch/mips/oprofile/Makefile
+@@ -8,7 +8,7 @@ DRIVER_OBJS = $(addprefix ../../../drivers/oprofile/, \
+ 		oprofilefs.o oprofile_stats.o \
+ 		timer_int.o )
+ 
+-oprofile-y				:= $(DRIVER_OBJS) common.o
++oprofile-y				:= $(DRIVER_OBJS) common.o mips_crawl.o context.o backtrace.o
+ 
+ oprofile-$(CONFIG_CPU_MIPS32)		+= op_model_mipsxx.o
+ oprofile-$(CONFIG_CPU_MIPS64)		+= op_model_mipsxx.o
+diff --git a/arch/mips/oprofile/backtrace.c b/arch/mips/oprofile/backtrace.c
+new file mode 100644
+index 0000000..851e852
+--- /dev/null
++++ b/arch/mips/oprofile/backtrace.c
+@@ -0,0 +1,126 @@
++/*
++ * Mips specific backtracing code for oprofile
++ *
++ * @remark Copyright 2002 OProfile authors
++ * @remark Read the file COPYING
++ *
++ * Copyright (c) 2008 Wind River Systems, Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * Author: David Lerner <david.lerner@windriver.com>
++ *
++ * Based on i386 oprofile backtrace code by John Levon, David Smith modified
++ * for mips.
++ *
++ */
++
++#include <linux/types.h>
++#include <linux/sched.h>
++#include <linux/mm.h>
++#include <linux/oprofile.h>
++#include <asm/uaccess.h>
++#include <asm/stacktrace.h>
++#include "mem_validate.h"
++#include "mips_context.h"
++#include "stack_crawl.h"
++#include "context.h"
++#include "backtrace.h"
++
++#define MAX_DEPTH 64
++
++/*
++ * Indicate that backtrace logic failed
++ */
++#define BACKTRACE_ABORTED (0UL)
++
++/*
++ * op_kernel_backtrace()
++ * returns a pointer to the user register set if op_user_backtrace should
++ * proceed
++ */
++static
++struct pt_regs *op_kernel_backtrace(struct pt_regs *const regs,
++				    unsigned int *depth)
++{
++	/* taken from arch/mips/kernel/traps.c */
++	unsigned long pc = regs->cp0_epc;
++
++	if (__kernel_text_address(pc)) {
++#ifdef CONFIG_KALLSYMS
++		unsigned long sp = regs->regs[29];
++		unsigned long ra = regs->regs[31];
++		while (pc && *depth) {
++			--(*depth);
++			pc = unwind_stack(current, &sp, pc, &ra);
++			oprofile_add_trace(pc);
++		}
++#endif
++		return 0;
++	}
++	return regs;
++}
++
++/*
++ * op_user_backtrace()
++ * Initiate a stack crawl, analyzing text instructions, to locate
++ * the next stack frame.  Log the discovered callstack pc addresses
++ * to the oprofile cpu buffer.
++ */
++static
++void op_user_backtrace(struct pt_regs *const regs, unsigned int *depth)
++{
++	struct memory_access_data membuf;
++	struct frame_deltas frame;
++	struct op_context child;
++	struct op_context parent;
++	int have_gprs = 1;	/* first pass through, we have gpr regs */
++	unsigned long pc_sample;
++	child.pc = (void *)regs->cp0_epc;
++	child.sp = (void *)regs->regs[REG_SP];
++	child.fp = (void *)regs->regs[REG_S8];
++	child.gpregs[BT_REG_SP] = regs->regs[REG_SP];
++	child.gpregs[BT_REG_FP] = regs->regs[REG_S8];
++	child.gpregs[BT_REG_LR] = regs->regs[REG_RA];
++	/*  child could be a leaf, impacting frame_crawl */
++	child.leaf = true;
++
++	while (*depth) {
++		--(*depth);
++		pc_sample = BACKTRACE_ABORTED;
++		memset((void *)&frame, 0, (size_t) sizeof(frame));
++		if (op_frame_crawl((void *)child.pc, &membuf, have_gprs,
++				   &frame)) {
++			/* Found next frame, sp & pc */
++			if (apply_context_results(&child, &frame, &parent)) {
++				if (parent.pc) {
++					/* Frame looked good && pc > 0 */
++					pc_sample = (unsigned long)parent.pc;
++				}
++			}
++		}
++		/* log the sample */
++		oprofile_add_trace(pc_sample);
++		child.pc = parent.pc;
++		child.sp = parent.sp;
++		child.fp = parent.fp;
++		child.gpregs[BT_REG_SP] = (unsigned long)parent.sp;
++		child.gpregs[BT_REG_FP] = (unsigned long)parent.fp;
++		child.leaf = 0;
++		have_gprs = 0;
++		if (pc_sample == BACKTRACE_ABORTED)
++			break;
++	}
++}
++
++void mips_backtrace(struct pt_regs *const regs, unsigned int depth)
++{
++	struct pt_regs *uregs;
++	if (depth > MAX_DEPTH)
++		depth = MAX_DEPTH;
++	uregs = op_kernel_backtrace(regs, &depth);
++	if (uregs)
++		op_user_backtrace(uregs, &depth);
++}
+diff --git a/arch/mips/oprofile/backtrace.h b/arch/mips/oprofile/backtrace.h
+new file mode 100644
+index 0000000..0b49062
+--- /dev/null
++++ b/arch/mips/oprofile/backtrace.h
+@@ -0,0 +1,25 @@
++/*
++ * Mips specific backtracing code for oprofile
++ *
++ * Copyright (c) 2008 Windriver Systems, Inc.
++ *
++ * Author: David Lerner <david.lerner@windriver.com>
++ *
++ * Based on i386 oprofile backtrace code by John Levon, David Smith
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++#ifndef BACKTRACE_H
++#define BACKTRACE_H
++
++/*
++ * The mips backtrace crawl - this may take a while since
++ * frame pointers are of no value, and the code traces and follows
++ * instructions to find function epilogs or prologs.
++ */
++extern void mips_backtrace(struct pt_regs *const regs, unsigned int depth);
++
++#endif /* BACKTRACE_H */
+diff --git a/arch/mips/oprofile/common.c b/arch/mips/oprofile/common.c
+index f9eb1ab..0f5d3eb 100644
+--- a/arch/mips/oprofile/common.c
++++ b/arch/mips/oprofile/common.c
+@@ -14,6 +14,7 @@
+ #include <asm/cpu-info.h>
+ 
+ #include "op_impl.h"
++#include "backtrace.h"
+ 
+ extern struct op_mips_model op_model_mipsxx_ops __weak;
+ extern struct op_mips_model op_model_rm9000_ops __weak;
+@@ -103,10 +104,6 @@ int __init oprofile_arch_init(struct oprofile_operations *ops)
+ 	if (!lmodel)
+ 		return -ENODEV;
+ 
+-	res = lmodel->init();
+-	if (res)
+-		return res;
+-
+ 	model = lmodel;
+ 
+ 	ops->create_files	= op_mips_create_files;
+@@ -114,12 +111,17 @@ int __init oprofile_arch_init(struct oprofile_operations *ops)
+ 	//ops->shutdown         = op_mips_shutdown;
+ 	ops->start		= op_mips_start;
+ 	ops->stop		= op_mips_stop;
+-	ops->cpu_type		= lmodel->cpu_type;
+-
+-	printk(KERN_INFO "oprofile: using %s performance monitoring.\n",
+-	       lmodel->cpu_type);
++	ops->backtrace		= mips_backtrace;
+ 
+-	return 0;
++	res = lmodel->init();
++	if (res) {
++		printk(KERN_INFO "oprofile: cpu model init failed.\n");
++	} else {
++		ops->cpu_type = lmodel->cpu_type;
++		printk(KERN_INFO "oprofile: using %s performance monitoring.\n",
++			lmodel->cpu_type);
++	}
++	return res;
+ }
+ 
+ void oprofile_arch_exit(void)
+diff --git a/arch/mips/oprofile/context.c b/arch/mips/oprofile/context.c
+new file mode 100644
+index 0000000..f1da5b7
+--- /dev/null
++++ b/arch/mips/oprofile/context.c
+@@ -0,0 +1,236 @@
++/*
++ * Manages register deltas created by the op_frame_crawl api and
++ * provides the api to apply these delta on the child frame to
++ * the parent frame.  The term 'context' refers to the callstack
++ * context.
++ *
++ * Copyright (c) 2001-2008 Windriver Systems, Inc.
++ *
++ * Author: David Lerner <david.lerner@windriver.com>
++ *         Wind River scopetools developers
++ *
++ * This code is closely adapted from the improved backtrace 'context' analysis
++ * code that was developed to be shared by profiler and debugger
++ * products, host and target based for various Wind River Systems, Inc products.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/uaccess.h>
++#include "mips_context.h"
++#include "stack_crawl.h"
++#include "mem_validate.h"
++#include "context.h"
++
++/*
++ * Use the given struct new_value_delta specification to calculate the required
++ * value based on currently accessible memory and the register values stored in
++ * the "child" parameter.  The "stack_range" parameter is used to cache the
++ * currently validated range of accessible stack for the execution context
++ * denoted by "child".
++ *
++ * Returns true if the value was successfully calculated.  In this case,
++ * "result" is populated with the result of the computation.
++ */
++
++bool apply_delta(const struct new_value_delta *const delta,
++		 const struct op_context *const child,
++		 crawl_validation *stack_range, void **result)
++{
++	/* Determine value using the current context and the calculated delta */
++	if (LOCATION_REG_OFFSET == delta->location) {
++#if RTITOOLS_CONTEXT_USES_SP
++		if (BT_REG_SP == delta->reg) {
++			*result =
++			    (void *)((unsigned long)child->sp + delta->offset);
++		} else
++#endif
++#if RTITOOLS_CONTEXT_USES_FP
++		if (BT_REG_FP == delta->reg) {
++			*result =
++			    (void *)((unsigned long)child->fp + delta->offset);
++		} else
++#endif
++		{
++			/* picked up from one of the gpregs, these are only
++			 * valid for leaf frames
++			  */
++			if (!child->leaf) {
++				d1printf
++				    ("value in register in non-leaf - aborting\n");
++				return false;
++			}
++			*result = (void *)
++			    ((unsigned long)child->gpregs[delta->reg] +
++			     delta->offset);
++		}
++	}
++
++	else if (LOCATION_REG_INDIRECT == delta->location) {
++		void **target;
++#if RTITOOLS_CONTEXT_USES_SP
++		if (BT_REG_SP == delta->reg) {
++			target =
++			    (void *)((unsigned long)child->sp + delta->offset);
++			if (!SPOk(target, stack_range)) {
++				d1printf
++				    ("Invalid address in child sp (%p + 0x%lx)- aborting\n",
++				     child->sp, delta->offset);
++				return false;
++			}
++		} else
++#endif
++#if RTITOOLS_CONTEXT_USES_FP
++		if (BT_REG_FP == delta->reg) {
++			target =
++			    (void **)((unsigned long)child->fp + delta->offset);
++			if (!SPOk(target, stack_range)) {
++				d1printf
++				    ("Invalid address in child fp (%p + 0x%lx)- aborting\n",
++				     child->fp, delta->offset);
++				return false;
++			}
++		} else
++#endif
++		{
++			/* picked up from one of the gpregs */
++			if (!child->leaf) {
++				d1printf
++				    ("value in register in non-leaf - aborting\n");
++				return false;
++			}
++
++			target =
++			    (void *)((unsigned long)child->gpregs[delta->reg] +
++				     delta->offset);
++		}
++		if (will_page_fault(target)) {
++			d1printf
++			    ("Invalid address %p picked up from gpregs+%d\n",
++			     target, delta->reg);
++			return false;
++		}
++		*result = *target;
++	}
++
++	else if (LOCATION_ABSOLUTE == delta->location) {
++		*result = (void **)delta->offset;
++		if (!SPOk(*result, stack_range)) {
++			d1printf("Invalid absolute address: %p\n", *result);
++			return false;
++		}
++
++	} else if (LOCATION_UNKNOWN == delta->location) {
++		d1printf("Unknown SP location - aborting\n");
++		return false;
++	} else {
++		d0printf("Unknown location value: %d\n", delta->location);
++		return false;
++	}
++
++	return true;
++}
++
++/*
++ *  Applies the results of a stack frame trace (as described by the given
++ * ContextFrame structure) to an instance of a stack frame (as given by the
++ * "child" parameter) and stores the resulting "parent" stack frame description
++ * in the "parent" parameter.  All of the parameters must point at fully valid
++ * structures.
++ *
++ *  This routine validates pointers (e.g., sp, fp) before dreferencing them.
++ * If it discovers an invalid value, it aborts and returns false.
++ * Otherwise it returns true.
++ */
++bool apply_context_results(struct op_context *const child,
++			   const struct frame_deltas *const resFrame,
++			   struct op_context *parent)
++{
++	/* NOTE: this logic used to use spOk and fpOk booleans to track whether
++	 * the stack and frame pointer addresses had been checked already, so
++	 * that future dereferences didn't need to be checked.  However, in
++	 * practice, this could lead to unchecked dereferences since the first
++	 * check would be on (reg + offset), and a future check against
++	 * (reg + new_offset) would be skipped if the first succeeded.
++	 * This practice was replaced with using a valid address range tracking
++	 * var, stack_range.  This has a few advantages, including avoiding the
++	 * above issue, can be faster for archs which use both stack and frame
++	 * pointers since the valid stack range is shared. */
++	crawl_validation stack_range;
++	stack_range.tid = child->validation_parms.tid;
++	stack_range.txtRng.pStart = 0;
++	stack_range.txtRng.pEnd = 0;
++
++#if RTITOOLS_CONTEXT_USES_SP
++	/* Determine SP value using current context and calculated delta */
++	if (LOCATION_UNUSED == resFrame->spLocation.location) {
++		parent->sp = child->sp;
++	} else {
++		if (!apply_delta(&resFrame->spLocation, child, &stack_range,
++				 &parent->sp)) {
++			d1printf("Error applying SP delta\n");
++			return false;
++		}
++	}
++#endif /* RTITOOLS_CONTEXT_USES_SP */
++
++#if RTITOOLS_CONTEXT_USES_FP
++	/* Determine FP value using current context and calculated delta */
++	if (LOCATION_UNUSED == resFrame->fpLocation.location)
++		parent->fp = child->fp;
++#  if RTITOOLS_CONTEXT_USES_SP
++	/* Note that only the SH uses this flag for fp location now.  We should
++	   examine the target-specific code to see if it's really necessary
++	   and/or appropriate. */
++	else if (LOCATION_NEW_SP == resFrame->fpLocation.location) {
++		void **target =
++		    (void **)((unsigned long)parent->sp +
++			      resFrame->fpLocation.offset);
++		if (!(SPOk(target, &stack_range))) {
++			d1printf
++			    ("Invalid address in parent sp (%p) while locating fp - aborting\n",
++			     target);
++			return false;
++		}
++		parent->fp = *target;
++	}
++#  endif /* RTITOOLS_CONTEXT_USES_SP */
++	else {
++		if (!apply_delta(&resFrame->fpLocation, child, &stack_range,
++				 &parent->fp)) {
++			d1printf("Error applying FP delta\n");
++			return false;
++		}
++	}
++#endif /* RTITOOLS_CONTEXT_USES_FP */
++
++	/* Determine PC value using current context and calculated delta */
++#if RTITOOLS_CONTEXT_USES_SP
++	if (LOCATION_NEW_SP == resFrame->pcLocation.location) {
++		void **target =
++		    (void **)((unsigned long)parent->sp +
++			      resFrame->pcLocation.offset);
++		if (!(SPOk(target, &stack_range))) {
++			d1printf
++			    ("Invalid address in parent sp (%p) - aborting\n",
++			     target);
++			return false;
++		}
++		parent->pc = *target;
++	}
++#endif /* USES_SP */
++
++	else {
++		if (!apply_delta(&resFrame->pcLocation, child, &stack_range,
++				 &parent->pc)) {
++			d1printf("Error applying PC delta\n");
++			return false;
++		}
++	}
++
++	/* no way of failing now, copy over the rest of the known values */
++	return true;
++}
+diff --git a/arch/mips/oprofile/context.h b/arch/mips/oprofile/context.h
+new file mode 100644
+index 0000000..68fd19c
+--- /dev/null
++++ b/arch/mips/oprofile/context.h
+@@ -0,0 +1,73 @@
++/*
++ * context.h - api and structs for applying frame deltas from child to parent
++ *
++ * Copyright (c) 2008 Windriver Systems, Inc.
++ *
++ * Author: David Lerner <david.lerner@windriver.com>
++ *         Wind River scopetools developers
++ *
++ * This code is closely adapted from the improved backtrace 'context' analysis
++ * code that was developed to be shared by profiler and debugger
++ * products, host and target based for various Wind River Systems, Inc products.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++#ifndef context_h
++#define context_h
++
++/*
++ * struct op_context - this should be passed in and out of the
++ *   Context package, but its members should not be accessed
++ *   by external packages.  They are subject to change.
++ */
++struct op_context {
++	void *pc;		/* Program counter for this context */
++#if RTITOOLS_CONTEXT_USES_FP
++	void *fp;		/* Frame pointer for this context */
++#endif
++#if RTITOOLS_CONTEXT_USES_SP
++	void *sp;		/* Stack pointer for this context */
++#endif
++
++	unsigned long gpregs[BT_NUM_GPREGS];	/* general purpose registers
++						   used for tracing.
++						   These are only valid for
++						   the first call frame. */
++
++	bool leaf;		/* false if no possibility of being a leaf */
++
++	bool firstInstruction;	/* == true if we are at the first
++				 * instruction of a function */
++
++	unsigned int patchDepth;	/* counts number of patched functions
++					 * we've passed through to get to this
++					 * call stack frame.
++					 * Needed to accurately trace callstacks
++					 * with one patched function recursively
++					 * calling itself and another patched
++					 * function.
++					 * Trust me. */
++
++	crawl_validation validation_parms;	/* currently valid PC text range
++						   and task id for context */
++};
++
++/*
++ *  Applies the results of a stack frame trace (as described by the given
++ * op_context structure) to an instance of a stack frame (as given by the
++ * "child" parameter) and stores the resulting "parent" stack frame description
++ * in the "parent" parameter.  All of the parameters must point at fully valid
++ * structures.
++ *
++ *  This routine validates pointers (e.g., sp, fp) before dreferencing them.
++ * If it discovers an invalid value, it aborts and returns false.
++ * Otherwise it returns true.
++ */
++extern bool apply_context_results(struct op_context *const child,
++				  const struct frame_deltas *const resFrame,
++				  struct op_context *parent);
++
++#endif /* context_h */
+diff --git a/arch/mips/oprofile/mem_validate.h b/arch/mips/oprofile/mem_validate.h
+new file mode 100644
+index 0000000..f40b476
+--- /dev/null
++++ b/arch/mips/oprofile/mem_validate.h
+@@ -0,0 +1,155 @@
++/*
++ * mem_validate.h - inline api to validate that memory is reasonable
++ *
++ * Copyright (c) 2008 Windriver Systems, Inc.
++ *
++ * Author: David Lerner <david.lerner@windriver.com>
++ *         Wind River scopetools developers
++ *
++ * This code is closely adapted from the improved backtrace 'context' analysis
++ * code that was developed to be shared by profiler and debugger
++ * products, host and target based for various Wind River Systems, Inc products.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#ifndef _MEM_VALIDATE_H_
++#define _MEM_VALIDATE_H_
++
++/*
++ * Return 1 if will  page fault, or 0 if it won't
++ */
++extern int will_page_fault(const void *const address);
++
++/*
++ * Context address types
++ */
++typedef enum rtiContextAddrType {
++	CNTXT_ADDR_STACK_T,	/* stack aligned, within stack limits */
++	CNTXT_ADDR_FRAME_T,	/* frame aligned, within stack limits */
++	CNTXT_ADDR_TEXT_T,	/* width aligned, within task text limits */
++	CNTXT_ADDR_UNKNOWN_T	/* memProbe candidate */
++} RtiTools_ContextAddressType;
++
++/*
++ *  A simple range of target addresses.
++ */
++typedef struct {
++	void *pStart;
++	void *pEnd;
++} ADRS_RANGE;
++
++#define range_set(range, start, end)            \
++	do {                                    \
++		if (range != 0) {               \
++			range->pStart = start;  \
++			range->pEnd = end;      \
++		}                               \
++	} while (0);
++
++/*
++ *  The crawl_validation structure holds values which are used to expidite
++ * validation of target addresses.  For example, the "tid" member can be used
++ * to determine stack bounds, making validation of stack addresses trivial.
++ * Task id (tid) is represented as an unsigned long, since Vx tids are
++ * pointers, using the unsigned long type makes sure there's enough bitwidth
++ * available for storage.  */
++typedef struct {
++	unsigned long tid;
++	ADRS_RANGE txtRng;
++} crawl_validation;
++
++/*
++ * Allocated by backtrace client and currently used to pass
++ *	data between PCOk and instruction() to preserve original
++ *	WindRiver backtrace API organization
++ */
++struct memory_access_data {
++	void *pc_copied;
++	void *data;
++};
++
++/*
++ * PCOk - check for valid PC address
++ *
++ * Input Args:
++ *  pc         - PC text address to validate
++ *  membuf - a pointer to an internal buffer setup by client
++ *
++ * Returns:
++ *  true if valid address, else, false
++ */
++static inline bool PCOk(const void const *pc, struct memory_access_data *membuf)
++{
++	if (will_page_fault(pc))
++		return false;
++	if (__copy_from_user_inatomic(&membuf->data, pc, sizeof(membuf->data)))
++		return false;
++	membuf->pc_copied = (void *)pc;
++	return true;
++}
++
++/*
++ *  The instruction() routine is used by the op_frame_crawl() function to
++ * discover which instruction resides at the given pc.  For normal cross-
++ * compilation, where the crawling code is running in the same memory context
++ * as the instructions it's looking at, this is macro-ized into essentially a
++ * no-op.  In the case we're compiling the crawl code for host-native use,
++ * we simply provide the signature for this routine.  The client *must* provide
++ * an implementation.
++ *
++ * The "pc" parameter is used by op_frame_crawl() to specify the target-
++ * relative address of the instruction it's inspecting.  The "arg" parameter is
++ * an opaque pointer to client-defined data; op_frame_crawl() will pass the
++ * pointer given to it to all calls to instruction().
++ *
++ * instruction() should return a pointer which op_frame_crawl() can dereference
++ * to read the instructions at the given target pc.  The instruction at that
++ * address should be represented in the endianness of the machine executing
++ * op_frame_crawl().
++ */
++
++static inline
++    void *instruction(const void const *pc, struct memory_access_data *membuf)
++{
++	if (membuf->pc_copied != pc) {
++		if (__copy_from_user_inatomic
++		    (&membuf->data, pc, sizeof(membuf->data))) {
++			/* copy failed, stuff bad instruction into the buffer */
++			membuf->data = 0;
++		}
++	}
++	return &membuf->data;
++}
++
++ /*
++  * FPOk - check for a valid frame-pointer value
++  *
++  * Input Args:
++  *  fp         - frame address to validate
++  *  client_arg - ignored in this implementation, using page fault tests instead
++  *
++  * Returns:
++  *  true if valid address, else, false
++  */
++#define FPOk SPOk
++
++ /*
++  * SPOk - check for a valid stack-pointer value
++  *
++  * Input Args:
++  *  sp         - stack address to validate
++  *  client_arg - ignored in this implementation, using page fault tests instead
++  *
++  * Returns:
++  *  true if valid address, else, false
++  */
++static inline bool SPOk(const void *const sp, crawl_validation *validation)
++{
++	return !will_page_fault(sp);
++}
++
++#endif /* _MEM_VALIDATE_H_ */
+diff --git a/arch/mips/oprofile/mips_context.h b/arch/mips/oprofile/mips_context.h
+new file mode 100644
+index 0000000..1848470
+--- /dev/null
++++ b/arch/mips/oprofile/mips_context.h
+@@ -0,0 +1,232 @@
++/*
++ *  mips-context.h - MIPS-specific context information.h
++ *
++ * Copyright (c) 2008 Windriver Systems, Inc.
++ *
++ * Author: David Lerner <david.lerner@windriver.com>
++ *         Wind River scopetools developers
++ *
++ * This code is closely adapted from the improved backtrace 'context' analysis
++ * code that was developed to be shared by profiler and debugger
++ * products, host and target based for various Wind River Systems, Inc products.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * (The file was also known as mips_regs.h in scopetools source tree)
++ */
++
++#ifndef _MIPS_CONTEXT_H_
++#define _MIPS_CONTEXT_H_
++
++/*
++ * Architecture specific defines
++ */
++
++/*
++ * Instruction search range from the original input PC is limited to + or -
++ * RTITOOLS_CONTEXT_MAX_FN_LENGTH instructions.
++ */
++#define RTITOOLS_CONTEXT_MAX_FN_LENGTH (2048)
++
++typedef unsigned long tAddr;	/* Address type */
++
++#define MIPS_ABI_O32    (1)
++#define MIPS_ABI_N32    (2)
++
++#  define MIPS_ABI      MIPS_ABI_N32	/* dml hack */
++
++#if (MIPS_ABI == MIPS_ABI_O32)
++#  define STACK_ALIGN     (4)
++#  define FRAME_ALIGN     (4)
++#  define MIN_STACK_WIDTH (4)
++#elif (MIPS_ABI == MIPS_ABI_N32)
++/* 64-bit N32 stack alignment is 8 bytes, but VxWorks only
++ * supports 32-bit addresses, so allow 4-byte alignment.
++ */
++#  define STACK_ALIGN     (4)
++#  define FRAME_ALIGN     (8)
++#  define MIN_STACK_WIDTH (8)
++#endif
++
++/* big endian 64-bit targets require a 4-byte register offset. */
++#if defined(__KERNEL__)
++#	if defined(CONFIG_64BIT) && defined(CONFIG_CPU_BIG_ENDIAN)
++		/* dml - setting per spirit of original code,
++		   define REGISTER_OFFSET (4)
++		   only made the word swapping problem seen in test worse.
++		   Requires further investigaion.
++		 */
++#		define REGISTER_OFFSET (0)
++#	else
++#		define REGISTER_OFFSET (0)
++#	endif
++#else
++# error should not get here
++#	if defined(RTI_ENDIAN_BIG) && defined(MIPS_64BIT)
++#  		define REGISTER_OFFSET (4)
++#	else
++#  		define REGISTER_OFFSET (0)
++#	endif
++#endif
++
++#define MIN_INST_WIDTH  (4)
++
++#define INITIAL_STK_FRAME_SIZE  (MAX_TASK_ARGS * sizeof(_RType))
++
++/* Number of back branches before we stop taking them */
++#define MAX_ARB_BRANCHES         10
++
++typedef unsigned int tInst;	/* Instruction type */
++typedef int rOffset;		/* instruction register offset field */
++#define INST_SIZE (4)		/* Size of instr -- avoid sizeof() overhead */
++
++/*
++ *  Parameters - define context parameters here
++ */
++
++/* How many instructions to look backwards */
++#define MAX_BACKWARD_SEARCH      10
++
++/* Instructions before we assume we're not in the prologue.  This typically
++   includes just the instructions between the stack push
++   (addiu    sp,sp,-96) and saving the link register (sw     ra,56(sp)).*/
++#define MAX_PROLOGUE_LENGTH      24
++
++/* How long is the epilogue? [until restore fp] */
++#define MAX_EPILOGUE_LENGTH      35
++
++#if (MAX_PROLOGUE_LENGTH > MAX_BACKWARD_SEARCH)
++#if (MAX_PROLOGUE_LENGTH > MAX_EPILOGUE_LENGTH)
++#define MAX_BACKWARD_LENGTH      (MAX_PROLOGUE_LENGTH * INST_SIZE)
++#else
++#define MAX_BACKWARD_LENGTH      (MAX_EPILOGUE_LENGTH * INST_SIZE)
++#endif
++#else
++#if (MAX_BACKWARD_SEARCH > MAX_EPILOGUE_LENGTH)
++#define MAX_BACKWARD_LENGTH      (MAX_BACKWARD_SEARCH * INST_SIZE)
++#else
++#define MAX_BACKWARD_LENGTH      (MAX_EPILOGUE_LENGTH * INST_SIZE)
++#endif
++#endif
++
++#define MAX_FORWARD_LENGTH           (4 * INST_SIZE)
++#define MAX_SEARCH_LENGTH            (MAX_BACKWARD_LENGTH + \
++					MAX_FORWARD_LENGTH)
++
++/*
++ *  Instruction values - define any instruction op-codes here
++ */
++#define INST_UNKNOWN       (0xffffffff)
++
++#define INST_ADD_TO_SP     (0x23bd0000)	/* addi/addiu sp,sp,immed */
++#define MASK_ADD_OFFSET    (0x0000ffff)	/* Signed 16-bit offset added to SP */
++#define MASK_NEG_OFFSET    (0x00008000)
++#define NEG_SIGN_EXTEND     0xffff0000
++#define MASK_ADD_OPCODE    (0xfbff0000)	/* ignore addi/addiu differences */
++
++#define MASK_OPCODE         0xfc000000	/* MIPS major op codes are 1st 6 bits */
++#define INST_ADDIU          0x24000000	/* addiu rd,rs,immed */
++#define INST_LUI            0x3c000000	/* lui   rd,immed    */
++
++#define MASK_BASIC_OPCODE   0xfc0007ff	/* add, sub, mult, div, jr, mov, etc. */
++#define INST_ADDU           0x00000021	/* addu  rd,rs,rt    */
++#define INST_NOP            0x00000000
++
++/* Convert mips' signed 16-bit immediate instruction-embedded values
++ * into signed int (32-bit) values. Note that ints are still 32 bits
++ * for MIPS64.
++ */
++#define IMM_TO_INT(inst) \
++(signed int) (((inst) & MASK_NEG_OFFSET) ?\
++ (((inst) & MASK_ADD_OFFSET) | NEG_SIGN_EXTEND) :\
++ ((inst) & MASK_ADD_OFFSET))
++
++#define INST_STORE_RA_64   (0xffbf0000)	/* sd  ra,offset(sp) */
++#define INST_RESTORE_RA_64 (0xdfbf0000)	/* ld  ra,offset(sp) */
++#define INST_STORE_RA_32   (0xafbf0000)	/* sw  ra,offset(sp) */
++#define INST_RESTORE_RA_32 (0x8fbf0000)	/* lw  ra,offset(sp) */
++
++#define MASK_SWLW_OFFSET   (0x0000ffff)	/* Store/load word offset */
++#define MASK_SWLW_OPCODE   (0xffff0000)
++#define MASK_SWLW_FP_SP    (0xffff8000)
++#define INST_SW_FP_SP      (0xafbe0000)	/* sw  fp,+d(sp) */
++#define INST_LW_FP_SP      (0x8fbe0000)	/* lw  fp,+d(sp) */
++#define INST_FP_TO_SP      (0x03c0e821)	/* move sp,fp  [move sp,s8] */
++#define INST_SP_TO_FP      (0x03a0f021)	/* move fp,sp  [move s8,sp] */
++#define MASK_LX_OPCODE     (0xfc0007ff)
++#define INST_LBUX          (0x7c00018a)	/* LBUX Rd,Rindx(Rbase) DSP ASE only */
++#define INST_LHX           (0x7c00010a)	/* LHX  Rd,Rindx(Rbase) DSP ASE only */
++#define INST_LWX           (0x7c00000a)	/* LWX  Rd,Rindx(Rbase) DSP ASE only */
++
++#define MASK_NEG_OFFSET    (0x00008000)	/* for all 16-bit signed offsets */
++
++/* Unconditional branch instructions */
++#define INST_JR_REG        (0x00000008)	/* jr t1, for example */
++#define INST_JR_T9_REG     (0x03200008)	/* jr   t9 */
++#define MASK_JR_REG        (0xfc1ff83f)	/* ick */
++#define INST_J             (0x08000000)	/* First six bits */
++#define INST_JAL           (0x0c000000)	/* First six bits */
++#define MASK_JUMP_OFFSET   (0x03ffffff)	/* Mask off the first six bits */
++#define MASK_JUMP_OPCODE   (0xfc000000)
++
++/* Conditional branch instructions */
++#define INST_BEQ           (0x10000000)	/* All branches execute delay slot */
++#define INST_B             (0x10000000)	/* B is BEQ 0, 0, offset */
++#define INST_BNE           (0x14000000)
++#define INST_BLEZ          (0x18000000)
++#define INST_BGTZ          (0x1c000000)
++#define INST_BPOSGE32      (0x041c0000)	/* BPOSGE32  (DSP ASE only) */
++#define MASK_BRANCH_OFFSET (0x0000ffff)	/* Branch offset */
++#define MASK_BRANCH_OPCODE (0xfc000000)
++#define MASK_B_OPCODE      (0xffff0000)
++
++#define INST_RTS           (0x03e00008)	/* jr ra */
++
++#define INST_BRANCH_SELFPT (0x1000ffff)
++
++/* eret instruction */
++#define INST_ERET          (0x42000018)
++
++#define CAUSE_EXCCODE_MASK (0x0000007c)
++#define CAUSE_INTRPT_CODE  (0)
++#define CAUSE_SYSCL_CODE   (8)
++
++/*
++ *  Context flags - define arch specific context package flags here
++ */
++/* CHECK_TOP_FIRST if you want to call RtiTools_ContextTopDiscover at the
++ * beginning of RtiTools_ContextCallingContextGet; CHECK_TOP_LAST if you
++ * want to call it at the end.  You can use both, don't unless you
++ * have to.
++ */
++#define RTITOOLS_CONTEXT_CHECK_TOP_FIRST        (1)
++#define RTITOOLS_CONTEXT_CHECK_TOP_LAST         (0)
++
++#define RTITOOLS_CONTEXT_USES_SP  (1)	/* Does context package use sp? */
++#define RTITOOLS_CONTEXT_USES_FP  (1)	/* Does context package use fp? */
++
++/* Register numbers for op_context */
++enum register_name {
++	BT_REG_LR,
++	BT_NUM_GPREGS,
++	BT_REG_SP,
++	BT_REG_FP,
++	BT_REG_PC
++};
++
++/* Register numbers for struct pt_regs */
++enum reg_num {
++	REG_ZERO, REG_AT, REG_V0, REG_V1,
++	REG_A0, REG_A1, REG_A2, REG_A3,
++	REG_T0, REG_T1, REG_T2, REG_T3,
++	REG_T4, REG_T5, REG_T6, REG_T7,
++	REG_S0, REG_S1, REG_S2, REG_S3,
++	REG_S4, REG_S5, REG_S6, REG_S7,
++	REG_T8, REG_T9, REG_K0, REG_K1,
++	REG_GP, REG_SP, REG_S8, REG_RA,
++	REG_ALL			/* This last one is the number of GPRs */
++};
++
++#endif /* ifndef _MIPS_CONTEXT_H_ */
+diff --git a/arch/mips/oprofile/mips_crawl.c b/arch/mips/oprofile/mips_crawl.c
+new file mode 100644
+index 0000000..0673902
+--- /dev/null
++++ b/arch/mips/oprofile/mips_crawl.c
+@@ -0,0 +1,1597 @@
++/*
++ * mips dependent frame crawling logic
++ *
++ * Copyright (c) 2007-2008 Windriver Systems, Inc.
++ *
++ * Author: David Lerner <david.lerner@windriver.com>
++ *         Wind River scopetools developers
++ *
++ * This code is closely adapted from the improved backtrace 'context' analysis
++ * code that was developed to be shared by profiler and debugger
++ * products, host and target based for various Wind River Systems, Inc products.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++/*
++DESCRIPTION
++Architecture specific part of context tools for MIPS32/64.
++
++The MIPS n32 ABI was developed by Silicon Graphics Incorporated (SGI) for
++ease in porting 32-bit operating systems and applications to 64-bit MIPS
++processors.  This entails the following issues.
++
+++ The n32 ABI supports 32-bit addresses and integers, sign extending them
++to 64 bits before being placed in the 64-bit registers.  The original ABI
++from MIPS is designated o32 and has no support for 64-bit registers,
++restricts the number of floating point (FP) registers to 16 instead of 32,
++and makes inefficient use of the FP registers.  Unlike o32 which allows
++passing of up to 4 values in general purpose (GP) and FP registers
++(r4-r7, f12-f15), n32 supports 8 registers each (r4-r11, f12-f19).
++
+++ The 64-bit internal representation of data necessitates stack region
++alignment to quad-words (16 bytes) and all stack entries must be aligned to
++double-word (8-byte) addresses, even values occupying 32 bits or less.
++
+++ Within each 64-bit stack slot non-FP values requiring less than 64 bits are
++right justified, i.e., occupy the highest order bytes, in big-endian systems.
++(MIPS is a native little-endian architecture that supports big-endian
++operation.  So, for example, given a stack entry address of 0x40080, the
++starting address of a byte, short, int, and double are as follows for the
++different endian systems:
++
++Type    Little      Big
++------  --------    --------
++byte    0x400080    0x400087
++short   0x400080    0x400086
++int32   0x400080    0x400084
++float   0x400080    0x400084
++double  0x400080    0x400080
++
+++ Integers of 32 bits are always sign-extended before being passed in a
++register, regardless of whether the integer is signed or not.
++
+++ Quad-precision (128-bit) FP values (C long double) are passed in 16-byte
++aligned stack slots and even-odd pairs of FP registers, even if doing so
++skips a 64-bit stack slot or a register assignment.
++
+++ FP values are passed in FP registers whenever possible, irrespective of any
++integer values preceding them in an argument list, unlike o32.
++
++    - Variable (varargs) arguments are an exception to this rule.  Any FP
++    values in a varargs part of the argument list are passed in GP registers.
++    NOTE: functions accepting variable numbers of FP arguments MUST be
++    prototyped!
++
+++ C99 complex types are passed in multiple FP registers, as available:
++
++Type                    Passed as
++-------------------     --------------
++float complex           2 floats
++double complex          2 doubles
++long double complex     2 long doubles
++
++This has an impact on stack slots.  Because the size of a float complex is
++8 bytes (2 4-byte floats) but two float argument registers take 16 bytes
++of stack space, the float complex stack entry is padded with an extra 8 bytes.
++For example, if a float complex argument is passed in f14 and f15 and the next
++argument in f16, the corresponding stack locations for a slot at 0x400080
++would be the first float at 0x400080 and the second float at 0x400084, but
++the following argument would be in a slot starting at 0x400090.
++
+++ Structures, unions or other composite types are regarded as a series of
++64-bit values and are passed into functions as a number of GP registers and/or
++FP registers as they fit and any excess passed on the stack according to the
++composition of the type and the stack alignment rules.  This means:
++
++    - Regardless of the structure layout, it is treated by the compiler as a
++    series of 64-bit parts.  If a part is a double float and not part of a
++    union, it is passed in a FP register while all other parts as passed in
++    GP registers.
++
++    - All unions are treated as a series of integer double-words as far as
++    GP register assignment is concerned.  NOTE: no attempt is made to
++    differentiate FP members from integer for passing in FP registers!
++
++    - Array members of structures are passed like unions while array arguments
++    are passed by reference.  (Applies to C and C++, but others may differ.)
++
++    - Despite right-justifying small scalar values in their stack slots,
++    structure parameters are always left-justified, which applies to
++    structures smaller than 64-bits as well as any remaing parts of a
++    structure not passed in registers, whether or not it is an integral number
++    of 64-bit parts.  In other words, the remaining part is stored on the
++    stack exactly as laid out in regular memory.
++
+++ Return values from functions are passed back in r2 (and r3 if needed) or
++f0 (and f2 if needed), as specified by the type.  Note that the f0/f2 rule
++allows for even/odd pairing.  Composite return types (structure, union, etc.)
++have strange rules that say they must be returned as follows:
++
++    - A structure with only one or two FP members returns them with f0 holding
++    the first and and f2 the second.
++
++    - Any other structure or union members of at most 128 bits are returned
++    with r2 holding the first 64 bits, r3 holding the second 64 bits.
++
++    - Composite return types larger than 128 bits are passed back transparently
++    in a memory location reserved by the caller.  A pointer to the area is
++    passed implicitly as the first argument to the function.
++
+++ The callee function saves any non-volatile registers it uses, ranging from
++GP registers r24 to r31 and the even FP registers from f20 to f30.
++
+++ Unlike o32, routines are NOT restricted to a single exit block (epilogue).
++
+++ Unlike o32, the gp (global pointer registr r28) is saved by the callee,
++rather than the caller.  This gives the following saving scheme:
++
++Reg#        Name    Use                     Saver
++---------   -----   ----------------------  -------------
++$0          zero    HW zero                 N/A
++$1          at      assembler temporary     CALLER
++$2-$3       v0-v1   function results        CALLER
++$4-$11      a0-a7   function input args     CALLER
++$12-$15     t4-t7   temporaries             CALLER
++$16-$23     s0-s7   always saved if used    callee
++$24-$25     t8-t9   temporaries             CALLER
++$26-$27     k0-k1   reserved for kernel     N/A
++$28         gp      global pointer          callee
++$29         sp      stack pointer           callee
++$30         s8/fp   frame pointer, if used  callee
++$31         ra      return address          CALLER
++hi,lo               mult/div special regs   CALLER
++$f0,$f2             FP results              CALLER
++$f1,$f3             FP temporaries          CALLER
++$f4-$f11            FP temporaries          CALLER
++$f12-$f19           FP input args           CALLER
++$f20-$f23 (32-bit)  FP temporaries          CALLER
++$f24-$f31 (64-bit)  FP temporaries          callee
++$f20-$f31 (even, n32) FP temporaries        callee
++$f20-$f31 (odd, n32)  FP temporaries        CALLER
++
+++ At most 8 registers are used for passing input arguments, whether all FP,
++all GP, or a combination thereof.  Any remaining arguments are passed on the
++stack.  The function passing the arguments (the caller) is not required to
++allocate space on the stack for the registers nor is the called function (the
++callee), unlike o32.  In the following examples of register/stack assignment,
++'s' is a single precision FP, 'd' is a double precision FP, and 'n' is an
++integer.
++
++Argument List               N32 Register and Stack Assignments
++--------------------------  ----------------------------------------------
++n1,n2                       r4,r5
++s1,s2                       f12,f13
++d1,d2                       f12,f13
++s1,d1                       f12,f13
++d1,s1                       f12,f13
++n1,d1                       r4,f13
++d1,n1,d2                    f12,r5,f14
++n1,n2,d1                    r4,r5,f14
++d1,n1,n2                    f12,r5,r6
++s1,n1,n2                    f12,r5,r6
++d1,s1,s2                    f12,f13,f14
++s1,s2,d1                    f12,f13,f14
++n1,n2,n3,n4,n5,n6,n7,n8     r4,r5,r6,r7,r8,r9,r10,r11
++n1,n2,n3,d1                 r4,r5,r6,f15
++n1,n2,n3,s1                 r4,r5,r6,f15
++s1,s2,s3,s4,s5,s6,s7,s8     f12,f13,f14,f15,f16,f17,f18,f19
++s1,n1,s2,n2                 f12,r5,f14,r7
++n1,s1,n2,s2                 r4,f13,r6,f15
++n1,s1,n2,n3                 r4,f13,r6,r7
++d1,d2,d3,d4,d5,d6,d7,d8     f12,f13,f14,f15,f16,f17,f18,f19
++d1,d2,d3,d4,d5,s1,s2,s3,s4  f12,f13,f14,f15,f16,f17,f18,f19,stack
++d1,d2,d3,s1,s2,s3,n1,n2,n3  f12,f13,f14,f15,f16,f17,r10,r11,stack
++
+++ The bit sizes for o32, n32, and 64-bit model C types:
++
++C Type          032 and n32         64-bit
++--------------  ------------------  ------
++char             8                   8
++short int       16                  16
++int             32                  32
++long int        32                  64
++long long int   64                  64
++pointer         32                  64
++float           32                  32
++double          64                  64
++long double     64 (128 in n32)     128
++*/
++
++#include <linux/types.h>
++#include <linux/uaccess.h>
++#include <linux/ptrace.h>
++
++#include "mem_validate.h"
++#include "mips_context.h"
++#include "stack_crawl.h"
++
++/*-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
++ * Debugging/programming DEFINEs
++ *-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-*/
++int op_context_debug_output; /* = 0 */
++
++/*
++ * Make a page fault or else prove we won't.  Tool used by PCOk and SPOk
++ * Return 0 if no page fault, 1 if page fault happened
++ */
++int will_page_fault(const void *const address)
++{
++	long dst;
++	if (probe_kernel_read(&dst, (void *)address, sizeof(long)) != 0)
++		return 1;	/* page fault or address error */
++	return 0;
++}
++
++/**
++ * op_frame_crawl - given a target pc value, locate the calling stack frame
++ *
++ * DESCRIPTION
++ *  This function analyzes instruction flow around the given program counter
++ * and returns when it has either figured out the locations of the calling
++ * stack frame, or determined it's been confused and cannot figure out where
++ * the calling context is located.  The function containing "startpc" should
++ * conform to the c/c++ abi, otherwise this function may be less accurate.
++ * "gprs_available" should be set to true if the caller has access to valid
++ * contents of the general purpose register values corresponding to the
++ * "child's" stack frame.  When set to false, op_frame_crawl() will do extra
++ * work to locate these values on the stack.  Note that all non-pc, non-sp,
++ * and non-fp registers are considered "general purpose," including the LR.
++ *
++ * The "client_arg" parameter value is not directly used by the op_frame_crawl()
++ * routine at all.  However it is passed to all instruction() and PCOk() calls,
++ * and is used to pass client-specific data that may be necessary for the
++ * client-specific implementations of these functions.
++ *
++ * RETURNS
++ *   true            - context found
++ *   false         - context not found
++ */
++bool op_frame_crawl(void *startpc,
++		    void *client_arg,
++		    bool gprs_available, struct frame_deltas *res_frame)
++{
++	/*
++	 * MIPS has three categories of functions [see "See Mips Run", p278]
++	 * 1.  Leaf functions - ra stays in register, sp may be used
++	 * 2.  Non-leaf functions - ra saved on stack, sp is allocated at
++	 *     function prologue and stays that way during the function
++	 * 3.  Complex functions - ra saved, sp is allocated at prologue but may
++	 *     change during execution.  In these functions, a frame pointer is
++	 *     used to store the low water mark for the stack pointer.
++	 *
++	 * For our purposes, these decompose into the following cases:
++	 *   1.  ra is never saved or is unsaved when we start looking
++	 *   2.  sp is never altered or is unaltered when we start looking
++	 *   3.  ra is saved on the stack, referenced with sp
++	 *   4.  ra is saved on the stack, referenced with fp
++	 */
++
++	bool reverseOperation = false;
++	int i, j;
++	const tInst *pcCur = 0;
++	const tInst *pcCurStart = startpc;
++	const tInst *branchArray[MAX_ARB_BRANCHES];
++	tInst curInst;		/* instruction pointed to by pcCur */
++	int branchCount = 0;
++	long offset;
++	bool fpBeingUsed = false;
++
++	/* most clauses don't use the frame pointer, so by default we mark it as
++	   untracked for the current frame. */
++
++	res_frame->fpLocation.location = LOCATION_UNUSED;
++
++	/*
++	 * walk forward from the vicinity of the PC to determine
++	 * the current stack frame
++	 */
++	for (i = 0; i < RTITOOLS_CONTEXT_MAX_FN_LENGTH; ++i) {
++resumeFwdSearch:
++		pcCur = pcCurStart + i;
++		if (!PCOk(pcCur, client_arg)) {
++			d1printf(" %p: invalid PC!  Loop #%u; reversing...\n",
++				 pcCur, i);
++			reverseOperation = true;
++			break;
++		}
++		curInst = *(tInst *) instruction(pcCur, client_arg);
++
++		d3printf("%p: op code 0x%08x\n", pcCur, curInst);
++
++		/*----
++		 * First, find instructions that indicate we're in the epilogue:
++		 * ... [body] ...
++		 * lw    ra,offset(sp)  [32-bit regs]
++		 *    OR
++		 * ld    ra,offset(sp)  [64-bit regs]
++		 * ... [restore other registers]
++		 * addiu sp,sp,positiveamount
++		 * jr    ra
++		 * ... [possibly addiu sp,sp,positiveamount] ...
++		 */
++
++		/*--- lw  ra,offset(sp)
++		 *--- ld  ra,offset(sp)
++		 * If we encounter this one first, we need to find out what
++		 * local stack space is,
++		 * i.e., continue searching down for addiu sp,sp,+xx.
++		 */
++		if (((curInst & MASK_SWLW_OPCODE) == INST_RESTORE_RA_32) ||
++		    ((curInst & MASK_SWLW_OPCODE) == INST_RESTORE_RA_64)) {
++			uint32_t nextInst, nextNextInst;
++			offset = curInst & MASK_SWLW_OFFSET;
++			location_set_reg_indirect(&res_frame->pcLocation,
++						  BT_REG_SP, offset);
++
++			/* PC location is affected by register size */
++			if ((curInst & MASK_SWLW_OPCODE) == INST_RESTORE_RA_32) {
++				d2printf("  %p: lw ra,0x%lx(sp)\n", pcCur,
++					 offset);
++			}
++			/* MIPS64 BE has this -- we need to offset by a 32-bit
++			 * register width to get the least significant 32 bits
++			 * of the address because VxWorks currently supports
++			 * only 32-bit addresses.
++			 */
++			if ((curInst & MASK_SWLW_OPCODE) == INST_RESTORE_RA_64) {
++				res_frame->pcLocation.offset += REGISTER_OFFSET;
++				d2printf("  %p: ld ra,0x%lx(sp)\n", pcCur,
++					 res_frame->pcLocation.offset);
++			}
++			/* We must check for a GCC optimizer trick here to
++			 * shorten our search for a return point.
++			 * Some routines are optimized to be a special form of
++			 * tail-continued with this epilogue:
++			 *
++			 *  ...
++			 *  ld  ra,offset(sp)
++			 *  j   <anotherRoutine>
++			 *  addiu sp,sp,posConst
++			 *
++			 * In this case, we need only find the SP offset and
++			 * we're done.
++			 */
++			if (!PCOk(pcCur + 2, client_arg)) {
++				d1printf(" %p: bogus PC! [0]; reversing...\n",
++					 pcCur + 2);
++				reverseOperation = true;
++				break;
++			}
++
++			nextInst =
++			    *(uint32_t *) instruction(pcCur + 1, client_arg);
++			nextNextInst =
++			    *(uint32_t *) instruction(pcCur + 2, client_arg);
++
++			if (((nextInst & MASK_JUMP_OPCODE) == INST_J) &&
++			    ((nextNextInst & MASK_OPCODE) == INST_ADDIU)) {
++				location_set_reg_off(&res_frame->spLocation,
++						     BT_REG_SP,
++						     nextNextInst &
++						     MASK_ADD_OFFSET);
++				d2printf("    %p: j <routine>\n", pcCur + 1);
++				d2printf("    %p: addiu sp,sp,0x%lx(sp)\n",
++					 pcCur + 2,
++					 res_frame->spLocation.offset);
++
++				return true;
++			}
++			continue;
++		}
++
++		/*--- move sp,fp
++		 * restoring intermediate sp from fp
++		 */
++		if (curInst == INST_FP_TO_SP) {
++			fpBeingUsed = true;
++			location_set_reg_off(&res_frame->spLocation, BT_REG_FP,
++					     0);
++			d2printf("  %p: move sp,fp; fp = 0x%lx\n", pcCur,
++				 res_frame->spLocation.offset);
++			continue;
++		}
++
++		/*--- lw  fp,+d(sp)
++		 * restoration of stack frame pointer register from stack
++		 */
++		if ((curInst & MASK_SWLW_FP_SP) == INST_LW_FP_SP) {
++			/* we may already have seen this */
++			if (is_location_unknown_unused(&res_frame->fpLocation)) {
++				location_set_reg_indirect(&res_frame->
++							  fpLocation, BT_REG_SP,
++							  curInst &
++							  MASK_SWLW_OFFSET);
++				d2printf("  %p: lw fp,%ld(sp)\n", pcCur,
++					 res_frame->fpLocation.offset);
++			}
++			continue;
++		}
++
++		/*--- jr ra
++		 * End of routine.
++		 * Search for stack restoration instruction either preceding
++		 * this instruction or immediately following it in the branch
++		 * delay slot.
++		 *
++		 * ...
++		 * jr ra               / end of preceding routine [stop search]
++		 * addiu sp,sp,-xx     / our prolog               [stop search]
++		 * ...
++		 * lw/ld ra,offset(sp) / look for this if not already known
++		 * addiu sp,sp,+xx     / looking for this..
++		 * ...
++		 * jr ra        <-- we're here
++		 * addiu sp,sp,+xx     / .. or this
++		 */
++		if (curInst == INST_RTS) {
++			tInst nextInst;
++
++			d2printf("  %p: jr ra\n", pcCur);
++			if (!PCOk(pcCur + 1, client_arg)) {
++				d1printf(" %p: bogus PC! [0]; reversing...\n",
++					 pcCur + 1);
++				reverseOperation = true;
++				break;
++			}
++
++			nextInst =
++			    *(tInst *) instruction(pcCur + 1, client_arg);
++			d3printf("    %p: op code 0x%08x\n", pcCur + 1,
++				 nextInst);
++
++			/* check branch delay slot first */
++			if ((nextInst & MASK_ADD_OPCODE) == INST_ADD_TO_SP) {
++				offset = IMM_TO_INT(nextInst);
++
++				/* want only offset >= 0; if < 0, it's a prolog */
++				if (offset >= 0) {
++					if (!fpBeingUsed) {
++						res_frame->spLocation.location =
++						    LOCATION_REG_OFFSET;
++						res_frame->spLocation.reg =
++						    BT_REG_SP;
++					}
++					res_frame->spLocation.offset += offset;
++					d2printf
++					    ("    %p: addiu sp,sp,0x%lx follows jr ra\n",
++					     pcCur + 1, offset);
++				} else {
++					break;
++				}
++			}
++
++			/* if we have not found PC or SP location yet,
++			 * search back a few instructions
++			 */
++			if ((res_frame->pcLocation.location == LOCATION_UNKNOWN)
++			    || (res_frame->spLocation.location ==
++				LOCATION_UNKNOWN)) {
++				/* Look backwards, but avoid the case where we
++				 * might detect somebody else's stack restore:
++				 *
++				 * jr ra
++				 * addiu sp, sp, -32
++				 * our_function_label
++				 * jr ra
++				 * other_delay_slot
++				 */
++
++				/* j <= i so that we don't go beyond starting point */
++				for (j = 1; j < MAX_BACKWARD_SEARCH && j <= i;
++				     j++) {
++					tInst travInst;
++
++					if (!PCOk(pcCur - j, client_arg)) {
++						d1printf
++						    (" %p: bogus PC! [1]; reversing...\n",
++						     pcCur - j);
++						reverseOperation = true;
++						break;
++					}
++
++					travInst =
++					    *(tInst *) instruction(pcCur - j,
++								   client_arg);
++
++					/* search ends at preceding routine's end */
++					if (travInst == INST_RTS) {
++						d2printf
++						    ("    jr ra @ %p while searching for "
++						     "addiu sp,sp,+xx; stop search\n",
++						     pcCur - j);
++						break;
++					}
++
++					/*--- lw  fp,+d(sp)
++					 * restoration of stack frame pointer
++					 * register from stack
++					 */
++					if ((travInst & MASK_SWLW_FP_SP) ==
++					    INST_LW_FP_SP) {
++						/* we may already have seen this */
++						if (is_location_unknown_unused
++						    (&res_frame->fpLocation)) {
++							location_set_reg_indirect
++							    (&res_frame->
++							     fpLocation,
++							     BT_REG_SP,
++							     travInst &
++							     MASK_SWLW_OFFSET);
++							d2printf
++							    ("    %p: lw fp,%ld(sp)\n",
++							     pcCur - j,
++							     res_frame->
++							     fpLocation.offset);
++						}
++						continue;
++					}
++
++					/* find PC if not already known */
++					if ((res_frame->pcLocation.location ==
++					     LOCATION_UNKNOWN)
++					    &&
++					    (((travInst & MASK_SWLW_OPCODE) ==
++					      INST_RESTORE_RA_32)
++					     || ((travInst & MASK_SWLW_OPCODE)
++						 == INST_RESTORE_RA_64))) {
++						offset =
++						    travInst & MASK_SWLW_OFFSET;
++						location_set_reg_indirect
++						    (&res_frame->pcLocation,
++						     BT_REG_SP, offset);
++
++						/* PC location is affected by register size */
++						if ((travInst &
++						     MASK_SWLW_OPCODE) ==
++						    INST_RESTORE_RA_32) {
++							d2printf
++							    ("    %p: lw ra,0x%lx(sp)\n",
++							     pcCur, offset);
++						} else {
++							/* MIPS64: we need to offset by a 32-bit register
++							 * width to get the least significant 32 bits of
++							 * the address because VxWorks currently supports
++							 * only 32-bit addresses.
++							 */
++							res_frame->pcLocation.offset +=
++							    REGISTER_OFFSET;
++							d2printf
++							    ("    %p: ld ra,0x%lx(sp)\n",
++							     pcCur,
++							     res_frame->
++							     pcLocation.offset);
++						}
++					}
++
++					/* addiu sp,sp,offset: Found what we're searching for.
++					 * If positive offset, we've found SP offset.
++					 * If negative offset, we've found our own prolog.
++					 */
++					else if ((res_frame->spLocation.
++						  location == LOCATION_UNKNOWN)
++						 &&
++						 ((travInst & MASK_ADD_OPCODE)
++						  == INST_ADD_TO_SP)) {
++						tInst prevTravInst;
++
++						if (!PCOk
++						    (pcCur - j - 1,
++						     client_arg)) {
++							d1printf
++							    (" %p: bogus PC! [2]; reversing...\n",
++							     pcCur - j - 1);
++							reverseOperation = true;
++							break;
++						}
++
++						prevTravInst =
++						    *(tInst *) instruction(pcCur - j - 1,
++									   client_arg);
++
++						if ((prevTravInst != INST_RTS)) {
++							if (!fpBeingUsed) {
++								res_frame->
++								    spLocation.
++								    location =
++								    LOCATION_REG_OFFSET;
++								res_frame->
++								    spLocation.
++								    reg =
++								    BT_REG_SP;
++							}
++							res_frame->spLocation.
++							    offset +=
++							    IMM_TO_INT
++							    (travInst);
++							d2printf
++							    ("    %p: Found restore stack: %ld\n",
++							     pcCur - j - 1,
++							     res_frame->
++							     spLocation.offset);
++							/* break; */
++						}
++					}
++
++					else if ((res_frame->pcLocation.
++						  location != LOCATION_UNKNOWN)
++						 && (res_frame->spLocation.
++						     location !=
++						     LOCATION_UNKNOWN)) {
++						break;
++					}
++				}
++
++				if (reverseOperation == true)
++					break;
++
++			}
++
++			/* if "next instr == stack pop" */
++			/* if we have not found PC location yet, assume it's
++			 * in register
++			 */
++			if (res_frame->pcLocation.location == LOCATION_UNKNOWN) {
++				d2printf("    assuming pc in reg\n");
++				location_set_reg_off(&res_frame->pcLocation,
++						     BT_REG_LR, 0);
++
++				/* same assumption for SP */
++				if (res_frame->spLocation.location ==
++				    LOCATION_UNKNOWN) {
++					d2printf("    assuming sp in reg\n");
++					location_set_reg_off(&res_frame->
++							     spLocation,
++							     BT_REG_SP, 0);
++				}
++			}
++
++			return true;
++		}
++
++		/*----
++		 * Next, look for instructions that indicate we're in the
++		 * prologue of either this or some other function:
++		 *   addiu sp,sp,[negative amount] <-- already got this one
++		 *   sw    ra,offset(sp)
++		 */
++		if ((curInst & MASK_SWLW_OPCODE) == INST_STORE_RA_32 ||
++		    (curInst & MASK_SWLW_OPCODE) == INST_STORE_RA_64) {
++			if (i < MAX_PROLOGUE_LENGTH) {
++				offset = curInst & MASK_SWLW_OFFSET;
++				if ((offset & MASK_NEG_OFFSET) != 0)
++					offset |= ~MASK_ADD_OFFSET;
++				location_set_reg_off(&res_frame->pcLocation,
++						     BT_REG_LR, 0);
++
++				/* MIPS64 can use both, and we want to make sure
++				 * that we find the right one
++				 */
++				if ((curInst & MASK_SWLW_OPCODE) ==
++				    INST_STORE_RA_64) {
++					d2printf("  %p: sd ra,%ld(sp)\n", pcCur,
++						 offset);
++				} else {
++					d2printf("  %p: sw ra,%ld(sp)\n", pcCur,
++						 offset);
++				}
++
++				/* Search upward for the 'addiu sp, sp, offset'
++				 * stack creation operation
++				 */
++				for (j = 1; j <= MAX_PROLOGUE_LENGTH; j++) {
++					tInst travInst;
++
++					if (!PCOk(pcCur - j, client_arg)) {
++						d1printf
++						    (" %p: bogus PC! [3]; reversing...\n",
++						     pcCur - j);
++						reverseOperation = true;
++						break;
++					}
++
++					travInst =
++					    *(tInst *) instruction(pcCur - j,
++								   client_arg);
++
++					/*--- move fp,sp  [move s8,sp]
++					 * This signals that the fp is being used in this routine
++					 * and we must use it also, but only if we didn't start
++					 * on this instruction.  If this instruction has not yet
++					 * executed, the SP and PC offsets and locations are as
++					 * we find them.  But, if the instruction has executed,
++					 * the SP will have an absolute location and its offset
++					 * will be adjusted by any addiu value.
++					 */
++					if ((travInst == INST_SP_TO_FP)
++					    && ((i - j) != 0)) {
++						fpBeingUsed = true;
++						location_set_reg_off
++						    (&res_frame->spLocation,
++						     BT_REG_FP, 0);
++						d2printf
++						    ("    %p: move fp,sp;  fp being used\n",
++						     pcCur - j);
++					}
++
++					/*--- sw  fp,+d(sp)
++					 * Storing of stack frame pointer register on stack.
++					 * If we started here, fp is not yet on stack.
++					 */
++					if (((travInst & MASK_SWLW_FP_SP) ==
++					     INST_SW_FP_SP) && ((i - j) != 0)) {
++						/* we may already have seen this */
++						if (is_location_unknown_unused
++						    (&res_frame->fpLocation)) {
++							location_set_reg_indirect
++							    (&res_frame->
++							     fpLocation,
++							     BT_REG_SP,
++							     travInst &
++							     MASK_SWLW_OFFSET);
++							d2printf
++							    ("    %p: sw fp,%ld(sp)\n",
++							     pcCur - j,
++							     res_frame->
++							     fpLocation.offset);
++						}
++						continue;
++					}
++
++					if ((travInst & MASK_ADD_OPCODE) ==
++					    INST_ADD_TO_SP) {
++						/* A positive addition to the stack pointer is popping
++						 * something off of the stack and is not a part of the
++						 * prologue which is setting the stack up.
++						 * Stop scanning backwards and try finding the epilogue */
++						offset = IMM_TO_INT(travInst);
++						if (!
++						    (travInst &
++						     MASK_NEG_OFFSET)) {
++							d2printf
++							    ("    %p: addiu sp,sp,+%ld; not in prologue\n",
++							     pcCur - j, offset);
++							break;
++						}
++
++						if (!fpBeingUsed) {
++							res_frame->spLocation.
++							    location =
++							    LOCATION_REG_OFFSET;
++							res_frame->spLocation.
++							    reg = BT_REG_SP;
++						}
++
++						/* Negative offset now is just adding later */
++						res_frame->spLocation.offset +=
++						    -offset;
++						d2printf
++						    ("    %p: addiu sp,sp,-%ld; done[1]\n",
++						     pcCur - j, -offset);
++
++						return true;
++					}
++				}
++
++				/* couldn't find the stack pointer; try reverse processing */
++				d2printf
++				    ("    can't find addiu sp,sp,offset; reversing...\n");
++				reverseOperation = true;
++				break;
++			}
++		}
++
++		/*--- addiu sp,sp,offset
++		 */
++		if ((curInst & MASK_ADD_OPCODE) == INST_ADD_TO_SP) {
++			tInst prevInst, nextInst;
++
++			offset = IMM_TO_INT(curInst);
++
++			/* if the immediate value is negative */
++			if (offset < 0) {
++				offset = -offset;
++				d2printf("  %p: addiu sp,sp,-%ld\n", pcCur,
++					 offset);
++				if (i < MAX_PROLOGUE_LENGTH) {
++					d2printf("    epilogue entry @ %p\n",
++						 pcCur);
++					location_set_reg_off(&res_frame->
++							     pcLocation,
++							     BT_REG_LR, 0);
++					location_set_reg_off(&res_frame->
++							     spLocation,
++							     BT_REG_SP, 0);
++				}
++
++				return true;
++			}
++
++			d2printf("  %p: addiu sp,sp,+%ld\n", pcCur, offset);
++
++			/*
++			 * Test for a tail continued function; one that restores
++			 * the stack, then jumps directly to another function,
++			 * without linking, instead of returning to the caller.
++			 * If we find this, then all stack info is known and we
++			 * don't have to follow the jump/branch.
++			 *
++			 *  ...
++			 *   b              0xc008216c  [unconditional branch]
++			 *   addiu          sp,sp,48    [stack restore in branch delay slot]
++			 *
++			 * In some cases, the compiler will not optimize the
++			 * stack pop into the tail-continued functions jump
++			 * delay-slot,
++			 *
++			 *   lw         ra,20(sp)
++			 *          (...)
++			 *   addiu      sp,sp,48
++			 *   j          intUnlock
++			 *   nop
++			 *
++			 * so we should check the next instruction for a jump
++			 * as well.
++			 */
++			if (!PCOk(pcCur - 1, client_arg)) {
++				d1printf
++				    (" %p: bogus address [5]!  Reversing...\n",
++				     pcCur - 1);
++				reverseOperation = true;
++				break;
++			}
++			if (!PCOk(pcCur + 1, client_arg)) {
++				d1printf
++				    (" %p: bogus address [6]!  Reversing...\n",
++				     pcCur + 1);
++				reverseOperation = true;
++				break;
++			}
++
++			prevInst =
++			    *(tInst *) instruction(pcCur - 1, client_arg);
++			nextInst =
++			    *(tInst *) instruction(pcCur + 1, client_arg);
++
++			if (((prevInst & MASK_JUMP_OPCODE) == INST_J) ||
++			    ((nextInst & MASK_JUMP_OPCODE) == INST_J) ||
++			    ((prevInst & MASK_BRANCH_OPCODE) == INST_B) ||
++			    ((nextInst & MASK_BRANCH_OPCODE) == INST_B)) {
++				const tInst *pcTrav;
++				tInst travInst;
++
++				d2printf("  tail-continue @ %p\n", pcCur);
++				if (!fpBeingUsed) {
++					res_frame->spLocation.location =
++					    LOCATION_REG_OFFSET;
++					res_frame->spLocation.reg = BT_REG_SP;
++				}
++				res_frame->spLocation.offset += offset;
++
++				/* Now we need to locate the return address.
++				 * Scan backwards looking for a load from stack,
++				 * otherwise assume its in a register.
++				 */
++				for (j = 0; j < MAX_EPILOGUE_LENGTH; ++j) {
++					pcTrav = pcCur - 1 - j;
++					if (!PCOk(pcTrav, client_arg)) {
++						d1printf
++						    (" %p: bogus PC! [7]; reversing...\n",
++						     pcTrav);
++						reverseOperation = true;
++						break;
++					}
++
++					travInst =
++					    *(tInst *) instruction(pcTrav,
++								   client_arg);
++
++					if ((travInst & MASK_SWLW_OPCODE) ==
++					    INST_RESTORE_RA_32
++					    || (travInst & MASK_SWLW_OPCODE) ==
++					    INST_RESTORE_RA_64) {
++						offset = IMM_TO_INT(travInst);
++
++						/*
++						 * MIPS64 can use both, and we want to make sure
++						 * that we find the right one
++						 */
++						if ((travInst &
++						     MASK_SWLW_OPCODE) ==
++						    INST_STORE_RA_64) {
++							res_frame->pcLocation.
++							    offset =
++							    REGISTER_OFFSET +
++							    offset;
++							d2printf
++							    ("    %p: sd ra,%ld(sp)\n",
++							     pcTrav,
++							     res_frame->
++							     pcLocation.offset);
++						} else {
++							res_frame->pcLocation.
++							    offset = offset;
++							d2printf
++							    ("    %p: sw ra,%ld(sp)\n",
++							     pcTrav, offset);
++						}
++						res_frame->pcLocation.location =
++						    LOCATION_REG_INDIRECT;
++						res_frame->pcLocation.reg =
++						    BT_REG_SP;
++
++						return true;
++					}
++
++					/* Some tail-continued functions are actually shorter than
++					 * other functions' epilogues.  This can cause us to
++					 * inadvertantly walk back into the previous function's
++					 * epilogue, and mistakenly pick up its link register
++					 * save instruction (see _d_sub on malta24kbe/32 bit/Vx6.1
++					 * bsp for an example).  To solve this problem, we look
++					 * for a stack reservation that will signal one of two
++					 * things: either the prologue of the current function,
++					 * or that we've exited the epilogue of the current
++					 * function (i.e., the return address is _definately_ in
++					 * ra at this point).
++					 */
++					if (((travInst & MASK_ADD_OPCODE) ==
++					     INST_ADD_TO_SP)
++					    && ((travInst & MASK_NEG_OFFSET) !=
++						0)) {
++						d2printf
++						    ("    left epilogue @ %p\n",
++						     pcTrav);
++						break;
++					}
++				}	/* for (1 to epilogue_length) */
++
++				if (reverseOperation == true)
++					break;
++
++				/* didn't find ra on the stack,
++				 * assume it's in the register */
++				location_set_reg_off(&res_frame->pcLocation,
++						     BT_REG_LR, 0);
++
++				return true;
++			}
++			/* if "previous or next instruction is a jump" */
++			if (offset >= 0) {
++				if (!fpBeingUsed) {
++					res_frame->spLocation.location =
++					    LOCATION_REG_OFFSET;
++					res_frame->spLocation.reg = BT_REG_SP;
++				}
++				res_frame->spLocation.offset += offset;
++				d2printf("    adjusting sp offset by 0x%lx\n",
++					 offset);
++			}
++		}
++
++		/*----
++		 * Lastly, look for branch statements
++		 * The B[FT]S versions have delays, but we skip them because
++		 * we assume they are never interesting.  We were wrong.
++		 * For example, strncmp puts the FP_TO_SP instruction in the
++		 * delay slot. Fix this by not taking a branch until the
++		 * instruction after it has been analyzed.
++		 */
++
++		/* -1 ensures that we check the delay slot first - this can't
++		 * be used if we haven't processed at least one instruction!
++		 */
++		if (i >= 1) {
++			tInst prevInst;
++
++			if (!PCOk(pcCur - 1, client_arg)) {
++				d1printf(" %p: bogus PC! [%u]; reversing...\n",
++					 pcCur - 1, __LINE__);
++				reverseOperation = true;
++				break;
++			}
++
++			prevInst =
++			    *(tInst *) instruction(pcCur - 1, client_arg);
++
++			/* Test for a branch to an arbitrary register.  We can
++			 * track only a certain type.  If it isn't that case,
++			 * we should give up.
++			 * The case we look for is a computed go-to:
++			 *
++			 *  ...
++			 *  lui     t9,0xc00c    [load upper 16 bits of address]
++			 *  addiu   t9,t9,18488  [load lower 16 bits of address]
++			 *  addu    v1,t9,v1     [add offset into list]
++			 *  jr      v1           [go to computed address]
++			 *  nop
++			 *  b       func1        [list[0]]  follow this branch
++			 *  nop
++			 *  b       func2        [list[1]]
++			 *  nop
++			 *  ...
++			 *
++			 * In this case we use a default offset of zero,
++			 * selecting the first address in the list.
++			 */
++			if ((prevInst & MASK_JR_REG) == INST_JR_REG) {
++				tInst nextInst[2];	/* pcCur +1, pcCur +2 */
++				tInst localPrevInst[3];	/* pcCur [-2, -3, -4] */
++
++				if (PCOk(pcCur - 4, client_arg) ||
++				    PCOk(pcCur + 2, client_arg)) {
++					/* reverse operation */
++					d2printf
++					    ("  %p: discovered jump to register - reverse op\n",
++					     pcCur - 1);
++					reverseOperation = true;
++					break;
++				}
++
++				nextInst[0] =
++				    *(tInst *) instruction(pcCur + 1,
++							   client_arg);
++				nextInst[1] =
++				    *(tInst *) instruction(pcCur + 2,
++							   client_arg);
++
++				localPrevInst[0] =
++				    *(tInst *) instruction(pcCur - 2,
++							   client_arg);
++				localPrevInst[1] =
++				    *(tInst *) instruction(pcCur - 3,
++							   client_arg);
++				localPrevInst[2] =
++				    *(tInst *) instruction(pcCur - 4,
++							   client_arg);
++
++				if (((localPrevInst[0] & MASK_BASIC_OPCODE) ==
++				     INST_ADDU)
++				    && ((localPrevInst[1] & MASK_OPCODE) ==
++					INST_ADDIU)
++				    && ((localPrevInst[2] & MASK_OPCODE) ==
++					INST_LUI) && (curInst == INST_NOP)
++				    && ((nextInst[0] & MASK_BRANCH_OPCODE) ==
++					INST_B) && (nextInst[1] == INST_NOP)) {
++					const tInst *pc = pcCur + 2;
++					const rOffset offset =
++					    nextInst[0] & MASK_BRANCH_OFFSET;
++					d2printf
++					    ("  %p: computed go-to; following to %p\n",
++					     pcCur - 1, pc + offset);
++
++					pcCurStart = pc + offset - 1;
++					i = 0;
++					continue;
++				}
++			}
++
++			if ((prevInst & MASK_BRANCH_OPCODE) == INST_BEQ ||
++			    (prevInst & MASK_BRANCH_OPCODE) == INST_BNE ||
++			    (prevInst & MASK_BRANCH_OPCODE) == INST_BLEZ ||
++			    (prevInst & MASK_BRANCH_OPCODE) == INST_BGTZ ||
++			    (prevInst & MASK_B_OPCODE) == INST_BPOSGE32) {
++				const rOffset offset =
++				    *(tInst *) instruction(pcCur - 1,
++							   client_arg)
++				    & MASK_BRANCH_OFFSET;
++
++				/* Ignore negative test branches */
++				if (!(offset & 0x8000) && offset != 0) {
++					/* const tInst * pc = pcCur + 1; */
++					uint32_t nextInst;
++					d2printf
++					    ("  %p: forward branch [delay] by 0x%04x to %p\n",
++					     pcCur - 1, offset, pcCur + offset);
++
++					if (!PCOk(pcCur + 1, client_arg))
++						goto follow_branch;
++
++					nextInst =
++					    *(tInst *) instruction(pcCur + 1,
++								   client_arg);
++
++					/* trick caught in point8(): check next
++					 * inst for possible epilogue inst
++					 * and follow if found
++					 */
++					if ((nextInst == INST_RTS) ||
++					    ((nextInst & MASK_SWLW_OPCODE) ==
++					     INST_RESTORE_RA_32)
++					    || ((nextInst & MASK_SWLW_OPCODE) ==
++						INST_RESTORE_RA_64)
++					    ||
++					    (((nextInst & MASK_ADD_OPCODE) ==
++					      INST_ADD_TO_SP)
++					     &&
++					     (!((nextInst & MASK_ADD_OFFSET) &
++						0x8000)))) {
++						d2printf
++						    ("    ignoring branch, continuing\n");
++						continue;
++					}
++
++follow_branch:
++					/* no epilogue, so follow branch */
++					pcCurStart = pcCur + offset - 1;
++					i = 0;
++					continue;
++				}
++			}
++
++			/* Take all arbitrary branches - check delay slot */
++			if ((prevInst & MASK_B_OPCODE) == INST_BEQ) {
++				offset = IMM_TO_INT(prevInst);
++
++				d2printf
++				    ("  %p: arbitrary branch [delay] by %ld to %p\n",
++				     pcCur - 1, offset, pcCur + offset);
++
++				pcCurStart = pcCur + offset;
++				i = 0;
++
++				/* we limit the number of arbitrary branches taken */
++				if (branchCount >= MAX_ARB_BRANCHES) {
++					d1printf
++					    ("    Too many branches![1] Reversing...\n");
++					reverseOperation = true;
++				} else {
++					/* check for infinite loop */
++					for (j = 0; j < branchCount; j++) {
++						if (branchArray[j] ==
++						    (pcCur - 1)) {
++							d1printf
++							    ("    Infinite loop![1] Reversing...\n");
++							reverseOperation = true;
++							break;
++						}
++					}
++					branchArray[branchCount++] =
++					    (pcCur - 1);
++				}
++
++				if (reverseOperation == true) {
++					d2printf
++					    ("  %p: branch loop - reverse operation\n",
++					     pcCur - 1);
++					break;
++				}
++
++				continue;
++			}
++
++			if ((prevInst & MASK_JUMP_OPCODE) == INST_J) {
++				/* Offset is actually a `target': it is
++				 * bit-shifted two left to align on a byte
++				 * boundary [28 bits] and then the upper
++				 * 4/36 bits are taken from the top of the
++				 * current 32-/64-bit address.
++				 */
++				tAddr offset =
++				    (tAddr) (prevInst & MASK_JUMP_OFFSET);
++				offset <<= 2;
++				offset |= ((tAddr) (pcCur - 1) & 0xF0000000);
++
++				if (offset != 0) {
++					d2printf
++					    ("  %p: arbitrary branch to 0x%lx\n",
++					     pcCur - 1, offset);
++					/* Set for arbitrary branch */
++					i = 0;
++					pcCurStart = (tInst *) offset - 1;
++
++					/* we limit the number of arbitrary branches taken */
++					if (branchCount >= MAX_ARB_BRANCHES) {
++						d1printf
++						    ("    Too many branches![2] Reversing...\n");
++						reverseOperation = true;
++					} else {
++						/* check for infinite loop */
++						for (j = 0; j < branchCount;
++						     j++) {
++							if (branchArray[j] ==
++							    (pcCur - 1)) {
++								d1printf
++								    ("    Infinite loop![2] Reversing...\n");
++								reverseOperation
++								    = true;
++								break;
++							}
++						}
++						branchArray[branchCount++] =
++						    (pcCur - 1);
++					}
++					if (reverseOperation == true) {
++						d2printf
++						    ("  branch loop - reverse operation\n");
++						break;
++					} else {
++						continue;
++					}
++				}
++			}
++		}
++		/* if >= 1 instruction */
++	}			/* ...for ( < RTITOOLS_CONTEXT_MAX_FN_LENGTH) */
++
++	/*
++	 * Reset search to start from the original PC and search backwards,
++	 * looking for the prolog and assuming nothing is known.
++	 */
++
++	if (reverseOperation) {
++		init_ContextFrame(res_frame);
++		/* most clauses don't use the frame pointer, so by default we
++		 * mark it as untracked for the current frame.
++		 */
++		res_frame->fpLocation.location = LOCATION_UNUSED;
++
++		pcCurStart = startpc;
++		d2printf("< %p: Begin reverse search\n", pcCurStart);
++
++		for (i = 0; i < RTITOOLS_CONTEXT_MAX_FN_LENGTH; i++) {
++			pcCur = pcCurStart - i;
++			if (!PCOk(pcCur, client_arg)) {
++				d1printf(" %p: invalid PC!  REV2 loop #%u\n",
++					 pcCur, i);
++				return false;
++			}
++
++			curInst = *(tInst *) instruction(pcCur, client_arg);
++
++			d3printf(" < %p: examining instruction 0x%08x\n", pcCur,
++				 curInst);
++
++			/*----
++			 * Look for a function prologue [remember, we're moving
++			 * backwards]:
++			 *
++			 * [some other function's jr ra]
++			 * addiu sp,sp,-offset
++			 * sw    ra,+d(sp)
++			 * sw    fp,+d(sp)      [optional fp support]
++			 * move  fp,sp          [   "     "     "   ]
++			 * ...
++			 */
++
++			/*--- move fp,sp  [move s8,sp]
++			 * This signals that the fp is being used in this
++			 * routine and we must use it also, but only if we
++			 * didn't start on this instruction.
++			 * If this instruction has not yet executed, the SP
++			 * and PC offsets and locations are as we find them.
++			 * But, if the instruction has executed, the SP will
++			 * have an absolute location and its offset will be
++			 * adjusted by any addiu value.
++			 */
++			if ((curInst == INST_SP_TO_FP) && (i > 0)) {
++				fpBeingUsed = true;
++				location_set_reg_off(&res_frame->spLocation,
++						     BT_REG_FP, 0);
++				d2printf("  < %p: move fp,sp;  fp being used\n",
++					 pcCur);
++			}
++
++			/*--- sw  fp,+d(sp)
++			 * Storing of stack frame pointer register on stack.
++			 * If we started here, fp is not yet on stack.
++			 */
++			if (((curInst & MASK_SWLW_FP_SP) == INST_SW_FP_SP)
++			    && (i > 0)) {
++				/* we may already have seen this */
++				if (is_location_unknown_unused
++				    (&res_frame->fpLocation)) {
++					location_set_reg_indirect(&res_frame->
++								  fpLocation,
++								  BT_REG_SP,
++								  curInst &
++								  MASK_SWLW_OFFSET);
++					d2printf("  < %p: sw fp,%ld(sp)\n",
++						 pcCur,
++						 res_frame->fpLocation.offset);
++				}
++				continue;
++			}
++
++			/*--- SW  ra,offset(sp)
++			 *    SD  ra,offset(sp)
++			 */
++			if ((curInst & MASK_SWLW_OPCODE) == INST_STORE_RA_32 ||
++			    (curInst & MASK_SWLW_OPCODE) == INST_STORE_RA_64) {
++				res_frame->pcLocation.location =
++				    LOCATION_REG_INDIRECT;
++				res_frame->pcLocation.reg = BT_REG_SP;
++
++				/* MIPS64 can use both, and we want to make sure
++				 * that we find the right one
++				 */
++				offset = curInst & MASK_SWLW_OFFSET;
++				if ((curInst & MASK_SWLW_OPCODE) ==
++				    INST_STORE_RA_64) {
++					d2printf("  < %p: sd ra,%ld(sp)\n",
++						 pcCur, offset);
++					res_frame->pcLocation.offset =
++					    REGISTER_OFFSET + offset;
++				} else {
++					d2printf("  < %p: sw ra,%ld(sp)\n",
++						 pcCur, offset);
++					res_frame->pcLocation.offset = offset;
++				}
++
++				if (res_frame->spLocation.location ==
++				    LOCATION_UNKNOWN)
++					res_frame->spLocation.offset = 0;
++
++				/* Search backward to learn about sp restoration
++				 * and start of function */
++				for (j = 1; j < MAX_EPILOGUE_LENGTH; j++) {
++					tInst travInst;
++
++					if (!PCOk(pcCur - j, client_arg)) {
++						d1printf
++						    (" < %p: bogus PC! [1]\n",
++						     pcCur - j);
++						return false;
++					}
++
++					travInst =
++					    *(tInst *) instruction(pcCur - j,
++								   client_arg);
++					/*--- sw  fp,+d(sp)
++					 * Storing of stack frame pointer register on stack.
++					 * If we started here, fp is not yet on stack.
++					 */
++					if ((travInst & MASK_SWLW_FP_SP) ==
++					    INST_SW_FP_SP) {
++						/* we may already have seen this */
++						if (is_location_unknown_unused
++						    (&res_frame->fpLocation)) {
++							location_set_reg_indirect
++							    (&res_frame->
++							     fpLocation,
++							     BT_REG_SP,
++							     travInst &
++							     MASK_SWLW_OFFSET);
++							d2printf
++							    ("    < %p: sw fp,%ld(sp)\n",
++							     pcCur - j,
++							     res_frame->
++							     fpLocation.offset);
++						}
++						continue;
++					}
++
++					if ((travInst & MASK_ADD_OPCODE) ==
++					    INST_ADD_TO_SP) {
++						offset = IMM_TO_INT(travInst);
++						if (offset > 0) {
++							/* If we encounter an ADD_TO_SP > 0 opcode, we
++							 * are in the epilogue of some other function
++							 * -- oops
++							 */
++							d2printf
++							    ("    < %p: addiu sp,sp,+%ld: underran "
++							     "function - ending\n",
++							     pcCur - j, offset);
++						} else {
++							offset = -offset;
++
++							/* sp location depends on fp use */
++							if (!fpBeingUsed) {
++								res_frame->
++								    spLocation.
++								    location =
++								    LOCATION_REG_OFFSET;
++								res_frame->
++								    spLocation.
++								    reg =
++								    BT_REG_SP;
++							}
++
++							res_frame->spLocation.
++							    offset += offset;
++							d2printf
++							    ("    < %p: addiu sp,sp,-%ld; done\n",
++							     pcCur - j, offset);
++						}
++
++						break;
++					}
++				}
++
++				return true;
++			}
++
++			/* if STORE_RA */
++			/*--- ADDIU sp,sp,imm
++			 * If we encounter this one first, the ra, sp, and fp
++			 * are still in their registers, if the fp is being
++			 * used at all [should only happen if we start in the
++			 * prologue]
++			 */
++			if ((curInst & MASK_ADD_OPCODE) == INST_ADD_TO_SP) {
++				offset = IMM_TO_INT(curInst);
++
++				if (offset > 0) {
++					/* found a stack pop instead of a
++					 * push (positive modification)
++					 */
++					d2printf("  < %p: addiu sp,sp,+%ld\n",
++						 pcCur, offset);
++					if (!gprs_available) {
++						d2printf
++						    ("    underran function - ending\n");
++						return false;
++					}
++
++					/* Forward and backward search has failed in leaf
++					 * function, so it is likely that we are in spaghetti
++					 * code like that written for VxWorks semaphore support
++					 * and the regs still have the values we seek.
++					 */
++					if (res_frame->spLocation.location ==
++					    LOCATION_UNKNOWN)
++						location_set_reg_off
++						    (&res_frame->spLocation,
++						     BT_REG_SP, 0);
++					return true;
++				}
++
++				/* Done: found a stack push;
++				 * offset is negative, so negate. */
++				offset = -offset;
++
++				/* sp location depends on fp use */
++				if (!fpBeingUsed) {
++					res_frame->spLocation.location =
++					    LOCATION_REG_OFFSET;
++					res_frame->spLocation.reg = BT_REG_SP;
++				}
++
++				res_frame->spLocation.offset += offset;
++				d2printf("  < %p: addiu sp,sp,-%ld\n", pcCur,
++					 offset);
++
++				if (gprs_available
++				    && (res_frame->pcLocation.location ==
++					LOCATION_UNKNOWN)) {
++					location_set_reg_off(&res_frame->
++							     pcLocation,
++							     BT_REG_LR, 0);
++				}
++
++				return true;
++			}
++
++			/*----
++			 * We're going backwards so, if we see any of these
++			 * things, we have overrun our current function:
++			 *   MOVE   sp,fp           :fp to sp
++			 *   LW/LD  ra,offset(sp)   :restore ra
++			 *   JR     ra              :rts
++			 *   [restore fp] <-- we should never end up at a delay
++			 *                    slot..that would be weird
++			 */
++			if ((curInst & MASK_SWLW_OPCODE) == INST_RESTORE_RA_32
++			    || (curInst & MASK_SWLW_OPCODE) ==
++			    INST_RESTORE_RA_64 || (curInst == INST_RTS)) {
++				tInst brInst, prevInst;
++
++				if ((curInst & MASK_SWLW_OPCODE) ==
++				    INST_RESTORE_RA_32) {
++					d2printf("  < %p: lw ra,%d(sp) !\n",
++						 pcCur,
++						 curInst & MASK_SWLW_OFFSET);
++				} else if ((curInst & MASK_SWLW_OPCODE) ==
++					   INST_RESTORE_RA_64) {
++					d2printf("  < %p: ld ra,%d(sp) !\n",
++						 pcCur,
++						 curInst & MASK_SWLW_OFFSET);
++				} else {
++					d2printf("  < %p: jr ra !\n", pcCur);
++				}
++
++				/* Special case:
++				 * lw/ld ra,x(sp) in branch delay slot.
++				 * As seen in the C line editor loop (private
++				 * routine following viLedLibInit), taking this
++				 * branch will take us to the epilogue.
++				 */
++				if (!PCOk(pcCur - 1, client_arg)) {
++					d1printf
++					    (" %p: REV bogus address [3]!\n",
++					     pcCur - 1);
++					return false;
++				}
++
++				prevInst =
++				    *(tInst *) instruction(pcCur - 1,
++							   client_arg);
++				brInst = prevInst & MASK_BRANCH_OPCODE;
++
++				if ((((prevInst & MASK_B_OPCODE) == INST_BEQ) ||
++				     (brInst == INST_BEQ) ||
++				     (brInst == INST_BNE) ||
++				     (brInst == INST_BLEZ) ||
++				     (brInst == INST_BGTZ) ||
++				     (brInst == INST_BPOSGE32)) &&
++				    (((curInst & MASK_SWLW_OPCODE) ==
++				      INST_RESTORE_RA_32)
++				     || ((curInst & MASK_SWLW_OPCODE) ==
++					 INST_RESTORE_RA_64))) {
++					offset = IMM_TO_INT(prevInst);
++
++					reverseOperation = false;
++					pcCurStart = pcCur + offset;
++					i = 0;
++					offset = curInst & MASK_SWLW_OFFSET;
++					location_set_reg_indirect(&res_frame->
++								  pcLocation,
++								  BT_REG_SP,
++								  offset);
++
++					if ((curInst & MASK_SWLW_OPCODE) ==
++					    INST_RESTORE_RA_64) {
++						res_frame->pcLocation.offset += 4;	/* only 32-bit address */
++						d2printf
++						    ("    %p: branch to %p followed by ld ra,%ld"
++						     "(sp)\n", pcCur - 1,
++						     pcCurStart, offset);
++					} else {
++						d2printf
++						    ("    %p: branch to %p followed by lw ra,%ld"
++						     "(sp)\n", pcCur - 1,
++						     pcCurStart, offset);
++					}
++					d2printf
++					    ("      follow branch, resume forward search\n");
++					goto resumeFwdSearch;
++				}
++
++				/* Forward and backward search has failed in
++				 * NON-LEAF function, so we quit here.
++				 */
++				if (!gprs_available) {
++					d2printf
++					    ("    %p: underran non-leaf function - ending\n",
++					     pcCur);
++				}
++
++				/* Forward and backward search has failed in
++				 * LEAF function, so it is likely that we are
++				 * in spaghetti code like that written for
++				 * VxWorks semaphore support and the regs still
++				 * have the values we seek.
++				 */
++				else {
++					if (res_frame->spLocation.location ==
++					    LOCATION_UNKNOWN)
++						location_set_reg_off
++						    (&res_frame->spLocation,
++						     BT_REG_SP, 0);
++					if (res_frame->pcLocation.location ==
++					    LOCATION_UNKNOWN)
++						location_set_reg_off
++						    (&res_frame->pcLocation,
++						     BT_REG_PC, 0);
++					d2printf
++					    ("    %p: underran leaf function - ending\n",
++					     pcCur);
++				}
++
++				return true;
++			}
++		}		/* ...for loop */
++	}
++	/* reverse search */
++	d2printf("  ** %p: Bottomed out; i = %u **\n", pcCur, i);
++	/* Still here?  Something's wrong.. give up. */
++
++	res_frame->spLocation.location = LOCATION_UNKNOWN;
++	res_frame->pcLocation.location = LOCATION_UNKNOWN;
++
++	return false;
++}
+diff --git a/arch/mips/oprofile/stack_crawl.h b/arch/mips/oprofile/stack_crawl.h
+new file mode 100644
+index 0000000..f3ae8b5
+--- /dev/null
++++ b/arch/mips/oprofile/stack_crawl.h
+@@ -0,0 +1,223 @@
++/*
++ * stack_crawl.h
++ * Contains the Arch-independent api to the arch-dependent code. To be included
++ * by clients of the <arch>_crawl functionality.
++ *
++ * Copyright (c) 2008 Windriver Systems, Inc.
++ *
++ * Author: David Lerner <david.lerner@windriver.com>
++ *         Wind River scopetools developers
++ *
++ * This code is closely adapted from the improved backtrace 'context' analysis
++ * code that was developed to be shared by profiler and debugger
++ * products, host and target based for various Wind River Systems, Inc products.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#ifndef stack_crawl_h
++#define stack_crawl_h
++
++/*
++ * This symbol can also be set to '1' by the developer from the make
++ * command line to enable using development features and testing code:
++ * make <target> "RTI_TESTING_FLAG = '-DOP_CONTEXT_DEV_MODE=1'"
++ */
++#if defined(OP_CONTEXT_DEV_MODE)
++#undef OP_CONTEXT_DEV_MODE
++#endif
++
++/* Development mode - 0 for prod */
++#define OP_CONTEXT_DEV_MODE       (1)
++
++/*
++ *  A context package-wide verbosity setting.  Should be be set and reside in
++ * client's code.
++*/
++extern int op_context_debug_output;
++
++/*
++ * some logging operations for debugging
++ */
++#include <linux/kernel.h>
++#if OP_CONTEXT_DEV_MODE
++#define v0printf(fmt, args...) printk(fmt, ##args)
++#  define v1printf        if (op_context_debug_output >= 1) \
++				v0printf
++#  define v2printf        if (op_context_debug_output >= 2) \
++				v0printf
++#  define v3printf        if (op_context_debug_output >= 3) \
++				v0printf
++#  define d0printf(fmt, args...)     v0printf(fmt, ##args)
++#  define d1printf(fmt, args...)     v1printf(fmt, ##args)
++#  define d2printf(fmt, args...)     v2printf(fmt, ##args)
++#  define d3printf(fmt, args...)     v3printf(fmt, ##args)
++#else /* if OP_CONTEXT_DEV_MODE */
++#  define d0printf(fmt, args...)
++#  define d1printf(fmt, args...)
++#  define d2printf(fmt, args...)
++#  define d3printf(fmt, args...)
++#endif /* if OP_CONTEXT_DEV_MODE */
++
++/*
++ * Location operations, specifying where the associated value can be found.
++ */
++enum value_location {
++	LOCATION_UNKNOWN = 0,	/* uh-oh */
++	LOCATION_UNUSED,	/* If this location is unused by this arch */
++	LOCATION_INDETERMINATE,	/* the value in question no longer exists.
++				   E.g., a non-returning function chooses not
++				   to save its LR.  Tracing from a child of this
++				   function, there's no way of determining the
++				   non-returning routine's parent. */
++	LOCATION_REG_OFFSET,	/* value is (reg) + (offset) */
++	LOCATION_REG_INDIRECT,	/* value is *(reg + byte offset) */
++	LOCATION_ABSOLUTE,	/* treat the offset as the actual value */
++	LOCATION_NEW_SP,	/* [pc only] update sp and THEN update pc */
++	LOCATION_ERROR		/* not to ever be returned! Only exists as a
++				   dynamic marker on the bounds of this enum */
++};
++
++/*
++ *  A structure specifying how a value can be calculated, given access to a
++ * set of registers, and target memory.  May specify a new absolute value,
++ * indicate memory is to be dereferenced, etc.
++ */
++struct new_value_delta {
++	enum value_location location;
++	enum register_name reg;
++	long offset;
++};
++
++/*
++ *  struct frame_deltas describes the location of the arch specific values
++ * for a particular stack call frame (typically the frame which "called" a
++ * given frame.  Note, this structure describes the location and not the
++ * actual value of these values, allowing client code to calculate the values
++ * in implementation-specific ways.
++ */
++struct frame_deltas {
++	struct new_value_delta pcLocation;
++#if RTITOOLS_CONTEXT_USES_FP
++	struct new_value_delta fpLocation;
++#endif
++#if RTITOOLS_CONTEXT_USES_SP
++	struct new_value_delta spLocation;
++#endif
++	/* TD: is this only used as a debugging aid?
++	 *  If so, ifdef out for production
++	 */
++	unsigned long steps;	/* #steps to locate parent function */
++};
++
++/*
++ * op_frame_crawl - given a target pc value, locate the calling stack frame
++ *
++ * DESCRIPTION
++ *  This function analyzes instruction flow around the given program counter
++ * and returns when it has either figured out the locations of the calling
++ * stack frame, or determined it's been confused and cannot figure out where
++ * the calling context is located.  The function containing "startpc" should
++ * conform to the c/c++ abi, otherwise this function may be less accurate.
++ * "gprs_available" should be set to true if the caller has access to valid
++ * contents of the general purpose register values corresponding to the
++ * "child's" stack frame.  When set to false, FrameCrawl() will do extra work
++ * to locate these values on the stack.  Note that all non-pc, non-sp, and
++ * non-fp registers are considered "general purpose," including the LR.
++ *
++ * The "client_arg" parameter value is not directly used by the FrameCrawl()
++ * routine at all.  However it is passed to all instruction() and PCOk() calls,
++ * and is used to pass client-specific data that may be necessary for the
++ * client-specific implementations of these functions.
++ *
++ * RETURNS
++ *   true            - context found
++ *   false         - context not found
++ */
++/* TD: should this routine ever conceptually return "TOP"? */
++extern bool op_frame_crawl(void *startpc,
++			   void *client_arg,
++			   bool gprs_available, struct frame_deltas *resFrame);
++
++/*
++ * A convenience function to quickly denote a register offset type delta.
++ */
++static inline
++    void location_set_reg_off(struct new_value_delta *delta,
++			      const enum register_name reg, const long offset)
++{
++	delta->location = LOCATION_REG_OFFSET;
++	delta->reg = reg;
++	delta->offset = offset;
++}
++
++/*
++ * A convenience function to quickly denote a register indirect type delta.
++ */
++static inline
++    void location_set_reg_indirect(struct new_value_delta *delta,
++				   const enum register_name reg,
++				   const long offset)
++{
++	delta->location = LOCATION_REG_INDIRECT;
++	delta->reg = reg;
++	delta->offset = offset;
++}
++
++/*
++ *  A convenience function to quickly reset/initialize a ContextFrame structure
++ * to a known starting state.
++ */
++static inline void init_ContextFrame(struct frame_deltas *resFrame)
++{
++	resFrame->pcLocation.location = LOCATION_UNKNOWN;
++	resFrame->pcLocation.reg = 0;
++	resFrame->pcLocation.offset = 0;
++
++#if RTITOOLS_CONTEXT_USES_SP
++	resFrame->spLocation.location = LOCATION_UNKNOWN;
++	resFrame->spLocation.reg = 0;
++	resFrame->spLocation.offset = 0;
++#endif
++
++#if RTITOOLS_CONTEXT_USES_FP
++	resFrame->fpLocation.location = LOCATION_UNKNOWN;
++	resFrame->fpLocation.reg = 0;
++	resFrame->fpLocation.offset = 0;
++#endif
++}
++
++/*
++ *  A convenience function to quickly determine if a delta is unknown or unused.
++ */
++static inline bool is_location_unknown_unused(struct new_value_delta *delta)
++{
++	return delta->location == LOCATION_UNKNOWN ||
++	    delta->location == LOCATION_UNUSED;
++}
++
++#if OP_CONTEXT_DEV_MODE
++/*
++ *  A debugging utility function providing a convenient method for dumping the
++ * stack around a given value.
++ */
++static inline void dumpStack(const unsigned long *sp, unsigned int width)
++{
++	unsigned int i;
++	const unsigned long *trav = sp - width / 2;
++
++	for (i = 0; i < width; ++i) {
++		if ((trav + i) != sp) {
++			d0printf("\t%p: 0x%lx\n", trav + i, *(trav + i));
++		} else {
++			d0printf("\t%p: 0x%lx  <------\n", trav + i,
++				 *(trav + i));
++		}
++	}
++}
++#endif /* if OP_CONTEXT_DEV_MODE */
++
++#endif /* stack_crawl_h */
+-- 
+1.6.5.2
+
