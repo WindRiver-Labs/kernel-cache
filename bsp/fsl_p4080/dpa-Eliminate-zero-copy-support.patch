@@ -1,0 +1,601 @@
+From df9d3dc1d0a5762e10765f1687f6b672878d904c Mon Sep 17 00:00:00 2001
+From: Andy Fleming <afleming@freescale.com>
+Date: Tue, 11 May 2010 15:48:38 -0400
+Subject: [PATCH 05/11] dpa: Eliminate zero-copy support
+
+Tests indicate it performs worse than just copying the buffers into
+skbs, due to extensive locking needed for the hash table.  Because this
+breaks scatter-gather support, we also eliminate that, and modify the
+buffer pools so we only have one pool with buffers large enough to hold
+any ethernet packet.
+
+Signed-off-by: Andy Fleming <afleming@freescale.com>
+[Original was taken from Freescale p4080 SDK 2.1 ISO image, patch
+"kernel-2.6.30-dpa-Eliminate-zero-copy-support.patch"
+Context changes were made in order to port to kernel 2.6.34.]
+Integrated-by: Yuri Nedel <Yuri.Nedel@windriver.com>
+---
+ drivers/net/dpa/dpa.c |  468 +++++++++----------------------------------------
+ 1 files changed, 85 insertions(+), 383 deletions(-)
+
+diff --git a/drivers/net/dpa/dpa.c b/drivers/net/dpa/dpa.c
+index bf33fab..5385b98 100644
+--- a/drivers/net/dpa/dpa.c
++++ b/drivers/net/dpa/dpa.c
+@@ -42,7 +42,6 @@
+ #include <linux/ip.h>		/* struct iphdr */
+ #include <linux/udp.h>		/* struct udphdr */
+ #include <linux/tcp.h>		/* struct tcphdr */
+-#include <linux/spinlock.h>
+ #include <linux/highmem.h>
+ #include <linux/percpu.h>
+ #ifdef CONFIG_DEBUG_FS
+@@ -63,7 +62,7 @@
+ #define ARRAY2_SIZE(arr)	(ARRAY_SIZE(arr) * ARRAY_SIZE((arr)[0]))
+ 
+ #define DPA_NETIF_FEATURES	0
+-#define DEFAULT_COUNT	64
++#define DEFAULT_COUNT		256
+ #define DPA_MAX_TX_BACKLOG	512
+ 
+ #define DPA_DESCRIPTION "FSL DPA Ethernet driver"
+@@ -121,189 +120,17 @@ struct dpa_bp {
+ 	};
+ 	size_t				count;
+ 	size_t				size;
+-	unsigned int			bp_kick_thresh;
+-	unsigned int			bp_blocks_per_page;
+-	char				kernel_pool;  /* kernel-owned pool */
+-	spinlock_t			lock;
+-	unsigned int			bp_refill_pending;
+-	union {
+-		struct page		**rxhash;
+-		struct {
+-			dma_addr_t	paddr;
+-			void *		vaddr;
+-		};
+-	};
++ 	dma_addr_t			paddr;
++ 	void				*vaddr;
+ };
+ 
+ static const size_t dpa_bp_size[] __devinitconst = {
+ 	/* Keep these sorted */
+-	DPA_BP_SIZE(128), DPA_BP_SIZE(512), DPA_BP_SIZE(1536)
++ 	DPA_BP_SIZE(1536)
+ };
+ 
+ static struct dpa_bp *dpa_bp_array[64];
+ 
+-static unsigned int dpa_hash_rxaddr(const struct dpa_bp *bp, dma_addr_t a)
+-{
+-	a >>= PAGE_SHIFT;
+-	a ^= (a >> ilog2(bp->count));
+-
+-	return (a & (__roundup_pow_of_two(bp->count) - 1));
+-}
+-
+-static struct page *dpa_get_rxpage(struct dpa_bp *bp, dma_addr_t addr)
+-{
+-	unsigned int h = dpa_hash_rxaddr(bp, addr);
+-	struct page *page = NULL;
+-	int i, j;
+-	unsigned long flags;
+-
+-	addr &= PAGE_MASK;
+-
+-	spin_lock_irqsave(&bp->lock, flags);
+-	for (i = h * DPA_HASH_MULTIPLE, j = 0;
+-			j < bp->count * DPA_HASH_MULTIPLE; j++) {
+-		if (bp->rxhash[i] && bp->rxhash[i]->index == addr) {
+-			page = bp->rxhash[i];
+-			bp->rxhash[i] = NULL;
+-			bp->bp_refill_pending++;
+-			break;
+-		}
+-
+-		i = (i + 1) == bp->count * DPA_HASH_MULTIPLE ? 0 : i + 1;
+-	}
+-	spin_unlock_irqrestore(&bp->lock, flags);
+-
+-	BUG_ON(!page);
+-	return page;
+-}
+-
+-static void dpa_hash_page(struct dpa_bp *bp, struct page *page, dma_addr_t base)
+-{
+-	unsigned int h = dpa_hash_rxaddr(bp, base);
+-	int i, j;
+-
+-	page->index = base & PAGE_MASK;
+-
+-	/* If the entry for this hash is missing, just find the next free one */
+-	for (i = h * DPA_HASH_MULTIPLE, j = 0;
+-			j < bp->count * DPA_HASH_MULTIPLE;
+-			j++,
+-			i = (i + 1) == (bp->count * DPA_HASH_MULTIPLE) ?
+-				0 : i + 1) {
+-		if (bp->rxhash[i])
+-			continue;
+-
+-		bp->rxhash[i] = page;
+-		return;
+-	}
+-
+-	BUG();
+-}
+-
+-static void bmb_free(const struct net_device *net_dev,
+-		     struct dpa_bp *bp, struct bm_buffer *bmb)
+-{
+-	int i;
+-	/*
+-	 * Go through the bmb array, and free/unmap every buffer remaining
+-	 * in it
+-	 */
+-	for (i = 0; i < 8; i++) {
+-		struct page *page;
+-
+-		if (!bmb[i].lo)
+-			break;
+-
+-		page = dpa_get_rxpage(bp, bmb[i].lo);
+-
+-		dma_unmap_page(net_dev->dev.parent, bmb[i].lo,
+-				bp->size, DMA_FROM_DEVICE);
+-
+-		put_page(page);
+-	}
+-}
+-
+-static void dpa_bp_refill(const struct net_device *net_dev, struct dpa_bp *bp,
+-			gfp_t mask)
+-{
+-	struct bm_buffer bmb[8];
+-	int err;
+-	unsigned int blocks;
+-	unsigned int blocks_per_page = bp->bp_blocks_per_page;
+-	unsigned int block_size = bp->size;
+-	struct page *page = NULL;
+-	unsigned long flags;
+-	int i;
+-
+-	spin_lock_irqsave(&bp->lock, flags);
+-	/* Round down to an integral number of pages */
+-	blocks = (bp->bp_refill_pending / blocks_per_page) * blocks_per_page;
+-
+-	bp->bp_refill_pending -= blocks;
+-
+-	spin_unlock_irqrestore(&bp->lock, flags);
+-
+-	for (i = 0; i < blocks; i++) {
+-		dma_addr_t addr;
+-		unsigned int off = (i % blocks_per_page) * block_size;
+-
+-		/* Do page allocation every time we need a new page */
+-		if ((i % blocks_per_page) == 0) {
+-			page = alloc_page(mask);
+-
+-			if (!page)
+-				break;
+-
+-			/* Update the reference count to reflect # of buffers */
+-			if (blocks_per_page > 1)
+-				atomic_add(blocks_per_page - 1,
+-						&compound_head(page)->_count);
+-		}
+-
+-		addr = dma_map_page(net_dev->dev.parent, page, off, block_size,
+-					DMA_FROM_DEVICE);
+-
+-		spin_lock_irqsave(&bp->lock, flags);
+-		/* Add the page to the hash table */
+-		dpa_hash_page(bp, page, addr);
+-
+-		spin_unlock_irqrestore(&bp->lock, flags);
+-
+-		/*
+- 		 * Fill the release buffer to release as many at a time as
+- 		 * is possible.
+- 		 */
+-		bmb[i % 8].hi = 0;
+-		bmb[i % 8].lo = addr;
+-
+-		/* When we get to the end of the buffer, send it all to bman */
+-		if ((i % 8) == 7) {
+-			err = bman_release(bp->pool, bmb, 8,
+-						BMAN_RELEASE_FLAG_WAIT_INT);
+-
+-			if (err < 0) {
+-				bmb_free(net_dev, bp, bmb);
+-				return;
+-			}
+-		}
+-	}
+-
+-	/* Take care of the leftovers ('i' will be one past the last block) */
+-	if ((i % 8) != 0) {
+-		err = bman_release(bp->pool, bmb, i % 8,
+-				BMAN_RELEASE_FLAG_WAIT_INT);
+-
+-		if (err < 0) {
+-			int j;
+-
+-			for (j = i % 8; j < 8; j++)
+-				bmb[j].lo = 0;
+-			bmb_free(net_dev, bp, bmb);
+-			return;
+-		}
+-	}
+-}
+-
+ static void __cold dpa_bp_depletion(struct bman_portal	*portal,
+ 				    struct bman_pool	*pool,
+ 				    void		*cb_ctx,
+@@ -367,32 +194,42 @@ _dpa_bp_alloc(struct net_device *net_dev, struct list_head *list,
+ 		return -ENODEV;
+ 	}
+ 
+-	/* paddr is only set for pools that are shared between partitions */
+-	if (dpa_bp->paddr == 0) {
+-		int hashsize = dpa_bp->count * DPA_HASH_MULTIPLE;
+-		hashsize = __roundup_pow_of_two(hashsize);
+-		dpa_bp->rxhash = kzalloc(hashsize * sizeof(struct page *),
+-					GFP_KERNEL);
+-		if (!dpa_bp->rxhash) {
+-			_errno = -ENOMEM;
+-			goto _return_bman_free_pool;
+-		}
+-
+-		dpa_bp->bp_blocks_per_page = PAGE_SIZE / dpa_bp->size;
+-		BUG_ON(dpa_bp->count < dpa_bp->bp_blocks_per_page);
+-		dpa_bp->bp_kick_thresh = dpa_bp->count - max((unsigned int)8,
+-						dpa_bp->bp_blocks_per_page);
+-		dpa_bp->bp_refill_pending = dpa_bp->count;
+-		dpa_bp->kernel_pool = 1;
+-
+-		spin_lock_init(&dpa_bp->lock);
+-		dpa_bp_refill(net_dev, dpa_bp, GFP_KERNEL);
+-	} else {
+-		/* This is a shared pool, which the kernel doesn't manage */
+-		dpa_bp->kernel_pool = 0;
+-		devm_request_mem_region(net_dev->dev.parent, dpa_bp->paddr,
+-					dpa_bp->size * dpa_bp->count,
+-					KBUILD_MODNAME);
++	  	if (dpa_bp->paddr == 0) {
++ 		int i;
++ 		dpa_bp->vaddr = alloc_pages_exact(dpa_bp->size * dpa_bp->count,
++ 						GFP_DPA_BP);
++ 		if (!dpa_bp->vaddr) {
++  			_errno = -ENOMEM;
++  			goto _return_bman_free_pool;
++  		}
++  
++ 		dpa_bp->paddr = dma_map_single(net_dev->dev.parent,
++ 						dpa_bp->vaddr,
++ 						dpa_bp->size * dpa_bp->count,
++ 						DMA_BIDIRECTIONAL);
++ 
++ 		if (dpa_bp->paddr == 0) {
++ 			_errno = -EIO;
++ 			goto _return_free_pages_exact;
++ 		}
++ 
++ 		for (i = 0; i < dpa_bp->count; i++) {
++ 			struct bm_buffer bmb;
++  
++ 			bmb.hi = 0;
++ 			bmb.lo = dpa_bp->paddr + i * dpa_bp->size;
++ 
++ 			_errno = bman_release(dpa_bp->pool, &bmb, 1,
++ 						BMAN_RELEASE_FLAG_WAIT |
++ 						BMAN_RELEASE_FLAG_WAIT_INT);
++ 			if (_errno < 0) {
++ 				goto _return_bman_acquire;
++ 			}
++ 		}
++  	} else {
++  		devm_request_mem_region(net_dev->dev.parent, dpa_bp->paddr,
++  					dpa_bp->size * dpa_bp->count,
++  					KBUILD_MODNAME);
+ 		dpa_bp->vaddr = devm_ioremap_prot(net_dev->dev.parent,
+ 					dpa_bp->paddr,
+ 						  dpa_bp->size * dpa_bp->count,
+@@ -411,6 +248,12 @@ _dpa_bp_alloc(struct net_device *net_dev, struct list_head *list,
+ 
+ 	return 0;
+ 
++_return_bman_acquire:
++	dma_unmap_single(net_dev->dev.parent, dpa_bp->paddr,
++				dpa_bp->size * dpa_bp->count,
++				DMA_BIDIRECTIONAL);
++_return_free_pages_exact:
++	free_pages_exact(dpa_bp->vaddr, dpa_bp->size * dpa_bp->count);
+ _return_bman_free_pool:
+ 	bman_free_pool(dpa_bp->pool);
+ 
+@@ -436,13 +279,9 @@ _dpa_bp_free(struct device *dev, struct dpa_bp *dpa_bp)
+ {
+ 	uint8_t	bpid;
+ 
+-	if (dpa_bp->kernel_pool) {
+-		kfree(dpa_bp->rxhash);
+-	} else {
+-		dma_unmap_single(dev, dpa_bp->paddr,
++	dma_unmap_single(dev, dpa_bp->paddr,
+ 			dpa_bp->size * dpa_bp->count, DMA_BIDIRECTIONAL);
+-		free_pages_exact(dpa_bp->vaddr, dpa_bp->size * dpa_bp->count);
+-	}
++	free_pages_exact(dpa_bp->vaddr, dpa_bp->size * dpa_bp->count);
+ 	bpid = dpa_pool2bpid(dpa_bp);
+ 	dpa_bp_array[bpid] = 0;
+ 	bman_free_pool(dpa_bp->pool);
+@@ -631,16 +470,7 @@ dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
+ 
+ 	_errno = 0;
+ 	if (fd->format == qm_fd_sg) {
+-		struct page *page = NULL;
+-
+-		if (_dpa_bp->kernel_pool) {
+-			page = dpa_get_rxpage(_dpa_bp, _bmb.lo);
+-
+-			sgt = (typeof(sgt))(kmap(page) +
+-				(_bmb.lo & ~PAGE_MASK) + dpa_fd_offset(fd));
+-		} else
+-			sgt = (typeof(sgt))(dpa_phys2virt(_dpa_bp, &_bmb)
+-				+ dpa_fd_offset(fd));
++		sgt = (dpa_phys2virt(_dpa_bp, &_bmb) + dpa_fd_offset(fd));
+ 
+ 		i = 0;
+ 		do {
+@@ -667,31 +497,24 @@ dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
+ 					bman_get_params(dpa_bp->pool)->bpid,
+ 					_errno);
+ 				if (_errno >= 0)
+-					_errno = __errno;
+-			}
+-		} while (!sgt[i-1].final);
+-
+-		if (_dpa_bp->kernel_pool) {
+-			kunmap(page);
+-			put_page(page);
+-		}
+-	}
+-
+-	if (!_dpa_bp->kernel_pool) {
+-		__errno = bman_release(_dpa_bp->pool, &_bmb, 1,
+-				BMAN_RELEASE_FLAG_WAIT_INT);
+-		if (unlikely(__errno < 0)) {
+-			cpu_netdev_err(net_dev,
+-					"%s:%hu:%s(): bman_release(%hu) = %d\n",
+-					__file__, __LINE__, __func__,
+-					bman_get_params(_dpa_bp->pool)->bpid,
+-					_errno);
+-			if (_errno >= 0)
+-				_errno = __errno;
+-		}
+-	}
+-
+-	return _errno;
++  					_errno = __errno;
++  			}
++  		} while (!sgt[i-1].final);
++  	}
++  
++ 	__errno = bman_release(_dpa_bp->pool, &_bmb, 1, 0);
++ 	if (unlikely(__errno < 0)) {
++ 		if (netif_msg_drv(priv) && net_ratelimit())
++ 			cpu_netdev_err(net_dev, "%s:%hu:%s(): "
++  					"bman_release(%hu) = %d\n",
++  					__file__, __LINE__, __func__,
++  					bman_get_params(_dpa_bp->pool)->bpid,
++  					__errno);
++ 		if (_errno >= 0)
++ 			_errno = __errno;
++  	}
++  
++  	return _errno;
+ }
+ 
+ /* net_device */
+@@ -1312,121 +1135,20 @@ static void __cold dpa_change_rx_flags(struct net_device *net_dev, int flags)
+ 	cpu_netdev_dbg(net_dev, "%s:%s() ->\n", __file__, __func__);
+ }
+ 
+-static void dpa_rx_skb_add_page(struct sk_buff *skb, struct page *page,
+-				u32 offset, u32 size)
+-{
+-	skb_fill_page_desc(skb, skb_shinfo(skb)->nr_frags, page, offset, size);
+-
+-	skb->len	+= size;
+-	skb->data_len	+= size;
+-	skb->truesize	+= size;
+-}
+-
+-static int dpa_process_sg(struct net_device *net_dev, struct sk_buff *skb,
+-			struct dpa_bp *sgt_bp, const struct qm_fd *fd)
+-{
+-	const struct dpa_priv_s	*priv;
+-	struct dpa_bp *dpa_bp;
+-	u8 bpid;
+-	const struct qm_sg_entry *sgt;
+-	int err = 0;
+-	struct page *page;
+-	int i;
+-
+-	priv = netdev_priv(net_dev);
+-
+-	page = dpa_get_rxpage(sgt_bp, fd->addr_lo);
+-
+-	sgt = kmap(page) + (fd->addr_lo & ~PAGE_MASK) + dpa_fd_offset(fd);
+-
+-	bpid = sgt[0].bpid;
+-	dpa_bp = dpa_bpid2pool(bpid);
+-	for (i = 0; !i || !sgt[i - 1].final; i++) {
+-		struct page *newpage;
+-		unsigned int offset;
+-
+-		if (bpid != sgt[i].bpid) {
+-			bpid = sgt[i].bpid;
+-			dpa_bp = dpa_bpid2pool(bpid);
+-			if (IS_ERR(dpa_bp)) {
+-				cpu_netdev_err(net_dev, "%s:%hu:%s(): "
+-					   "Could not find pool for BPID %hu\n",
+-					   __file__, __LINE__, __func__, bpid);
+-				err = -EINVAL;
+-				goto err_bpid2pool_failed;
+-			}
+-		}
+-
+-		newpage = dpa_get_rxpage(dpa_bp, sgt[i].addr_lo);
+-
+-		offset = (sgt[i].addr_lo + sgt[i].offset) & ~PAGE_MASK;
+-		dpa_rx_skb_add_page(skb, newpage, offset, sgt[i].length);
+-
+-		/* Unmap the page */
+-		dma_unmap_page(net_dev->dev.parent, newpage->index + offset,
+-				dpa_bp->size, DMA_FROM_DEVICE);
+-	}
+-
+-	if (!__pskb_pull_tail(skb,
+-				ETH_HLEN + NN_RESERVED_SPACE(net_dev) +
+-				TT_RESERVED_SPACE(net_dev))) {
+-		cpu_netdev_err(net_dev, "%s:%hu:%s(): "
+-			       "__pskb_pull_tail() failed\n",
+-			       __file__, __LINE__, __func__);
+-
+-		err = -1;
+-		goto err_pspb_pull_failed;
+-	}
+-	kunmap(page);
+-	put_page(page);
+-
+-	return 0;
+-
+-err_pspb_pull_failed:
+-err_bpid2pool_failed:
+-	kunmap(page);
+-	put_page(page);
+-	/* Free all the buffers in the skb */
+-	dev_kfree_skb(skb);
+-	return err;
+-}
+-
+ static int dpa_process_one(struct net_device *net_dev, struct sk_buff *skb,
+ 				struct dpa_bp *dpa_bp, const struct qm_fd *fd)
+ {
+ 	int err;
+ 
+-	if (dpa_bp->kernel_pool) {
+-		struct page *page;
+-		unsigned int off = (fd->addr_lo +
+-					dpa_fd_offset(fd)) & ~PAGE_MASK;
+-
+-		page = dpa_get_rxpage(dpa_bp, fd->addr_lo);
+-
+-		dpa_rx_skb_add_page(skb, page, off, dpa_fd_length(fd));
+-
+-		dma_unmap_page(net_dev->dev.parent, page->index + off,
+-				dpa_bp->size, DMA_FROM_DEVICE);
+-
+-		if (!__pskb_pull_tail(skb, ETH_HLEN +
+-					NN_RESERVED_SPACE(net_dev) +
+-					TT_RESERVED_SPACE(net_dev))) {
+-			cpu_netdev_err(net_dev, "%s:%hu:%s(): "
+-				       "__pskb_pull_tail() failed\n",
+-				       __file__, __LINE__, __func__);
+-			return -1;
+-		}
+-	} else {
+-		memcpy(skb_put(skb, dpa_fd_length(fd)),
+-			dpa_phys2virt(dpa_bp, (const struct bm_buffer *)fd) +
+-				dpa_fd_offset(fd),
+-			dpa_fd_length(fd));
+-
+-		err = dpa_fd_release(net_dev, fd);
+-		if (err < 0) {
+-			dump_stack();
+-			panic("Can't release buffer to BM during RX\n");
+-		}
++ 	memcpy(skb_put(skb, dpa_fd_length(fd)),
++ 			dpa_phys2virt(dpa_bp, (struct bm_buffer *)fd) +
++ 			dpa_fd_offset(fd),
++ 			dpa_fd_length(fd));
++  
++ 	err = dpa_fd_release(net_dev, fd);
++ 	if (err < 0) {
++ 		dump_stack();
++ 		panic("Can't release buffer to BM during RX\n");		
+ 	}
+ 
+ 	return 0;
+@@ -1503,7 +1225,7 @@ static void __hot _dpa_rx(struct net_device		*net_dev,
+ 	dpa_bp = dpa_bpid2pool(dpa_fd->fd.bpid);
+ 	BUG_ON(IS_ERR(dpa_bp));
+ 
+-	if (dpa_fd->fd.format == qm_fd_sg && !dpa_bp->kernel_pool) {
++	if (dpa_fd->fd.format == qm_fd_sg) {
+ 		percpu_priv->stats.rx_dropped++;
+ 		cpu_netdev_err(net_dev, "%s:%hu:%s(): Dropping a SG frame\n",
+ 			       __file__, __LINE__, __func__);
+@@ -1511,12 +1233,7 @@ static void __hot _dpa_rx(struct net_device		*net_dev,
+ 	}
+ 
+ 	skb = NULL;
+-	if (dpa_bp->kernel_pool) {
+-		size = ETH_HLEN + NN_ALLOCATED_SPACE(net_dev) +
+-			TT_ALLOCATED_SPACE(net_dev);
+-		skb = __skb_dequeue(&percpu_priv->rx_recycle);
+-	} else
+-		size = dpa_fd_length(&dpa_fd->fd);
++	size = dpa_fd_length(&dpa_fd->fd);
+ 
+ 	if (skb == NULL) {
+ 		skb = __netdev_alloc_skb(net_dev, DPA_BP_HEAD + NET_IP_ALIGN + size, GFP_DPA);
+@@ -1535,10 +1252,7 @@ static void __hot _dpa_rx(struct net_device		*net_dev,
+ 	skb_reserve(skb, NET_IP_ALIGN+DPA_BP_HEAD);
+ 
+ 	/* Fill the SKB */
+-	if (dpa_fd->fd.format == qm_fd_sg)
+-		_errno = dpa_process_sg(net_dev, skb, dpa_bp, &dpa_fd->fd);
+-	else
+-		_errno = dpa_process_one(net_dev, skb, dpa_bp, &dpa_fd->fd);
++	_errno = dpa_process_one(net_dev, skb, dpa_bp, &dpa_fd->fd);
+ 
+ 	if (unlikely(_errno < 0)) {
+ 		percpu_priv->stats.rx_dropped++;
+@@ -1551,25 +1265,13 @@ static void __hot _dpa_rx(struct net_device		*net_dev,
+         fman_test_ip_manip((void *)priv->mac_dev, skb->data);
+ #endif /* CONFIG_FSL_FMAN_TEST */
+ 
+-	_errno = netif_rx_ni(skb);
+-	if (unlikely(_errno != NET_RX_SUCCESS)) {
+-		if (netif_msg_rx_status(priv))
+-			cpu_netdev_warn(net_dev, "%s:%hu:%s(): "
+-					"netif_rx_ni() = %d\n",
+-					__file__, __LINE__, __func__, _errno);
+-
++	if (unlikely(netif_receive_skb(skb) != NET_RX_SUCCESS))
+ 		percpu_priv->stats.rx_dropped++;
+-
+-		goto _return_dev_kfree_skb;
+-	}
+-
+-	net_dev->last_rx = jiffies;
+-
+-	if (dpa_bp->bp_refill_pending > dpa_bp->bp_kick_thresh)
+-		dpa_bp_refill(net_dev, dpa_bp, GFP_KERNEL);
+-
+-	return;
+-
++  
++  	net_dev->last_rx = jiffies;
++  
++  	return;
++  
+ _return_dev_kfree_skb:
+ 	dev_kfree_skb(skb);
+ _return_dpa_fd_release:
+-- 
+1.6.5.2
+
