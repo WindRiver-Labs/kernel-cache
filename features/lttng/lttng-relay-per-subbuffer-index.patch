@@ -1,0 +1,451 @@
+From 2db55b9242cb11a98c5b74df4f6f993092a0e5e5 Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Thu, 13 May 2010 19:27:39 -0400
+Subject: [PATCH 268/391] lttng-relay-per-subbuffer-index
+
+lttng relay per subbuffer index
+
+Create per-subbuffer page index in preparation to let the reader exchange the
+subbuffer with its own pages to eliminate writer-reader possible data corruption
+in flight recorder mode.
+
+Steven Rostedt, with great patience and lenghy explanations, explained to me the
+benefit of having an extra "page" (or "subbuffer") owned by the reader for
+flight-recorder mode tracing. Credits go to him for getting the idea into my
+mind.
+
+Currently, this data corruption is dealt with by checking the return value of
+the put_subbuf ioctl. If the reader position has been pushed by the writer, the
+reader knows the data it just read was corrupted.
+
+For flight recorder tracing, we always add a supplementary subbuffer to permit
+this atomic exchange.
+
+For normal tracing, given the buffer semantic does not allow the writer to
+overwrite the reader subbuffer, we never allocate this supplementary subbuffer.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@polymtl.ca>
+---
+ include/linux/ltt-relay.h |   33 +++++++++---
+ ltt/ltt-relay-alloc.c     |  132 ++++++++++++++++++++++++++++++++++++---------
+ ltt/ltt-relay-irqoff.c    |    3 +-
+ ltt/ltt-relay-locked.c    |    3 +-
+ ltt/ltt-relay-lockless.c  |    3 +-
+ 5 files changed, 137 insertions(+), 37 deletions(-)
+
+diff --git a/include/linux/ltt-relay.h b/include/linux/ltt-relay.h
+index a8c8836..d73e87e 100644
+--- a/include/linux/ltt-relay.h
++++ b/include/linux/ltt-relay.h
+@@ -5,7 +5,10 @@
+  * Copyright (C) 1999, 2000, 2001, 2002 - Karim Yaghmour (karim@opersys.com)
+  * Copyright (C) 2008 - Mathieu Desnoyers (mathieu.desnoyers@polymtl.ca)
+  *
+- * CONFIG_RELAY definitions and declarations
++ * CONFIG_RELAY definitions and declarations.
++ *
++ * Credits to Steven Rostedt for proposing to use an extra-subbuffer owned by
++ * the reader in flight recorder mode.
+  */
+ 
+ #ifndef _LINUX_LTT_RELAY_H
+@@ -30,16 +33,27 @@
+  */
+ #define LTT_RELAY_CHANNEL_VERSION		8
+ 
++struct rchan_page {
++	void *virt;			/* page virtual address (cached) */
++	struct page *page;		/* pointer to page structure */
++};
++
++struct rchan_sb {
++	struct rchan_page *pages;	/* Pointer to rchan pages for subbuf */
++};
++
+ /*
+  * Per-cpu relay channel buffer
+  */
+ struct rchan_buf {
+ 	void *chan_private;		/* private data for this buf */
+-	void **virt;			/* Array of pointers to page addr */
+-	struct page **pages;		/* Array of pointers to pages */
++	struct rchan_sb *rchan_wsb;	/* Array of rchan_sb for writer */
++	struct rchan_sb rchan_rsb;	/* rchan_sb for reader */
+ 	struct rchan *chan;		/* associated channel */
+ 	struct dentry *dentry;		/* channel file dentry */
+ 	struct kref kref;		/* channel buffer refcount */
++	void **_virt;			/* Array of pointers to page addr */
++	struct page **_pages;		/* Array of pointers to pages */
+ 	unsigned int page_count;	/* number of current buffer pages */
+ 	unsigned int cpu;		/* this buf's cpu */
+ 	unsigned int random_access;	/* buffer performs random page access */
+@@ -60,6 +74,7 @@ struct rchan {
+ 	struct list_head list;		/* for channel list */
+ 	struct dentry *parent;		/* parent dentry passed to open */
+ 	int subbuf_size_order;		/* order of sub-buffer size */
++	int extra_reader_sb;		/* bool: has extra reader subbuffer */
+ 	char base_filename[NAME_MAX];	/* saved base filename */
+ };
+ 
+@@ -232,14 +247,15 @@ memcpy_fallback:
+ static __inline__ int ltt_relay_write(struct rchan_buf *buf, size_t offset,
+ 	const void *src, size_t len)
+ {
+-	size_t index;
++	size_t sbidx, index;
+ 	ssize_t pagecpy;
+ 
+ 	offset &= buf->chan->alloc_size - 1;
+-	index = offset >> PAGE_SHIFT;
++	sbidx = offset >> buf->chan->subbuf_size_order;
++	index = (offset & (buf->chan->subbuf_size - 1)) >> PAGE_SHIFT;
+ 	pagecpy = min_t(size_t, len, (- offset) & ~PAGE_MASK);
+-	ltt_relay_do_copy(buf->virt[index] + (offset & ~PAGE_MASK),
+-			  src, pagecpy);
++	ltt_relay_do_copy(buf->rchan_wsb[sbidx].pages[index].virt
++				+ (offset & ~PAGE_MASK), src, pagecpy);
+ 
+ 	if (unlikely(len != pagecpy))
+ 		_ltt_relay_write(buf, offset, src, len, pagecpy);
+@@ -255,7 +271,8 @@ struct rchan *ltt_relay_open(const char *base_filename,
+ 			 size_t subbuf_size,
+ 			 size_t n_subbufs,
+ 			 struct rchan_callbacks *cb,
+-			 void *private_data);
++			 void *private_data,
++			 int extra_reader_sb);
+ extern void ltt_relay_close(struct rchan *chan);
+ 
+ void ltt_relay_get_chan(struct rchan *chan);
+diff --git a/ltt/ltt-relay-alloc.c b/ltt/ltt-relay-alloc.c
+index d073163..afda3c0 100644
+--- a/ltt/ltt-relay-alloc.c
++++ b/ltt/ltt-relay-alloc.c
+@@ -32,14 +32,18 @@ static LIST_HEAD(relay_channels);
+  *	@buf: the buffer struct
+  *	@size: total size of the buffer
+  */
+-static int relay_alloc_buf(struct rchan_buf *buf, size_t *size)
++static int relay_alloc_buf(struct rchan_buf *buf, size_t *size,
++			   size_t n_subbufs, int extra_reader_sb)
+ {
+-	long i, n_pages;
++	long i, j, n_pages, n_pages_per_sb, page_idx = 0;
+ 	struct page **pages;
+ 	void **virt;
+ 
+ 	*size = PAGE_ALIGN(*size);
+ 	n_pages = *size >> PAGE_SHIFT;
++	n_pages_per_sb = n_pages >> get_count_order(n_subbufs);
++	if (extra_reader_sb)
++		n_pages += n_pages_per_sb;	/* Add pages for reader */
+ 
+ 	pages = kmalloc_node(max_t(size_t, sizeof(*pages) * n_pages,
+ 				   1 << INTERNODE_CACHE_SHIFT),
+@@ -61,8 +65,59 @@ static int relay_alloc_buf(struct rchan_buf *buf, size_t *size)
+ 		virt[i] = page_address(pages[i]);
+ 	}
+ 	buf->page_count = n_pages;
+-	buf->pages = pages;
+-	buf->virt = virt;
++	buf->_pages = pages;
++	buf->_virt = virt;
++
++	/* Allocate write-side page index */
++	buf->rchan_wsb = kzalloc_node(max_t(size_t,
++				sizeof(struct rchan_sb) * n_subbufs,
++				1 << INTERNODE_CACHE_SHIFT),
++				GFP_KERNEL, cpu_to_node(buf->cpu));
++	if (unlikely(!buf->rchan_wsb))
++		goto depopulate;
++
++	for (i = 0; i < n_subbufs; i++) {
++		buf->rchan_wsb[i].pages =
++			kzalloc_node(max_t(size_t,
++				sizeof(struct rchan_page) * n_pages_per_sb,
++				1 << INTERNODE_CACHE_SHIFT),
++				GFP_KERNEL, cpu_to_node(buf->cpu));
++		if (!buf->rchan_wsb[i].pages)
++			goto free_rchan_wsb;
++	}
++
++	if (extra_reader_sb) {
++		/* Allocate read-side page index */
++		buf->rchan_rsb.pages =
++			kzalloc_node(max_t(size_t,
++				sizeof(struct rchan_page) * n_pages_per_sb,
++				1 << INTERNODE_CACHE_SHIFT),
++				GFP_KERNEL, cpu_to_node(buf->cpu));
++		if (unlikely(!buf->rchan_rsb.pages))
++			goto free_rchan_wsb;
++	} else {
++		buf->rchan_rsb.pages = NULL;
++	}
++
++	/* Assign pages to write-side page index */
++	for (i = 0; i < n_subbufs; i++) {
++		for (j = 0; j < n_pages_per_sb; j++) {
++			WARN_ON(page_idx > n_pages);
++			buf->rchan_wsb[i].pages[j].virt = virt[page_idx];
++			buf->rchan_wsb[i].pages[j].page = pages[page_idx];
++			page_idx++;
++		}
++	}
++
++	if (extra_reader_sb) {
++		for (j = 0; j < n_pages_per_sb; j++) {
++			WARN_ON(page_idx > n_pages);
++			buf->rchan_rsb.pages[j].virt = virt[page_idx];
++			buf->rchan_rsb.pages[j].page = pages[page_idx];
++			page_idx++;
++		}
++	}
++
+ 	/*
+ 	 * If kmalloc ever uses vmalloc underneath, make sure the buffer pages
+ 	 * will not fault.
+@@ -70,6 +125,10 @@ static int relay_alloc_buf(struct rchan_buf *buf, size_t *size)
+ 	vmalloc_sync_all();
+ 	return 0;
+ 
++free_rchan_wsb:
++	for (i = 0; i < n_subbufs; i++)
++		kfree(buf->rchan_wsb[i].pages);
++	kfree(buf->rchan_wsb);
+ depopulate:
+ 	/*
+ 	 * Free all pages from [ i - 1 down to 0 ].
+@@ -99,7 +158,8 @@ static struct rchan_buf *relay_create_buf(struct rchan *chan, int cpu)
+ 		return NULL;
+ 
+ 	buf->cpu = cpu;
+-	ret = relay_alloc_buf(buf, &chan->alloc_size);
++	ret = relay_alloc_buf(buf, &chan->alloc_size, chan->n_subbufs,
++			      chan->extra_reader_sb);
+ 	if (ret)
+ 		goto free_buf;
+ 
+@@ -146,11 +206,19 @@ static void relay_destroy_buf(struct rchan_buf *buf)
+ 	struct page **pages;
+ 	long i;
+ 
+-	pages = buf->pages;
++	/* Destroy index */
++	if (chan->extra_reader_sb)
++		kfree(buf->rchan_rsb.pages);
++	for (i = 0; i < chan->n_subbufs; i++)
++		kfree(buf->rchan_wsb[i].pages);
++	kfree(buf->rchan_wsb);
++
++	/* Destroy pages */
++	pages = buf->_pages;
+ 	for (i = 0; i < buf->page_count; i++)
+ 		__free_page(pages[i]);
+-	kfree(buf->pages);
+-	kfree(buf->virt);
++	kfree(buf->_pages);
++	kfree(buf->_virt);
+ 	chan->buf[buf->cpu] = NULL;
+ 	kfree(buf);
+ 	kref_put(&chan->kref, relay_destroy_channel);
+@@ -349,6 +417,7 @@ static int __cpuinit relay_hotcpu_callback(struct notifier_block *nb,
+  *	@n_subbufs: number of sub-buffers
+  *	@cb: client callback functions
+  *	@private_data: user-defined data
++ *	@extra_reader_sb: allocate an extra subbuffer for the reader
+  *
+  *	Returns channel pointer if successful, %NULL otherwise.
+  *
+@@ -362,7 +431,8 @@ struct rchan *ltt_relay_open(const char *base_filename,
+ 			 size_t subbuf_size,
+ 			 size_t n_subbufs,
+ 			 struct rchan_callbacks *cb,
+-			 void *private_data)
++			 void *private_data,
++			 int extra_reader_sb)
+ {
+ 	unsigned int i;
+ 	struct rchan *chan;
+@@ -383,6 +453,7 @@ struct rchan *ltt_relay_open(const char *base_filename,
+ 	chan->alloc_size = FIX_SIZE(subbuf_size * n_subbufs);
+ 	chan->parent = parent;
+ 	chan->private_data = private_data;
++	chan->extra_reader_sb = extra_reader_sb;
+ 	strlcpy(chan->base_filename, base_filename, NAME_MAX);
+ 	setup_callbacks(chan, cb);
+ 	kref_init(&chan->kref);
+@@ -447,13 +518,14 @@ EXPORT_SYMBOL_GPL(ltt_relay_close);
+ void _ltt_relay_write(struct rchan_buf *buf, size_t offset,
+ 	const void *src, size_t len, ssize_t pagecpy)
+ {
+-	size_t index;
++	size_t sbidx, index;
+ 
+ 	do {
+ 		len -= pagecpy;
+ 		src += pagecpy;
+ 		offset += pagecpy;
+-		index = offset >> PAGE_SHIFT;
++		sbidx = offset >> buf->chan->subbuf_size_order;
++		index = (offset & (buf->chan->subbuf_size - 1)) >> PAGE_SHIFT;
+ 
+ 		/*
+ 		 * Underlying layer should never ask for writes across
+@@ -462,7 +534,7 @@ void _ltt_relay_write(struct rchan_buf *buf, size_t offset,
+ 		WARN_ON(offset >= buf->chan->alloc_size);
+ 
+ 		pagecpy = min_t(size_t, len, PAGE_SIZE - (offset & ~PAGE_MASK));
+-		ltt_relay_do_copy(buf->virt[index]
++		ltt_relay_do_copy(buf->rchan_wsb[sbidx].pages[index].virt
+ 				+ (offset & ~PAGE_MASK), src, pagecpy);
+ 	} while (unlikely(len != pagecpy));
+ }
+@@ -478,27 +550,30 @@ EXPORT_SYMBOL_GPL(_ltt_relay_write);
+ int ltt_relay_read(struct rchan_buf *buf, size_t offset,
+ 	void *dest, size_t len)
+ {
+-	size_t index;
++	size_t sbidx, index;
+ 	ssize_t pagecpy, orig_len;
+ 
+ 	orig_len = len;
+ 	offset &= buf->chan->alloc_size - 1;
+-	index = offset >> PAGE_SHIFT;
++	sbidx = offset >> buf->chan->subbuf_size_order;
++	index = (offset & (buf->chan->subbuf_size - 1)) >> PAGE_SHIFT;
+ 	if (unlikely(!len))
+ 		return 0;
+ 	for (;;) {
+ 		pagecpy = min_t(size_t, len, PAGE_SIZE - (offset & ~PAGE_MASK));
+-		memcpy(dest, buf->virt[index] + (offset & ~PAGE_MASK), pagecpy);
++		memcpy(dest, buf->rchan_wsb[sbidx].pages[index].virt
++			+ (offset & ~PAGE_MASK), pagecpy);
+ 		len -= pagecpy;
+ 		if (likely(!len))
+ 			break;
+ 		dest += pagecpy;
+ 		offset += pagecpy;
+-		index = offset >> PAGE_SHIFT;
++		index = (offset & (buf->chan->subbuf_size - 1)) >> PAGE_SHIFT;
+ 		/*
+ 		 * Underlying layer should never ask for reads across
+ 		 * subbuffers.
+ 		 */
++		WARN_ON(sbidx != offset >> buf->chan->subbuf_size_order);
+ 		WARN_ON(offset >= buf->chan->alloc_size);
+ 	}
+ 	return orig_len;
+@@ -517,15 +592,17 @@ EXPORT_SYMBOL_GPL(ltt_relay_read);
+ int ltt_relay_read_cstr(struct rchan_buf *buf, size_t offset,
+ 		void *dest, size_t len)
+ {
+-	size_t index;
++	size_t sbidx, index;
+ 	ssize_t pagecpy, pagelen, strpagelen, orig_offset;
+ 	char *str;
+ 
+ 	offset &= buf->chan->alloc_size - 1;
+-	index = offset >> PAGE_SHIFT;
++	sbidx = offset >> buf->chan->subbuf_size_order;
++	index = (offset & (buf->chan->subbuf_size - 1)) >> PAGE_SHIFT;
+ 	orig_offset = offset;
+ 	for (;;) {
+-		str = (char *)buf->virt[index] + (offset & ~PAGE_MASK);
++		str = (char *)buf->rchan_wsb[sbidx].pages[index].virt
++				+ (offset & ~PAGE_MASK);
+ 		pagelen = PAGE_SIZE - (offset & ~PAGE_MASK);
+ 		strpagelen = strnlen(str, pagelen);
+ 		if (len) {
+@@ -535,13 +612,14 @@ int ltt_relay_read_cstr(struct rchan_buf *buf, size_t offset,
+ 			dest += pagecpy;
+ 		}
+ 		offset += strpagelen;
+-		index = offset >> PAGE_SHIFT;
++		index = (offset & (buf->chan->subbuf_size - 1)) >> PAGE_SHIFT;
+ 		if (strpagelen < pagelen)
+ 			break;
+ 		/*
+ 		 * Underlying layer should never ask for reads across
+ 		 * subbuffers.
+ 		 */
++		WARN_ON(sbidx != offset >> buf->chan->subbuf_size_order);
+ 		WARN_ON(offset >= buf->chan->alloc_size);
+ 	}
+ 	if (len)
+@@ -557,11 +635,12 @@ EXPORT_SYMBOL_GPL(ltt_relay_read_cstr);
+  */
+ struct page *ltt_relay_read_get_page(struct rchan_buf *buf, size_t offset)
+ {
+-	size_t index;
++	size_t sbidx, index;
+ 
+ 	offset &= buf->chan->alloc_size - 1;
+-	index = offset >> PAGE_SHIFT;
+-	return buf->pages[index];
++	sbidx = offset >> buf->chan->subbuf_size_order;
++	index = (offset & (buf->chan->subbuf_size - 1)) >> PAGE_SHIFT;
++	return buf->rchan_wsb[sbidx].pages[index].page;
+ }
+ EXPORT_SYMBOL_GPL(ltt_relay_read_get_page);
+ 
+@@ -577,11 +656,12 @@ EXPORT_SYMBOL_GPL(ltt_relay_read_get_page);
+  */
+ void *ltt_relay_offset_address(struct rchan_buf *buf, size_t offset)
+ {
+-	size_t index;
++	size_t sbidx, index;
+ 
+ 	offset &= buf->chan->alloc_size - 1;
+-	index = offset >> PAGE_SHIFT;
+-	return buf->virt[index] + (offset & ~PAGE_MASK);
++	sbidx = offset >> buf->chan->subbuf_size_order;
++	index = (offset & (buf->chan->subbuf_size - 1)) >> PAGE_SHIFT;
++	return buf->rchan_wsb[sbidx].pages[index].virt + (offset & ~PAGE_MASK);
+ }
+ EXPORT_SYMBOL_GPL(ltt_relay_offset_address);
+ 
+diff --git a/ltt/ltt-relay-irqoff.c b/ltt/ltt-relay-irqoff.c
+index b7b751a..8abf61d 100644
+--- a/ltt/ltt-relay-irqoff.c
++++ b/ltt/ltt-relay-irqoff.c
+@@ -937,7 +937,8 @@ static int ltt_relay_create_channel(const char *trace_name,
+ 			subbuf_size,
+ 			n_subbufs,
+ 			&trace->callbacks,
+-			ltt_chan);
++			ltt_chan,
++			overwrite);
+ 	tmpname_len = strlen(tmpname);
+ 	if (tmpname_len > 0) {
+ 		/* Remove final _ for pretty printing */
+diff --git a/ltt/ltt-relay-locked.c b/ltt/ltt-relay-locked.c
+index ab4db4c..f6517f0 100644
+--- a/ltt/ltt-relay-locked.c
++++ b/ltt/ltt-relay-locked.c
+@@ -880,7 +880,8 @@ static int ltt_relay_create_channel(const char *trace_name,
+ 			subbuf_size,
+ 			n_subbufs,
+ 			&trace->callbacks,
+-			ltt_chan);
++			ltt_chan,
++			overwrite);
+ 	tmpname_len = strlen(tmpname);
+ 	if (tmpname_len > 0) {
+ 		/* Remove final _ for pretty printing */
+diff --git a/ltt/ltt-relay-lockless.c b/ltt/ltt-relay-lockless.c
+index fddbe02..9847702 100644
+--- a/ltt/ltt-relay-lockless.c
++++ b/ltt/ltt-relay-lockless.c
+@@ -938,7 +938,8 @@ static int ltt_relay_create_channel(const char *trace_name,
+ 			subbuf_size,
+ 			n_subbufs,
+ 			&trace->callbacks,
+-			ltt_chan);
++			ltt_chan,
++			overwrite);
+ 	tmpname_len = strlen(tmpname);
+ 	if (tmpname_len > 0) {
+ 		/* Remove final _ for pretty printing */
+-- 
+1.6.5.2
+
