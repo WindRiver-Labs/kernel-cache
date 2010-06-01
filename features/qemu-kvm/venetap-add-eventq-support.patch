@@ -1,0 +1,341 @@
+From 16555d41966575715b353d73abd4d05d2b303b14 Mon Sep 17 00:00:00 2001
+From: Gregory Haskins <ghaskins@novell.com>
+Date: Tue, 22 Sep 2009 23:25:20 -0400
+Subject: [PATCH 051/119] venetap: add eventq support
+
+Adds the host-side support for an event-channel between the host and
+guest.  We will use this later in the series.
+
+Signed-off-by: Gregory Haskins <ghaskins@novell.com>
+---
+ kernel/vbus/devices/venet/device.c      |  192 ++++++++++++++++++++++++++++++-
+ kernel/vbus/devices/venet/tap.c         |    1 +
+ kernel/vbus/devices/venet/venetdevice.h |    7 +
+ 3 files changed, 197 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/vbus/devices/venet/device.c b/kernel/vbus/devices/venet/device.c
+index 2b89fc9..75e91ed 100644
+--- a/kernel/vbus/devices/venet/device.c
++++ b/kernel/vbus/devices/venet/device.c
+@@ -61,12 +61,19 @@ static int maxcount = 2048;
+ module_param(maxcount, int, 0600);
+ MODULE_PARM_DESC(maxcount, "maximum size for rx/tx ioq ring");
+ 
++/* This must be defined as the largest event we can generate */
++#define EVQ_EVSIZE sizeof(struct venet_event_linkstate)
++
+ #define PMTD_POOL_ID 100
++#define EVQ_DPOOL_ID 101
++#define EVQ_QUEUE_ID 102
+ 
+ static void venetdev_tx_isr(struct ioq_notifier *notifier);
+ static int venetdev_rx_thread(void *__priv);
+ static int venetdev_tx_thread(void *__priv);
+ 
++static void evq_send_linkstatus(struct venetdev *priv, bool status);
++
+ static int
+ venetdev_queue_init(struct venetdev_queue *q,
+ 		    struct vbus_shm *shm,
+@@ -119,6 +126,52 @@ venetdev_pmtd_init(struct venetdev *priv,
+ 	return 0;
+ }
+ 
++static int
++venetdev_evq_dpool_init(struct venetdev *priv,
++			struct vbus_shm *shm, struct shm_signal *signal)
++{
++	if (signal || !priv->vbus.evq.enabled)
++		return -EINVAL;
++
++	if (priv->vbus.evq.shm)
++		return -EEXIST;
++
++	priv->vbus.evq.shm = shm;
++
++	return 0;
++}
++
++static int
++venetdev_evq_queue_init(struct venetdev *priv,
++			struct vbus_shm *shm, struct shm_signal *signal)
++{
++	int ret;
++
++	if (!signal || !priv->vbus.evq.shm)
++		return -EINVAL;
++
++	if (priv->vbus.evq.queue.queue)
++		return -EEXIST;
++
++	ret = venetdev_queue_init(&priv->vbus.evq.queue, shm, signal, NULL);
++	if (ret < 0)
++		return ret;
++
++	/*
++	 * Validate that the dpool size is sane w.r.t. the number of
++	 * descriptors in the ring
++	 */
++	if (ioq_size(priv->vbus.evq.queue.queue)*EVQ_EVSIZE
++	    != priv->vbus.evq.shm->len) {
++		ioq_put(priv->vbus.evq.queue.queue);
++		priv->vbus.evq.queue.queue = NULL;
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++
+ /* Assumes priv->lock is held */
+ static void
+ venetdev_txq_notify_inc(struct venetdev *priv)
+@@ -242,6 +295,71 @@ venetdev_change_mtu(struct net_device *dev, int new_mtu)
+ 
+ /*
+  * ---------------------------
++ * EVQ support
++ * ---------------------------
++ */
++
++static void
++evq_send_event(struct venetdev *priv, struct venet_event_header *header)
++{
++	struct ioq_iterator         iter;
++	struct ioq                 *ioq = priv->vbus.evq.queue.queue;
++	int                         ret;
++	size_t                      offset;
++	void                       *ptr;
++	unsigned long               flags;
++
++	BUG_ON(!priv->vbus.evq.enabled);
++	BUG_ON(!priv->vbus.evq.queue.queue);
++	BUG_ON(header->size > EVQ_EVSIZE);
++
++	spin_lock_irqsave(&priv->vbus.evq.lock, flags);
++
++	ret = ioq_iter_init(ioq, &iter, ioq_idxtype_inuse, 0);
++	BUG_ON(ret < 0);
++
++	ret = ioq_iter_seek(&iter, ioq_seek_tail, 0, 0);
++	BUG_ON(ret < 0);
++
++	/* FIXME */
++	BUG_ON(!iter.desc->sown);
++
++	offset = (size_t)iter.desc->ptr;
++	ptr = priv->vbus.evq.shm->ptr + offset;
++
++	if ((offset + header->size) > priv->vbus.evq.shm->len) {
++		SHM_SIGNAL_FAULT(ioq->signal, "offset overrun: %d+%d > %d\n",
++				 offset, header->size, priv->vbus.evq.shm->len);
++		goto out;
++	}
++
++	memcpy(ptr, header, header->size);
++
++	ret = ioq_iter_push(&iter, 0);
++	BUG_ON(ret < 0);
++
++out:
++	spin_unlock_irqrestore(&priv->vbus.evq.lock, flags);
++
++	ioq_signal(ioq, 0);
++}
++
++static void
++evq_send_linkstatus(struct venetdev *priv, bool status)
++{
++	struct venet_event_linkstate event = {
++		.header = {
++			.size = sizeof(struct venet_event_linkstate),
++			.id = VENET_EVENT_LINKSTATE,
++		},
++		.state = status ? 1 : 0,
++	};
++
++	evq_send_event(priv, &event.header);
++}
++
++/*
++ * ---------------------------
+  * Scatter-Gather support
+  * ---------------------------
+  */
+@@ -536,7 +654,7 @@ venetdev_rx(struct venetdev *priv)
+ 
+ 		skb = dev_alloc_skb(len + NET_IP_ALIGN);
+ 		if (unlikely(!skb)) {
+-			printk(KERN_INFO "VENETTAP: skb alloc failed:"	\
++			printk(KERN_INFO "VENETDEV: skb alloc failed:"	\
+ 			       " memory squeeze.\n");
+ 			priv->netif.stats.rx_errors++;
+ 			priv->netif.stats.rx_dropped++;
+@@ -842,7 +960,7 @@ venetdev_netdev_tx(struct sk_buff *skb, struct net_device *dev)
+ 		/*
+ 		 * We have a link-down condition
+ 		 */
+-		printk(KERN_ERR "VENETTAP: tx on link down\n");
++		printk(KERN_ERR "VENETDEV: tx on link down\n");
+ 		goto flowcontrol;
+ 	}
+ 
+@@ -996,6 +1114,9 @@ venetdev_vlink_up(struct venetdev *priv)
+ 
+ 	venetdev_check_netif_congestion(priv);
+ 
++	/* FIXME: we always assume the link is up for now */
++	evq_send_linkstatus(priv, true);
++
+ 	ioq_notify_enable(priv->vbus.rxq.queue, 0);
+ 
+ out:
+@@ -1081,6 +1202,24 @@ venetdev_negcap_sg(struct venetdev *priv, u32 requested)
+ 	return ret;
+ }
+ 
++static u32
++venetdev_negcap_evq(struct venetdev *priv, u32 requested)
++{
++	u32 available = VENET_CAP_EVQ_LINKSTATE;
++	u32 ret;
++
++	ret = available & requested;
++
++	if (ret) {
++		priv->vbus.evq.enabled = true;
++
++		if (ret & VENET_CAP_EVQ_LINKSTATE)
++			priv->vbus.evq.linkstate = true;
++	}
++
++	return ret;
++}
++
+ /*
+  * Negotiate Capabilities - This function is provided so that the
+  * interface may be extended without breaking ABI compatability
+@@ -1111,6 +1250,9 @@ venetdev_negcap(struct venetdev *priv, void *data, unsigned long len)
+ 	case VENET_CAP_GROUP_SG:
+ 		caps.bits = venetdev_negcap_sg(priv, caps.bits);
+ 		break;
++	case VENET_CAP_GROUP_EVENTQ:
++		caps.bits = venetdev_negcap_evq(priv, caps.bits);
++		break;
+ 	default:
+ 		caps.bits = 0;
+ 		break;
+@@ -1187,7 +1329,6 @@ venetdev_flushrx(struct venetdev *priv)
+ 	return 0;
+ }
+ 
+-
+ void venetdev_init(struct venetdev *device, struct net_device *dev)
+ {
+ 	device->vbus.rx_ops      = &venetdev_flat_rx_ops;
+@@ -1212,6 +1353,37 @@ void venetdev_init(struct venetdev *device, struct net_device *dev)
+ 
+ }
+ 
++static int
++venetdev_evqquery(struct venetdev *priv, void *data, unsigned long len)
++{
++	struct vbus_memctx *ctx = priv->vbus.ctx;
++	struct venet_eventq_query query;
++	int ret;
++
++	if (len != sizeof(query))
++		return -EINVAL;
++
++	if (priv->vbus.link)
++		return -EINVAL;
++
++	ret = ctx->ops->copy_from(ctx, &query, data, sizeof(query));
++	if (ret)
++		return -EFAULT;
++
++	if (query.flags)
++		return -EINVAL;
++
++	query.evsize = EVQ_EVSIZE;
++	query.dpid   = EVQ_DPOOL_ID;
++	query.qid    = EVQ_QUEUE_ID;
++
++	ret = ctx->ops->copy_to(ctx, data, &query, sizeof(query));
++	if (ret)
++		return -EFAULT;
++
++	return 0;
++}
++
+ /*
+  * This is called whenever a driver wants to perform a synchronous
+  * "function call" to our device.  It is similar to the notion of
+@@ -1242,6 +1414,8 @@ venetdev_vlink_call(struct vbus_connection *conn,
+ 		return venetdev_flushrx(priv);
+ 	case VENET_FUNC_PMTDQUERY:
+ 		return PMTD_POOL_ID;
++	case VENET_FUNC_EVQQUERY:
++		return venetdev_evqquery(priv, data, len);
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1277,6 +1451,10 @@ venetdev_vlink_shm(struct vbus_connection *conn,
+ 					   venetdev_rx_isr);
+ 	case PMTD_POOL_ID:
+ 		return venetdev_pmtd_init(priv, shm, signal);
++	case EVQ_DPOOL_ID:
++		return venetdev_evq_dpool_init(priv, shm, signal);
++	case EVQ_QUEUE_ID:
++		return venetdev_evq_queue_init(priv, shm, signal);
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1333,6 +1511,14 @@ venetdev_vlink_release(struct vbus_connection *conn)
+ 		vbus_shm_put(priv->vbus.pmtd.shm);
+ 	priv->vbus.pmtd.shm = NULL;
+ 	priv->vbus.pmtd.enabled = false;
++
++	if (priv->vbus.evq.shm)
++		vbus_shm_put(priv->vbus.evq.shm);
++	if (priv->vbus.evq.queue.queue)
++		venetdev_queue_release(&priv->vbus.evq.queue);
++	priv->vbus.evq.shm = NULL;
++	priv->vbus.evq.enabled = false;
++	priv->vbus.evq.linkstate = false;
+ }
+ 
+ /*
+diff --git a/kernel/vbus/devices/venet/tap.c b/kernel/vbus/devices/venet/tap.c
+index 44b8827..b7612ee 100644
+--- a/kernel/vbus/devices/venet/tap.c
++++ b/kernel/vbus/devices/venet/tap.c
+@@ -244,6 +244,7 @@ venettap_device_create(struct vbus_devclass *dc,
+ 	memset(priv, 0, sizeof(*priv));
+ 
+ 	spin_lock_init(&priv->lock);
++	spin_lock_init(&priv->vbus.evq.lock);
+ 	random_ether_addr(priv->hmac);
+ 	random_ether_addr(priv->cmac);
+ 
+diff --git a/kernel/vbus/devices/venet/venetdevice.h b/kernel/vbus/devices/venet/venetdevice.h
+index 2a32e5a..97bd630 100644
+--- a/kernel/vbus/devices/venet/venetdevice.h
++++ b/kernel/vbus/devices/venet/venetdevice.h
+@@ -86,6 +86,13 @@ struct venetdev {
+ 			struct vbus_shm     *shm;
+ 			int                  enabled:1;
+ 		} pmtd;
++		struct {
++			spinlock_t             lock;
++			struct vbus_shm       *shm;
++			struct venetdev_queue  queue;
++			int                    enabled:1;
++			int                    linkstate:1;
++		} evq;
+ 		int                          connected:1;
+ 		int                          opened:1;
+ 		int                          link:1;
+-- 
+1.6.5.2
+

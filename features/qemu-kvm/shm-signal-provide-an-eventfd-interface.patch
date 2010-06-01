@@ -1,0 +1,201 @@
+From c00dcea91cac2ab209ecc8834de80ab6fda6061b Mon Sep 17 00:00:00 2001
+From: Gregory Haskins <ghaskins@novell.com>
+Date: Fri, 31 Jul 2009 09:39:47 -0400
+Subject: [PATCH 016/119] shm-signal: provide an eventfd interface
+
+This patch creates a helper function that allows an eventfd to be used
+as a source of shm_signal wakeups.
+
+Signed-off-by: Gregory Haskins <ghaskins@novell.com>
+---
+ include/linux/shm_signal.h |   15 +++++
+ lib/Kconfig                |    1 +
+ lib/shm_signal.c           |  123 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 139 insertions(+), 0 deletions(-)
+
+diff --git a/include/linux/shm_signal.h b/include/linux/shm_signal.h
+index 21cf750..f31513b 100644
+--- a/include/linux/shm_signal.h
++++ b/include/linux/shm_signal.h
+@@ -57,6 +57,10 @@ struct shm_signal_desc {
+ #ifdef __KERNEL__
+ 
+ #include <linux/kref.h>
++#include <linux/eventfd.h>
++#include <linux/wait.h>
++#include <linux/poll.h>
++#include <linux/file.h>
+ #include <linux/interrupt.h>
+ 
+ struct shm_signal_notifier {
+@@ -184,6 +188,17 @@ int shm_signal_disable(struct shm_signal *s, int flags);
+  **/
+ int shm_signal_inject(struct shm_signal *s, int flags);
+ 
++/**
++ * shm_signal_eventfd_bind() - Bind an eventfd to a SHM_SIGNAL
++ * @s:        SHM_SIGNAL context
++ *
++ * Binds an eventfd to the shm_signal such that any signal to the eventfd
++ * will trigger a notifier->signal() callback on the shm_signal.
++ *
++ **/
++int shm_signal_eventfd_bindfd(struct shm_signal *signal, int fd);
++int shm_signal_eventfd_bindfile(struct shm_signal *signal, struct file *file);
++
+ #endif /* __KERNEL__ */
+ 
+ #endif /* _LINUX_SHM_SIGNAL_H */
+diff --git a/lib/Kconfig b/lib/Kconfig
+index 30403e0..1130486 100644
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@ -212,6 +212,7 @@ config LRU_CACHE
+ 
+ config SHM_SIGNAL
+ 	boolean "SHM Signal - Generic shared-memory signaling mechanism"
++	select EVENTFD
+ 	default n
+ 	help
+ 	 Provides a shared-memory based signaling mechansim to indicate
+diff --git a/lib/shm_signal.c b/lib/shm_signal.c
+index fbba74f..3ea8c66 100644
+--- a/lib/shm_signal.c
++++ b/lib/shm_signal.c
+@@ -23,6 +23,7 @@
+ #include <linux/module.h>
+ #include <linux/interrupt.h>
+ #include <linux/shm_signal.h>
++#include <linux/workqueue.h>
+ 
+ int shm_signal_enable(struct shm_signal *s, int flags)
+ {
+@@ -190,3 +191,125 @@ void shm_signal_init(struct shm_signal *s, enum shm_signal_locality locale,
+ 	s->desc     = desc;
+ }
+ EXPORT_SYMBOL_GPL(shm_signal_init);
++
++/*
++ * ---------------------------------------------
++ * eventfd interface
++ *
++ * Allows a shm_signal to be triggered using a pair of eventfds
++ * ---------------------------------------------
++ */
++
++struct _eventfd_signal {
++	struct eventfd_ctx            *eventfd;
++	struct shm_signal             *signal;
++	poll_table                     pt;
++	wait_queue_head_t             *wqh;
++	wait_queue_t                   wait;
++	struct work_struct             shutdown;
++};
++
++static void
++eventfd_signal_shutdown(struct work_struct *work)
++{
++	struct _eventfd_signal *_signal;
++
++	_signal = container_of(work, struct _eventfd_signal, shutdown);
++
++	shm_signal_put(_signal->signal);
++	eventfd_ctx_put(_signal->eventfd);
++	kfree(_signal);
++}
++
++/*
++ * Called with wqh->lock held and interrupts disabled
++ */
++static int
++eventfd_signal_wakeup(wait_queue_t *wait, unsigned mode, int sync, void *key)
++{
++	struct _eventfd_signal *_signal;
++	unsigned long flags = (unsigned long)key;
++
++	_signal = container_of(wait, struct _eventfd_signal, wait);
++
++	if (flags & POLLIN)
++		/* An event has been signaled */
++		_shm_signal_wakeup(_signal->signal);
++
++	if (flags & POLLHUP) {
++		/* The eventfd is closing, detach.. */
++		__remove_wait_queue(_signal->wqh, &_signal->wait);
++		schedule_work(&_signal->shutdown);
++	}
++
++	return 0;
++}
++
++static void
++eventfd_signal_ptable(struct file *file, wait_queue_head_t *wqh, poll_table *pt)
++{
++	struct _eventfd_signal *_signal;
++
++	_signal = container_of(pt, struct _eventfd_signal, pt);
++
++	_signal->wqh = wqh;
++	add_wait_queue(wqh, &_signal->wait);
++}
++
++int shm_signal_eventfd_bindfile(struct shm_signal *signal, struct file *file)
++{
++	struct _eventfd_signal *_signal;
++	struct eventfd_ctx *eventfd = NULL;
++	int ret = -EINVAL;
++
++	_signal = kzalloc(sizeof(*_signal), GFP_KERNEL);
++	if (!_signal)
++		return -ENOMEM;
++
++	eventfd = eventfd_ctx_fileget(file);
++	if (IS_ERR(eventfd)) {
++		ret = PTR_ERR(eventfd);
++		goto fail;
++	}
++
++	_signal->eventfd = eventfd;
++	_signal->signal  = signal;
++	INIT_WORK(&_signal->shutdown, eventfd_signal_shutdown);
++
++	init_waitqueue_func_entry(&_signal->wait, eventfd_signal_wakeup);
++	init_poll_funcptr(&_signal->pt, eventfd_signal_ptable);
++
++	file->f_op->poll(file, &_signal->pt);
++
++	return 0;
++
++fail:
++	if (eventfd && !IS_ERR(eventfd))
++		eventfd_ctx_put(eventfd);
++
++	kfree(_signal);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(shm_signal_eventfd_bindfile);
++
++int shm_signal_eventfd_bindfd(struct shm_signal *signal, int fd)
++{
++	struct file *file = NULL;
++	int ret = -EINVAL;
++
++	file = eventfd_fget(fd);
++	if (IS_ERR(file)) {
++		ret = PTR_ERR(file);
++		goto out;
++	}
++
++	ret = shm_signal_eventfd_bindfile(signal, file);
++
++out:
++	if (file && !IS_ERR(file))
++		fput(file);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(shm_signal_eventfd_bindfd);
+-- 
+1.6.5.2
+

@@ -1,0 +1,202 @@
+From 8591120bd53cadccc7ad318a93683c726a5d2b5c Mon Sep 17 00:00:00 2001
+From: Gregory Haskins <ghaskins@novell.com>
+Date: Wed, 26 Aug 2009 20:54:28 -0400
+Subject: [PATCH 034/119] venettap: add pre-mapped tx descriptor support
+
+Signed-off-by: Gregory Haskins <ghaskins@novell.com>
+---
+ kernel/vbus/devices/venet-tap.c |   89 ++++++++++++++++++++++++++++++++-------
+ 1 files changed, 74 insertions(+), 15 deletions(-)
+
+diff --git a/kernel/vbus/devices/venet-tap.c b/kernel/vbus/devices/venet-tap.c
+index b96fa1f..b1e90f6 100644
+--- a/kernel/vbus/devices/venet-tap.c
++++ b/kernel/vbus/devices/venet-tap.c
+@@ -64,6 +64,8 @@ static int maxcount = 2048;
+ module_param(maxcount, int, 0600);
+ MODULE_PARM_DESC(maxcount, "maximum size for rx/tx ioq ring");
+ 
++#define PMTD_POOL_ID 100
++
+ static void venettap_tx_isr(struct ioq_notifier *notifier);
+ static int venettap_rx_thread(void *__priv);
+ static int venettap_tx_thread(void *__priv);
+@@ -125,10 +127,13 @@ struct venettap {
+ 		wait_queue_head_t            rx_empty;
+ 		struct {
+ 			char                 buf[MAX_VSG_DESC_SIZE];
+-			struct venet_sg     *desc;
+ 			size_t               len;
+ 			int                  enabled:1;
+ 		} sg;
++		struct {
++			struct vbus_shm     *shm;
++			int                  enabled:1;
++		} pmtd;
+ 		int                          connected:1;
+ 		int                          opened:1;
+ 		int                          link:1;
+@@ -178,6 +183,21 @@ venettap_queue_release(struct venettap_queue *q)
+ 	q->queue = NULL;
+ }
+ 
++static int
++venettap_pmtd_init(struct venettap *priv,
++		   struct vbus_shm *shm, struct shm_signal *signal)
++{
++	if (signal || !priv->vbus.pmtd.enabled)
++		return -EINVAL;
++
++	if (priv->vbus.pmtd.shm)
++		return -EEXIST;
++
++	priv->vbus.pmtd.shm = shm;
++
++	return 0;
++}
++
+ /* Assumes priv->lock is held */
+ static void
+ venettap_txq_notify_inc(struct venettap *priv)
+@@ -324,29 +344,56 @@ venettap_change_mtu(struct net_device *dev, int new_mtu)
+ static int
+ venettap_sg_decode(struct venettap *priv, void *ptr, int len)
+ {
+-	struct venet_sg *vsg;
+-	struct vbus_memctx *ctx;
++	struct venet_sg *vsg = (struct venet_sg *)priv->vbus.sg.buf;
+ 	int ret;
+ 
+-	if (len < sizeof(*vsg))
++	PDEBUG("desc: %p/%d\n", ptr, len);
++
++	if (unlikely(len < sizeof(*vsg) || len > MAX_VSG_DESC_SIZE)) {
++		PDEBUG("invalid len: %d\n", len);
+ 		return -1;
++	}
+ 
+ 	/*
+ 	 * SG is enabled, so we need to pull in the venet_sg
+ 	 * header before we can interpret the rest of the
+ 	 * packet
+ 	 */
+-	if (unlikely(len > MAX_VSG_DESC_SIZE))
+-		return -1;
+ 
+-	priv->vbus.sg.len = len;
++	if (priv->vbus.pmtd.shm) {
++		/* 'ptr' is an offset into our PMTD pool when pmtd is enabled */
++		size_t offset = (size_t)ptr;
++		void *_ptr = priv->vbus.pmtd.shm->ptr + offset;
+ 
+-	vsg = priv->vbus.sg.desc;
+-	ctx = priv->vbus.ctx;
++		if ((offset + len) > priv->vbus.pmtd.shm->len) {
++			PDEBUG("offset overrun: %d+%d > %d\n",
++			       offset, len, priv->vbus.pmtd.shm->len);
++			return -1;
++		}
+ 
+-	ret = ctx->ops->copy_from(ctx, vsg, ptr, len);
+-	if (ret)
++		/*
++		 * We copy the descriptor here even though its technically
++		 * mapped to avoid the possibility that a malicious guest
++		 * can alter the descriptor after we validate it
++		 */
++		memcpy((void *)vsg, _ptr, len);
++
++	} else {
++		struct vbus_memctx *ctx = priv->vbus.ctx;
++
++		ret = ctx->ops->copy_from(ctx, vsg, ptr, len);
++		if (ret) {
++			PDEBUG("copy_from: EFAULT\n");
++			return -1;
++		}
++	}
++
++	PDEBUG("pmtd-pool:%p, vsg=%p\n", priv->vbus.pmtd.shm->ptr, vsg);
++
++	if (len < VSG_DESC_SIZE(vsg->count)) {
++		PDEBUG("%d < %d\n", len, VSG_DESC_SIZE(vsg->count));
+ 		return -1;
++	}
+ 
+ 	if (vsg->flags & VENET_SG_FLAG_GSO) {
+ 		/* GSO packets shall not exceed 64k frames */
+@@ -361,6 +408,8 @@ venettap_sg_decode(struct venettap *priv, void *ptr, int len)
+ 		if (vsg->len > (priv->netif.dev->mtu + ETH_HLEN))
+ 			return -1;
+ 
++	priv->vbus.sg.len = len;
++
+ 	return vsg->len;
+ }
+ 
+@@ -373,7 +422,7 @@ static int
+ venettap_sg_import(struct venettap *priv, struct sk_buff *skb,
+ 		   void *ptr, int len)
+ {
+-	struct venet_sg *vsg = priv->vbus.sg.desc;
++	struct venet_sg *vsg = (struct venet_sg *)priv->vbus.sg.buf;
+ 	struct vbus_memctx *ctx = priv->vbus.ctx;
+ 	int remain = len;
+ 	int ret;
+@@ -1081,17 +1130,19 @@ static u32
+ venettap_negcap_sg(struct venettap *priv, u32 requested)
+ {
+ 	u32 available = VENET_CAP_SG|VENET_CAP_TSO4|VENET_CAP_TSO6
+-		|VENET_CAP_ECN;
++		|VENET_CAP_ECN|VENET_CAP_PMTD;
+ 	u32 ret;
+ 
+ 	ret = available & requested;
+ 
+ 	if (ret & VENET_CAP_SG) {
+ 		priv->vbus.sg.enabled = true;
+-		priv->vbus.sg.desc = (struct venet_sg *)priv->vbus.sg.buf;
+ 		priv->vbus.rx_ops = &venettap_sg_rx_ops;
+ 	}
+ 
++	if (ret & VENET_CAP_PMTD)
++		priv->vbus.pmtd.enabled = true;
++
+ 	return ret;
+ }
+ 
+@@ -1229,6 +1280,8 @@ venettap_vlink_call(struct vbus_connection *conn,
+ 		return venettap_negcap(priv, data, len);
+ 	case VENET_FUNC_FLUSHRX:
+ 		return venettap_flushrx(priv);
++	case VENET_FUNC_PMTDQUERY:
++		return PMTD_POOL_ID;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1262,6 +1315,8 @@ venettap_vlink_shm(struct vbus_connection *conn,
+ 	case VENET_QUEUE_TX:
+ 		return venettap_queue_init(&priv->vbus.rxq, shm, signal,
+ 					   venettap_rx_isr);
++	case PMTD_POOL_ID:
++		return venettap_pmtd_init(priv, shm, signal);
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1312,8 +1367,12 @@ venettap_vlink_release(struct vbus_connection *conn)
+ 
+ 	priv->vbus.sg.enabled = false;
+ 	priv->vbus.rx_ops = &venettap_flat_rx_ops;
+-	priv->vbus.sg.desc = NULL;
+ 	priv->vbus.sg.len = 0;
++
++	if (priv->vbus.pmtd.shm)
++		vbus_shm_put(priv->vbus.pmtd.shm);
++	priv->vbus.pmtd.shm = NULL;
++	priv->vbus.pmtd.enabled = false;
+ }
+ 
+ static struct vbus_connection_ops venettap_vbus_link_ops = {
+-- 
+1.6.5.2
+
