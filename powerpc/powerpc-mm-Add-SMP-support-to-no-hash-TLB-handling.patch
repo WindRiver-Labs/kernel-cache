@@ -1,0 +1,295 @@
+From ad69e2046bf4f2d3f36ef32eef05ebf6b58f3b14 Mon Sep 17 00:00:00 2001
+From: Li Wang <li.wang@windriver.com>
+Date: Tue, 11 May 2010 13:12:57 +0800
+Subject: [PATCH] powerpc/mm: Add SMP support to no-hash TLB handling
+
+The patch backports from upstream.
+Becasue there is only no-hash TLB handling in wrlinux-3.0 about powerpc32,
+It only reserves the no-hash TLB handling and the related caller.
+
+[ commit f048aace29e007f2b642097e2da8231e0e9cce2d upstream ]
+
+This commit moves the whole no-hash TLB handling out of line into a
+new tlb_nohash.c file, and implements some basic SMP support using
+IPIs and/or broadcast tlbivax instructions.
+
+Note that I'm using local invalidations for D->I cache coherency.
+
+At worst, if another processor is trying to execute the same and
+has the old entry in its TLB, it will just take a fault and re-do
+the TLB flush locally (it won't re-do the cache flush in any case).
+
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Acked-by: Kumar Gala <galak@kernel.crashing.org>
+Signed-off-by: Paul Mackerras <paulus@samba.org>
+Integrated-by: Li Wang <li.wang@windriver.com>
+---
+ arch/powerpc/include/asm/highmem.h  |    4 +-
+ arch/powerpc/include/asm/tlbflush.h |  114 +++++++++++++++++++++++++++++++---
+ arch/powerpc/kernel/ppc_ksyms.c     |    1 -
+ arch/powerpc/mm/fault.c             |    2 +-
+ arch/powerpc/mm/mem.c               |    2 +-
+ arch/powerpc/mm/mmu_context_32.c    |    6 +-
+ 6 files changed, 111 insertions(+), 18 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/highmem.h b/arch/powerpc/include/asm/highmem.h
+index 5d99b64..3895534 100644
+--- a/arch/powerpc/include/asm/highmem.h
++++ b/arch/powerpc/include/asm/highmem.h
+@@ -85,7 +85,7 @@ static inline void *kmap_atomic_prot(struct page *page, enum km_type type, pgpro
+ 	BUG_ON(!pte_none(*(kmap_pte-idx)));
+ #endif
+ 	set_pte_at(&init_mm, vaddr, kmap_pte-idx, mk_pte(page, prot));
+-	flush_tlb_page(NULL, vaddr);
++	local_flush_tlb_page(NULL, vaddr);
+ 
+ 	return (void*) vaddr;
+ }
+@@ -113,7 +113,7 @@ static inline void kunmap_atomic(void *kvaddr, enum km_type type)
+ 	 * this pte without first remap it
+ 	 */
+ 	pte_clear(&init_mm, vaddr, kmap_pte-idx);
+-	flush_tlb_page(NULL, vaddr);
++	local_flush_tlb_page(NULL, vaddr);
+ #endif
+ 	pagefault_enable();
+ }
+diff --git a/arch/powerpc/include/asm/tlbflush.h b/arch/powerpc/include/asm/tlbflush.h
+index a2c6bfd..ac19343 100644
+--- a/arch/powerpc/include/asm/tlbflush.h
++++ b/arch/powerpc/include/asm/tlbflush.h
+@@ -27,8 +27,8 @@
+  */
+ 
+ #include <linux/mm.h>
++#include <asm/mmu_context.h>
+ 
+-extern void _tlbie(unsigned long address, unsigned int pid);
+ extern void _tlbil_all(void);
+ extern void _tlbil_pid(unsigned int pid);
+ extern void _tlbil_va(unsigned long address, unsigned int pid);
+@@ -39,35 +39,116 @@ extern void _tlbil_va(unsigned long address, unsigned int pid);
+ extern void _tlbia(void);
+ #endif
+ 
+-static inline void flush_tlb_mm(struct mm_struct *mm)
++struct tlb_flush_param {
++	unsigned long addr;
++	unsigned int pid;
++};
++
++static inline void do_flush_tlb_mm_ipi(void *param)
+ {
+-	_tlbil_pid(mm->context.id);
++	struct tlb_flush_param *p = param;
++
++	_tlbil_pid(p ? p->pid : 0);
+ }
+ 
+-static inline void flush_tlb_page(struct vm_area_struct *vma,
+-				  unsigned long vmaddr)
++static inline void do_flush_tlb_page_ipi(void *param)
+ {
+-	_tlbil_va(vmaddr, vma ? vma->vm_mm->context.id : 0);
++	struct tlb_flush_param *p = param;
++
++	_tlbil_va(p->addr, p->pid);
+ }
+ 
+-static inline void flush_tlb_page_nohash(struct vm_area_struct *vma,
+-					 unsigned long vmaddr)
++static inline void local_flush_tlb_mm(struct mm_struct *mm)
+ {
+-	flush_tlb_page(vma, vmaddr);
++	unsigned int pid;
++
++	preempt_disable();
++	pid = mm->context.id;
++	if (pid != NO_CONTEXT)
++		_tlbil_pid(pid);
++	preempt_enable();
++}
++
++static inline void local_flush_tlb_page(struct vm_area_struct *vma, unsigned long vmaddr)
++{
++	unsigned int pid;
++
++	preempt_disable();
++	pid = vma ? vma->vm_mm->context.id : 0;
++	if (pid != NO_CONTEXT)
++		_tlbil_va(vmaddr, pid);
++	preempt_enable();
++}
++
++static inline void flush_tlb_mm(struct mm_struct *mm)
++{
++	cpumask_t cpu_mask;
++	unsigned int pid;
++
++	preempt_disable();
++	pid = mm->context.id;
++	if (unlikely(pid == NO_CONTEXT))
++		goto no_context;
++	cpu_mask = mm->cpu_vm_mask;
++	cpu_clear(smp_processor_id(), cpu_mask);
++	if (!cpus_empty(cpu_mask)) {
++		struct tlb_flush_param p = { .pid = pid };
++		smp_call_function_mask(cpu_mask, do_flush_tlb_mm_ipi, &p, 1);
++	}
++	_tlbil_pid(pid);
++ no_context:
++	preempt_enable();
++}
++
++static inline void flush_tlb_page(struct vm_area_struct *vma, unsigned long vmaddr)
++{
++	cpumask_t cpu_mask;
++	unsigned int pid;
++
++	preempt_disable();
++	pid = vma ? vma->vm_mm->context.id : 0;
++	if (unlikely(pid == NO_CONTEXT))
++		goto bail;
++	cpu_mask = vma->vm_mm->cpu_vm_mask;
++	cpu_clear(smp_processor_id(), cpu_mask);
++	if (!cpus_empty(cpu_mask)) {
++		struct tlb_flush_param p = { .pid = pid, .addr = vmaddr };
++		smp_call_function_mask(cpu_mask,
++				       do_flush_tlb_page_ipi, &p, 1);
++	}
++	_tlbil_va(vmaddr, pid);
++ bail:
++	preempt_enable();
+ }
+ 
+ static inline void flush_tlb_range(struct vm_area_struct *vma,
+ 				   unsigned long start, unsigned long end)
+ {
+-	_tlbil_pid(vma->vm_mm->context.id);
++	flush_tlb_mm(vma->vm_mm);
+ }
+ 
+ static inline void flush_tlb_kernel_range(unsigned long start,
+ 					  unsigned long end)
+ {
++#ifdef CONFIG_SMP
++	preempt_disable();
++	smp_call_function(do_flush_tlb_mm_ipi, NULL, 1);
++	_tlbil_pid(0);
++	preempt_enable();
++#else
+ 	_tlbil_pid(0);
++#endif
+ }
+ 
++#ifdef CONFIG_SMP
++extern void flush_tlb_mm(struct mm_struct *mm);
++extern void flush_tlb_page(struct vm_area_struct *vma, unsigned long vmaddr);
++#else
++#define flush_tlb_mm(mm)		local_flush_tlb_mm(mm)
++#define flush_tlb_page(vma,addr)	local_flush_tlb_page(vma,addr)
++#endif
++#define flush_tlb_page_nohash(vma,addr)	flush_tlb_page(vma,addr)
++
+ #elif defined(CONFIG_PPC32)
+ /*
+  * TLB flushing for "classic" hash-MMMU 32-bit CPUs, 6xx, 7xx, 7xxx
+@@ -81,6 +162,15 @@ extern void flush_tlb_page_nohash(struct vm_area_struct *vma, unsigned long addr
+ extern void flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 			    unsigned long end);
+ extern void flush_tlb_kernel_range(unsigned long start, unsigned long end);
++static inline void local_flush_tlb_page(struct vm_area_struct *vma,
++					unsigned long vmaddr)
++{
++	flush_tlb_page(vma, vmaddr);
++}
++static inline void local_flush_tlb_mm(struct mm_struct *mm)
++{
++	flush_tlb_mm(mm);
++}
+ 
+ #else
+ /*
+@@ -158,6 +248,10 @@ static inline void flush_tlb_kernel_range(unsigned long start,
+ {
+ }
+ 
++static inline void local_flush_tlb_mm(struct mm_struct *mm)
++{
++}
++
+ /* Private function for use by PCI IO mapping code */
+ extern void __flush_hash_table_range(struct mm_struct *mm, unsigned long start,
+ 				     unsigned long end);
+diff --git a/arch/powerpc/kernel/ppc_ksyms.c b/arch/powerpc/kernel/ppc_ksyms.c
+index f642546..fd723a3 100644
+--- a/arch/powerpc/kernel/ppc_ksyms.c
++++ b/arch/powerpc/kernel/ppc_ksyms.c
+@@ -118,7 +118,6 @@ EXPORT_SYMBOL(giveup_spe);
+ EXPORT_SYMBOL(flush_instruction_cache);
+ EXPORT_SYMBOL(flush_tlb_kernel_range);
+ EXPORT_SYMBOL(flush_tlb_page);
+-EXPORT_SYMBOL(_tlbie);
+ #if defined(CONFIG_4xx) || defined(CONFIG_8xx) || defined(CONFIG_FSL_BOOKE)
+ EXPORT_SYMBOL(_tlbil_va);
+ #endif
+diff --git a/arch/powerpc/mm/fault.c b/arch/powerpc/mm/fault.c
+index 3bd420c..2faa72f 100644
+--- a/arch/powerpc/mm/fault.c
++++ b/arch/powerpc/mm/fault.c
+@@ -664,7 +664,7 @@ good_area:
+ 				}
+ 				pte_update(ptep, 0, _PAGE_HWEXEC |
+ 					   _PAGE_ACCESSED);
+-				_tlbie(address, mm->context.id);
++				local_flush_tlb_page(vma, address);
+ 				pte_unmap_unlock(ptep, ptl);
+ 				up_read(&mm->mmap_sem);
+ 				return 0;
+diff --git a/arch/powerpc/mm/mem.c b/arch/powerpc/mm/mem.c
+index 78f38d8..234c24e 100644
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@ -517,7 +517,7 @@ void native_update_mmu_cache(struct vm_area_struct *vma, unsigned long address,
+ 		 * we invalidate the TLB here, thus avoiding dcbst
+ 		 * misbehaviour.
+ 		 */
+-		_tlbie(address, 0 /* 8xx doesn't care about PID */);
++		_tlbil_va(address, 0 /* 8xx doesn't care about PID */);
+ #endif
+ 		/* The _PAGE_USER test should really be _PAGE_EXEC, but
+ 		 * older glibc versions execute some code from no-exec
+diff --git a/arch/powerpc/mm/mmu_context_32.c b/arch/powerpc/mm/mmu_context_32.c
+index 9d2df7b..b982ed0 100644
+--- a/arch/powerpc/mm/mmu_context_32.c
++++ b/arch/powerpc/mm/mmu_context_32.c
+@@ -152,7 +152,7 @@ static unsigned int steal_context_up(unsigned int id)
+ 	mm->context.id = NO_CONTEXT;
+ 
+ 	/* Flush the TLB for that context */
+-	flush_tlb_mm(mm);
++	local_flush_tlb_mm(mm);
+ 
+ 	/* XXX This clear should ultimately be part of local_flush_tlb_mm */
+ 	__clear_bit(id, stale_map[cpu]);
+@@ -220,7 +220,7 @@ void switch_mmu_context(struct mm_struct *prev,
+ 	if (test_bit(id, stale_map[cpu])) {
+ 		pr_debug("[%d] flushing stale context %d for mm @%p !\n",
+ 			 cpu, id, next);
+-		flush_tlb_mm(next);
++		local_flush_tlb_mm(next);
+ 
+ 		/* XXX This clear should ultimately be part of flush_tlb_mm */
+ 		__clear_bit(id, stale_map[cpu]);
+@@ -241,7 +241,7 @@ steal_context(void)
+ 	if (next_mmu_context < FIRST_CONTEXT)
+ 		next_mmu_context = FIRST_CONTEXT;
+ 	mm = context_mm[next_mmu_context];
+-	flush_tlb_mm(mm);
++	local_flush_tlb_mm(mm);
+ 	destroy_context(mm);
+ }
+ #endif  /* CONFIG_MPC85xx_DS  || (CONFIG_E500 && CONFIG_SMP) */
+-- 
+1.6.0.4
+
