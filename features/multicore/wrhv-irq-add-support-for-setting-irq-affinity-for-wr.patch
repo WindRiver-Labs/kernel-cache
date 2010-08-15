@@ -1,0 +1,230 @@
+From b6ea3fc941f18dc1fd60f1b995017719e7430d4a Mon Sep 17 00:00:00 2001
+From: Kevin Hao <kexin.hao@windriver.com>
+Date: Fri, 6 Aug 2010 15:29:24 +0800
+Subject: [PATCH 1/3] wrhv/irq: add support for setting irq affinity for wrhv_irq_chip
+
+By default, the hypervisor will route all the irq to core0 in a VB.
+But on some platform such as p4080, there is a requirement that some
+irq must be routed to the specific core. So we add the support for
+setting irq affinity by using vbi_vcore_irq_redirect VBI.
+
+We have to unmask the irq first on the core to which the irq will
+be dispatched before we redirect this irq, and the unmask function
+must be executed on that core. We use smp_call_function_single to
+get the irq unmasked on that core. But smp_call_function_single
+can't be called with irq disabled, and the irq_set_affinity is always
+invoked with irq disabled. So we use a tasklet to do this work.
+
+Also set the correct irq_default_affinity for both x86 and powerpc.
+On x86 since the CONFIG_GENERIC_PENDING_IRQ is enabled by default,
+we also need to set IRQ_MOVE_PCNTXT for irq descriptor to migrate
+the irq in process context.
+
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ arch/powerpc/kernel/vbi/wrhv.c |    5 ++
+ arch/x86/kernel/vbi/wrhv.c     |    7 ++-
+ kernel/vbi/wrhv.c              |  128 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 139 insertions(+), 1 deletions(-)
+
+diff --git a/arch/powerpc/kernel/vbi/wrhv.c b/arch/powerpc/kernel/vbi/wrhv.c
+index 85373c1..6854712 100644
+--- a/arch/powerpc/kernel/vbi/wrhv.c
++++ b/arch/powerpc/kernel/vbi/wrhv.c
+@@ -563,6 +563,11 @@ void __init wrhv_init_irq(void)
+ 	int i;
+ 	struct irq_desc *desc;
+ 
++#ifdef CONFIG_SMP
++	/* Be default all the irqs will be routed to core0 */
++	cpumask_copy(irq_default_affinity, cpumask_of(0));
++#endif
++
+ 	wrhv_irq_chip.typename = "WRHV-PIC";
+ 	for (i = 0; i < WRHV_NR_IRQS; i++) {
+ 		desc = irq_to_desc_alloc_node(i, 0);
+diff --git a/arch/x86/kernel/vbi/wrhv.c b/arch/x86/kernel/vbi/wrhv.c
+index abd5dd2..2ff7c73 100644
+--- a/arch/x86/kernel/vbi/wrhv.c
++++ b/arch/x86/kernel/vbi/wrhv.c
+@@ -100,8 +100,13 @@ static void wrhv_pre_intr_init_hook(void)
+ {
+ 	int i;
+ 
++#ifdef CONFIG_SMP
++	/* Be default all the irqs will be routed to core0 */
++	cpumask_copy(irq_default_affinity, cpumask_of(0));
++#endif
++
+ 	for (i = 0; i < NR_IRQS; i++) {
+-		irq_desc[i].status = IRQ_DISABLED;
++		irq_desc[i].status = IRQ_DISABLED | IRQ_MOVE_PCNTXT;
+ 		irq_desc[i].action = NULL;
+ 		irq_desc[i].depth = 1;
+ 		set_irq_chip_and_handler_name(i, &wrhv_irq_chip,
+diff --git a/kernel/vbi/wrhv.c b/kernel/vbi/wrhv.c
+index e618356..2f99450 100644
+--- a/kernel/vbi/wrhv.c
++++ b/kernel/vbi/wrhv.c
+@@ -25,9 +25,37 @@
+ #include <linux/suspend.h>
+ #include <linux/cpu.h>
+ #include <linux/debugfs.h>
++#include <vbi/private.h>
+ 
+ #define VIOAPIC_BASE_ADDR	(&wr_vb_control->vIoapic)
+ 
++#ifdef CONFIG_SMP
++enum wrhv_irq_action {
++	WRHV_IRQ_SET_AFFINITY = 1
++};
++
++struct wrhv_irq_struct {
++	enum wrhv_irq_action action;
++	int irq;
++	int ocpu, ncpu;
++	struct wrhv_irq_struct *next;
++};
++
++struct wrhv_irq_head {
++	struct wrhv_irq_struct *head;
++	struct wrhv_irq_struct **next;
++};
++
++static struct wrhv_irq_head wrhv_irq_head = {
++	.head	= NULL,
++	.next	= &(wrhv_irq_head.head),
++};
++
++static DEFINE_SPINLOCK(wrhv_irq_lock);
++static void wrhv_irq_task(unsigned long arg);
++static DECLARE_TASKLET(wrhv_irq_tasklet, wrhv_irq_task, 0);
++#endif
++
+ static void wrhv_enable_irq(unsigned int irq)
+ {
+ 	vbi_unmask_vioapic_irq(irq);
+@@ -73,6 +101,56 @@ static void smp_wrhv_unmask_irq(void *irq)
+ 	vbi_unmask_vioapic_irq((unsigned int)irq);
+ }
+ 
++static void wrhv_mask_irq_ipi(void *p)
++{
++	unsigned int irq = *(unsigned int *)p;
++
++	wrhv_mask_irq(irq);
++}
++
++static void wrhv_unmask_irq_ipi(void *p)
++{
++	unsigned int irq = *(unsigned int *)p;
++
++	wrhv_unmask_irq(irq);
++}
++
++static void wrhv_irq_task(unsigned long arg)
++{
++	struct wrhv_irq_struct *list;
++	struct wrhv_irq_head *head = &wrhv_irq_head;
++
++	spin_lock(&wrhv_irq_lock);
++	list = head->head;
++	head->head = NULL;
++	head->next = &(head->head);
++	spin_unlock(&wrhv_irq_lock);
++
++	while (list) {
++		struct wrhv_irq_struct *cur = list;
++		int irq = cur->irq;
++
++		switch (cur->action) {
++		case WRHV_IRQ_SET_AFFINITY:
++		{
++			int ocpu = cur->ocpu, ncpu = cur->ncpu;
++
++			smp_call_function_single(ocpu, wrhv_mask_irq_ipi,
++						&irq, 1);
++			smp_call_function_single(ncpu, wrhv_unmask_irq_ipi,
++						&irq, 1);
++			vbi_vcore_irq_redirect(irq, ncpu);
++			break;
++		}
++		default:
++			printk(KERN_ERR "Unknown action for irq task\n");
++		}
++
++		list = cur->next;
++		kfree(cur);
++	}
++}
++
+ /* Currently all the external interrupts are routed to cpu 0 and
+  * handled by cpu0, so we need make sure the startup/shutdown functions
+  * operate cpu 0's vioapic.
+@@ -113,6 +191,55 @@ static unsigned int smp_wrhv_startup_irq(unsigned int irq)
+ 	}
+ 	return 0;
+ }
++
++int wrhv_irq_set_affinity(unsigned int irq,
++				const struct cpumask *dest)
++{
++	struct irq_desc *desc = irq_to_desc(irq);
++	struct wrhv_irq_struct *p;
++	int cpu;
++	struct wrhv_irq_head *head = &wrhv_irq_head;
++
++#ifdef CONFIG_PPC85xx_VT_MODE
++	/* Currently we don't support set affinity in direct irq mode */
++	if (wrhv_dir_irq) {
++		printk(KERN_WARNING "Currently we don't support set affinity"
++			" in direct irq mode on e500mc.\n");
++
++		return -1;
++	}
++#endif
++
++	if (cpumask_equal(desc->affinity, dest))
++		return 0;
++
++	cpu = cpumask_first(dest);
++	/* we only support to bond the irq to signle vcore */
++	if (!cpumask_equal(cpumask_of(cpu), dest))
++		return -1;
++
++	p = kzalloc(sizeof(*p), GFP_ATOMIC);
++	if (!p) {
++		printk(KERN_ERR "Can't get memory for set irq affinity\n");
++		return -1;
++	}
++
++	p->irq = irq;
++	p->ocpu = cpumask_first(desc->affinity);
++	p->ncpu = cpu;
++	p->next = NULL;
++	p->action = WRHV_IRQ_SET_AFFINITY;
++
++	/* irq_set_affinity is invoked with irq disabled */
++	spin_lock(&wrhv_irq_lock);
++	*head->next = p;
++	head->next = &(p->next);
++	spin_unlock(&wrhv_irq_lock);
++
++	tasklet_schedule(&wrhv_irq_tasklet);
++
++	return 0;
++}
+ #endif
+ 
+ struct irq_chip wrhv_irq_chip = {
+@@ -120,6 +247,7 @@ struct irq_chip wrhv_irq_chip = {
+ #ifdef CONFIG_SMP
+ 	.startup	= smp_wrhv_startup_irq,
+ 	.shutdown	= smp_wrhv_shutdown_irq,
++	.set_affinity	= wrhv_irq_set_affinity,
+ #endif
+ 	.mask		= wrhv_mask_irq,
+ 	.ack		= wrhv_ack_irq,
+-- 
+1.6.5.2
+
