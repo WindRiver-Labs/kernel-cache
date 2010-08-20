@@ -1,0 +1,141 @@
+From 2342e6b0b38394c6855e55c8c63cf038a65e1dc2 Mon Sep 17 00:00:00 2001
+From: Weiwei Wang <weiwei.wang@windriver.com>
+Date: Mon, 9 Aug 2010 14:38:45 +0800
+Subject: [PATCH 48/63] net: decreasing real_num_tx_queues needs to flush qdisc
+
+commit f0796d5c73e59786d09a1e617689d1d415f2db44 upstream
+
+Reducing real_num_queues needs to flush the qdisc otherwise
+skbs with queue_mappings greater then real_num_tx_queues can
+be sent to the underlying driver.
+
+The flow for this is,
+
+dev_queue_xmit()
+    dev_pick_tx()
+            skb_tx_hash()  => hash using real_num_tx_queues
+            skb_set_queue_mapping()
+    ...
+    qdisc_enqueue_root() => enqueue skb on txq from hash
+...
+dev->real_num_tx_queues -= n
+...
+sch_direct_xmit()
+    dev_hard_start_xmit()
+            ndo_start_xmit(skb,dev) => skb queue set with old hash
+
+skbs are enqueued on the qdisc with skb->queue_mapping set
+0 < queue_mappings < real_num_tx_queues.  When the driver
+decreases real_num_tx_queues skb's may be dequeued from the
+qdisc with a queue_mapping greater then real_num_tx_queues.
+
+This fixes a case in ixgbe where this was occurring with DCB
+and FCoE. Because the driver is using queue_mapping to map
+skbs to tx descriptor rings we can potentially map skbs to
+rings that no longer exist.
+
+Signed-off-by: John Fastabend <john.r.fastabend@intel.com>
+Tested-by: Ross Brattain <ross.b.brattain@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+[minor context mods]
+Integrated-by: Weiwei Wang <weiwei.wang@windriver.com>
+---
+ drivers/net/ixgbe/ixgbe_main.c |    2 +-
+ include/linux/netdevice.h      |    3 +++
+ include/net/sch_generic.h      |   20 ++++++++++++++++----
+ net/core/dev.c                 |   18 ++++++++++++++++++
+ 4 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ixgbe/ixgbe_main.c b/drivers/net/ixgbe/ixgbe_main.c
+index 1f25385..bc5e114 100644
+--- a/drivers/net/ixgbe/ixgbe_main.c
++++ b/drivers/net/ixgbe/ixgbe_main.c
+@@ -4060,7 +4060,7 @@ static void ixgbe_set_num_queues(struct ixgbe_adapter *adapter)
+ 
+ done:
+ 	/* Notify the stack of the (possibly) reduced Tx Queue count. */
+-	adapter->netdev->real_num_tx_queues = adapter->num_tx_queues;
++	netif_set_real_num_tx_queues(adapter->netdev, adapter->num_tx_queues);
+ }
+ 
+ static void ixgbe_acquire_msix_vectors(struct ixgbe_adapter *adapter,
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 89b8309..7ce645d 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1546,6 +1546,9 @@ static inline int netif_is_multiqueue(const struct net_device *dev)
+ 	return (dev->num_tx_queues > 1);
+ }
+ 
++extern void netif_set_real_num_tx_queues(struct net_device *dev,
++					 unsigned int txq);
++
+ /* Use this variant when it is known for sure that it
+  * is executing from hardware interrupt context or with hardware interrupts
+  * disabled.
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 67dc08e..18ce3e6 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -312,12 +312,24 @@ extern void qdisc_calculate_pkt_len(struct sk_buff *skb,
+ extern void tcf_destroy(struct tcf_proto *tp);
+ extern void tcf_destroy_chain(struct tcf_proto **fl);
+ 
+-/* Reset all TX qdiscs of a device.  */
++/* Reset all TX qdiscs greater then index of a device.  */
++static inline void qdisc_reset_all_tx_gt(struct net_device *dev, unsigned int i)
++{
++	struct Qdisc *qdisc;
++
++	for (; i < dev->num_tx_queues; i++) {
++		qdisc = netdev_get_tx_queue(dev, i)->qdisc;
++		if (qdisc) {
++			spin_lock_bh(qdisc_lock(qdisc));
++			qdisc_reset(qdisc);
++			spin_unlock_bh(qdisc_lock(qdisc));
++		}
++	}
++}
++
+ static inline void qdisc_reset_all_tx(struct net_device *dev)
+ {
+-	unsigned int i;
+-	for (i = 0; i < dev->num_tx_queues; i++)
+-		qdisc_reset(netdev_get_tx_queue(dev, i)->qdisc);
++	qdisc_reset_all_tx_gt(dev, 0);
+ }
+ 
+ /* Are all TX queues of the device empty?  */
+diff --git a/net/core/dev.c b/net/core/dev.c
+index a99e3c1..15b2d85 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -1537,6 +1537,24 @@ static void dev_queue_xmit_nit(struct sk_buff *skb, struct net_device *dev)
+ 	rcu_read_unlock();
+ }
+ 
++/*
++ * Routine to help set real_num_tx_queues. To avoid skbs mapped to queues
++ * greater then real_num_tx_queues stale skbs on the qdisc must be flushed.
++ */
++void netif_set_real_num_tx_queues(struct net_device *dev, unsigned int txq)
++{
++	unsigned int real_num = dev->real_num_tx_queues;
++
++	if (unlikely(txq > dev->num_tx_queues))
++		;
++	else if (txq > real_num)
++		dev->real_num_tx_queues = txq;
++	else if (txq < real_num) {
++		dev->real_num_tx_queues = txq;
++		qdisc_reset_all_tx_gt(dev, txq);
++	}
++}
++EXPORT_SYMBOL(netif_set_real_num_tx_queues);
+ 
+ static inline void __netif_reschedule(struct Qdisc *q)
+ {
+-- 
+1.6.5.2
+
