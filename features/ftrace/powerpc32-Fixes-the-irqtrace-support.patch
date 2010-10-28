@@ -1,0 +1,181 @@
+From c5bb738cb70b49f90d22ee121a10849c7448130f Mon Sep 17 00:00:00 2001
+From: Wu Zhangjin <zhangjin.wu@windriver.com>
+Date: Tue, 26 Oct 2010 14:42:04 +0800
+Subject: [PATCH] powerpc32: Fixes the irqtrace support
+
+The commit "powerpc: Add irqtrace support for 32-bit powerpc" added
+irqtrace support for 32-bit powerpc, but it also has broken the handling
+of the processor exceptions, a problem of such has been observed is:
+ptrace(PTRACE_SINGLESTEP,...) failed on amcc_kilauea_405ex board.
+
+"The single-step request is actually several operations batched into
+one. A PTRACE_SINGLESTEP request will execute a single instruction in
+the child task, then stop the child and notify the parent with a
+SIGTRAP."[1]
+
+The observed phenomenon of the failure is: after sending
+PTRACE_SINGLESTEP request to the child, the parent wait for the SIGTRAP
+signal to check if the child is stopped, but the parent wait there and
+never get the SIGTRAP signal.
+
+	if (fork() == 0) {
+		/* child */
+		ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+		execl("child-program", ...);
+	} else {
+		/* parent */
+		wait(&status);		--> hang here
+		...
+		ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
+		...
+	}
+
+Normally, after sending out the SINGLESTEP request, one instruction of
+the child will be executed and when it completes, DebugException()[2]
+should handles it and at last send the SIGTRAP signal out:
+
+void __kprobes native_DebugException(struct pt_regs *regs, unsigned long debug_status)
+{
+        current->thread.dbsr = debug_status;
+
+        if (debug_status & DBSR_BT) {
+                [snip]
+        } else if (debug_status & DBSR_IC) {    /* Instruction complete */
+                [snip]
+                if (notify_die(DIE_SSTEP, "single_step", regs, 5,
+                               5, SIGTRAP) == NOTIFY_STOP) {
+                        return;
+                }
+                [snip]
+                _exception(SIGTRAP, regs, TRAP_TRACE, regs->nip);
+        }
+        [snip]
+}
+
+The observation of "ps -eo stat,command" shows the child process is really
+woken up, so, the debug_status should be wrong and DebugException() never go to
+the (debug_status & DBSR_IC) branch.
+
+And another observation via testing shows this problem only happen when
+compiling the kernel with CONFIG_IRQSOFF_TRACER=y, So, the low-level
+support of IRQSOFF_TRACER: IRQFLAGS has been investigated and at last we
+found the following piece of source code has overridden the debug_status
+argument of DebugException() and introduced the problem:
+
+1. debug_status is passed via the r4 register by the high-level exception handler
+
+arch/powerpc/kernel/head_40x.S:
+
+	/* 0x2000 - Debug Exception */
+	START_EXCEPTION(0x2000, DebugTrap)
+	[snip]
+        /* continue normal handling for a critical exception... */
+2:      mfspr   r4,SPRN_DBSR
+        addi    r3,r1,STACK_FRAME_OVERHEAD
+        EXC_XFER_TEMPLATE(DebugException, 0x2002, \
+                (MSR_KERNEL & ~(MSR_ME|MSR_DE|MSR_CE)), \
+                NOCOPY, crit_transfer_to_handler, ret_from_crit_exc)
+
+$ objdump -S -d vmlinux
+
+void __kprobes native_DebugException(struct pt_regs *regs, unsigned long debug_status)
+{
+        current->thread.dbsr = debug_status;
+c000d808:       90 82 02 3c     stw     r4,572(r2)
+
+2. but the irqtrace support has overrided the r4 register
+
+arch/powerpc/kernel/entry_32.S:
+
+/*
+ * This code finishes saving the registers to the exception frame
+ * and jumps to the appropriate handler for the exception, turning
+ * on address translation.
+ * Note that we rely on the caller having set cr0.eq iff the exception
+ * occurred in kernel mode (i.e. MSR:PR = 0).
+ */
+	.globl	transfer_to_handler_full
+transfer_to_handler_full:
+	SAVE_NVGPRS(r11)
+	/* fall through */
+
+	mflr	r9
+	lwz	r11,0(r9)		/* virtual address of handler */
+	lwz	r9,4(r9)		/* where to go when done */
+ #ifdef CONFIG_TRACE_IRQFLAGS
+	[snip]
+	bl	trace_hardirqs_off
+	[snip]
+	lwz	r4,GPR4(r1)		/*** Here override the r4 register ***/
+	[snip]
+1:	mtctr	r11
+	mtlr	r9
+	bctr				/* jump to handler */
+ #else /* CONFIG_TRACE_IRQFLAGS */
+	mtspr	SPRN_SRR0,r11
+	mtspr	SPRN_SRR1,r10
+	mtlr	r9
+	SYNC
+	RFI				/* jump to handler, enable MMU */
+ #endif /* CONFIG_TRACE_IRQFLAGS */
+
+As we can see above, "lwz     r4,GPR4(r1)" overrides the content in the
+r4 register which is passed to the DebugException() by the high-level
+exception handler and make the DebugException() has no opportunity to
+response the "Instruction Complete" and as a result, no SIGTRAP signal
+will be sent to the parent, and the parent wait there all the time,
+then, the failure.
+
+Before trace_hardirqs_off() is called, the registers has been saved into
+the stack(pt_regs), so, we have no need to touch them except the
+handler(r11), return address(r9) and the specific r3 register(for normal
+interrupts has been set to pt_regs and for syscalls is an argument)[3].
+So, feel free to remove the other parts, similar to the modification
+around trace_hardirqs_on().
+
+----
+[1] http://mikecvet.wordpress.com/2010/08/14/ptrace-tutorial/
+[2] arch/powerpc/kernel/traps.c
+[3] arch/powerpc/kernel/entry_32.S
+
+Signed-off-by: Wu Zhangjin <zhangjin.wu@windriver.com>
+---
+ arch/powerpc/kernel/entry_32.S |   13 -------------
+ 1 files changed, 0 insertions(+), 13 deletions(-)
+
+diff --git a/arch/powerpc/kernel/entry_32.S b/arch/powerpc/kernel/entry_32.S
+index 88d3fe4..931803c 100644
+--- a/arch/powerpc/kernel/entry_32.S
++++ b/arch/powerpc/kernel/entry_32.S
+@@ -243,13 +243,7 @@ reenable_mmu:				/* re-enable mmu so we can */
+ 	stw	r11,12(r1)
+ 	stw	r3,ORIG_GPR3(r1)
+ 	bl	trace_hardirqs_off
+-	lwz	r0,GPR0(r1)
+ 	lwz	r3,ORIG_GPR3(r1)
+-	lwz	r4,GPR4(r1)
+-	lwz	r5,GPR5(r1)
+-	lwz	r6,GPR6(r1)
+-	lwz	r7,GPR7(r1)
+-	lwz	r8,GPR8(r1)
+ 	lwz	r9,8(r1)
+ 	lwz	r11,12(r1)
+ 1:	mtctr	r11
+@@ -331,14 +325,7 @@ _GLOBAL(DoSyscall)
+ 	/* We came in with interrupts disabled, we enable them now */
+ 	bl	trace_hardirqs_on
+ 	mfmsr	r11
+-	lwz	r0,GPR0(r1)
+-	lwz	r3,GPR3(r1)
+-	lwz	r4,GPR4(r1)
+ 	ori	r11,r11,MSR_EE
+-	lwz	r5,GPR5(r1)
+-	lwz	r6,GPR6(r1)
+-	lwz	r7,GPR7(r1)
+-	lwz	r8,GPR8(r1)
+ 	mtmsr	r11
+ 1:
+ #endif /* CONFIG_TRACE_IRQFLAGS */
+-- 
+1.6.5.2
+
