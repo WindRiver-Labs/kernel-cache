@@ -1,0 +1,306 @@
+From 9725b3f4b3210fa0a1a97fbeeb422efafa5a4622 Mon Sep 17 00:00:00 2001
+From: Yong Zhang <yong.zhang@windriver.com>
+Date: Tue, 24 Aug 2010 14:36:11 +0800
+Subject: [PATCH] octeon-ethernet: Fix race freeing transmit buffers
+
+commit a620c1632629b42369e78448acc7b384fe1faf48 upstream
+
+The existing code had the following race:
+
+Thread-1                       Thread-2
+
+inc/read in_use
+                               inc/read in_use
+inc tx_free_list[qos].len
+                               inc tx_free_list[qos].len
+
+The actual in_use value was incremented twice, but thread-1 is going
+to free memory based on its stale value, and will free one too many
+times.  The result is that memory is freed back to the kernel while
+its packet is still in the transmit buffer.  If the memory is
+overwritten before it is transmitted, the hardware will put a valid
+checksum on it and send it out (just like it does with good packets).
+If by chance the TCP flags are clobbered but not the addresses or
+ports, the result can be a broken TCP stream.
+
+The fix is to track the number of freed packets in a single location
+(a Fetch-and-Add Unit register).  That way it can never get out of sync
+with itself.
+
+We try to free up to MAX_SKB_TO_FREE (currently 10) buffers at a time.
+If fewer are available we adjust the free count with the difference.
+The action of claiming buffers to free is atomic so two threads cannot
+claim the same buffers.
+
+Signed-off-by: David Daney <ddaney@caviumnetworks.com>
+Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+[Yong Zhang: fix patch confict and build]
+Integrated-by: Yong Zhang <yong.zhang@windriver.com>
+---
+ drivers/net/cavium-ethernet/ethernet-defines.h |    2 +
+ drivers/net/cavium-ethernet/ethernet-tx.c      |   66 ++++++++++---------
+ drivers/net/cavium-ethernet/ethernet-tx.h      |   25 +++++++
+ drivers/net/cavium-ethernet/ethernet.c         |   80 ++++++++++++++----------
+ 4 files changed, 109 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/net/cavium-ethernet/ethernet-defines.h b/drivers/net/cavium-ethernet/ethernet-defines.h
+index 2ed49df..926999f 100644
+--- a/drivers/net/cavium-ethernet/ethernet-defines.h
++++ b/drivers/net/cavium-ethernet/ethernet-defines.h
+@@ -103,6 +103,8 @@
+ 
+ /* Maximum number of packets to process per interrupt. */
+ #define MAX_RX_PACKETS 120
++/* Maximum number of SKBs to try to free per xmit packet. */
++#define MAX_SKB_TO_FREE 10
+ #define MAX_OUT_QUEUE_DEPTH 1000
+ 
+ #ifndef CONFIG_SMP
+diff --git a/drivers/net/cavium-ethernet/ethernet-tx.c b/drivers/net/cavium-ethernet/ethernet-tx.c
+index e8d56d9..8dd9e64 100644
+--- a/drivers/net/cavium-ethernet/ethernet-tx.c
++++ b/drivers/net/cavium-ethernet/ethernet-tx.c
+@@ -81,8 +81,10 @@ int cvm_oct_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	uint64_t                    old_scratch2;
+ 	int                         dropped;
+ 	int                         qos;
++	int queue_it_up;
+ 	cvm_oct_private_t          *priv = (cvm_oct_private_t *)netdev_priv(dev);
+-	int32_t in_use;
++	int32_t skb_to_free;
++	int32_t undo;
+ 	int32_t buffers_to_free;
+ #if REUSE_SKBUFFS_WITHOUT_FREE
+ 	unsigned char *fpa_head;
+@@ -115,10 +117,13 @@ int cvm_oct_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		old_scratch = cvmx_scratch_read64(CVMX_SCR_SCRATCH);
+ 		old_scratch2 = cvmx_scratch_read64(CVMX_SCR_SCRATCH+8);
+ 
+-		/* Assume we're going to be able t osend this packet. Fetch and increment
+-		   the number of pending packets for output */
++		/*
++		 * Fetch and increment the number of packets to be
++		 * freed.
++		 */
+ 		cvmx_fau_async_fetch_and_add32(CVMX_SCR_SCRATCH+8, FAU_NUM_PACKET_BUFFERS_TO_FREE, 0);
+-		cvmx_fau_async_fetch_and_add32(CVMX_SCR_SCRATCH, priv->fau+qos*4, 1);
++		cvmx_fau_async_fetch_and_add32(CVMX_SCR_SCRATCH,
++					priv->fau + qos * 4, MAX_SKB_TO_FREE);
+ 	}
+ 
+ 	/* The CN3XXX series of parts has an errata (GMX-401) which causes the
+@@ -271,14 +276,27 @@ dont_put_skbuff_in_hw:
+ 	if (USE_ASYNC_IOBDMA) {
+ 		/* Get the number of skbuffs in use by the hardware */
+ 		CVMX_SYNCIOBDMA;
+-		in_use = cvmx_scratch_read64(CVMX_SCR_SCRATCH);
++		skb_to_free = cvmx_scratch_read64(CVMX_SCR_SCRATCH);
+ 		buffers_to_free = cvmx_scratch_read64(CVMX_SCR_SCRATCH+8);
+ 	} else {
+ 		/* Get the number of skbuffs in use by the hardware */
+-		in_use = cvmx_fau_fetch_and_add32(priv->fau+qos*4, 1);
++		skb_to_free = cvmx_fau_fetch_and_add32(priv->fau+qos*4, 1);
+ 		buffers_to_free = cvmx_fau_fetch_and_add32(FAU_NUM_PACKET_BUFFERS_TO_FREE, 0);
+ 	}
+ 
++	/*
++	 * We try to claim MAX_SKB_TO_FREE buffers.  If there were not
++	 * that many available, we have to un-claim (undo) any that
++	 * were in excess.  If skb_to_free is positive we will free
++	 * that many buffers.
++	 */
++	undo = skb_to_free > 0 ?
++			MAX_SKB_TO_FREE : skb_to_free + MAX_SKB_TO_FREE;
++	if (undo > 0)
++		cvmx_fau_atomic_add32(priv->fau+qos*4, -undo);
++	skb_to_free = -skb_to_free > MAX_SKB_TO_FREE ?
++		MAX_SKB_TO_FREE : -skb_to_free;
++
+ 	/* If we're sending faster than the receive can free them then don't do
+ 	   the HW free */
+ 	if ((buffers_to_free < -100) && !pko_command.s.dontfree) {
+@@ -311,42 +329,28 @@ dont_put_skbuff_in_hw:
+ 		cvmx_scratch_write64(CVMX_SCR_SCRATCH+8, old_scratch2);
+ 	}
+ 
++	queue_it_up = 0;
+ 	if (unlikely(dropped)) {
+ 		dev_kfree_skb_any(skb);
+-		cvmx_fau_atomic_add32(priv->fau+qos*4, -1);
+ 		priv->stats.tx_dropped++;
+ 	} else {
+ 		if (USE_SKBUFFS_IN_HW) {
+ 			/* Put this packet on the queue to be freed later */
+-			if (pko_command.s.dontfree){
+-				if (unlikely(skb_shared(skb)))
+-					dev_kfree_skb_any(skb);
+-				else
+-					skb_queue_tail(&priv->tx_free_list[qos], skb);
+-			}
+-			else {
++			if (pko_command.s.dontfree)
++				queue_it_up = 1;
++			else
+ 				cvmx_fau_atomic_add32(FAU_NUM_PACKET_BUFFERS_TO_FREE, -1);
+-				cvmx_fau_atomic_add32(priv->fau+qos*4, -1);
+-			}
+-		} else {
+-			 if (unlikely(skb_shared(skb)))
+-				 dev_kfree_skb_any(skb);
+-			 else
+-				/* Put this packet on the queue to be freed later */
+-				skb_queue_tail(&priv->tx_free_list[qos], skb);
+-		}
++		} else
++			queue_it_up = 1;
+ 	}
+ 
+-	/* Free skbuffs not in use by the hardware, possibly two at a time */
+-	if (skb_queue_len(&priv->tx_free_list[qos]) > in_use) {
++	if (queue_it_up) {
+ 		spin_lock(&priv->tx_free_list[qos].lock);
+-		/* Check again now that we have the lock. It might have changed */
+-		if (skb_queue_len(&priv->tx_free_list[qos]) > in_use)
+-			dev_kfree_skb(__skb_dequeue(&priv->tx_free_list[qos]));
+-		if (skb_queue_len(&priv->tx_free_list[qos]) > in_use)
+-			dev_kfree_skb(__skb_dequeue(&priv->tx_free_list[qos]));
++		__skb_queue_tail(&priv->tx_free_list[qos], skb);
++		cvm_oct_free_tx_skbs(priv, skb_to_free, qos, 0);
+ 		spin_unlock(&priv->tx_free_list[qos].lock);
+-	}
++	} else
++		cvm_oct_free_tx_skbs(priv, skb_to_free, qos, 1);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/cavium-ethernet/ethernet-tx.h b/drivers/net/cavium-ethernet/ethernet-tx.h
+index 4baccde..5a49d6b 100644
+--- a/drivers/net/cavium-ethernet/ethernet-tx.h
++++ b/drivers/net/cavium-ethernet/ethernet-tx.h
+@@ -40,3 +40,28 @@ int cvm_oct_xmit_pow(struct sk_buff *skb, struct net_device *dev);
+ int cvm_oct_transmit_qos(struct net_device *dev, void *work_queue_entry, int do_free, int qos);
+ void cvm_oct_tx_shutdown(struct net_device *dev);
+ 
++/**
++ * Free dead transmit skbs.
++ *
++ * @priv:              The driver data
++ * @skb_to_free:       The number of SKBs to free (free none if negative).
++ * @qos:               The queue to free from.
++ * @take_lock:         If true, acquire the skb list lock.
++ */
++static inline void cvm_oct_free_tx_skbs(cvm_oct_private_t *priv,
++					int skb_to_free,
++					int qos, int take_lock)
++{
++	/* Free skbuffs not in use by the hardware.  */
++	if (skb_to_free > 0) {
++		if (take_lock)
++			spin_lock(&priv->tx_free_list[qos].lock);
++		while (skb_to_free > 0) {
++			dev_kfree_skb(__skb_dequeue(&priv->tx_free_list[qos]));
++			skb_to_free--;
++		}
++		if (take_lock)
++			spin_unlock(&priv->tx_free_list[qos].lock);
++	}
++}
++
+diff --git a/drivers/net/cavium-ethernet/ethernet.c b/drivers/net/cavium-ethernet/ethernet.c
+index 84b640f..6c102fc 100644
+--- a/drivers/net/cavium-ethernet/ethernet.c
++++ b/drivers/net/cavium-ethernet/ethernet.c
+@@ -130,44 +130,58 @@ struct net_device *cvm_oct_device[TOTAL_NUMBER_OF_PORTS];
+  */
+ static void cvm_do_timer(unsigned long arg)
+ {
++	int32_t skb_to_free, undo;
++	int queues_per_port;
++	int qos;
++	cvm_oct_private_t *priv;
+ 	static int port;
+-	if (port < CVMX_PIP_NUM_INPUT_PORTS) {
+-		if (cvm_oct_device[port]) {
+-			int queues_per_port;
+-			int qos;
+-			cvm_oct_private_t *priv = (cvm_oct_private_t *)netdev_priv(cvm_oct_device[port]);
+-			if (priv->poll) {
+-				/* skip polling if we don't get the lock */
+-				if (!down_trylock(&mdio_sem)) {
+-					priv->poll(cvm_oct_device[port]);
+-					up(&mdio_sem);
+-				}
+-			}
+ 
+-			queues_per_port = cvmx_pko_get_num_queues(port);
+-			/* Drain any pending packets in the free list */
+-			for (qos = 0; qos < queues_per_port; qos++) {
+-				if (skb_queue_len(&priv->tx_free_list[qos])) {
+-					spin_lock(&priv->tx_free_list[qos].lock);
+-					while (skb_queue_len(&priv->tx_free_list[qos]) > cvmx_fau_fetch_and_add32(priv->fau+qos*4, 0))
+-						dev_kfree_skb(__skb_dequeue(&priv->tx_free_list[qos]));
+-					spin_unlock(&priv->tx_free_list[qos].lock);
+-				}
+-			}
+-			cvm_oct_device[port]->get_stats(cvm_oct_device[port]);
+-		}
+-		port++;
+-		/* Poll the next port in a 50th of a second.
+-		   This spreads the polling of ports out a little bit */
+-		mod_timer(&cvm_oct_poll_timer, jiffies + HZ/50);
+-	} else {
++	if (port >= CVMX_PIP_NUM_INPUT_PORTS) {
++		/*
++		 * All ports have been polled. Start the next
++		 * iteration through the ports in one second.
++		 */
++
+ 		port = 0;
+-		/* All ports have been polled. Start the next iteration through
+-		   the ports in one second */
+ 		mod_timer(&cvm_oct_poll_timer, jiffies + HZ);
++		return;
+ 	}
+-}
+ 
++	if (!cvm_oct_device[port])
++		goto out;
++
++	priv = netdev_priv(cvm_oct_device[port]);
++	if (priv->poll) {
++		/* skip polling if we don't get the lock */
++		if (!down_trylock(&mdio_sem)) {
++			priv->poll(cvm_oct_device[port]);
++			up(&mdio_sem);
++		}
++	}
++
++	queues_per_port = cvmx_pko_get_num_queues(port);
++	/* Drain any pending packets in the free list */
++	for (qos = 0; qos < queues_per_port; qos++) {
++		if (skb_queue_len(&priv->tx_free_list[qos]) == 0)
++			continue;
++		skb_to_free = cvmx_fau_fetch_and_add32(priv->fau + qos * 4,
++							MAX_SKB_TO_FREE);
++		undo = skb_to_free > 0 ?
++			MAX_SKB_TO_FREE : skb_to_free + MAX_SKB_TO_FREE;
++		if (undo > 0)
++			cvmx_fau_atomic_add32(priv->fau+qos*4, -undo);
++		skb_to_free = -skb_to_free > MAX_SKB_TO_FREE ?
++				MAX_SKB_TO_FREE : -skb_to_free;
++		cvm_oct_free_tx_skbs(priv, skb_to_free, qos, 1);
++	}
++	cvm_oct_device[port]->get_stats(cvm_oct_device[port]);
++
++out:
++	port++;
++	/* Poll the next port in a 50th of a second.
++	   This spreads the polling of ports out a little bit */
++	mod_timer(&cvm_oct_poll_timer, jiffies + HZ / 50);
++}
+ 
+ /**
+  * Configure common hardware for all interfaces
+-- 
+1.7.0.4
+
