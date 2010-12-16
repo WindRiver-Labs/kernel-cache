@@ -1,0 +1,443 @@
+From 149680ceb46b7c604b764aead3fa1a8b78db877d Mon Sep 17 00:00:00 2001
+From: Andy Fleming <afleming@freescale.com>
+Date: Thu, 10 Dec 2009 18:31:43 +0800
+Subject: [PATCH 085/252] dpa: Numerous optimizations
+
+* Add a free_list for dpa_fd entries, so we eventually never allocate
+* Add a dpa_bp_array so dpa_bpid2pool is fast
+* Double the size of the hash table so that we double the chance of
+  finding an empty slot at or adjacent to the hash value
+* Add skb recycling
+* Changed the default buffer count to 64
+* Optimize the hash search a bit. It was using the % operator, and this
+  resulted in a divide and a multiply for each iteration of the loop.
+  Instead, we resize the table to be a power of 2, so we can use a mask.
+
+Signed-off-by: Andy Fleming <afleming@freescale.com>
+[Applied FSL SDK 2.0.3 patch "kernel-2.6.30-dpa-Numerous-optimizations.patch"]
+Integrated-by: Yuri Nedel <Yuri.Nedel@windriver.com>
+---
+ drivers/net/dpa/dpa.c |  193 ++++++++++++++++++++++++++++++++-----------------
+ drivers/net/dpa/dpa.h |    4 +
+ 2 files changed, 132 insertions(+), 65 deletions(-)
+
+diff --git a/drivers/net/dpa/dpa.c b/drivers/net/dpa/dpa.c
+index 2f42b90..800526a 100644
+--- a/drivers/net/dpa/dpa.c
++++ b/drivers/net/dpa/dpa.c
+@@ -63,6 +63,7 @@
+ #define ARRAY2_SIZE(arr)	(ARRAY_SIZE(arr) * ARRAY_SIZE((arr)[0]))
+ 
+ #define DPA_NETIF_FEATURES	0
++#define DEFAULT_COUNT	64
+ 
+ #define DPA_DESCRIPTION "FSL DPA Ethernet driver"
+ 
+@@ -102,6 +103,8 @@ static const char rtx[][3] = {
+ #define DPA_BP_HEAD	64
+ #define DPA_BP_SIZE(s)	(DPA_BP_HEAD + (s))
+ 
++#define DPA_HASH_MULTIPLE 2
++
+ #define FM_FD_STAT_ERRORS							  \
+ 	(FM_PORT_FRM_ERR_DMA			| FM_PORT_FRM_ERR_PHYSICAL	| \
+ 	 FM_PORT_FRM_ERR_SIZE			| FM_PORT_FRM_ERR_CLS_DISCARD	| \
+@@ -136,12 +139,14 @@ static const size_t dpa_bp_size[] __devinitconst = {
+ 	DPA_BP_SIZE(128), DPA_BP_SIZE(512), DPA_BP_SIZE(1536)
+ };
+ 
++static struct dpa_bp *dpa_bp_array[64];
++
+ static unsigned int dpa_hash_rxaddr(const struct dpa_bp *bp, dma_addr_t a)
+ {
+ 	a >>= PAGE_SHIFT;
+ 	a ^= (a >> ilog2(bp->count));
+ 
+-	return (a % bp->count);
++	return (a & (__roundup_pow_of_two(bp->count) - 1));
+ }
+ 
+ static struct page *dpa_get_rxpage(struct dpa_bp *bp, dma_addr_t addr)
+@@ -154,13 +159,16 @@ static struct page *dpa_get_rxpage(struct dpa_bp *bp, dma_addr_t addr)
+ 	addr &= PAGE_MASK;
+ 
+ 	spin_lock_irqsave(&bp->lock, flags);
+-	for (i = h, j = 0; j < bp->count; j++, i = (i + 1) % bp->count) {
++	for (i = h * DPA_HASH_MULTIPLE, j = 0;
++			j < bp->count * DPA_HASH_MULTIPLE; j++) {
+ 		if (bp->rxhash[i] && bp->rxhash[i]->index == addr) {
+ 			page = bp->rxhash[i];
+ 			bp->rxhash[i] = NULL;
+ 			bp->bp_refill_pending++;
+ 			break;
+ 		}
++
++		i = (i + 1) == bp->count * DPA_HASH_MULTIPLE ? 0 : i + 1;
+ 	}
+ 	spin_unlock_irqrestore(&bp->lock, flags);
+ 
+@@ -176,7 +184,11 @@ static void dpa_hash_page(struct dpa_bp *bp, struct page *page, dma_addr_t base)
+ 	page->index = base & PAGE_MASK;
+ 
+ 	/* If the entry for this hash is missing, just find the next free one */
+-	for (i = h, j = 0; j < bp->count; j++, i = (i + 1) % bp->count) {
++	for (i = h * DPA_HASH_MULTIPLE, j = 0;
++			j < bp->count * DPA_HASH_MULTIPLE;
++			j++,
++			i = (i + 1) == (bp->count * DPA_HASH_MULTIPLE) ?
++				0 : i + 1) {
+ 		if (bp->rxhash[i])
+ 			continue;
+ 
+@@ -303,6 +315,30 @@ static void __cold dpa_bp_depletion(struct bman_portal	*portal,
+ 	cpu_pr_debug(KBUILD_MODNAME ": %s:%s() ->\n", __file__, __func__);
+ }
+ 
++static struct dpa_bp * __must_check __attribute__((nonnull))
++dpa_size2pool(const struct list_head *list, size_t size)
++{
++	struct dpa_bp	*dpa_bp;
++
++	list_for_each_entry(dpa_bp, list, list) {
++		if (DPA_BP_SIZE(size) <= dpa_bp->size)
++			return dpa_bp;
++	}
++	return ERR_PTR(-ENODEV);
++}
++
++static struct dpa_bp * __must_check __attribute__((nonnull))
++dpa_bpid2pool(int bpid)
++{
++	return dpa_bp_array[bpid];
++}
++
++static int __cold __must_check __attribute__((nonnull))
++dpa_pool2bpid(const struct dpa_bp *dpa_bp)
++{
++	return bman_get_params(dpa_bp->pool)->bpid;
++}
++
+ static int __devinit __must_check __cold __attribute__((nonnull))
+ _dpa_bp_alloc(struct net_device *net_dev, struct list_head *list,
+ 		struct dpa_bp *dpa_bp)
+@@ -332,8 +368,10 @@ _dpa_bp_alloc(struct net_device *net_dev, struct list_head *list,
+ 
+ 	/* paddr is only set for pools that are shared between partitions */
+ 	if (dpa_bp->paddr == 0) {
+-		dpa_bp->rxhash = kzalloc(dpa_bp->count * sizeof(struct page *),
+-					 GFP_KERNEL);
++		int hashsize = dpa_bp->count * DPA_HASH_MULTIPLE;
++		hashsize = __roundup_pow_of_two(hashsize);
++		dpa_bp->rxhash = kzalloc(hashsize * sizeof(struct page *),
++					GFP_KERNEL);
+ 		if (!dpa_bp->rxhash) {
+ 			_errno = -ENOMEM;
+ 			goto _return_bman_free_pool;
+@@ -368,6 +406,7 @@ _dpa_bp_alloc(struct net_device *net_dev, struct list_head *list,
+ 	}
+ 
+ 	list_add_tail(&dpa_bp->list, list);
++	dpa_bp_array[dpa_pool2bpid(dpa_bp)] = dpa_bp;
+ 
+ 	return 0;
+ 
+@@ -377,36 +416,6 @@ _return_bman_free_pool:
+ 	return _errno;
+ }
+ 
+-static struct dpa_bp * __must_check __attribute__((nonnull))
+-dpa_size2pool(const struct list_head *list, size_t size)
+-{
+-	struct dpa_bp	*dpa_bp;
+-
+-	list_for_each_entry(dpa_bp, list, list) {
+-		if (DPA_BP_SIZE(size) <= dpa_bp->size)
+-			return dpa_bp;
+-	}
+-	return ERR_PTR(-ENODEV);
+-}
+-
+-static struct dpa_bp * __must_check __attribute__((nonnull))
+-dpa_bpid2pool(const struct list_head *list, int bpid)
+-{
+-	struct dpa_bp	*dpa_bp;
+-
+-	list_for_each_entry(dpa_bp, list, list) {
+-		if (bman_get_params(dpa_bp->pool)->bpid == bpid)
+-			return dpa_bp;
+-	}
+-	return ERR_PTR(-EINVAL);
+-}
+-
+-static int __cold __must_check __attribute__((nonnull))
+-dpa_pool2bpid(const struct dpa_bp *dpa_bp)
+-{
+-	return bman_get_params(dpa_bp->pool)->bpid;
+-}
+-
+ static void * __must_check __attribute__((nonnull))
+ dpa_phys2virt(const struct dpa_bp *dpa_bp, const struct bm_buffer *bmb)
+ {
+@@ -434,6 +443,7 @@ _dpa_bp_free(struct device *dev, struct dpa_bp *dpa_bp)
+ 		free_pages_exact(dpa_bp->vaddr, dpa_bp->size * dpa_bp->count);
+ 	}
+ 	bpid = dpa_pool2bpid(dpa_bp);
++	dpa_bp_array[bpid] = 0;
+ 	bman_free_pool(dpa_bp->pool);
+ 	list_del(&dpa_bp->list);
+ }
+@@ -615,7 +625,7 @@ dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
+ 
+ 	_bmb = (typeof(_bmb))fd;
+ 
+-	_dpa_bp = dpa_bpid2pool(&priv->dpa_bp_list, _bmb->bpid);
++	_dpa_bp = dpa_bpid2pool(_bmb->bpid);
+ 	BUG_ON(IS_ERR(_dpa_bp));
+ 
+ 	_errno = 0;
+@@ -634,7 +644,7 @@ dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
+ 
+ 		i = 0;
+ 		do {
+-			dpa_bp = dpa_bpid2pool(&priv->dpa_bp_list, sgt[i].bpid);
++			dpa_bp = dpa_bpid2pool(sgt[i].bpid);
+ 			BUG_ON(IS_ERR(dpa_bp));
+ 
+ 			j = 0;
+@@ -869,14 +879,20 @@ ingress_rx_default_dqrr(struct qman_portal		*portal,
+ 	percpu_priv->hwi[RX]++;
+ #endif
+ 
+-	dpa_fd = (typeof(dpa_fd))devm_kzalloc(net_dev->dev.parent,
+-			sizeof(*dpa_fd), GFP_ATOMIC);
+-	if (unlikely(dpa_fd == NULL)) {
+-		if (netif_msg_rx_err(priv))
+-			cpu_netdev_err(net_dev,
+-				"%s:%hu:%s(): devm_kzalloc() failed\n",
+-				__file__, __LINE__, __func__);
+-		goto _return;
++	if (list_empty(&percpu_priv->free_list)) {
++		dpa_fd = devm_kzalloc(net_dev->dev.parent,
++				sizeof(*dpa_fd), GFP_ATOMIC);
++		if (unlikely(dpa_fd == NULL)) {
++			if (netif_msg_rx_err(priv))
++				cpu_netdev_err(net_dev,
++					"%s:%hu:%s(): devm_kzalloc() failed\n",
++					__file__, __LINE__, __func__);
++			goto _return;
++		}
++	} else {
++		dpa_fd = list_first_entry(&percpu_priv->free_list,
++					typeof(*dpa_fd), list);
++		list_del(&dpa_fd->list);
+ 	}
+ 
+ 	dpa_fd->fd = dq->fd;
+@@ -1049,12 +1065,13 @@ ingress_tx_default_dqrr(struct qman_portal		*portal,
+ 			struct qman_fq			*fq,
+ 			const struct qm_dqrr_entry	*dq)
+ {
+-	const struct net_device	*net_dev;
++	struct net_device	*net_dev;
+ 	const struct dpa_priv_s	*priv;
+-	struct sk_buff		*skb;
++	struct dpa_percpu_priv_s *percpu_priv;
++	struct dpa_fd *dpa_fd;
+ 
+ 	net_dev = ((struct dpa_fq *)fq)->net_dev;
+-	priv = (typeof(priv))netdev_priv(net_dev);
++	priv = netdev_priv(net_dev);
+ 
+ 	if (netif_msg_tx_err(priv))
+ 		cpu_netdev_dbg(net_dev, "-> %s:%s()\n", __file__, __func__);
+@@ -1072,18 +1089,32 @@ ingress_tx_default_dqrr(struct qman_portal		*portal,
+ }
+ #endif /* CONFIG_FSL_FMAN_TEST */
+ 
++	percpu_priv = per_cpu_ptr(priv->percpu_priv, smp_processor_id());
+ #ifdef CONFIG_DEBUG_FS
+-	per_cpu_ptr(priv->percpu_priv, smp_processor_id())->hwi[TX]++;
++	percpu_priv->hwi[TX]++;
+ #endif
+ 
+-	skb = *(typeof(&skb))bus_to_virt(dq->fd.addr_lo);
++	if (list_empty(&percpu_priv->free_list)) {
++		dpa_fd = devm_kzalloc(net_dev->dev.parent,
++				sizeof(*dpa_fd), GFP_ATOMIC);
++		if (unlikely(dpa_fd == NULL)) {
++			if (netif_msg_rx_err(priv))
++				cpu_netdev_err(net_dev,
++					"%s:%hu:%s(): devm_kzalloc() failed\n",
++					__file__, __LINE__, __func__);
++			return qman_cb_dqrr_consume;
++		}
++	} else {
++		dpa_fd = list_first_entry(&percpu_priv->free_list,
++					typeof(*dpa_fd), list);
++		list_del(&dpa_fd->list);
++	}
+ 
+-	BUG_ON(net_dev != skb->dev);
++	dpa_fd->fd = dq->fd;
+ 
+-	dma_unmap_single(net_dev->dev.parent, dq->fd.addr_lo, skb_headlen(skb),
+-			DMA_TO_DEVICE);
++	list_add_tail(&dpa_fd->list, &percpu_priv->tx_fd_list);
+ 
+-	dev_kfree_skb_irq(skb);
++	schedule_work(&percpu_priv->fd_work);
+ 
+ 	if (netif_msg_tx_err(priv))
+ 		cpu_netdev_dbg(net_dev, "%s:%s() ->\n", __file__, __func__);
+@@ -1327,14 +1358,14 @@ static int dpa_process_sg(struct net_device *net_dev, struct sk_buff *skb,
+ 	sgt = kmap(page) + (fd->addr_lo & ~PAGE_MASK) + dpa_fd_offset(fd);
+ 
+ 	bpid = sgt[0].bpid;
+-	dpa_bp = dpa_bpid2pool(&priv->dpa_bp_list, bpid);
++	dpa_bp = dpa_bpid2pool(bpid);
+ 	for (i = 0; !i || !sgt[i - 1].final; i++) {
+ 		struct page *newpage;
+ 		unsigned int offset;
+ 
+ 		if (bpid != sgt[i].bpid) {
+ 			bpid = sgt[i].bpid;
+-			dpa_bp = dpa_bpid2pool(&priv->dpa_bp_list, bpid);
++			dpa_bp = dpa_bpid2pool(bpid);
+ 			if (IS_ERR(dpa_bp)) {
+ 				cpu_netdev_err(net_dev,
+ 					"Could not find pool for bpid %d\n",
+@@ -1430,7 +1461,7 @@ static void __hot dpa_rx(struct work_struct *fd_work)
+ 	percpu_priv = (typeof(percpu_priv))container_of(
+ 		fd_work, struct dpa_percpu_priv_s, fd_work);
+ 	net_dev = percpu_priv->net_dev;
+-	priv = (typeof(priv))netdev_priv(net_dev);
++	priv = netdev_priv(net_dev);
+ 
+ 	if (netif_msg_rx_status(priv))
+ 		cpu_netdev_dbg(net_dev, "-> %s:%s()\n", __file__, __func__);
+@@ -1442,6 +1473,33 @@ static void __hot dpa_rx(struct work_struct *fd_work)
+ 	percpu_priv->swi++;
+ #endif
+ 
++	/* Clean up any finished TX packets */
++	list_for_each_entry_safe(dpa_fd, tmp, &percpu_priv->tx_fd_list, list) {
++
++		skb = *(typeof(&skb))bus_to_virt(dpa_fd->fd.addr_lo);
++
++		BUG_ON(net_dev != skb->dev);
++
++		dma_unmap_single(net_dev->dev.parent, dpa_fd->fd.addr_lo,
++				skb_headlen(skb), DMA_TO_DEVICE);
++
++		if (skb_queue_len(&percpu_priv->rx_recycle) < DEFAULT_COUNT &&
++				skb_recycle_check(skb,
++					NET_IP_ALIGN +
++					ETH_HLEN +
++					NN_ALLOCATED_SPACE(net_dev) +
++					TT_ALLOCATED_SPACE(net_dev)))
++			__skb_queue_head(&percpu_priv->rx_recycle, skb);
++		else
++			dev_kfree_skb_any(skb);
++
++		local_irq_disable();
++		list_del(&dpa_fd->list);
++		list_add_tail(&dpa_fd->list, &percpu_priv->free_list);
++		local_irq_enable();
++
++	}
++
+ 	list_for_each_entry_safe(dpa_fd, tmp, &percpu_priv->fd_list, list) {
+ 		skb = NULL;
+ 
+@@ -1460,7 +1518,7 @@ static void __hot dpa_rx(struct work_struct *fd_work)
+ 		net_dev->stats.rx_packets++;
+ 		net_dev->stats.rx_bytes += dpa_fd_length(&dpa_fd->fd);
+ 
+-		dpa_bp = dpa_bpid2pool(&priv->dpa_bp_list, dpa_fd->fd.bpid);
++		dpa_bp = dpa_bpid2pool(dpa_fd->fd.bpid);
+ 		BUG_ON(IS_ERR(dpa_bp));
+ 
+ 		if (dpa_fd->fd.format == qm_fd_sg && !dpa_bp->kernel_pool) {
+@@ -1469,13 +1527,16 @@ static void __hot dpa_rx(struct work_struct *fd_work)
+ 			goto _continue_dpa_fd_release;
+ 		}
+ 
+-		if (dpa_bp->kernel_pool)
++		if (dpa_bp->kernel_pool) {
+ 			size = ETH_HLEN + NN_ALLOCATED_SPACE(net_dev) +
+ 				TT_ALLOCATED_SPACE(net_dev);
+-		else
++			skb = __skb_dequeue(&percpu_priv->rx_recycle);
++		} else
+ 			size = dpa_fd_length(&dpa_fd->fd);
+ 
+-		skb = __netdev_alloc_skb(net_dev, NET_IP_ALIGN + size, GFP_DPA);
++		if (!skb)
++			skb = __netdev_alloc_skb(net_dev,
++					NET_IP_ALIGN + size, GFP_DPA);
+ 		if (unlikely(skb == NULL)) {
+ 			if (netif_msg_rx_err(priv))
+ 				cpu_netdev_err(net_dev,
+@@ -1538,9 +1599,8 @@ _continue:
+ 		percpu_priv->count--;
+ 		percpu_priv->total++;
+ #endif
++		list_add_tail(&dpa_fd->list, &percpu_priv->free_list);
+ 		local_irq_enable();
+-
+-		devm_kfree(net_dev->dev.parent, dpa_fd);
+ 	}
+ }
+ 
+@@ -2346,14 +2406,14 @@ dpa_probe(struct of_device *_of_dev)
+ 		}
+ 
+ 		for (i = 0; i < count; i++) {
+-			dpa_bp[i].count	= 128;
++			dpa_bp[i].count	= DEFAULT_COUNT;
+ 			dpa_bp[i].size	= dpa_bp_size[i];
+ 		}
+ 	} else if (count == ARRAY_SIZE(dpa_bp_size)) {
+ 		for (i = 0, j = 0; i < count; i++) {
+ 			if (dpa_bp[i].count == 0 && dpa_bp[i].size == 0 &&
+ 					dpa_bp[i].paddr == 0) {
+-				dpa_bp[i].count	= 128;
++				dpa_bp[i].count	= DEFAULT_COUNT;
+ 				dpa_bp[i].size	= dpa_bp_size[i];
+ 				j++;
+ 			}
+@@ -2415,6 +2475,9 @@ dpa_probe(struct of_device *_of_dev)
+ 		percpu_priv->net_dev = net_dev;
+ 		INIT_WORK(&percpu_priv->fd_work, dpa_rx);
+ 		INIT_LIST_HEAD(&percpu_priv->fd_list);
++		INIT_LIST_HEAD(&percpu_priv->tx_fd_list);
++		INIT_LIST_HEAD(&percpu_priv->free_list);
++		skb_queue_head_init(&percpu_priv->rx_recycle);
+ 	}
+ 
+ 	/* FM */
+diff --git a/drivers/net/dpa/dpa.h b/drivers/net/dpa/dpa.h
+index b9e9469..d59688c 100644
+--- a/drivers/net/dpa/dpa.h
++++ b/drivers/net/dpa/dpa.h
+@@ -37,6 +37,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/list.h>		/* struct list_head */
+ #include <linux/workqueue.h>	/* struct work_struct */
++#include <linux/skbuff.h>
+ #ifdef CONFIG_DEBUG_FS
+ #include <linux/dcache.h>	/* struct dentry */
+ #endif
+@@ -56,6 +57,9 @@ struct dpa_percpu_priv_s {
+ 	struct net_device	*net_dev;
+ 	struct work_struct	 fd_work;
+ 	struct list_head	fd_list;
++	struct list_head	tx_fd_list;
++	struct list_head	free_list;
++	struct sk_buff_head	rx_recycle;
+ #ifdef CONFIG_DEBUG_FS
+ 	size_t			 count, total, max, hwi[2], swi;
+ #endif
+-- 
+1.6.5.2
+

@@ -1,0 +1,501 @@
+From 964871d75d610a08bb858939a88b9fb1b7b72677 Mon Sep 17 00:00:00 2001
+From: Andy Fleming <afleming@freescale.com>
+Date: Thu, 22 Oct 2009 01:48:12 -0500
+Subject: [PATCH 059/252] dpa: Add scatter-gather for RX
+
+Refactor the RX code to add scatter-gather support.  With this patch,
+things seem to work as well as they did before, but now we don't just
+drop the packets to use multiple buffers.
+
+Signed-off-by: Andy Fleming <afleming@freescale.com>
+[Applied FSL SDK 2.0.3 patch
+"kernel-2.6.30-dpa-Add-scatter-gather-for-RX.patch"]
+Integrated-by: Yuri Nedel <Yuri.Nedel@windriver.com>
+---
+ drivers/net/dpa/dpa.c |  322 +++++++++++++++++++++++++++----------------------
+ 1 files changed, 178 insertions(+), 144 deletions(-)
+
+diff --git a/drivers/net/dpa/dpa.c b/drivers/net/dpa/dpa.c
+index 3ce9e55..71748d5 100644
+--- a/drivers/net/dpa/dpa.c
++++ b/drivers/net/dpa/dpa.c
+@@ -30,7 +30,6 @@
+  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
+-#define CONFIG_DPA_RX_0_COPY 1
+ #include <linux/init.h>
+ #include <linux/module.h>
+ #include <linux/sort.h>
+@@ -38,7 +37,6 @@
+ #include <linux/of_platform.h>
+ #include <linux/io.h>
+ #include <linux/etherdevice.h>
+-#ifdef CONFIG_DPA_RX_0_COPY
+ #include <linux/if_arp.h>	/* arp_hdr_len() */
+ #include <linux/icmp.h>		/* struct icmphdr */
+ #include <linux/ip.h>		/* struct iphdr */
+@@ -46,7 +44,6 @@
+ #include <linux/tcp.h>		/* struct tcphdr */
+ #include <linux/spinlock.h>
+ #include <linux/highmem.h>
+-#endif
+ #include <linux/percpu.h>
+ #ifdef CONFIG_DEBUG_FS
+ #include <linux/debugfs.h>
+@@ -147,17 +144,28 @@ static unsigned int dpa_hash_rxaddr(const struct dpa_bp *bp, dma_addr_t a)
+ 	return (a % bp->count);
+ }
+ 
+-static struct page **dpa_find_rxpage(const struct dpa_bp *bp, dma_addr_t addr)
++static struct page *dpa_get_rxpage(struct dpa_bp *bp, dma_addr_t addr)
+ {
+ 	unsigned int h = dpa_hash_rxaddr(bp, addr);
++	struct page *page = NULL;
+ 	int i, j;
++	unsigned long flags;
+ 
+ 	addr &= PAGE_MASK;
+-	for (i = h, j = 0; j < bp->count; j++, i = (i + 1) % bp->count)
+-		if (bp->rxhash[i] && bp->rxhash[i]->index == addr)
+-			return &bp->rxhash[i];
+ 
+-	return NULL;
++	spin_lock_irqsave(&bp->lock, flags);
++	for (i = h, j = 0; j < bp->count; j++, i = (i + 1) % bp->count) {
++		if (bp->rxhash[i] && bp->rxhash[i]->index == addr) {
++			page = bp->rxhash[i];
++			bp->rxhash[i] = NULL;
++			bp->bp_refill_pending++;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&bp->lock, flags);
++
++	BUG_ON(!page);
++	return page;
+ }
+ 
+ static void dpa_hash_page(struct dpa_bp *bp, struct page *page, dma_addr_t base)
+@@ -188,22 +196,12 @@ static void bmb_free(const struct net_device *net_dev,
+ 	 * in it
+ 	 */
+ 	for (i = 0; i < 8; i++) {
+-		struct page **pageptr;
+ 		struct page *page;
+-		unsigned long flags;
+ 
+ 		if (!bmb[i].lo)
+ 			break;
+ 
+-		spin_lock_irqsave(&bp->lock, flags);
+-		pageptr = dpa_find_rxpage(bp, bmb[i].lo);
+-
+-		BUG_ON(!pageptr);
+-
+-		page = *pageptr;
+-		*pageptr = NULL;
+-
+-		spin_unlock_irqrestore(&bp->lock, flags);
++		page = dpa_get_rxpage(bp, bmb[i].lo);
+ 
+ 		dma_unmap_page(net_dev->dev.parent, bmb[i].lo,
+ 				bp->size, DMA_FROM_DEVICE);
+@@ -622,22 +620,14 @@ dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
+ 
+ 	_errno = 0;
+ 	if (fd->format == qm_fd_sg) {
+-#ifdef CONFIG_DPA_RX_0_COPY
+-		struct page **pageptr;
+ 		struct page *page = NULL;
+ 
+ 		if (_dpa_bp->kernel_pool) {
+-			unsigned long flags;
+-			spin_lock_irqsave(&_dpa_bp->lock, flags);
+-			pageptr = dpa_find_rxpage(_dpa_bp, _bmb->lo);
+-			page = *pageptr;
+-			spin_unlock_irqrestore(&_dpa_bp->lock, flags);
++			page = dpa_get_rxpage(_dpa_bp, _bmb->lo);
+ 
+ 			sgt = (typeof(sgt))(kmap(page) +
+ 				(_bmb->lo & ~PAGE_MASK) + dpa_fd_offset(fd));
+-		} else
+-#endif
+-		{
++		} else {
+ 			sgt = (typeof(sgt))(dpa_phys2virt(_dpa_bp, _bmb)
+ 				+ dpa_fd_offset(fd));
+ 		}
+@@ -672,20 +662,22 @@ dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
+ 			}
+ 		} while (!sgt[i-1].final);
+ 
+-#ifdef CONFIG_DPA_RX_0_COPY
+ 		if (_dpa_bp->kernel_pool)
+ 			kunmap(page);
+-#endif
+ 	}
+ 
+-	__errno = bman_release(_dpa_bp->pool, _bmb, 1,
+-			BMAN_RELEASE_FLAG_WAIT_INT);
+-	if (unlikely(__errno < 0)) {
+-		cpu_netdev_err(net_dev, "%s:%hu:%s(): bman_release(%hu) = %d\n",
+-				__file__, __LINE__, __func__,
+-				bman_get_params(_dpa_bp->pool)->bpid, _errno);
+-		if (_errno >= 0)
+-			_errno = __errno;
++	if (!_dpa_bp->kernel_pool) {
++		__errno = bman_release(_dpa_bp->pool, _bmb, 1,
++				BMAN_RELEASE_FLAG_WAIT_INT);
++		if (unlikely(__errno < 0)) {
++			cpu_netdev_err(net_dev,
++					"%s:%hu:%s(): bman_release(%hu) = %d\n",
++					__file__, __LINE__, __func__,
++					bman_get_params(_dpa_bp->pool)->bpid,
++					_errno);
++			if (_errno >= 0)
++				_errno = __errno;
++		}
+ 	}
+ 
+ 	return _errno;
+@@ -693,7 +685,6 @@ dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
+ 
+ /* net_device */
+ 
+-#ifdef CONFIG_DPA_RX_0_COPY
+ #define NN_ALLOCATED_SPACE(net_dev)	max((size_t)arp_hdr_len(net_dev),  sizeof(struct iphdr))
+ #define NN_RESERVED_SPACE(net_dev)	min((size_t)arp_hdr_len(net_dev),  sizeof(struct iphdr))
+ 
+@@ -701,7 +692,6 @@ dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
+ 	max(sizeof(struct icmphdr), max(sizeof(struct udphdr), sizeof(struct tcphdr)))
+ #define TT_RESERVED_SPACE(net_dev)	\
+ 	min(sizeof(struct icmphdr), min(sizeof(struct udphdr), sizeof(struct tcphdr)))
+-#endif
+ 
+ static enum qman_cb_dqrr_result
+ ingress_rx_error_dqrr(struct qman_portal *portal, struct qman_fq *fq,
+@@ -1309,22 +1299,133 @@ static void __cold dpa_change_rx_flags(struct net_device *net_dev, int flags)
+ 	cpu_netdev_dbg(net_dev, "%s:%s() ->\n", __file__, __func__);
+ }
+ 
++static void dpa_rx_skb_add_page(struct sk_buff *skb, struct page *page,
++				u32 offset, u32 size)
++{
++	skb_fill_page_desc(skb, 0, page, offset, size);
++
++	skb->len	+= size;
++	skb->data_len	+= size;
++	skb->truesize	+= size;
++}
++
++static int dpa_process_sg(struct net_device *net_dev, struct sk_buff *skb,
++			struct dpa_bp *sgt_bp, const struct qm_fd *fd)
++{
++	const struct dpa_priv_s	*priv;
++	struct dpa_bp *dpa_bp;
++	u8 bpid;
++	const struct qm_sg_entry *sgt;
++	int err = 0;
++	struct page *page;
++	int i;
++
++	priv = netdev_priv(net_dev);
++
++	page = dpa_get_rxpage(sgt_bp, fd->addr_lo);
++
++	sgt = kmap(page) + (fd->addr_lo & ~PAGE_MASK) + dpa_fd_offset(fd);
++
++	bpid = sgt[0].bpid;
++	dpa_bp = dpa_bpid2pool(&priv->dpa_bp_list, bpid);
++	for (i = 0; !i || !sgt[i - 1].final; i++) {
++		struct page *newpage;
++		unsigned int offset;
++
++		if (bpid != sgt[i].bpid) {
++			bpid = sgt[i].bpid;
++			dpa_bp = dpa_bpid2pool(&priv->dpa_bp_list, bpid);
++			if (IS_ERR(dpa_bp)) {
++				cpu_netdev_err(net_dev,
++					"Could not find pool for bpid %d\n",
++					bpid);
++				err = -EINVAL;
++				goto err_bpid2pool_failed;
++			}
++		}
++
++		newpage = dpa_get_rxpage(dpa_bp, sgt[i].addr_lo);
++
++		offset = (sgt[i].addr_lo + sgt[i].offset) & ~PAGE_MASK;
++		dpa_rx_skb_add_page(skb, newpage, offset, sgt[i].length);
++
++		/* Unmap the page */
++		dma_unmap_page(net_dev->dev.parent, newpage->index + offset,
++				dpa_bp->size, DMA_FROM_DEVICE);
++	}
++
++	if (!__pskb_pull_tail(skb,
++				ETH_HLEN + NN_RESERVED_SPACE(net_dev) +
++				TT_RESERVED_SPACE(net_dev))) {
++		cpu_netdev_err(net_dev, "__pskb_pull_tail() failed\n");
++
++		net_dev->stats.rx_dropped++;
++
++		err = -1;
++		goto err_pspb_pull_failed;
++	}
++	kunmap(page);
++
++	return 0;
++
++err_pspb_pull_failed:
++err_bpid2pool_failed:
++	kunmap(page);
++	/* Free all the buffers in the skb */
++	dev_kfree_skb(skb);
++	return err;
++}
++
++static int dpa_process_one(struct net_device *net_dev, struct sk_buff *skb,
++				struct dpa_bp *dpa_bp, struct qm_fd *fd)
++{
++	int err;
++
++	if (dpa_bp->kernel_pool) {
++		struct page *page;
++		unsigned int off = (fd->addr_lo +
++					dpa_fd_offset(fd)) & ~PAGE_MASK;
++
++		page = dpa_get_rxpage(dpa_bp, fd->addr_lo);
++
++		dpa_rx_skb_add_page(skb, page, off, dpa_fd_length(fd));
++
++		dma_unmap_page(net_dev->dev.parent, page->index + off,
++				dpa_bp->size, DMA_FROM_DEVICE);
++
++		if (!__pskb_pull_tail(skb, ETH_HLEN +
++					NN_RESERVED_SPACE(net_dev) +
++					TT_RESERVED_SPACE(net_dev))) {
++			cpu_netdev_err(net_dev, "__pskb_pull_tail() failed\n");
++			net_dev->stats.rx_dropped++;
++			return -1;
++		}
++	} else {
++		memcpy(skb_put(skb, dpa_fd_length(fd)),
++			dpa_phys2virt(dpa_bp, (const struct bm_buffer *)fd) +
++				dpa_fd_offset(fd),
++			dpa_fd_length(fd));
++
++		err = dpa_fd_release(net_dev, fd);
++		if (err < 0) {
++			dump_stack();
++			panic("Can't release buffer to BM during RX\n");
++		}
++	}
++
++	return 0;
++}
++
+ static void __hot dpa_rx(struct work_struct *fd_work)
+ {
+-	int			 _errno;
+-	struct net_device	*net_dev;
++	int _errno;
++	struct net_device *net_dev;
+ 	const struct dpa_priv_s	*priv;
+-	struct dpa_percpu_priv_s	 *percpu_priv;
+-	struct dpa_fd		*dpa_fd, *tmp;
+-	const struct bm_buffer	*bmb;
+-	struct dpa_bp	*dpa_bp;
+-	size_t			 head, size;
+-	struct sk_buff		*skb;
+-#ifdef CONFIG_DPA_RX_0_COPY
+-	struct page **pageptr;
+-	struct page *page = NULL;
+-	unsigned long flags;
+-#endif
++	struct dpa_percpu_priv_s *percpu_priv;
++	struct dpa_fd *dpa_fd, *tmp;
++	struct dpa_bp *dpa_bp;
++	size_t size;
++	struct sk_buff *skb;
+ 
+ 	percpu_priv = (typeof(percpu_priv))container_of(
+ 		fd_work, struct dpa_percpu_priv_s, fd_work);
+@@ -1346,7 +1447,7 @@ static void __hot dpa_rx(struct work_struct *fd_work)
+ 
+ 		if (unlikely(dpa_fd->fd.status & FM_FD_STAT_ERRORS) != 0) {
+ 			if (netif_msg_rx_err(priv))
+-				cpu_netdev_err(net_dev,
++				cpu_netdev_warn(net_dev,
+ 					"%s:%hu:%s(): FD status = 0x%08x\n",
+ 					__file__, __LINE__, __func__,
+ 					dpa_fd->fd.status & FM_FD_STAT_ERRORS);
+@@ -1359,46 +1460,22 @@ static void __hot dpa_rx(struct work_struct *fd_work)
+ 		net_dev->stats.rx_packets++;
+ 		net_dev->stats.rx_bytes += dpa_fd_length(&dpa_fd->fd);
+ 
+-		if (dpa_fd->fd.format == qm_fd_sg) {
+-			net_dev->stats.rx_dropped++;
+-			printk("dropping an SG frame");
++		dpa_bp = dpa_bpid2pool(&priv->dpa_bp_list, dpa_fd->fd.bpid);
++		BUG_ON(IS_ERR(dpa_bp));
+ 
++		if (dpa_fd->fd.format == qm_fd_sg && !dpa_bp->kernel_pool) {
++			net_dev->stats.rx_dropped++;
++			cpu_netdev_err(net_dev, "Dropping SG frame\n");
+ 			goto _continue_dpa_fd_release;
+ 		}
+ 
+-		BUG_ON(dpa_fd->fd.format != qm_fd_contig);
+-
+-		bmb = (typeof(bmb))&dpa_fd->fd;
+-
+-		dpa_bp = dpa_bpid2pool(&priv->dpa_bp_list, bmb->bpid);
+-		BUG_ON(IS_ERR(dpa_bp));
+-
+-#ifdef CONFIG_DPA_RX_0_COPY
+-		if (dpa_bp->kernel_pool) {
+-			spin_lock_irqsave(&dpa_bp->lock, flags);
+-			pageptr = dpa_find_rxpage(dpa_bp, bmb->lo);
+-
+-			if (!pageptr)
+-				cpu_pr_emerg("No page found for addr %x!\n",
+-						bmb->lo);
+-
+-			page = *pageptr;
+-			*pageptr = NULL;
+-
+-			dpa_bp->bp_refill_pending++;
+-			spin_unlock_irqrestore(&dpa_bp->lock, flags);
+-
+-			head = sizeof(*bmb) + NET_IP_ALIGN;
++		if (dpa_bp->kernel_pool)
+ 			size = ETH_HLEN + NN_ALLOCATED_SPACE(net_dev) +
+ 				TT_ALLOCATED_SPACE(net_dev);
+-		} else
+-#endif
+-		{
+-			head = NET_IP_ALIGN;
++		else
+ 			size = dpa_fd_length(&dpa_fd->fd);
+-		}
+ 
+-		skb = __netdev_alloc_skb(net_dev, head + size, GFP_DPA);
++		skb = __netdev_alloc_skb(net_dev, NET_IP_ALIGN + size, GFP_DPA);
+ 		if (unlikely(skb == NULL)) {
+ 			if (netif_msg_rx_err(priv))
+ 				cpu_netdev_err(net_dev,
+@@ -1410,55 +1487,18 @@ static void __hot dpa_rx(struct work_struct *fd_work)
+ 			goto _continue_dpa_fd_release;
+ 		}
+ 
+-		skb_reserve(skb, head);
+-
+-#ifdef CONFIG_DPA_RX_0_COPY
+-		if (dpa_bp->kernel_pool) {
+-			unsigned int off = (bmb->lo +
+-				dpa_fd_offset(&dpa_fd->fd)) & ~PAGE_MASK;
+-			unsigned int len = dpa_fd_length(&dpa_fd->fd);
+-			*(struct bm_buffer *)skb->head = *bmb;
+-
+-			skb_fill_page_desc(skb, 0, page, off, len);
+-
+-			skb->len	+= len;
+-			skb->data_len	+= len;
+-			skb->truesize	+= dpa_bp->size;
++		skb_reserve(skb, NET_IP_ALIGN);
+ 
+-			/*
+-			 * Unmap this page mapping,
+-			 * and remove one instance of the page from the hash
+-			 */
+-			dma_unmap_page(net_dev->dev.parent, page->index + off,
+-					dpa_bp->size, DMA_FROM_DEVICE);
+-
+-			if (unlikely(!__pskb_pull_tail(skb,
+-						ETH_HLEN +
+-						NN_RESERVED_SPACE(net_dev) +
+-						TT_RESERVED_SPACE(net_dev)))) {
+-				if (netif_msg_rx_err(priv))
+-					cpu_netdev_err(net_dev,
+-					"%s:%hu: __pskb_pull_tail() failed\n",
+-						       __file__, __LINE__);
+-
+-				net_dev->stats.rx_dropped++;
++		/* Fill the SKB */
++		if (dpa_fd->fd.format == qm_fd_sg)
++			_errno = dpa_process_sg(net_dev, skb, dpa_bp,
++						&dpa_fd->fd);
++		else
++			_errno = dpa_process_one(net_dev, skb, dpa_bp,
++						 &dpa_fd->fd);
+ 
+-				goto _continue_dev_kfree_skb;
+-			}
+-		} else
+-#endif
+-		{
+-			memcpy(skb_put(skb, size),
+-				dpa_phys2virt(dpa_bp, bmb) +
+-					dpa_fd_offset(&dpa_fd->fd),
+-				size);
+-
+-			_errno = dpa_fd_release(net_dev, &dpa_fd->fd);
+-			if (unlikely(_errno < 0)) {
+-				dump_stack();
+-				panic("Can't release buffer to BM during RX\n");
+-			}
+-		}
++		if (_errno)
++			goto _continue_dev_kfree_skb;
+ 
+ 		skb->protocol = eth_type_trans(skb, net_dev);
+ 
+@@ -1472,29 +1512,26 @@ static void __hot dpa_rx(struct work_struct *fd_work)
+ 				cpu_netdev_warn(net_dev, "%s:%hu:%s(): netif_rx_ni() = %d\n",
+ 						__file__, __LINE__, __func__, _errno);
+ 			net_dev->stats.rx_dropped++;
++			goto _continue_dev_kfree_skb;
+ 		}
+ 
+ 		net_dev->last_rx = jiffies;
+ 
+-#ifdef CONFIG_DPA_RX_0_COPY
+ 		if (dpa_bp->bp_refill_pending > dpa_bp->bp_kick_thresh)
+ 			dpa_bp_refill(net_dev, dpa_bp, GFP_KERNEL);
+-#endif
+ 
+ 		goto _continue;
+ 
++_continue_dev_kfree_skb:
++		dev_kfree_skb(skb);
+ _continue_dpa_fd_release:
+ 		_errno = dpa_fd_release(net_dev, &dpa_fd->fd);
+ 		if (unlikely(_errno < 0)) {
+ 			dump_stack();
+ 			panic("Can't release buffer to the BM during RX\n");
+ 		}
+-#ifdef CONFIG_DPA_RX_0_COPY
+-_continue_dev_kfree_skb:
+-		dev_kfree_skb(skb);
+-#endif
+-_continue:
+ 
++_continue:
+ 		local_irq_disable();
+ 		list_del(&dpa_fd->list);
+ #ifdef CONFIG_DEBUG_FS
+@@ -1505,9 +1542,6 @@ _continue:
+ 
+ 		devm_kfree(net_dev->dev.parent, dpa_fd);
+ 	}
+-
+-	if (netif_msg_rx_status(priv))
+-		cpu_netdev_dbg(net_dev, "%s:%s() ->\n", __file__, __func__);
+ }
+ 
+ static int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+-- 
+1.6.5.2
+
