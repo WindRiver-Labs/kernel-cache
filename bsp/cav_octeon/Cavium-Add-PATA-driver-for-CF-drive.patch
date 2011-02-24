@@ -1,0 +1,255 @@
+From af3eee3937bd40440686dedd28dddc2bb819c7e9 Mon Sep 17 00:00:00 2001
+From: ltian <le.tian@windriver.com>
+Date: Fri, 12 Nov 2010 11:37:19 +0800
+Subject: [PATCH 036/132] Cavium: Add PATA driver for CF drive
+
+Source: SDK 2.0.0-366
+
+Cavium now uses a Parallel ATA driver for Compact Flash
+support. Update and hook this driver into the appropriate
+subsystems. Also tweak:
+
+CF supports DMA mode which is disabled unless enable_dma is set to 1.
+The associated DMA channle should be stopped firstly before system
+reboot, becuase CF interface is on bootbus.
+
+On cn63XX the I/O clock runs at a different rate than the core
+clock.  It is important to use the right one to get proper timing
+values.
+
+Don't base the poll time out on jiffies. The typical wait time is far
+less than a single jiffy.
+
+Signed-off-by: ltian <le.tian@windriver.com>
+---
+ arch/mips/include/asm/octeon/octeon.h |    1 +
+ drivers/ata/Kconfig                   |    1 +
+ drivers/ata/pata_octeon_cf.c          |   84 ++++++++++++++++++++++++---------
+ 3 files changed, 64 insertions(+), 22 deletions(-)
+
+diff --git a/arch/mips/include/asm/octeon/octeon.h b/arch/mips/include/asm/octeon/octeon.h
+index 2ddbea9..801c308 100644
+--- a/arch/mips/include/asm/octeon/octeon.h
++++ b/arch/mips/include/asm/octeon/octeon.h
+@@ -216,6 +216,7 @@ struct octeon_cf_data {
+ 	unsigned int	base_region;	/* The chip select region used by CF */
+ 	int		is16bit;	/* 0 - 8bit, !0 - 16bit */
+ 	int		dma_engine;	/* -1 for no DMA */
++	void		*c0;
+ };
+ 
+ struct octeon_i2c_data {
+diff --git a/drivers/ata/Kconfig b/drivers/ata/Kconfig
+index 01c52c4..6fb46c7 100644
+--- a/drivers/ata/Kconfig
++++ b/drivers/ata/Kconfig
+@@ -756,6 +756,7 @@ config PATA_IXP4XX_CF
+ config PATA_OCTEON_CF
+ 	tristate "OCTEON Boot Bus Compact Flash support"
+ 	depends on CPU_CAVIUM_OCTEON
++	select HIGH_RES_TIMERS
+ 	help
+ 	  This option enables a polled compact flash driver for use with
+ 	  compact flash cards attached to the OCTEON boot bus.
+diff --git a/drivers/ata/pata_octeon_cf.c b/drivers/ata/pata_octeon_cf.c
+index 63d6efe..46d015c 100644
+--- a/drivers/ata/pata_octeon_cf.c
++++ b/drivers/ata/pata_octeon_cf.c
+@@ -12,10 +12,10 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/libata.h>
++#include <linux/hrtimer.h>
+ #include <linux/irq.h>
+ #include <linux/slab.h>
+ #include <linux/platform_device.h>
+-#include <linux/workqueue.h>
+ #include <scsi/scsi_host.h>
+ 
+ #include <asm/octeon/octeon.h>
+@@ -36,10 +36,11 @@
+ #define DRV_NAME	"pata_octeon_cf"
+ #define DRV_VERSION	"2.1"
+ 
++/* Poll interval in nS. */
++#define OCTEON_CF_BUSY_POLL_INTERVAL 500000
+ 
+ struct octeon_cf_port {
+-	struct workqueue_struct *wq;
+-	struct delayed_work delayed_finish;
++	struct hrtimer delayed_finish;
+ 	struct ata_port *ap;
+ 	int dma_finished;
+ };
+@@ -48,6 +49,11 @@ static struct scsi_host_template octeon_cf_sht = {
+ 	ATA_PIO_SHT(DRV_NAME),
+ };
+ 
++static int enable_dma;
++module_param(enable_dma, int, 0444);
++MODULE_PARM_DESC(enable_dma,
++		 "Enable use of DMA on interfaces that support it (0=no dma [default], 1=use dma)");
++
+ /**
+  * Convert nanosecond based time to setting used in the
+  * boot bus timing register, based on timing multiple
+@@ -60,7 +66,7 @@ static unsigned int ns_to_tim_reg(unsigned int tim_mult, unsigned int nsecs)
+ 	 * Compute # of eclock periods to get desired duration in
+ 	 * nanoseconds.
+ 	 */
+-	val = DIV_ROUND_UP(nsecs * (octeon_get_clock_rate() / 1000000),
++	val = DIV_ROUND_UP(nsecs * (octeon_get_io_clock_rate() / 1000000),
+ 			  1000 * tim_mult);
+ 
+ 	return val;
+@@ -106,7 +112,7 @@ static void octeon_cf_set_piomode(struct ata_port *ap, struct ata_device *dev)
+ 	int t2;
+ 	int t2i;
+ 
+-	T = (int)(2000000000000LL / octeon_get_clock_rate());
++	T = (int)(2000000000000LL / octeon_get_io_clock_rate());
+ 
+ 	if (ata_timing_compute(dev, dev->pio_mode, &timing, T, T))
+ 		BUG();
+@@ -199,7 +205,7 @@ static void octeon_cf_set_dmamode(struct ata_port *ap, struct ata_device *dev)
+ 	/* not spec'ed, value in eclocks, not affected by tim_mult */
+ 	dma_arq = 8;
+ 	pause = 25 - dma_arq * 1000 /
+-		(octeon_get_clock_rate() / 1000000); /* Tz */
++		(octeon_get_io_clock_rate() / 1000000); /* Tz */
+ 
+ 	oe_a = Td;
+ 	/* Tkr from cf spec, lengthened to meet T0 */
+@@ -695,9 +701,10 @@ static irqreturn_t octeon_cf_interrupt(int irq, void *dev_instance)
+ 				dma_int.s.done = 1;
+ 				cvmx_write_csr(CVMX_MIO_BOOT_DMA_INTX(ocd->dma_engine),
+ 					       dma_int.u64);
+-
+-				queue_delayed_work(cf_port->wq,
+-						   &cf_port->delayed_finish, 1);
++				hrtimer_start_range_ns(&cf_port->delayed_finish,
++						       ns_to_ktime(OCTEON_CF_BUSY_POLL_INTERVAL),
++						       OCTEON_CF_BUSY_POLL_INTERVAL / 5,
++						       HRTIMER_MODE_REL);
+ 				handled = 1;
+ 			} else {
+ 				handled |= octeon_cf_dma_finished(ap, qc);
+@@ -709,16 +716,17 @@ static irqreturn_t octeon_cf_interrupt(int irq, void *dev_instance)
+ 	return IRQ_RETVAL(handled);
+ }
+ 
+-static void octeon_cf_delayed_finish(struct work_struct *work)
++static enum hrtimer_restart octeon_cf_delayed_finish(struct hrtimer *hrt)
+ {
+-	struct octeon_cf_port *cf_port = container_of(work,
++	struct octeon_cf_port *cf_port = container_of(hrt,
+ 						      struct octeon_cf_port,
+-						      delayed_finish.work);
++						      delayed_finish);
+ 	struct ata_port *ap = cf_port->ap;
+ 	struct ata_host *host = ap->host;
+ 	struct ata_queued_cmd *qc;
+ 	unsigned long flags;
+ 	u8 status;
++	enum hrtimer_restart rv = HRTIMER_NORESTART;
+ 
+ 	spin_lock_irqsave(&host->lock, flags);
+ 
+@@ -733,8 +741,9 @@ static void octeon_cf_delayed_finish(struct work_struct *work)
+ 	status = ioread8(ap->ioaddr.altstatus_addr);
+ 	if (status & (ATA_BUSY | ATA_DRQ)) {
+ 		/* Still busy, try again. */
+-		queue_delayed_work(cf_port->wq,
+-				   &cf_port->delayed_finish, 1);
++		hrtimer_forward_now(hrt,
++				    ns_to_ktime(OCTEON_CF_BUSY_POLL_INTERVAL));
++		rv = HRTIMER_RESTART;
+ 		goto out;
+ 	}
+ 	qc = ata_qc_from_tag(ap, ap->link.active_tag);
+@@ -743,6 +752,7 @@ static void octeon_cf_delayed_finish(struct work_struct *work)
+ 		octeon_cf_dma_finished(ap, qc);
+ out:
+ 	spin_unlock_irqrestore(&host->lock, flags);
++	return rv;
+ }
+ 
+ static void octeon_cf_dev_config(struct ata_device *dev)
+@@ -903,17 +913,14 @@ static int __devinit octeon_cf_probe(struct platform_device *pdev)
+ 		ap->ioaddr.ctl_addr	= cs1 + (6 << 1) + 1;
+ 		octeon_cf_ops.sff_data_xfer = octeon_cf_data_xfer16;
+ 
+-		ap->mwdma_mask	= ATA_MWDMA4;
++		ap->mwdma_mask	= enable_dma ? ATA_MWDMA4 : 0;
+ 		irq = platform_get_irq(pdev, 0);
+ 		irq_handler = octeon_cf_interrupt;
+ 
+-		/* True IDE mode needs delayed work to poll for not-busy.  */
+-		cf_port->wq = create_singlethread_workqueue(DRV_NAME);
+-		if (!cf_port->wq)
+-			goto free_cf_port;
+-		INIT_DELAYED_WORK(&cf_port->delayed_finish,
+-				  octeon_cf_delayed_finish);
+-
++		/* True IDE mode needs a timer to poll for not-busy.  */
++		hrtimer_init(&cf_port->delayed_finish, CLOCK_MONOTONIC,
++			     HRTIMER_MODE_REL);
++		cf_port->delayed_finish.function = octeon_cf_delayed_finish;
+ 	} else {
+ 		/* 16 bit but not True IDE */
+ 		octeon_cf_ops.sff_data_xfer	= octeon_cf_data_xfer16;
+@@ -929,6 +936,7 @@ static int __devinit octeon_cf_probe(struct platform_device *pdev)
+ 		ap->ioaddr.ctl_addr	= base + 0xe;
+ 		ap->ioaddr.altstatus_addr = base + 0xe;
+ 	}
++	ocd->c0 = ap->ioaddr.ctl_addr;
+ 
+ 	ata_port_desc(ap, "cmd %p ctl %p", base, ap->ioaddr.ctl_addr);
+ 
+@@ -948,11 +956,43 @@ free_cf_port:
+ 	return -ENOMEM;
+ }
+ 
++static void octeon_cf_shutdown(struct device *dev)
++{
++	struct octeon_cf_data *ocd;
++	union cvmx_mio_boot_dma_cfgx dma_cfg;
++	union cvmx_mio_boot_dma_intx dma_int;
++
++	ocd = dev->platform_data;
++
++	if (ocd->dma_engine >= 0) {
++		/* Stop and clear the dma engine.  */
++		dma_cfg.u64 = 0;
++		dma_cfg.s.size = -1;
++		cvmx_write_csr(CVMX_MIO_BOOT_DMA_CFGX(ocd->dma_engine), dma_cfg.u64);
++
++		/* Disable the interrupt.  */
++		dma_int.u64 = 0;
++		cvmx_write_csr(CVMX_MIO_BOOT_DMA_INT_ENX(ocd->dma_engine), dma_int.u64);
++
++		/* Clear the DMA complete status */
++		dma_int.s.done = 1;
++		cvmx_write_csr(CVMX_MIO_BOOT_DMA_INTX(ocd->dma_engine), dma_int.u64);
++
++		__raw_writeb(0, ocd->c0);
++		udelay(20);
++		__raw_writeb(ATA_SRST, ocd->c0);
++		udelay(20);
++		__raw_writeb(0, ocd->c0);
++		mdelay(100);
++	}
++}
++
+ static struct platform_driver octeon_cf_driver = {
+ 	.probe		= octeon_cf_probe,
+ 	.driver		= {
+ 		.name	= DRV_NAME,
+ 		.owner	= THIS_MODULE,
++		.shutdown = octeon_cf_shutdown
+ 	},
+ };
+ 
+-- 
+1.6.5.2
+
