@@ -1,0 +1,255 @@
+From ac56f6237c46a5ae44982baab080508207bdbd63 Mon Sep 17 00:00:00 2001
+From: Denis Oliver Kropp <dok@shizo.directfb.home>
+Date: Tue, 19 Feb 2008 15:29:05 +0100
+Subject: [PATCH] Support resume of interrupted wait and regain lock after timeout.
+
+This is compatible with mutex/condition, except for expected errors.
+
+Requires user space changes.
+---
+ drivers/char/fusion/fusiondev.c |    6 ++-
+ drivers/char/fusion/skirmish.c  |  128 +++++++++++++++++++++++++++++----------
+ drivers/char/fusion/skirmish.h  |    9 +--
+ include/linux/fusion.h          |    5 +-
+ 4 files changed, 108 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/char/fusion/fusiondev.c b/drivers/char/fusion/fusiondev.c
+index 46f3da7..b87f3a6 100644
+--- a/drivers/char/fusion/fusiondev.c
++++ b/drivers/char/fusion/fusiondev.c
+@@ -770,7 +770,11 @@ skirmish_ioctl (FusionDev *dev, Fusionee *fusionee,
+                if (copy_from_user (&wait, (FusionSkirmishWait*) arg, sizeof(wait)))
+                     return -EFAULT;
+ 
+-               return fusion_skirmish_wait_ (dev, wait.id, fusion_id, wait.timeout);
++               ret = fusion_skirmish_wait_ (dev, &wait, fusion_id);
++               if (copy_to_user ((FusionSkirmishWait*) arg, &wait, sizeof(wait)))
++                    return -EFAULT;
++
++               return ret;
+ 
+           case _IOC_NR(FUSION_SKIRMISH_NOTIFY):
+                if (get_user (id, (int*) arg))
+diff --git a/drivers/char/fusion/skirmish.c b/drivers/char/fusion/skirmish.c
+index 6a08014..9eb7eea 100644
+--- a/drivers/char/fusion/skirmish.c
++++ b/drivers/char/fusion/skirmish.c
+@@ -425,58 +425,118 @@ fusion_skirmish_destroy (FusionDev *dev, int id)
+ }
+ 
+ int
+-fusion_skirmish_wait_ (FusionDev *dev, int id, int fusion_id, unsigned int timeout)
++fusion_skirmish_wait_ (FusionDev *dev, FusionSkirmishWait *wait, FusionID fusion_id)
+ {
+-     int             ret;
+-     int             lock_count;
+-     unsigned int    notify_count;
++     int             ret, ret2;
+      FusionSkirmish *skirmish;
+ 
+-     ret = fusion_skirmish_lock( &dev->skirmish, id, false, &skirmish );
+-     if (ret)
++     printk( KERN_DEBUG "FusionSkirmish: %s( 0x%x, lock count %u, notify count %u, timeout %u ) called...\n",
++             __FUNCTION__, wait->id, wait->lock_count, wait->notify_count, wait->timeout );
++
++     /* Lookup and lock the entry. */
++     ret = fusion_skirmish_lock( &dev->skirmish, wait->id, false, &skirmish );
++     if (ret) {
++          printk( KERN_DEBUG "FusionSkirmish: Failed to lookup skirmish with id 0x%x!\n", wait->id );
+           return ret;
++     }
++
++     printk( KERN_DEBUG "FusionSkirmish: Found entry at %p!\n", skirmish );
+ 
++     /* Statistics... */
+      dev->stat.skirmish_wait++;
+ 
+-     if (skirmish->lock_pid != current->pid) {
+-          fusion_skirmish_unlock( skirmish );
+-          return -EIO;
+-     }
++     /* Check if not a resumed call. */
++     if (!wait->lock_count) {
++          /* Cannot wait for skirmish not held by the current task. */
++          if (skirmish->lock_pid != current->pid) {
++               fusion_skirmish_unlock( skirmish );
++               printk( KERN_DEBUG "FusionSkirmish: Tried to wait for skirmish not held by the current task!\n" );
++               return -EIO;
++          }
+ 
+-     lock_count   = skirmish->lock_count;
+-     notify_count = skirmish->notify_count;
++          /* Remember lock and notification counters. */
++          wait->lock_count   = skirmish->lock_count;
++          wait->notify_count = skirmish->notify_count;
+ 
+-     skirmish->lock_fid = 0;
+-     skirmish->lock_pid = 0;
++          /* Temporarily give up the skirmish. */
++          skirmish->lock_fid = 0;
++          skirmish->lock_pid = 0;
+ 
+ #ifdef FUSION_BLOCK_SIGNALS
+-     if (current->pid <= PID_MAX_DEFAULT && ! --m_pidlocks[current->pid])
+-          unblock_all_signals();
++          if (current->pid <= PID_MAX_DEFAULT && ! --m_pidlocks[current->pid])
++               unblock_all_signals();
+ #endif
+ 
+-     fusion_skirmish_notify( skirmish, true );
++          /* Notify potential notifiers waiting for the entry. */
++          fusion_skirmish_notify( skirmish, true );
++     }
++     /* This might happen when lock count was not initialized. */
++     else if (skirmish->lock_pid == current->pid) {
++          fusion_skirmish_unlock( skirmish );
++          printk( KERN_DEBUG "FusionSkirmish: Tried to resume wait for skirmish still held by the current task!\n" );
++          return -EIO;
++     }
+ 
+-     if (timeout) {
+-          long timeout_jiffies = timeout * HZ / 1000;
++     /* Wait until the notification counter differs. */
++     if (wait->timeout) {
++          long timeout_jiffies = wait->timeout * HZ / 1000;
+ 
+-          while (notify_count == skirmish->notify_count) {
++          while (wait->notify_count == skirmish->notify_count && !ret)
+                ret = fusion_skirmish_wait( skirmish, &timeout_jiffies );
+-               if (ret)
+-                    return ret;
+-          }
++
++          wait->timeout = (timeout_jiffies * 1000 / HZ) ? : 1;
+      }
+      else {
+-          while (notify_count == skirmish->notify_count) {
++          while (wait->notify_count == skirmish->notify_count && !ret)
+                ret = fusion_skirmish_wait( skirmish, NULL );
+-               if (ret)
+-                    return ret;
+-          }
+      }
+ 
+-     while (skirmish->lock_pid) {
+-          ret = fusion_skirmish_wait( skirmish, NULL );
+-          if (ret)
++     /* Check for normal or unusual results. */
++     switch (ret) {
++          case 0:
++               break;
++
++          case -ETIMEDOUT:
++               printk( KERN_DEBUG "FusionSkirmish: Timeout while waiting for notification!\n" );
++
++               /* Relock after timeout. */
++               ret2 = fusion_skirmish_lock( &dev->skirmish, wait->id, false, &skirmish );
++               if (ret2) {
++                    printk( KERN_DEBUG "FusionSkirmish: Failed to relookup skirmish with id 0x%x!\n", wait->id );
++                    return ret2;
++               }
++               break;
++
++          case -EINTR:
++               /* Return immediately upon signal. */
++               printk( KERN_DEBUG "FusionSkirmish: Interrupted while waiting for notification!\n" );
+                return ret;
++
++          default:
++               /* Return immediately upon unusual result. */
++               printk( KERN_DEBUG "FusionSkirmish: Error while waiting for notification (%d)!\n", ret );
++               return ret;
++     }
++
++     /* Wait until the lock can be taken again. */
++     while (skirmish->lock_pid) {
++          ret2 = fusion_skirmish_wait( skirmish, NULL );
++          
++          /* Check for normal or unusual results. */
++          switch (ret2) {
++               case 0:
++                    break;
++
++               case -EINTR:
++                    /* Return immediately upon signal. */
++                    printk( KERN_DEBUG "FusionSkirmish: Interrupted while waiting for relock!\n" );
++                    return ret2;
++
++               default:
++                    /* Return immediately upon unusual result. */
++                    printk( KERN_DEBUG "FusionSkirmish: Error while waiting for notification (%d)!\n", ret2 );
++                    return ret2;
++          }
+      }
+ 
+ #ifdef FUSION_BLOCK_SIGNALS
+@@ -486,15 +546,17 @@ fusion_skirmish_wait_ (FusionDev *dev, int id, int fusion_id, unsigned int timeo
+ 
+      skirmish->lock_fid   = fusion_id;
+      skirmish->lock_pid   = current->pid;
+-     skirmish->lock_count = lock_count;
++     skirmish->lock_count = wait->lock_count;
+ 
+      fusion_skirmish_unlock( skirmish );
+ 
+-     return 0;
++     printk( KERN_DEBUG "FusionSkirmish: ...done (%d).\n", ret );
++
++     return ret;
+ }
+ 
+ int
+-fusion_skirmish_notify_ (FusionDev *dev, int id, int fusion_id)
++fusion_skirmish_notify_ (FusionDev *dev, int id, FusionID fusion_id)
+ {
+      int             ret;
+      FusionSkirmish *skirmish;
+diff --git a/drivers/char/fusion/skirmish.h b/drivers/char/fusion/skirmish.h
+index 988b8db..e60b40a 100644
+--- a/drivers/char/fusion/skirmish.h
++++ b/drivers/char/fusion/skirmish.h
+@@ -50,14 +50,13 @@ int fusion_skirmish_dismiss (FusionDev *dev,
+ int fusion_skirmish_destroy (FusionDev *dev,
+                              int        id);
+ 
+-int fusion_skirmish_wait_   (FusionDev   *dev,
+-                             int          id,
+-                             int          fusion_id,
+-                             unsigned int timeout);
++int fusion_skirmish_wait_   (FusionDev          *dev,
++                             FusionSkirmishWait *wait,
++                             FusionID            fusion_id);
+ 
+ int fusion_skirmish_notify_ (FusionDev *dev,
+                              int        id,
+-                             int        fusion_id);
++                             FusionID   fusion_id);
+ 
+ 
+ /* internal functions */
+diff --git a/include/linux/fusion.h b/include/linux/fusion.h
+index 88f7240..442d1cf 100644
+--- a/include/linux/fusion.h
++++ b/include/linux/fusion.h
+@@ -6,7 +6,7 @@
+ /*
+  * Fusion Kernel Device API Version
+  */
+-#define FUSION_API_MAJOR      7         /* Increased if backward compatibility is dropped. */
++#define FUSION_API_MAJOR      8         /* Increased if backward compatibility is dropped. */
+ #define FUSION_API_MINOR      0         /* Increased if new features are added. */
+ 
+ /*
+@@ -196,6 +196,9 @@ typedef struct {
+ typedef struct {
+      int                 id;            /* skirmish id */
+      unsigned int        timeout;       /* timeout in ms (0 = unlimited) */
++
++     unsigned int        lock_count;    /* MUST be set to zero, MUST NOT be reset when the system call is resumed. */
++     unsigned int        notify_count;  /* MUST NOT be reset when the system call is resumed after a signal. */
+ } FusionSkirmishWait;
+ 
+ 
+-- 
+1.7.3.3
+

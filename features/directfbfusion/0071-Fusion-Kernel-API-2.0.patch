@@ -1,0 +1,1266 @@
+From 4d44a211bdeb22b36dec65072faab2e186532922 Mon Sep 17 00:00:00 2001
+From: Denis Oliver Kropp <dok@directfb.org>
+Date: Sat, 29 Oct 2005 00:38:05 +0000
+Subject: [PATCH] Fusion Kernel API 2.0
+
+Added management of shared memory pools
+- register pools with a specified maximum possible size
+- manage virtual address space so that all pools system wide can be mapped in parallel
+- dispatch messages when the shared memory heap has been resized (for remapping)
+- new ioctls are FUSION_SHMPOOL_NEW, ATTACH, DETACH, DISPATCH and DESTROY
+
+Added support for mmap() on the Fusion device itself, providing one page of shared
+memory serving as the root structure for all other shared information/memory in a world.
+
+Block all slaves at FUSION_ENTER until the master issues the new FUSION_UNBLOCK ioctl.
+---
+ drivers/char/fusion/Makefile-2.4 |    2 +-
+ drivers/char/fusion/Makefile-2.6 |    2 +-
+ drivers/char/fusion/entries.c    |    6 +-
+ drivers/char/fusion/entries.h    |    5 +-
+ drivers/char/fusion/fusiondev.c  |  151 ++++++++++++++-
+ drivers/char/fusion/fusiondev.h  |   13 ++-
+ drivers/char/fusion/fusionee.c   |   39 ++++-
+ drivers/char/fusion/fusionee.h   |    4 +
+ drivers/char/fusion/property.c   |    2 +-
+ drivers/char/fusion/reactor.c    |    2 +-
+ drivers/char/fusion/shmpool.c    |  382 ++++++++++++++++++++++++++++++++++++++
+ drivers/char/fusion/shmpool.h    |   54 ++++++
+ drivers/char/fusion/skirmish.c   |    2 +-
+ include/linux/fusion.h           |  185 ++++++++++++-------
+ 14 files changed, 768 insertions(+), 81 deletions(-)
+ create mode 100644 drivers/char/fusion/shmpool.c
+ create mode 100644 drivers/char/fusion/shmpool.h
+
+diff --git a/drivers/char/fusion/Makefile-2.4 b/drivers/char/fusion/Makefile-2.4
+index 9726df3..dc13229 100644
+--- a/drivers/char/fusion/Makefile-2.4
++++ b/drivers/char/fusion/Makefile-2.4
+@@ -1,6 +1,6 @@
+ O_TARGET := fusion.o
+ 
+-obj-y   := call.o entries.o fifo.o fusiondev.o fusionee.o list.o property.o reactor.o ref.o skirmish.o
++obj-y   := call.o entries.o fifo.o fusiondev.o fusionee.o list.o property.o reactor.o ref.o skirmish.o shmpool.o
+ obj-$(CONFIG_FUSION_DEVICE)   := $(O_TARGET)
+ 
+ include $(TOPDIR)/Rules.make
+diff --git a/drivers/char/fusion/Makefile-2.6 b/drivers/char/fusion/Makefile-2.6
+index b636115..8c825b2 100644
+--- a/drivers/char/fusion/Makefile-2.6
++++ b/drivers/char/fusion/Makefile-2.6
+@@ -1,3 +1,3 @@
+ obj-$(CONFIG_FUSION_DEVICE) += fusion.o
+ 
+-fusion-y := call.o entries.o fifo.o fusiondev.o fusionee.o list.o property.o reactor.o ref.o skirmish.o
++fusion-y := call.o entries.o fifo.o fusiondev.o fusionee.o list.o property.o reactor.o ref.o skirmish.o shmpool.o
+diff --git a/drivers/char/fusion/entries.c b/drivers/char/fusion/entries.c
+index 747bd05..a6bfffa 100644
+--- a/drivers/char/fusion/entries.c
++++ b/drivers/char/fusion/entries.c
+@@ -146,7 +146,8 @@ fusion_entries_read_proc(char *buf, char **start, off_t offset,
+ 
+ int
+ fusion_entry_create( FusionEntries *entries,
+-                     int           *ret_id )
++                     int           *ret_id,
++                     void          *create_ctx )
+ {
+      int               ret;
+      FusionEntry      *entry;
+@@ -178,8 +179,9 @@ fusion_entry_create( FusionEntries *entries,
+      init_waitqueue_head( &entry->wait );
+ 
+      if (class->Init) {
+-          ret = class->Init( entry, entries->ctx );
++          ret = class->Init( entry, entries->ctx, create_ctx );
+           if (ret) {
++               up( &entries->lock );
+                kfree( entry );
+                return ret;
+           }
+diff --git a/drivers/char/fusion/entries.h b/drivers/char/fusion/entries.h
+index e6d9f8f..1d6259a 100644
+--- a/drivers/char/fusion/entries.h
++++ b/drivers/char/fusion/entries.h
+@@ -25,7 +25,7 @@ typedef struct __FD_FusionEntry FusionEntry;
+ typedef const struct {
+      int object_size;
+ 
+-     int  (*Init)   ( FusionEntry *entry, void *ctx );
++     int  (*Init)   ( FusionEntry *entry, void *ctx, void *create_ctx );
+      void (*Destroy)( FusionEntry *entry, void *ctx );
+      int  (*Print)  ( FusionEntry *entry, void *ctx, char *buf );
+ } FusionEntryClass;
+@@ -79,7 +79,8 @@ int  fusion_entries_read_proc( char *buf, char **start, off_t offset,
+ /* Create & Destroy */
+ 
+ int  fusion_entry_create  ( FusionEntries    *entries,
+-                            int              *ret_id );
++                            int              *ret_id,
++                            void             *create_ctx );
+ 
+ int  fusion_entry_destroy ( FusionEntries    *entries,
+                             int               id );
+diff --git a/drivers/char/fusion/fusiondev.c b/drivers/char/fusion/fusiondev.c
+index 4e4d979..c78d0d0 100644
+--- a/drivers/char/fusion/fusiondev.c
++++ b/drivers/char/fusion/fusiondev.c
+@@ -23,6 +23,7 @@
+ #include <linux/proc_fs.h>
+ #include <linux/poll.h>
+ #include <linux/init.h>
++#include <asm/io.h>
+ #include <asm/uaccess.h>
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 2)
+@@ -38,6 +39,7 @@
+ #include "reactor.h"
+ #include "ref.h"
+ #include "skirmish.h"
++#include "shmpool.h"
+ 
+ #if 0
+ #define DEBUG(x...)  printk (KERN_DEBUG "Fusion: " x)
+@@ -171,6 +173,9 @@ fusiondev_init (FusionDev *dev)
+ {
+      int ret;
+ 
++     init_MUTEX( &dev->enter_lock );
++     init_waitqueue_head( &dev->enter_wait );
++
+      ret = fusionee_init (dev);
+      if (ret)
+           goto error_fusionee;
+@@ -191,17 +196,24 @@ fusiondev_init (FusionDev *dev)
+      if (ret)
+           goto error_reactor;
+ 
++     ret = fusion_shmpool_init (dev);
++     if (ret)
++          goto error_shmpool;
++
+      ret = fusion_call_init (dev);
+      if (ret)
+           goto error_call;
+ 
+-     create_proc_read_entry("stat", 0, dev->proc_dir,
+-                            fusiondev_stat_read_proc, dev);
++     create_proc_read_entry( "stat", 0, dev->proc_dir,
++                             fusiondev_stat_read_proc, dev );
+ 
+      return 0;
+ 
+ 
+ error_call:
++     fusion_shmpool_deinit (dev);
++
++error_shmpool:
+      fusion_reactor_deinit (dev);
+ 
+ error_reactor:
+@@ -226,11 +238,15 @@ fusiondev_deinit (FusionDev *dev)
+      remove_proc_entry ("stat", dev->proc_dir);
+ 
+      fusion_call_deinit (dev);
++     fusion_shmpool_deinit (dev);
+      fusion_reactor_deinit (dev);
+      fusion_property_deinit (dev);
+      fusion_skirmish_deinit (dev);
+      fusion_ref_deinit (dev);
+      fusionee_deinit (dev);
++
++     if (dev->shared_area)
++          free_page( dev->shared_area );
+ }
+ 
+ /******************************************************************************/
+@@ -389,16 +405,30 @@ lounge_ioctl (FusionDev *dev, int fusion_id,
+                if (copy_from_user (&enter, (FusionEnter*) arg, sizeof(enter)))
+                     return -EFAULT;
+ 
+-               if (enter.api.major != FUSION_API_MAJOR || enter.api.minor > FUSION_API_MINOR)
+-                    return -ENOPROTOOPT;
+-
+-               enter.fusion_id = fusion_id;
++               ret = fusionee_enter( dev, &enter, fusion_id );
++               if (ret)
++                    return ret;
+ 
+                if (copy_to_user ((FusionEnter*) arg, &enter, sizeof(enter)))
+                     return -EFAULT;
+ 
+                return 0;
+ 
++          case _IOC_NR(FUSION_UNBLOCK):
++               if (fusion_id != FUSION_ID_MASTER)
++                    return -EPERM;
++
++               if (down_interruptible( &dev->enter_lock ))
++                    return -EINTR;
++
++               dev->enter_ok = 1;
++
++               wake_up_interruptible_all( &dev->enter_wait );
++
++               up( &dev->enter_lock );
++
++               return 0;
++
+           case _IOC_NR(FUSION_KILL):
+                if (copy_from_user (&kill, (FusionKill*) arg, sizeof(kill)))
+                     return -EFAULT;
+@@ -420,6 +450,9 @@ lounge_ioctl (FusionDev *dev, int fusion_id,
+                     case FT_REACTOR:
+                          return fusion_entry_set_info (&dev->reactor, &info);
+ 
++                    case FT_SHMPOOL:
++                         return fusion_entry_set_info (&dev->shmpool, &info);
++
+                     default:
+                          return -ENOSYS;
+                }
+@@ -441,6 +474,10 @@ lounge_ioctl (FusionDev *dev, int fusion_id,
+                          ret = fusion_entry_get_info (&dev->reactor, &info);
+                          break;
+ 
++                    case FT_SHMPOOL:
++                         ret = fusion_entry_get_info (&dev->shmpool, &info);
++                         break;
++
+                     default:
+                          return -ENOSYS;
+                }
+@@ -790,6 +827,71 @@ reactor_ioctl (FusionDev *dev, int fusion_id,
+ }
+ 
+ static int
++shmpool_ioctl (FusionDev *dev, int fusion_id,
++               unsigned int cmd, unsigned long arg)
++{
++     int                   id;
++     int                   ret;
++     FusionSHMPoolNew      pool;
++     FusionSHMPoolAttach   attach;
++     FusionSHMPoolDispatch dispatch;
++
++     switch (_IOC_NR(cmd)) {
++          case _IOC_NR(FUSION_SHMPOOL_NEW):
++               if (copy_from_user (&pool, (FusionSHMPoolNew*) arg, sizeof(pool)))
++                    return -EFAULT;
++
++               ret = fusion_shmpool_new (dev, &pool);
++               if (ret)
++                    return ret;
++
++               if (copy_to_user ((FusionSHMPoolNew*) arg, &pool, sizeof(pool))) {
++                    fusion_shmpool_destroy (dev, pool.pool_id);
++                    return -EFAULT;
++               }
++
++               return 0;
++
++          case _IOC_NR(FUSION_SHMPOOL_ATTACH):
++               if (copy_from_user (&attach,
++                                   (FusionSHMPoolAttach*) arg, sizeof(attach)))
++                    return -EFAULT;
++
++               ret = fusion_shmpool_attach (dev, &attach, fusion_id);
++               if (ret)
++                    return ret;
++
++               if (copy_to_user ((FusionSHMPoolAttach*) arg, &attach, sizeof(attach))) {
++                    fusion_shmpool_detach (dev, attach.pool_id, fusion_id);
++                    return -EFAULT;
++               }
++
++               return 0;
++
++          case _IOC_NR(FUSION_SHMPOOL_DETACH):
++               if (get_user (id, (int*) arg))
++                    return -EFAULT;
++
++               return fusion_shmpool_detach (dev, id, fusion_id);
++
++          case _IOC_NR(FUSION_SHMPOOL_DISPATCH):
++               if (copy_from_user (&dispatch,
++                                   (FusionSHMPoolDispatch*) arg, sizeof(dispatch)))
++                    return -EFAULT;
++
++               return fusion_shmpool_dispatch (dev, &dispatch, fusion_id);
++
++          case _IOC_NR(FUSION_SHMPOOL_DESTROY):
++               if (get_user (id, (int*) arg))
++                    return -EFAULT;
++
++               return fusion_shmpool_destroy (dev, id);
++     }
++
++     return -ENOSYS;
++}
++
++static int
+ fusion_ioctl (struct inode *inode, struct file *file,
+               unsigned int cmd, unsigned long arg)
+ {
+@@ -819,11 +921,45 @@ fusion_ioctl (struct inode *inode, struct file *file,
+ 
+           case FT_REACTOR:
+                return reactor_ioctl( dev, id, cmd, arg );
++
++          case FT_SHMPOOL:
++               return shmpool_ioctl( dev, id, cmd, arg );
+      }
+ 
+      return -ENOSYS;
+ }
+ 
++static int
++fusion_mmap( struct file           *file,
++             struct vm_area_struct *vma )
++{
++     int           fusion_id = (int) file->private_data;
++     FusionDev    *dev       = fusion_devs[iminor(file->f_dentry->d_inode)];
++     unsigned int  size;
++
++     if (vma->vm_pgoff != 0)
++          return -EINVAL;
++
++     size = vma->vm_end - vma->vm_start;
++     if (!size || size > PAGE_SIZE)
++          return -EINVAL;
++
++     if (!dev->shared_area) {
++          if (fusion_id != 1)
++               return -EPERM;
++
++          dev->shared_area = get_zeroed_page( GFP_KERNEL );
++          if (!dev->shared_area)
++               return -ENOMEM;
++
++          SetPageReserved( virt_to_page(dev->shared_area) );
++     }
++
++     return remap_pfn_range( vma, vma->vm_start,
++                             virt_to_phys((void*)dev->shared_area) >> PAGE_SHIFT,
++                             PAGE_SIZE, vma->vm_page_prot );
++}
++
+ static struct file_operations fusion_fops = {
+      .owner   = THIS_MODULE,
+      .open    = fusion_open,
+@@ -831,7 +967,8 @@ static struct file_operations fusion_fops = {
+      .release = fusion_release,
+      .read    = fusion_read,
+      .poll    = fusion_poll,
+-     .ioctl   = fusion_ioctl
++     .ioctl   = fusion_ioctl,
++     .mmap    = fusion_mmap
+ };
+ 
+ /******************************************************************************/
+diff --git a/drivers/char/fusion/fusiondev.h b/drivers/char/fusion/fusiondev.h
+index 58467c7..45d3dfe 100644
+--- a/drivers/char/fusion/fusiondev.h
++++ b/drivers/char/fusion/fusiondev.h
+@@ -24,7 +24,13 @@
+ #define FUSION_ASSUME(exp)    if (!(exp)) printk( KERN_ERR "fusiondev: assumption '" #exp "' failed!\n" )
+ 
+ typedef struct {
+-     int refs;
++     int                    refs;
++
++     struct semaphore       enter_lock;
++     int                    enter_ok;
++     wait_queue_head_t      enter_wait;
++
++     unsigned long          shared_area;
+ 
+      struct proc_dir_entry *proc_dir;
+ 
+@@ -40,6 +46,9 @@ typedef struct {
+ 
+           int skirmish_prevail_swoop;
+           int skirmish_dismiss;
++
++          int shmpool_attach;
++          int shmpool_detach;
+      } stat;
+ 
+      struct {
+@@ -59,6 +68,8 @@ typedef struct {
+ 
+      FusionEntries  reactor;
+ 
++     FusionEntries  shmpool;
++
+      struct {
+           int                ids;
+           FusionLink        *list;
+diff --git a/drivers/char/fusion/fusionee.c b/drivers/char/fusion/fusionee.c
+index 3b24001..a80f623 100644
+--- a/drivers/char/fusion/fusionee.c
++++ b/drivers/char/fusion/fusionee.c
+@@ -30,6 +30,7 @@
+ #include "reactor.h"
+ #include "ref.h"
+ #include "skirmish.h"
++#include "shmpool.h"
+ 
+ #if 0
+ #define DEBUG(x...)  printk (KERN_DEBUG "Fusion: " x)
+@@ -184,6 +185,37 @@ fusionee_new (FusionDev *dev, int *id)
+ }
+ 
+ int
++fusionee_enter (FusionDev   *dev,
++                FusionEnter *enter,
++                int          id)
++{
++     if (enter->api.major != FUSION_API_MAJOR || enter->api.minor > FUSION_API_MINOR)
++          return -ENOPROTOOPT;
++
++     enter->fusion_id = id;
++
++     if (id != FUSION_ID_MASTER) {
++          if (down_interruptible( &dev->enter_lock ))
++               return -EINTR;
++
++          if (dev->enter_ok) {
++               up( &dev->enter_lock );
++               return 0;
++          }
++
++          fusion_sleep_on( &dev->enter_wait, &dev->enter_lock, NULL );
++
++          if (signal_pending(current))
++               return -EINTR;
++
++          if (!dev->enter_ok)
++               return -EAGAIN;
++     }
++
++     return 0;
++}
++
++int
+ fusionee_send_message (FusionDev *dev, int id, int recipient,
+                        FusionMessageType msg_type, int msg_id,
+                        int msg_size, const void *msg_data)
+@@ -223,7 +255,7 @@ fusionee_send_message (FusionDev *dev, int id, int recipient,
+ 
+      message->data = message + 1;
+ 
+-     if (msg_type == FMT_CALL)
++     if (msg_type == FMT_CALL || msg_type == FMT_SHMPOOL)
+           memcpy (message->data, msg_data, msg_size);
+      else if (copy_from_user (message->data, msg_data, msg_size)) {
+           kfree (message);
+@@ -435,6 +467,7 @@ fusionee_destroy (FusionDev *dev, int id)
+      fusion_reactor_detach_all (dev, id);
+      fusion_property_cede_all (dev, id);
+      fusion_ref_clear_all_local (dev, id);
++     fusion_shmpool_detach_all (dev, id);
+ 
+      while (fusionee->messages.count) {
+           Message *message = (Message*) fusion_fifo_get (&fusionee->messages);
+@@ -446,6 +479,10 @@ fusionee_destroy (FusionDev *dev, int id)
+ 
+      kfree (fusionee);
+ 
++
++     if (id == FUSION_ID_MASTER && !dev->enter_ok)
++          wake_up_interruptible_all (&dev->enter_wait);
++
+      return ret;
+ }
+ 
+diff --git a/drivers/char/fusion/fusionee.h b/drivers/char/fusion/fusionee.h
+index ed65052..de79ff1 100644
+--- a/drivers/char/fusion/fusionee.h
++++ b/drivers/char/fusion/fusionee.h
+@@ -33,6 +33,10 @@ void fusionee_deinit (FusionDev *dev);
+ int fusionee_new           (FusionDev         *dev,
+                             int               *id);
+ 
++int fusionee_enter         (FusionDev         *dev,
++                            FusionEnter       *enter,
++                            int                id);
++
+ int fusionee_send_message  (FusionDev         *dev,
+                             int                id,
+                             int                recipient,
+diff --git a/drivers/char/fusion/property.c b/drivers/char/fusion/property.c
+index a39902e..7942e28 100644
+--- a/drivers/char/fusion/property.c
++++ b/drivers/char/fusion/property.c
+@@ -91,7 +91,7 @@ fusion_property_deinit( FusionDev *dev )
+ int
+ fusion_property_new( FusionDev *dev, int *ret_id )
+ {
+-     return fusion_entry_create( &dev->properties, ret_id );
++     return fusion_entry_create( &dev->properties, ret_id, NULL );
+ }
+ 
+ int
+diff --git a/drivers/char/fusion/reactor.c b/drivers/char/fusion/reactor.c
+index 180e4cd..2379db7 100644
+--- a/drivers/char/fusion/reactor.c
++++ b/drivers/char/fusion/reactor.c
+@@ -109,7 +109,7 @@ fusion_reactor_deinit (FusionDev *dev)
+ int
+ fusion_reactor_new (FusionDev *dev, int *ret_id)
+ {
+-     return fusion_entry_create( &dev->reactor, ret_id );
++     return fusion_entry_create( &dev->reactor, ret_id, NULL );
+ }
+ 
+ int
+diff --git a/drivers/char/fusion/shmpool.c b/drivers/char/fusion/shmpool.c
+new file mode 100644
+index 0000000..bbd028c
+--- /dev/null
++++ b/drivers/char/fusion/shmpool.c
+@@ -0,0 +1,382 @@
++/*
++ *	Fusion Kernel Module
++ *
++ *	(c) Copyright 2002-2003  Convergence GmbH
++ *
++ *      Written by Denis Oliver Kropp <dok@directfb.org>
++ *
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/config.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/smp_lock.h>
++#include <linux/sched.h>
++
++#include <linux/fusion.h>
++
++#include "fusiondev.h"
++#include "fusionee.h"
++#include "list.h"
++#include "shmpool.h"
++
++
++#define SHM_BASE    0x20010000     /* virtual base address */
++#define SHM_SIZE    0x1FFEF000     /* size of virtual address space */
++
++
++typedef struct {
++     FusionLink         link;
++     unsigned long      next_base;
++} AddrEntry;
++
++
++typedef struct {
++     FusionLink         link;
++
++     int                fusion_id;
++
++     int                count;     /* number of attach calls */
++} SHMPoolNode;
++
++typedef struct {
++     FusionEntry        entry;
++
++     int                max_size;
++
++     void              *addr_base;
++     int                size;
++
++     AddrEntry         *addr_entry;
++
++     FusionLink        *nodes;
++
++     int                dispatch_count;
++} FusionSHMPool;
++
++/******************************************************************************/
++
++static SHMPoolNode *get_node      ( FusionSHMPool *shmpool,
++                                    int            fusion_id );
++
++static void         remove_node   ( FusionSHMPool *shmpool,
++                                    int            fusion_id );
++
++static void         free_all_nodes( FusionSHMPool *shmpool );
++
++/******************************************************************************/
++
++
++static DECLARE_MUTEX (addr_lock);
++static FusionLink    *addr_entries;
++static unsigned long  addr_base = SHM_BASE;
++
++/******************************************************************************/
++
++static AddrEntry *
++add_addr_entry( unsigned long next_base )
++{
++     AddrEntry *entry = kmalloc( sizeof(AddrEntry), GFP_KERNEL );
++
++     entry->next_base = next_base;
++
++     fusion_list_prepend( &addr_entries, &entry->link );
++
++     return entry;
++}
++
++/******************************************************************************/
++
++static int
++fusion_shmpool_construct( FusionEntry *entry,
++                          void        *ctx,
++                          void        *create_ctx )
++{
++     FusionSHMPool    *shmpool = (FusionSHMPool*) entry;
++     FusionSHMPoolNew *poolnew = create_ctx;
++
++     down( &addr_lock );
++
++     if (addr_base + poolnew->max_size >= SHM_BASE + SHM_SIZE) {
++          up( &addr_lock );
++          printk( KERN_WARNING "%s: virtual address space exhausted! (FIXME)\n", __FUNCTION__ );
++          return -ENOSPC;
++     }
++
++     shmpool->max_size  = poolnew->max_size;
++     shmpool->addr_base = poolnew->addr_base = (void*) addr_base;
++
++     addr_base += PAGE_ALIGN(poolnew->max_size) + PAGE_SIZE; /* fence page */
++
++     shmpool->addr_entry = add_addr_entry( addr_base );
++
++     up( &addr_lock );
++
++     return 0;
++}
++
++static void
++fusion_shmpool_destruct( FusionEntry *entry,
++                         void        *ctx )
++{
++     AddrEntry     *addr_entry;
++     FusionSHMPool *shmpool = (FusionSHMPool*) entry;
++
++     free_all_nodes( shmpool );
++
++
++     down( &addr_lock );
++
++     fusion_list_remove( &addr_entries, &shmpool->addr_entry->link );
++
++
++     /*
++      * free trailing address space
++      */
++
++     addr_base = SHM_BASE;
++
++     fusion_list_foreach (addr_entry, addr_entries) {
++          if (addr_entry->next_base > addr_base)
++               addr_base = addr_entry->next_base;
++     }
++
++     up( &addr_lock );
++}
++
++static int
++fusion_shmpool_print( FusionEntry *entry,
++                      void        *ctx,
++                      char        *buf )
++{
++     int            num     = 0;
++     FusionSHMPool *shmpool = (FusionSHMPool*) entry;
++     FusionLink    *node    = shmpool->nodes;
++
++     fusion_list_foreach (node, shmpool->nodes) {
++          num++;
++     }
++
++     return sprintf( buf, "0x%p [0x%x] - 0x%x, %dx dispatch, %d nodes\n",
++                     shmpool->addr_base, shmpool->max_size, shmpool->size,
++                     shmpool->dispatch_count, num );
++}
++
++
++FUSION_ENTRY_CLASS( FusionSHMPool, shmpool, fusion_shmpool_construct,
++                    fusion_shmpool_destruct, fusion_shmpool_print )
++
++/******************************************************************************/
++
++int
++fusion_shmpool_init (FusionDev *dev)
++{
++     fusion_entries_init( &dev->shmpool, &shmpool_class, dev );
++
++     create_proc_read_entry( "shmpools", 0, dev->proc_dir,
++                             fusion_entries_read_proc, &dev->shmpool );
++
++     return 0;
++}
++
++void
++fusion_shmpool_deinit (FusionDev *dev)
++{
++     remove_proc_entry ("shmpools", dev->proc_dir);
++
++     fusion_entries_deinit( &dev->shmpool );
++}
++
++/******************************************************************************/
++
++int
++fusion_shmpool_new (FusionDev        *dev,
++                    FusionSHMPoolNew *pool)
++{
++     if (pool->max_size <= 0)
++          return -EINVAL;
++
++     return fusion_entry_create( &dev->shmpool, &pool->pool_id, pool );
++}
++
++int
++fusion_shmpool_attach (FusionDev           *dev,
++                       FusionSHMPoolAttach *attach,
++                       int                  fusion_id)
++{
++     int            ret;
++     SHMPoolNode   *node;
++     FusionSHMPool *shmpool;
++
++     ret = fusion_shmpool_lock( &dev->shmpool, attach->pool_id, &shmpool );
++     if (ret)
++          return ret;
++
++     dev->stat.shmpool_attach++;
++
++     node = get_node (shmpool, fusion_id);
++     if (!node) {
++          node = kmalloc (sizeof(SHMPoolNode), GFP_KERNEL);
++          if (!node) {
++               fusion_shmpool_unlock( shmpool );
++               return -ENOMEM;
++          }
++
++          node->fusion_id = fusion_id;
++          node->count     = 1;
++
++          fusion_list_prepend (&shmpool->nodes, &node->link);
++     }
++     else
++          node->count++;
++
++     attach->addr_base = shmpool->addr_base;
++     attach->size      = shmpool->size;
++
++     fusion_shmpool_unlock( shmpool );
++
++     return 0;
++}
++
++int
++fusion_shmpool_detach (FusionDev *dev, int id, int fusion_id)
++{
++     int            ret;
++     SHMPoolNode   *node;
++     FusionSHMPool *shmpool;
++
++     ret = fusion_shmpool_lock( &dev->shmpool, id, &shmpool );
++     if (ret)
++          return ret;
++
++     dev->stat.shmpool_detach++;
++
++     node = get_node (shmpool, fusion_id);
++     if (!node) {
++          fusion_shmpool_unlock( shmpool );
++          return -EIO;
++     }
++
++     if (! --node->count) {
++          fusion_list_remove (&shmpool->nodes, &node->link);
++          kfree (node);
++     }
++
++     fusion_shmpool_unlock( shmpool );
++
++     return 0;
++}
++
++int
++fusion_shmpool_dispatch( FusionDev             *dev,
++                         FusionSHMPoolDispatch *dispatch,
++                         int                    fusion_id )
++{
++     int                   ret;
++     FusionLink           *l;
++     FusionSHMPool        *shmpool;
++     FusionSHMPoolMessage  message;
++
++     if (dispatch->size <= 0)
++          return -EINVAL;
++
++     ret = fusion_shmpool_lock( &dev->shmpool, dispatch->pool_id, &shmpool );
++     if (ret)
++          return ret;
++
++     message.type = FSMT_REMAP;
++     message.size = dispatch->size;
++
++     shmpool->dispatch_count++;
++
++     shmpool->size = dispatch->size;
++
++     fusion_list_foreach (l, shmpool->nodes) {
++          SHMPoolNode *node = (SHMPoolNode *) l;
++
++          if (node->fusion_id == fusion_id)
++               continue;
++
++          fusionee_send_message (dev, fusion_id, node->fusion_id, FMT_SHMPOOL,
++                                 shmpool->entry.id, sizeof(message), &message);
++     }
++
++     fusion_shmpool_unlock( shmpool );
++
++     return 0;
++}
++
++int
++fusion_shmpool_destroy (FusionDev *dev, int id)
++{
++     return fusion_entry_destroy( &dev->shmpool, id );
++}
++
++void
++fusion_shmpool_detach_all (FusionDev *dev, int fusion_id)
++{
++     FusionLink *l;
++
++     down (&dev->shmpool.lock);
++
++     fusion_list_foreach (l, dev->shmpool.list) {
++          FusionSHMPool *shmpool = (FusionSHMPool *) l;
++
++          remove_node (shmpool, fusion_id);
++     }
++
++     up (&dev->shmpool.lock);
++}
++
++/******************************************************************************/
++
++static SHMPoolNode *
++get_node (FusionSHMPool *shmpool,
++          int            fusion_id)
++{
++     SHMPoolNode *node;
++
++     fusion_list_foreach (node, shmpool->nodes) {
++          if (node->fusion_id == fusion_id)
++               return node;
++     }
++
++     return NULL;
++}
++
++static void
++remove_node (FusionSHMPool *shmpool, int fusion_id)
++{
++     SHMPoolNode *node;
++
++     down (&shmpool->entry.lock);
++
++     fusion_list_foreach (node, shmpool->nodes) {
++          if (node->fusion_id == fusion_id) {
++               fusion_list_remove (&shmpool->nodes, &node->link);
++               break;
++          }
++     }
++
++     up (&shmpool->entry.lock);
++}
++
++static void
++free_all_nodes (FusionSHMPool *shmpool)
++
++{
++     FusionLink  *n;
++     SHMPoolNode *node;
++
++     fusion_list_foreach_safe (node, n, shmpool->nodes) {
++          kfree (node);
++     }
++
++     shmpool->nodes = NULL;
++}
+diff --git a/drivers/char/fusion/shmpool.h b/drivers/char/fusion/shmpool.h
+new file mode 100644
+index 0000000..5031650
+--- /dev/null
++++ b/drivers/char/fusion/shmpool.h
+@@ -0,0 +1,54 @@
++/*
++ *	Fusion Kernel Module
++ *
++ *	(c) Copyright 2002-2003  Convergence GmbH
++ *
++ *      Written by Denis Oliver Kropp <dok@directfb.org>
++ *
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ */
++ 
++#ifndef __FUSION__SHMPOOL_H__
++#define __FUSION__SHMPOOL_H__
++
++#include "fusiondev.h"
++#include "types.h"
++
++
++/* module init/cleanup */
++
++int  fusion_shmpool_init   (FusionDev *dev);
++void fusion_shmpool_deinit (FusionDev *dev);
++
++
++/* public API */
++
++int fusion_shmpool_new      (FusionDev             *dev,
++                             FusionSHMPoolNew      *pool);
++
++int fusion_shmpool_attach   (FusionDev             *dev,
++                             FusionSHMPoolAttach   *attach,
++                             int                    fusion_id);
++
++int fusion_shmpool_detach   (FusionDev             *dev,
++                             int                    id,
++                             int                    fusion_id);
++
++int fusion_shmpool_dispatch (FusionDev             *dev,
++                             FusionSHMPoolDispatch *dispatch,
++                             int                    fusion_id );
++
++int fusion_shmpool_destroy  (FusionDev             *dev,
++                             int                    id);
++
++
++/* internal functions */
++
++void fusion_shmpool_detach_all (FusionDev *dev,
++                                int        fusion_id);
++
++#endif
+diff --git a/drivers/char/fusion/skirmish.c b/drivers/char/fusion/skirmish.c
+index a3ed9c9..95bf350 100644
+--- a/drivers/char/fusion/skirmish.c
++++ b/drivers/char/fusion/skirmish.c
+@@ -82,7 +82,7 @@ fusion_skirmish_deinit (FusionDev *dev)
+ int
+ fusion_skirmish_new (FusionDev *dev, int *ret_id)
+ {
+-     return fusion_entry_create( &dev->skirmish, ret_id );
++     return fusion_entry_create( &dev->skirmish, ret_id, NULL );
+ }
+ 
+ int
+diff --git a/include/linux/fusion.h b/include/linux/fusion.h
+index ee1108f..ea525c9 100644
+--- a/include/linux/fusion.h
++++ b/include/linux/fusion.h
+@@ -5,79 +5,104 @@
+ #include <asm/types.h>
+ 
+ /*
+- * Sending
++ * Fusion Kernel Device API Version
++ */
++#define FUSION_API_MAJOR      2         /* Increased if backward compatibility is dropped. */
++#define FUSION_API_MINOR      0         /* Increased if new features are added. */
++
++/*
++ * The Fusion ID is a unique identifier for one process consisting of threads.
++ */
++typedef unsigned long FusionID;
++
++#define FUSION_ID_MASTER      1         /* This is the fusion id of the master (first process). */
++
++/*
++ * Entering a world
++ */
++typedef struct {
++     struct {
++          int            major;         /* Must be set to FUSION_API_MAJOR before entering. */
++          int            minor;         /* Must be set to FUSION_API_MINOR before entering. */
++     } api;
++
++     FusionID            fusion_id;     /* Returns the fusion id of the entering process. */
++} FusionEnter;
++
++
++/*
++ * Sending a message
+  */
+ typedef struct {
+-     int         fusion_id;      /* recipient */
++     FusionID            fusion_id;     /* recipient */
+ 
+-     int         msg_id;         /* optional message identifier */
+-     int         msg_size;       /* message size, must be greater than zero */
+-     const void *msg_data;       /* message data, must not be NULL */
++     int                 msg_id;        /* optional message identifier */
++     int                 msg_size;      /* message size, must be greater than zero */
++     const void         *msg_data;      /* message data, must not be NULL */
+ } FusionSendMessage;
+ 
+ /*
+- * Receiving
++ * Receiving a message
+  */
+ typedef enum {
+-     FMT_SEND,
+-     FMT_CALL,                   /* msg_id is the call id */
+-     FMT_REACTOR                 /* msg_id is the reactor id */
++     FMT_SEND,                          /* msg_id is an optional custom id */
++     FMT_CALL,                          /* msg_id is the call id */
++     FMT_REACTOR,                       /* msg_id is the reactor id */
++     FMT_SHMPOOL                        /* msg_id is the pool id */
+ } FusionMessageType;
+ 
+ typedef struct {
+-     FusionMessageType msg_type;
++     FusionMessageType   msg_type;      /* type (origin) of message */
+ 
+-     int               msg_id;
+-     int               msg_size;
++     int                 msg_id;        /* message id (custom id or call/reactor/pool id) */
++     int                 msg_size;      /* size of the following message data */
+ 
+      /* message data follows */
+ } FusionReadMessage;
+ 
+ /*
+- * Dispatching
++ * Dispatching a message via a reactor
+  */
+ typedef struct {
+-     int         reactor_id;
+-     int         self;
++     int                 reactor_id;
++     int                 self;
+ 
+-     int         msg_size;       /* message size, must be greater than zero */
+-     const void *msg_data;       /* message data, must not be NULL */
++     int                 msg_size;      /* message size, must be greater than zero */
++     const void         *msg_data;      /* message data, must not be NULL */
+ } FusionReactorDispatch;
+ 
+ /*
+  * Calling (synchronous RPC)
+  */
+ typedef struct {
+-     int                call_id;   /* new call id returned */
++     int                 call_id;       /* new call id returned */
+ 
+-     void              *handler;   /* function pointer of handler to install */
+-     void              *ctx;       /* optional handler context */
++     void               *handler;       /* function pointer of handler to install */
++     void               *ctx;           /* optional handler context */
+ } FusionCallNew;
+ 
+ typedef struct {
+-     int   ret_val;              /* return value of the call */
++     int                 ret_val;       /* return value of the call */
+ 
+-     int   call_id;              /* id of the requested call,
+-                                    each call has a fixed owner */
++     int                 call_id;       /* id of the requested call, each call has a fixed owner */
+ 
+-     int   call_arg;             /* optional int argument */
+-     void *call_ptr;             /* optional pointer argument (shared memory) */
++     int                 call_arg;      /* optional int argument */
++     void               *call_ptr;      /* optional pointer argument (shared memory) */
+ } FusionCallExecute;
+ 
+ typedef struct {
+-     int   call_id;              /* id of currently executing call */
++     int                 call_id;       /* id of currently executing call */
+ 
+-     int   val;                  /* value to return */
++     int                 val;           /* value to return */
+ } FusionCallReturn;
+ 
+ typedef struct {
+-     void              *handler;   /* function pointer of handler to call */
+-     void              *ctx;       /* optional handler context */
++     void               *handler;       /* function pointer of handler to call */
++     void               *ctx;           /* optional handler context */
+ 
+-     int                caller;    /* fusion id of the caller
+-                                      or zero if the call comes from Fusion */
+-     int                call_arg;  /* optional call parameter */
+-     void              *call_ptr;  /* optional call parameter */
++     int                 caller;        /* fusion id of the caller or zero if called from Fusion */
++     int                 call_arg;      /* optional call parameter */
++     void               *call_ptr;      /* optional call parameter */
+ } FusionCallMessage;
+ 
+ /*
+@@ -90,33 +115,70 @@ typedef struct {
+  *
+  */
+ typedef struct {
+-     int                id;        /* id of the reference to watch */
++     int                 id;            /* id of the reference to watch */
+ 
+-     int                call_id;   /* id of the call to execute */
+-     int                call_arg;  /* optional call parameter, e.g. the id of a
+-                                      user space resource associated with that
+-                                      reference */
++     int                 call_id;       /* id of the call to execute */
++     int                 call_arg;      /* optional call parameter, e.g. the id of a user
++                                           space resource associated with that reference */
+ } FusionRefWatch;
+ 
+ /*
+  * Inheriting local count from other reference
+  */
+ typedef struct {
+-     int                id;        /* own reference id */
+-     int                from;      /* id of the reference to inherit from */
++     int                 id;            /* own reference id */
++     int                 from;          /* id of the reference to inherit from */
+ } FusionRefInherit;
+ 
+ /*
+  * Killing other fusionees (experimental)
+  */
+ typedef struct {
+-     int fusion_id;    /* fusionee to kill, zero means all but ourself */
+-     int signal;       /* signal to be delivered, e.g. SIGTERM */
+-     int timeout_ms;   /* -1 means no timeout, 0 means infinite, otherwise the
+-                          max. time to wait until the fusionee(s) terminated */
++     FusionID            fusion_id;     /* fusionee to kill, zero means all but ourself */
++     int                 signal;        /* signal to be delivered, e.g. SIGTERM */
++     int                 timeout_ms;    /* -1 means no timeout, 0 means infinite, otherwise the
++                                           max. time to wait until the fusionee(s) terminated */
+ } FusionKill;
+ 
+ 
++/*
++ * Shared memory pools
++ */
++typedef struct {
++     int                 max_size;      /* Maximum size that this pool will be allowed to grow to. */
++
++     int                 pool_id;       /* Returns the new pool id. */
++     void               *addr_base;     /* Returns the base of the reserved virtual memory address space. */
++} FusionSHMPoolNew;
++
++typedef struct {
++     int                 pool_id;       /* The id of the pool to attach to. */
++
++     void               *addr_base;     /* Returns the base of the reserved virtual memory address space. */
++     int                 size;          /* Returns the current size of the pool. */
++} FusionSHMPoolAttach;
++
++typedef struct {
++     int                 pool_id;       /* The id of the pool to notify. */
++
++     int                 size;          /* New size of the pool. */
++} FusionSHMPoolDispatch;
++
++typedef enum {
++     FSMT_REMAP,                        /* Remap the pool due to a change of its size. */
++     FSMT_UNMAP                         /* Unmap the pool due to its destruction. */
++} FusionSHMPoolMessageType;
++
++typedef struct {
++     FusionSHMPoolMessageType type;     /* Type of the message. */
++
++     int                      size;     /* New size of the pool, if type is FSMT_REMAP. */
++} FusionSHMPoolMessage;
++
++
++/*
++ * Fusion types
++ */
+ typedef enum {
+      FT_LOUNGE,
+      FT_MESSAGING,
+@@ -124,7 +186,8 @@ typedef enum {
+      FT_REF,
+      FT_SKIRMISH,
+      FT_PROPERTY,
+-     FT_REACTOR
++     FT_REACTOR,
++     FT_SHMPOOL
+ } FusionType;
+ 
+ 
+@@ -134,31 +197,20 @@ typedef enum {
+ #define FUSION_ENTRY_INFO_NAME_LENGTH   24
+ 
+ typedef struct {
+-     FusionType type;
+-     int        id;
++     FusionType          type;
++     int                 id;
+ 
+-     char       name[FUSION_ENTRY_INFO_NAME_LENGTH];
++     char                name[FUSION_ENTRY_INFO_NAME_LENGTH];
+ } FusionEntryInfo;
+ 
+ 
+-typedef struct {
+-     struct {
+-          int major;
+-          int minor;
+-     } api;
+-
+-     int fusion_id;
+-} FusionEnter;
+-
+-#define FUSION_API_MAJOR   1  /* Increased if backward compatibility is dropped. */
+-#define FUSION_API_MINOR   1  /* Increased if new features are added. */
+-
+ 
+ #define FUSION_ENTER               _IOR(FT_LOUNGE,    0x00, FusionEnter)
+-#define FUSION_KILL                _IOW(FT_LOUNGE,    0x01, FusionKill)
++#define FUSION_UNBLOCK             _IO (FT_LOUNGE,    0x01)
++#define FUSION_KILL                _IOW(FT_LOUNGE,    0x02, FusionKill)
+ 
+-#define FUSION_ENTRY_SET_INFO      _IOW(FT_LOUNGE,    0x02, FusionEntryInfo)
+-#define FUSION_ENTRY_GET_INFO      _IOW(FT_LOUNGE,    0x03, FusionEntryInfo)
++#define FUSION_ENTRY_SET_INFO      _IOW(FT_LOUNGE,    0x03, FusionEntryInfo)
++#define FUSION_ENTRY_GET_INFO      _IOW(FT_LOUNGE,    0x04, FusionEntryInfo)
+ 
+ #define FUSION_SEND_MESSAGE        _IOW(FT_MESSAGING, 0x00, FusionSendMessage)
+ 
+@@ -199,4 +251,11 @@ typedef struct {
+ #define FUSION_REACTOR_DISPATCH    _IOW(FT_REACTOR,   0x03, FusionReactorDispatch)
+ #define FUSION_REACTOR_DESTROY     _IOW(FT_REACTOR,   0x04, int)
+ 
++#define FUSION_SHMPOOL_NEW         _IOW(FT_SHMPOOL,   0x00, FusionSHMPoolNew)
++#define FUSION_SHMPOOL_ATTACH      _IOW(FT_SHMPOOL,   0x01, FusionSHMPoolAttach)
++#define FUSION_SHMPOOL_DETACH      _IOW(FT_SHMPOOL,   0x02, int)
++#define FUSION_SHMPOOL_DISPATCH    _IOW(FT_SHMPOOL,   0x03, FusionSHMPoolDispatch)
++#define FUSION_SHMPOOL_DESTROY     _IOW(FT_SHMPOOL,   0x04, int)
++
+ #endif
++
+-- 
+1.7.3.3
+

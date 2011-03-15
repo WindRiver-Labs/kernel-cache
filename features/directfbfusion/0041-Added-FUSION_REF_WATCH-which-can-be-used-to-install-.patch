@@ -1,0 +1,647 @@
+From 60140aac9c4528eff62f64948c5452f1da8d336f Mon Sep 17 00:00:00 2001
+From: Denis Oliver Kropp <dok@directfb.org>
+Date: Wed, 9 Jul 2003 23:31:28 +0000
+Subject: [PATCH] Added FUSION_REF_WATCH which can be used to install a reference watcher with an optional argument that will be passed to it.
+
+The reference watcher is a call that is executed when the reference counter
+gets zero. The optional argument could, for example, be the id of a user space
+resource associated with that reference.
+
+This is a much better way than polling all references regularly.
+---
+ drivers/char/fusion/call.c      |   70 +++++++++++++++++++----------
+ drivers/char/fusion/call.h      |    3 +-
+ drivers/char/fusion/fusiondev.c |    8 +++
+ drivers/char/fusion/fusionee.c  |   24 ++++++----
+ drivers/char/fusion/ref.c       |   77 +++++++++++++++++++++++++++++---
+ drivers/char/fusion/ref.h       |   49 +++++++++++---------
+ include/linux/fusion.h          |   93 ++++++++++++++++++++++++---------------
+ 7 files changed, 225 insertions(+), 99 deletions(-)
+
+diff --git a/drivers/char/fusion/call.c b/drivers/char/fusion/call.c
+index 3bae945..fafd8b0 100644
+--- a/drivers/char/fusion/call.c
++++ b/drivers/char/fusion/call.c
+@@ -52,7 +52,7 @@ typedef struct {
+      void              *ctx;
+ 
+      FusionLink          *executions;      /* prepending! */
+-     FusionCallExecution *next;            /* points to the last item of executions */
++     FusionLink          *last;            /* points to the last item of executions */
+ 
+      int                count;    /* number of calls ever made */
+ } FusionCall;
+@@ -84,12 +84,16 @@ fusion_call_read_proc (char *buf, char **start, off_t offset,
+      spin_lock (&dev->call.lock);
+ 
+      fusion_list_foreach (l, dev->call.list) {
++          bool        idle = true;
+           FusionCall *call = (FusionCall*) l;
+ 
++          if (call->executions)
++               idle = ((FusionCallExecution*) call->executions)->executed;
++
+           written += sprintf(buf+written,
+                              "(%5d) 0x%08x (%d calls) %s\n",
+                              call->pid, call->id, call->count,
+-                             call->next ? "executing" : "idle");
++                             idle ? "idle" : "executing");
+ 
+           if (written < offset) {
+                offset -= written;
+@@ -202,7 +206,7 @@ fusion_call_execute (FusionDev *dev, int fusion_id, FusionCallExecute *execute)
+      message.handler  = call->handler;
+      message.ctx      = call->ctx;
+ 
+-     message.caller   = execution->caller;
++     message.caller   = fusion_id;
+ 
+      message.call_arg = execute->call_arg;
+      message.call_ptr = execute->call_ptr;
+@@ -211,27 +215,33 @@ fusion_call_execute (FusionDev *dev, int fusion_id, FusionCallExecute *execute)
+                                   call->id, sizeof(message), &message);
+      if (ret) {
+           remove_execution (call, execution);
++          kfree (execution);
+           unlock_call (call);
+           return ret;
+      }
+ 
+      call->count++;
+ 
+-     /* TODO: implement timeout */
+-     fusion_sleep_on (&execution->wait, &call->lock, 0);
+-
+-     call = lock_call (dev, execute->call_id);
+-     if (!call)
+-          return -EIDRM;
++     if (fusion_id) {
++          /* TODO: implement timeout */
++          fusion_sleep_on (&execution->wait, &call->lock, 0);
+ 
+-     execute->ret_val = execution->ret_val;
++          call = lock_call (dev, execute->call_id);
++          if (!call)
++               return -EIDRM;
+ 
+-     remove_execution (call, execution);
++          if (signal_pending(current)) {
++               execution->caller = 0;
++               unlock_call (call);
++               return -ERESTARTSYS;
++          }
+ 
+-     kfree (execution);
++          execute->ret_val = execution->ret_val;
++          
++          remove_execution (call, execution);
+ 
+-     if (signal_pending(current))
+-          ret = -ERESTARTSYS;
++          kfree (execution);
++     }
+ 
+      unlock_call (call);
+ 
+@@ -247,16 +257,26 @@ fusion_call_return (FusionDev *dev, int fusion_id, FusionCallReturn *call_ret)
+      if (!call)
+           return -EINVAL;
+ 
+-     fusion_list_foreach (l, call->executions) {
++     l = call->last;
++     while (l) {
+           FusionCallExecution *execution = (FusionCallExecution*) l;
+ 
+-          if (execution->executed)
++          if (execution->executed) {
++               l = l->prev;
+                continue;
++          }
+ 
+-          execution->ret_val  = call_ret->val;
+-          execution->executed = true;
++          if (execution->caller) {
++               execution->ret_val  = call_ret->val;
++               execution->executed = true;
+ 
+-          wake_up_interruptible_all (&execution->wait);
++               wake_up_interruptible_all (&execution->wait);
++          }
++          else {
++               remove_execution (call, execution);
++
++               kfree (execution);
++          }
+ 
+           unlock_call (call);
+ 
+@@ -393,8 +413,8 @@ add_execution (FusionCall        *call,
+      /* Add execution. */
+      fusion_list_prepend (&call->executions, &execution->link);
+ 
+-     if (!call->next)
+-          call->next = execution;
++     if (!call->last)
++          call->last = &execution->link;
+ 
+      return execution;
+ }
+@@ -403,8 +423,8 @@ static void
+ remove_execution (FusionCall          *call,
+                   FusionCallExecution *execution)
+ {
+-     if (call->next == execution)
+-          call->next = (FusionCallExecution*) execution->link.prev;
++     if (call->last == &execution->link)
++          call->last = execution->link.prev;
+ 
+      fusion_list_remove (&call->executions, &execution->link);
+ }
+@@ -412,8 +432,8 @@ remove_execution (FusionCall          *call,
+ static void
+ free_all_executions (FusionCall *call)
+ {
+-     while (call->next) {
+-          FusionCallExecution *execution = call->next;
++     while (call->last) {
++          FusionCallExecution *execution = (FusionCallExecution *) call->last;
+ 
+           remove_execution (call, execution);
+ 
+diff --git a/drivers/char/fusion/call.h b/drivers/char/fusion/call.h
+index 02e3fcd..1a5190e 100644
+--- a/drivers/char/fusion/call.h
++++ b/drivers/char/fusion/call.h
+@@ -32,7 +32,8 @@ int fusion_call_new     (FusionDev         *dev,
+                          FusionCallNew     *call);
+ 
+ int fusion_call_execute (FusionDev         *dev,
+-                         int                fusion_id,
++                         int                fusion_id, /* zero if call is
++                                                          from Fusion */
+                          FusionCallExecute *execute);
+ 
+ int fusion_call_return  (FusionDev         *dev,
+diff --git a/drivers/char/fusion/fusiondev.c b/drivers/char/fusion/fusiondev.c
+index 9af7b5e..1bce763 100644
+--- a/drivers/char/fusion/fusiondev.c
++++ b/drivers/char/fusion/fusiondev.c
+@@ -286,6 +286,7 @@ fusion_ioctl (struct inode *inode, struct file *file,
+      FusionDev             *dev = fusion_devs[minor(inode->i_rdev)];
+      FusionSendMessage      send;
+      FusionReactorDispatch  dispatch;
++     FusionRefWatch         watch;
+      FusionKill             kill;
+      FusionCallNew          call;
+      FusionCallExecute      execute;
+@@ -424,6 +425,13 @@ fusion_ioctl (struct inode *inode, struct file *file,
+ 
+                return refs;
+ 
++          case FUSION_REF_WATCH:
++               if (copy_from_user (&watch, (FusionRefWatch*) arg, sizeof(watch)))
++                    return -EFAULT;
++
++               return fusion_ref_watch (dev, watch.id,
++                                        watch.call_id, watch.call_arg);
++
+           case FUSION_REF_DESTROY:
+                if (get_user (id, (int*) arg))
+                     return -EFAULT;
+diff --git a/drivers/char/fusion/fusionee.c b/drivers/char/fusion/fusionee.c
+index bdcf18d..3af351c 100644
+--- a/drivers/char/fusion/fusionee.c
++++ b/drivers/char/fusion/fusionee.c
+@@ -180,21 +180,24 @@ fusionee_send_message (FusionDev *dev, int id, int recipient,
+                        int msg_size, const void *msg_data)
+ {
+      Message  *message;
+-     Fusionee *sender;
++     Fusionee *sender   = NULL;
+      Fusionee *fusionee = lock_fusionee (dev, recipient);
+ 
+      if (!fusionee)
+           return -EINVAL;
+ 
+-     sender = lock_fusionee (dev, id);
+-     if (!sender) {
+-          unlock_fusionee (fusionee);
+-          return -EIO;
++     if (id) {
++          sender = lock_fusionee (dev, id);
++          if (!sender) {
++               unlock_fusionee (fusionee);
++               return -EIO;
++          }
+      }
+ 
+      message = kmalloc (sizeof(Message) + msg_size, GFP_ATOMIC);
+      if (!message) {
+-          unlock_fusionee (sender);
++          if (sender)
++               unlock_fusionee (sender);
+           unlock_fusionee (fusionee);
+           return -ENOMEM;
+      }
+@@ -205,7 +208,8 @@ fusionee_send_message (FusionDev *dev, int id, int recipient,
+           memcpy (message->data, msg_data, msg_size);
+      else if (copy_from_user (message->data, msg_data, msg_size)) {
+           kfree (message);
+-          unlock_fusionee (sender);
++          if (sender)
++               unlock_fusionee (sender);
+           unlock_fusionee (fusionee);
+           return -EFAULT;
+      }
+@@ -217,11 +221,13 @@ fusionee_send_message (FusionDev *dev, int id, int recipient,
+      fusion_fifo_put (&fusionee->messages, &message->link);
+ 
+      fusionee->rcv_total++;
+-     sender->snd_total++;
++     if (sender)
++          sender->snd_total++;
+ 
+      wake_up_interruptible_all (&fusionee->wait);
+ 
+-     unlock_fusionee (sender);
++     if (sender)
++          unlock_fusionee (sender);
+      unlock_fusionee (fusionee);
+ 
+      return 0;
+diff --git a/drivers/char/fusion/ref.c b/drivers/char/fusion/ref.c
+index 0919c3d..18311d7 100644
+--- a/drivers/char/fusion/ref.c
++++ b/drivers/char/fusion/ref.c
+@@ -23,6 +23,7 @@
+ 
+ #include "fusiondev.h"
+ #include "list.h"
++#include "call.h"
+ #include "ref.h"
+ 
+ typedef struct {
+@@ -44,6 +45,10 @@ typedef struct {
+ 
+      int                locked;    /* non-zero fusion id of lock owner */
+ 
++     bool               watched;   /* true if watch has been installed */
++     int                call_id;   /* id of call registered with a watch */
++     int                call_arg;  /* optional call parameter */
++
+      FusionLink        *local_refs;
+ 
+      wait_queue_head_t  wait;
+@@ -57,9 +62,11 @@ static FusionRef *lock_ref       (FusionDev *dev, int id);
+ static void       unlock_ref     (FusionRef *ref);
+ 
+ static int        add_local      (FusionRef *ref, int fusion_id, int add);
+-static void       clear_local    (FusionRef *ref, int fusion_id);
++static void       clear_local    (FusionDev *dev, FusionRef *ref, int fusion_id);
+ static void       free_all_local (FusionRef *ref);
+ 
++static void       notify_ref     (FusionDev *dev, FusionRef *ref);
++
+ /******************************************************************************/
+ 
+ static int
+@@ -236,7 +243,7 @@ fusion_ref_down (FusionDev *dev, int id, int fusion_id)
+      }
+ 
+      if (ref->local + ref->global == 0)
+-          wake_up_interruptible_all (&ref->wait);
++          notify_ref (dev, ref);
+ 
+      unlock_ref (ref);
+ 
+@@ -253,9 +260,13 @@ fusion_ref_zero_lock (FusionDev *dev, int id, int fusion_id)
+           if (!ref)
+                return -EINVAL;
+ 
+-          if (ref->locked) {
++          if (ref->watched) {
+                unlock_ref (ref);
++               return -EACCES;
++          }
+ 
++          if (ref->locked) {
++               unlock_ref (ref);
+                return ref->locked == fusion_id ? -EIO : -EAGAIN;
+           }
+ 
+@@ -336,6 +347,43 @@ fusion_ref_stat (FusionDev *dev, int id, int *refs)
+ }
+ 
+ int
++fusion_ref_watch (FusionDev      *dev,
++                  int             id,
++                  int             call_id,
++                  int             call_arg)
++{
++     FusionRef *ref = lock_ref (dev, id);
++
++     if (!ref)
++          return -EINVAL;
++
++     if (ref->pid != current->pid) {
++          unlock_ref (ref);
++          return -EACCES;
++     }
++
++     if (ref->global + ref->local == 0) {
++          unlock_ref (ref);
++          return -EIO;
++     }
++
++     if (ref->watched) {
++          unlock_ref (ref);
++          return -EBUSY;
++     }
++
++     ref->watched  = true;
++     ref->call_id  = call_id;
++     ref->call_arg = call_arg;
++     
++     wake_up_interruptible_all (&ref->wait);
++     
++     unlock_ref (ref);
++
++     return 0;
++}
++
++int
+ fusion_ref_destroy (FusionDev *dev, int id)
+ {
+      FusionRef *ref = lookup_ref (dev, id);
+@@ -370,7 +418,7 @@ fusion_ref_clear_all_local (FusionDev *dev, int fusion_id)
+      fusion_list_foreach (l, dev->ref.list) {
+           FusionRef *ref = (FusionRef *) l;
+ 
+-          clear_local (ref, fusion_id);
++          clear_local (dev, ref, fusion_id);
+      }
+ 
+      spin_unlock (&dev->ref.lock);
+@@ -449,7 +497,7 @@ add_local (FusionRef *ref, int fusion_id, int add)
+ }
+ 
+ static void
+-clear_local (FusionRef *ref, int fusion_id)
++clear_local (FusionDev *dev, FusionRef *ref, int fusion_id)
+ {
+      FusionLink *l;
+ 
+@@ -465,7 +513,7 @@ clear_local (FusionRef *ref, int fusion_id)
+                ref->local -= local->refs;
+ 
+                if (ref->local + ref->global == 0)
+-                    wake_up_interruptible_all (&ref->wait);
++                    notify_ref (dev, ref);
+ 
+                fusion_list_remove (&ref->local_refs, l);
+ 
+@@ -491,3 +539,20 @@ free_all_local (FusionRef *ref)
+ 
+      ref->local_refs = NULL;
+ }
++
++static void
++notify_ref (FusionDev *dev, FusionRef *ref)
++{
++     if (ref->watched) {
++          FusionCallExecute execute;
++
++          execute.call_id  = ref->call_id;
++          execute.call_arg = ref->call_arg;
++          execute.call_ptr = NULL;
++
++          fusion_call_execute (dev, 0, &execute);
++     }
++     else
++          wake_up_interruptible_all (&ref->wait);
++}
++
+diff --git a/drivers/char/fusion/ref.h b/drivers/char/fusion/ref.h
+index 088544a..5ac05df 100644
+--- a/drivers/char/fusion/ref.h
++++ b/drivers/char/fusion/ref.h
+@@ -27,35 +27,40 @@ void fusion_ref_deinit (FusionDev *dev);
+ 
+ /* public API */
+ 
+-int fusion_ref_new          (FusionDev *dev,
+-                             int       *id);
++int fusion_ref_new          (FusionDev      *dev,
++                             int            *id);
+ 
+-int fusion_ref_up           (FusionDev *dev,
+-                             int        id,
+-                             int        fusion_id);
++int fusion_ref_up           (FusionDev      *dev,
++                             int             id,
++                             int             fusion_id);
+ 
+-int fusion_ref_down         (FusionDev *dev,
+-                             int        id,
+-                             int        fusion_id);
++int fusion_ref_down         (FusionDev      *dev,
++                             int             id,
++                             int             fusion_id);
+ 
+-int fusion_ref_zero_lock    (FusionDev *dev,
+-                             int        id,
+-                             int        fusion_id);
++int fusion_ref_zero_lock    (FusionDev      *dev,
++                             int             id,
++                             int             fusion_id);
+ 
+-int fusion_ref_zero_trylock (FusionDev *dev,
+-                             int        id,
+-                             int        fusion_id);
++int fusion_ref_zero_trylock (FusionDev      *dev,
++                             int             id,
++                             int             fusion_id);
+ 
+-int fusion_ref_unlock       (FusionDev *dev,
+-                             int        id,
+-                             int        fusion_id);
++int fusion_ref_unlock       (FusionDev      *dev,
++                             int             id,
++                             int             fusion_id);
+ 
+-int fusion_ref_stat         (FusionDev *dev,
+-                             int        id,
+-                             int       *refs);
++int fusion_ref_stat         (FusionDev      *dev,
++                             int             id,
++                             int            *refs);
+ 
+-int fusion_ref_destroy      (FusionDev *dev,
+-                             int        id);
++int fusion_ref_watch        (FusionDev      *dev,
++                             int             id,
++                             int             call_id,
++                             int             call_arg);
++
++int fusion_ref_destroy      (FusionDev      *dev,
++                             int             id);
+ 
+ 
+ /* internal functions */
+diff --git a/include/linux/fusion.h b/include/linux/fusion.h
+index 20d2b9e..394b7e4 100644
+--- a/include/linux/fusion.h
++++ b/include/linux/fusion.h
+@@ -8,84 +8,104 @@
+  * Sending
+  */
+ typedef struct {
+-  int         fusion_id;      /* recipient */
++     int         fusion_id;      /* recipient */
+ 
+-  int         msg_id;         /* optional message identifier */
+-  int         msg_size;       /* message size, must be greater than zero */
+-  const void *msg_data;       /* message data, must not be NULL */
++     int         msg_id;         /* optional message identifier */
++     int         msg_size;       /* message size, must be greater than zero */
++     const void *msg_data;       /* message data, must not be NULL */
+ } FusionSendMessage;
+ 
+ /*
+  * Receiving
+  */
+ typedef enum {
+-  FMT_SEND,
+-  FMT_CALL,                   /* msg_id is the call id */
+-  FMT_REACTOR                 /* msg_id is the reactor id */
++     FMT_SEND,
++     FMT_CALL,                   /* msg_id is the call id */
++     FMT_REACTOR                 /* msg_id is the reactor id */
+ } FusionMessageType;
+ 
+ typedef struct {
+-  FusionMessageType msg_type;
++     FusionMessageType msg_type;
+ 
+-  int               msg_id;
+-  int               msg_size;
++     int               msg_id;
++     int               msg_size;
+ 
+-  /* message data follows */
++     /* message data follows */
+ } FusionReadMessage;
+ 
+ /*
+  * Dispatching
+  */
+ typedef struct {
+-  int         reactor_id;
+-  int         self;
++     int         reactor_id;
++     int         self;
+ 
+-  int         msg_size;       /* message size, must be greater than zero */
+-  const void *msg_data;       /* message data, must not be NULL */
++     int         msg_size;       /* message size, must be greater than zero */
++     const void *msg_data;       /* message data, must not be NULL */
+ } FusionReactorDispatch;
+ 
+ /*
+  * Calling (synchronous RPC)
+  */
+ typedef struct {
+-  int                call_id;   /* new call id returned */
++     int                call_id;   /* new call id returned */
+ 
+-  void              *handler;   /* function pointer of handler to install */
+-  void              *ctx;       /* optional handler context */
++     void              *handler;   /* function pointer of handler to install */
++     void              *ctx;       /* optional handler context */
+ } FusionCallNew;
+ 
+ typedef struct {
+-  int   ret_val;              /* return value of the call */
++     int   ret_val;              /* return value of the call */
+ 
+-  int   call_id;              /* each call has a fixed owner */
+-  
+-  int   call_arg;             /* optional int argument */
+-  void *call_ptr;             /* optional pointer argument (shared memory) */
++     int   call_id;              /* id of the requested call,
++                                    each call has a fixed owner */
++
++     int   call_arg;             /* optional int argument */
++     void *call_ptr;             /* optional pointer argument (shared memory) */
+ } FusionCallExecute;
+ 
+ typedef struct {
+-  int   call_id;              /* id of currently executing call */
++     int   call_id;              /* id of currently executing call */
+ 
+-  int   val;                  /* value to return */
++     int   val;                  /* value to return */
+ } FusionCallReturn;
+ 
+ typedef struct {
+-  void              *handler;   /* function pointer of handler to call */
+-  void              *ctx;       /* optional handler context */
++     void              *handler;   /* function pointer of handler to call */
++     void              *ctx;       /* optional handler context */
+ 
+-  int                caller;    /* fusion id of the caller */
+-  int                call_arg;  /* optional call parameter */
+-  void              *call_ptr;  /* optional call parameter */
++     int                caller;    /* fusion id of the caller
++                                      or zero if the call comes from Fusion */
++     int                call_arg;  /* optional call parameter */
++     void              *call_ptr;  /* optional call parameter */
+ } FusionCallMessage;
+-  
++
++/*
++ * Watching a reference
++ *
++ * This information is needed to have a specific call being executed if the
++ * reference count reaches zero. Currently one watch per reference is allowed.
++ *
++ * The call is made by Fusion and therefor has a caller id of zero.
++ * 
++ */
++typedef struct {
++     int                id;        /* id of the reference to watch */
++
++     int                call_id;   /* id of the call to execute */
++     int                call_arg;  /* optional call parameter, e.g. the id of a
++                                      user space resource associated with that
++                                      reference */
++} FusionRefWatch;
++
+ /*
+  * Killing other fusionees (experimental)
+  */
+ typedef struct {
+-  int fusion_id;    /* fusionee to kill, zero means all but ourself */
+-  int signal;       /* signal to be delivered, e.g. SIGTERM */
+-  int timeout_ms;   /* -1 means no timeout, 0 means infinite, otherwise the
+-                       max. time to wait until the fusionee(s) terminated */
++     int fusion_id;    /* fusionee to kill, zero means all but ourself */
++     int signal;       /* signal to be delivered, e.g. SIGTERM */
++     int timeout_ms;   /* -1 means no timeout, 0 means infinite, otherwise the
++                          max. time to wait until the fusionee(s) terminated */
+ } FusionKill;
+ 
+ 
+@@ -109,7 +129,8 @@ typedef struct {
+ #define FUSION_REF_ZERO_TRYLOCK         _IOW('F', 0x16, sizeof(int))
+ #define FUSION_REF_UNLOCK               _IOW('F', 0x17, sizeof(int))
+ #define FUSION_REF_STAT                 _IOW('F', 0x18, sizeof(int))
+-#define FUSION_REF_DESTROY              _IOW('F', 0x19, sizeof(int))
++#define FUSION_REF_WATCH                _IOW('F', 0x19, sizeof(FusionRefWatch))
++#define FUSION_REF_DESTROY              _IOW('F', 0x1A, sizeof(int))
+ 
+ #define FUSION_SKIRMISH_NEW             _IOW('F', 0x20, sizeof(int))
+ #define FUSION_SKIRMISH_PREVAIL         _IOW('F', 0x21, sizeof(int))
+-- 
+1.7.3.3
+

@@ -1,0 +1,2249 @@
+From 8c0da28ffb26f7718114628a9e1f624b985181c8 Mon Sep 17 00:00:00 2001
+From: Denis Oliver Kropp <dok@directfb.org>
+Date: Fri, 12 Dec 2003 18:46:10 +0000
+Subject: [PATCH] Use semaphores instead of spinlocks.
+
+---
+ drivers/char/fusion/call.c      |  130 +++++++++++++++++------------
+ drivers/char/fusion/fusiondev.c |   32 ++++---
+ drivers/char/fusion/fusiondev.h |   68 ++++++++--------
+ drivers/char/fusion/fusionee.c  |  154 +++++++++++++++++++++--------------
+ drivers/char/fusion/property.c  |  140 +++++++++++++++++++------------
+ drivers/char/fusion/reactor.c   |  145 +++++++++++++++++++-------------
+ drivers/char/fusion/ref.c       |  175 +++++++++++++++++++++++----------------
+ drivers/char/fusion/skirmish.c  |  129 ++++++++++++++++++-----------
+ 8 files changed, 579 insertions(+), 394 deletions(-)
+
+diff --git a/drivers/char/fusion/call.c b/drivers/char/fusion/call.c
+index fafd8b0..410a64a 100644
+--- a/drivers/char/fusion/call.c
++++ b/drivers/char/fusion/call.c
+@@ -41,7 +41,7 @@ typedef struct {
+ typedef struct {
+      FusionLink         link;
+ 
+-     spinlock_t         lock;
++     struct semaphore   lock;
+ 
+      int                id;        /* call id */
+ 
+@@ -59,10 +59,9 @@ typedef struct {
+ 
+ /******************************************************************************/
+ 
+-static FusionCall *lookup_call (FusionDev *dev, int id);
+-
+-static FusionCall *lock_call   (FusionDev *dev, int id);
+-static void        unlock_call (FusionCall *call);
++static int  lookup_call (FusionDev *dev, int id, FusionCall **ret_call);
++static int  lock_call   (FusionDev *dev, int id, FusionCall **ret_call);
++static void unlock_call (FusionCall *call);
+ 
+ static FusionCallExecution *add_execution       (FusionCall          *call,
+                                                  int                  fusion_id,
+@@ -81,7 +80,8 @@ fusion_call_read_proc (char *buf, char **start, off_t offset,
+      FusionDev  *dev     = private;
+      int         written = 0;
+ 
+-     spin_lock (&dev->call.lock);
++     if (down_interruptible (&dev->call.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->call.list) {
+           bool        idle = true;
+@@ -104,7 +104,7 @@ fusion_call_read_proc (char *buf, char **start, off_t offset,
+                break;
+      }
+ 
+-     spin_unlock (&dev->call.lock);
++     up (&dev->call.lock);
+ 
+      *start = buf + offset;
+      written -= offset;
+@@ -123,7 +123,7 @@ fusion_call_init (FusionDev *dev)
+      create_proc_read_entry("calls", 0, dev->proc_dir,
+                             fusion_call_read_proc, dev);
+ 
+-     dev->call.lock = SPIN_LOCK_UNLOCKED;
++     init_MUTEX(&dev->call.lock);
+ 
+      return 0;
+ }
+@@ -133,10 +133,10 @@ fusion_call_deinit (FusionDev *dev)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->call.lock);
++     down (&dev->call.lock);
+ 
+      remove_proc_entry ("calls", dev->proc_dir);
+-     
++
+      l = dev->call.list;
+      while (l) {
+           FusionLink *next = l->next;
+@@ -149,7 +149,7 @@ fusion_call_deinit (FusionDev *dev)
+           l = next;
+      }
+ 
+-     spin_unlock (&dev->call.lock);
++     up (&dev->call.lock);
+ }
+ 
+ /******************************************************************************/
+@@ -159,25 +159,28 @@ fusion_call_new (FusionDev *dev, int fusion_id, FusionCallNew *call_new)
+ {
+      FusionCall *call;
+ 
+-     call = kmalloc (sizeof(FusionCall), GFP_ATOMIC);
++     call = kmalloc (sizeof(FusionCall), GFP_KERNEL);
+      if (!call)
+           return -ENOMEM;
+ 
+      memset (call, 0, sizeof(FusionCall));
+ 
+-     spin_lock (&dev->call.lock);
++     if (down_interruptible (&dev->call.lock)) {
++          kfree (call);
++          return -EINTR;
++     }
+ 
+      call->id        = dev->call.ids++;
+      call->pid       = current->pid;
+      call->fusion_id = fusion_id;
+-     call->lock      = SPIN_LOCK_UNLOCKED;
+-
+      call->handler   = call_new->handler;
+      call->ctx       = call_new->ctx;
+ 
++     init_MUTEX (&call->lock);
++
+      fusion_list_prepend (&dev->call.list, &call->link);
+ 
+-     spin_unlock (&dev->call.lock);
++     up (&dev->call.lock);
+ 
+      call_new->call_id = call->id;
+ 
+@@ -192,9 +195,9 @@ fusion_call_execute (FusionDev *dev, int fusion_id, FusionCallExecute *execute)
+      FusionCallExecution *execution;
+      FusionCallMessage    message;
+ 
+-     call = lock_call (dev, execute->call_id);
+-     if (!call)
+-          return -EINVAL;
++     ret = lock_call (dev, execute->call_id, &call);
++     if (ret)
++          return ret;
+ 
+      execution = add_execution (call, fusion_id, execute);
+      if (!execution) {
+@@ -226,9 +229,9 @@ fusion_call_execute (FusionDev *dev, int fusion_id, FusionCallExecute *execute)
+           /* TODO: implement timeout */
+           fusion_sleep_on (&execution->wait, &call->lock, 0);
+ 
+-          call = lock_call (dev, execute->call_id);
+-          if (!call)
+-               return -EIDRM;
++          ret = lock_call (dev, execute->call_id, &call);
++          if (ret)
++               return ret == -EINVAL ? -EIDRM : ret;
+ 
+           if (signal_pending(current)) {
+                execution->caller = 0;
+@@ -237,7 +240,7 @@ fusion_call_execute (FusionDev *dev, int fusion_id, FusionCallExecute *execute)
+           }
+ 
+           execute->ret_val = execution->ret_val;
+-          
++
+           remove_execution (call, execution);
+ 
+           kfree (execution);
+@@ -251,11 +254,13 @@ fusion_call_execute (FusionDev *dev, int fusion_id, FusionCallExecute *execute)
+ int
+ fusion_call_return (FusionDev *dev, int fusion_id, FusionCallReturn *call_ret)
+ {
++     int         ret;
+      FusionLink *l;
+-     FusionCall *call = lock_call (dev, call_ret->call_id);
++     FusionCall *call;
+ 
+-     if (!call)
+-          return -EINVAL;
++     ret = lock_call (dev, call_ret->call_id, &call);
++     if (ret)
++          return ret;
+ 
+      l = call->last;
+      while (l) {
+@@ -291,25 +296,30 @@ fusion_call_return (FusionDev *dev, int fusion_id, FusionCallReturn *call_ret)
+ int
+ fusion_call_destroy (FusionDev *dev, int fusion_id, int call_id)
+ {
+-     FusionCall *call = lookup_call (dev, call_id);
++     int         ret;
++     FusionCall *call;
+ 
+-     if (!call)
+-          return -EINVAL;
++     ret = lookup_call (dev, call_id, &call);
++     if (ret)
++          return ret;
+ 
+      if (call->fusion_id != fusion_id) {
+-          spin_unlock (&dev->call.lock);
++          up (&dev->call.lock);
+           return -EIO;
+      }
+ 
+-     spin_lock (&call->lock);
++     if (down_interruptible (&call->lock)) {
++          up (&dev->call.lock);
++          return -EINTR;
++     }
+ 
+      fusion_list_remove (&dev->call.list, &call->link);
+ 
+      free_all_executions (call);
+ 
+-     spin_unlock (&dev->call.lock);
++     up (&dev->call.lock);
+ 
+-     spin_unlock (&call->lock);
++     up (&call->lock);
+ 
+      kfree (call);
+ 
+@@ -321,7 +331,7 @@ fusion_call_destroy_all (FusionDev *dev, int fusion_id)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->call.lock);
++     down (&dev->call.lock);
+ 
+      l = dev->call.list;
+ 
+@@ -329,66 +339,80 @@ fusion_call_destroy_all (FusionDev *dev, int fusion_id)
+           FusionLink *next = l->next;
+           FusionCall *call = (FusionCall *) l;
+ 
+-          spin_lock (&call->lock);
++          down (&call->lock);
+ 
+           if (call->fusion_id == fusion_id) {
+                free_all_executions (call);
+ 
+                fusion_list_remove (&dev->call.list, &call->link);
+ 
+-               spin_unlock (&call->lock);
++               up (&call->lock);
+ 
+                kfree (call);
+           }
+           else
+-               spin_unlock (&call->lock);
++               up (&call->lock);
+ 
+           l = next;
+      }
+ 
+-     spin_unlock (&dev->call.lock);
++     up (&dev->call.lock);
+ }
+ 
+ /******************************************************************************/
+ 
+-static FusionCall *
+-lookup_call (FusionDev *dev, int id)
++static int
++lookup_call (FusionDev *dev, int id, FusionCall **ret_call)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->call.lock);
++     if (down_interruptible (&dev->call.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->call.list) {
+           FusionCall *call = (FusionCall *) l;
+ 
+-          if (call->id == id)
+-               return call;
++          if (call->id == id) {
++               *ret_call = call;
++               return 0;
++          }
+      }
+ 
+-     spin_unlock (&dev->call.lock);
++     up (&dev->call.lock);
+ 
+-     return NULL;
++     return -EINVAL;
+ }
+ 
+-static FusionCall *
+-lock_call (FusionDev *dev, int id)
++static int
++lock_call (FusionDev *dev, int id, FusionCall **ret_call)
+ {
+-     FusionCall *call = lookup_call (dev, id);
++     int         ret;
++     FusionCall *call;
++
++     ret = lookup_call (dev, id, &call);
++     if (ret)
++          return ret;
+ 
+      if (call) {
+           fusion_list_move_to_front (&dev->call.list, &call->link);
+ 
+-          spin_lock (&call->lock);
+-          spin_unlock (&dev->call.lock);
++          if (down_interruptible (&call->lock)) {
++               up (&dev->call.lock);
++               return -EINTR;
++          }
++
++          up (&dev->call.lock);
+      }
+ 
+-     return call;
++     *ret_call = call;
++
++     return 0;
+ }
+ 
+ static void
+ unlock_call (FusionCall *call)
+ {
+-     spin_unlock (&call->lock);
++     up (&call->lock);
+ }
+ 
+ static FusionCallExecution *
+@@ -399,7 +423,7 @@ add_execution (FusionCall        *call,
+      FusionCallExecution *execution;
+ 
+      /* Allocate execution. */
+-     execution = kmalloc (sizeof(FusionCallExecution), GFP_ATOMIC);
++     execution = kmalloc (sizeof(FusionCallExecution), GFP_KERNEL);
+      if (!execution)
+           return NULL;
+ 
+diff --git a/drivers/char/fusion/fusiondev.c b/drivers/char/fusion/fusiondev.c
+index 8abb3cf..bb814de 100644
+--- a/drivers/char/fusion/fusiondev.c
++++ b/drivers/char/fusion/fusiondev.c
+@@ -52,7 +52,7 @@ struct proc_dir_entry *proc_fusion_dir;
+ #define NUM_MINORS 8
+ 
+ static FusionDev  *fusion_devs[NUM_MINORS] = { 0 };
+-static spinlock_t  devs_lock               = SPIN_LOCK_UNLOCKED;
++static DECLARE_MUTEX(devs_lock);
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 0)
+ static devfs_handle_t devfs_handles[NUM_MINORS];
+@@ -65,7 +65,7 @@ static inline unsigned iminor(struct inode *inode)
+ /******************************************************************************/
+ 
+ void
+-fusion_sleep_on(wait_queue_head_t *q, spinlock_t *lock, signed long *timeout)
++fusion_sleep_on(wait_queue_head_t *q, struct semaphore *lock, signed long *timeout)
+ {
+      wait_queue_t wait;
+ 
+@@ -78,7 +78,7 @@ fusion_sleep_on(wait_queue_head_t *q, spinlock_t *lock, signed long *timeout)
+      __add_wait_queue (q, &wait);
+      spin_unlock (&q->lock);
+ 
+-     spin_unlock (lock);
++     up (lock);
+ 
+      if (timeout)
+           *timeout = schedule_timeout(*timeout);
+@@ -93,7 +93,7 @@ fusion_sleep_on(wait_queue_head_t *q, spinlock_t *lock, signed long *timeout)
+      __add_wait_queue (q, &wait);
+      write_unlock (&q->lock);
+ 
+-     spin_unlock (lock);
++     up (lock);
+ 
+      if (timeout)
+           *timeout = schedule_timeout(*timeout);
+@@ -231,14 +231,15 @@ fusion_open (struct inode *inode, struct file *file)
+ 
+      DEBUG( "fusion_open\n" );
+ 
+-     spin_lock (&devs_lock);
++     if (down_interruptible (&devs_lock))
++          return -EINTR;
+ 
+      if (!fusion_devs[minor]) {
+           char buf[4];
+ 
+-          fusion_devs[minor] = kmalloc (sizeof(FusionDev), GFP_ATOMIC);
++          fusion_devs[minor] = kmalloc (sizeof(FusionDev), GFP_KERNEL);
+           if (!fusion_devs[minor]) {
+-               spin_unlock (&devs_lock);
++               up (&devs_lock);
+                return -ENOMEM;
+           }
+ 
+@@ -255,13 +256,13 @@ fusion_open (struct inode *inode, struct file *file)
+                kfree (fusion_devs[minor]);
+                fusion_devs[minor] = NULL;
+ 
+-               spin_unlock (&devs_lock);
++               up (&devs_lock);
+ 
+                return ret;
+           }
+      }
+      else if (file->f_flags & O_EXCL) {
+-          spin_unlock (&devs_lock);
++          up (&devs_lock);
+           return -EBUSY;
+      }
+ 
+@@ -277,14 +278,14 @@ fusion_open (struct inode *inode, struct file *file)
+                fusion_devs[minor] = NULL;
+           }
+ 
+-          spin_unlock (&devs_lock);
++          up (&devs_lock);
+ 
+           return ret;
+      }
+ 
+      fusion_devs[minor]->refs++;
+ 
+-     spin_unlock (&devs_lock);
++     up (&devs_lock);
+ 
+ 
+      file->private_data = (void*) fusion_id;
+@@ -295,14 +296,17 @@ fusion_open (struct inode *inode, struct file *file)
+ static int
+ fusion_release (struct inode *inode, struct file *file)
+ {
++     int ret;
+      int minor     = iminor(inode);
+      int fusion_id = (int) file->private_data;
+ 
+      DEBUG( "fusion_release\n" );
+ 
+-     fusionee_destroy (fusion_devs[minor], fusion_id);
++     ret = fusionee_destroy (fusion_devs[minor], fusion_id);
++     if (ret)
++          return ret;
+ 
+-     spin_lock (&devs_lock);
++     down (&devs_lock);
+ 
+      if (! --fusion_devs[minor]->refs) {
+           fusiondev_deinit (fusion_devs[minor]);
+@@ -314,7 +318,7 @@ fusion_release (struct inode *inode, struct file *file)
+           fusion_devs[minor] = NULL;
+      }
+ 
+-     spin_unlock (&devs_lock);
++     up (&devs_lock);
+ 
+      return 0;
+ }
+diff --git a/drivers/char/fusion/fusiondev.h b/drivers/char/fusion/fusiondev.h
+index 69c0f56..023f8f6 100644
+--- a/drivers/char/fusion/fusiondev.h
++++ b/drivers/char/fusion/fusiondev.h
+@@ -11,7 +11,7 @@
+  *	as published by the Free Software Foundation; either version
+  *	2 of the License, or (at your option) any later version.
+  */
+- 
++
+ #ifndef __FUSIONDEV_H__
+ #define __FUSIONDEV_H__
+ 
+@@ -21,67 +21,67 @@
+ 
+ typedef struct {
+      int refs;
+-     
++
+      struct proc_dir_entry *proc_dir;
+-     
++
+      struct {
+-          int         property_lease_purchase;
+-          int         property_cede;
++          int property_lease_purchase;
++          int property_cede;
+ 
+-          int         reactor_attach;
+-          int         reactor_detach;
++          int reactor_attach;
++          int reactor_detach;
+ 
+-          int         ref_up;
+-          int         ref_down;
++          int ref_up;
++          int ref_down;
+ 
+-          int         skirmish_prevail_swoop;
+-          int         skirmish_dismiss;
++          int skirmish_prevail_swoop;
++          int skirmish_dismiss;
+      } stat;
+-     
++
+      struct {
+-          int         ids;
+-          FusionLink *list;
+-          spinlock_t  lock;
++          int                ids;
++          FusionLink        *list;
++          struct semaphore   lock;
+      } call;
+ 
+      struct {
+           int                last_id;
+           FusionLink        *list;
+-          spinlock_t         lock;
++          struct semaphore   lock;
+           wait_queue_head_t  wait;
+      } fusionee;
+-     
++
+      struct {
+-          int         ids;
+-          FusionLink *list;
+-          spinlock_t  lock;
++          int                ids;
++          FusionLink        *list;
++          struct semaphore   lock;
+      } property;
+-     
++
+      struct {
+-          int         ids;
+-          FusionLink *list;
+-          spinlock_t  lock;
++          int                ids;
++          FusionLink        *list;
++          struct semaphore   lock;
+      } reactor;
+-     
++
+      struct {
+-          int         ids;
+-          FusionLink *list;
+-          spinlock_t  lock;
++          int                ids;
++          FusionLink        *list;
++          struct semaphore   lock;
+      } ref;
+-     
++
+      struct {
+-          int         ids;
+-          FusionLink *list;
+-          spinlock_t  lock;
++          int                ids;
++          FusionLink        *list;
++          struct semaphore   lock;
+      } skirmish;
+ } FusionDev;
+ 
+ /*
+- * Special version of interruptible_sleep_on() that unlocks the spinlock
++ * Special version of interruptible_sleep_on() that unlocks the mutex
+  * after adding the entry to the queue (just before schedule).
+  */
+ void fusion_sleep_on (wait_queue_head_t *q,
+-                      spinlock_t        *lock,
++                      struct semaphore  *lock,
+                       signed long       *timeout_ms);
+ 
+ #endif
+diff --git a/drivers/char/fusion/fusionee.c b/drivers/char/fusion/fusionee.c
+index 44e894b..d05f558 100644
+--- a/drivers/char/fusion/fusionee.c
++++ b/drivers/char/fusion/fusionee.c
+@@ -40,7 +40,7 @@
+ typedef struct {
+      FusionLink        link;
+ 
+-     spinlock_t        lock;
++     struct semaphore  lock;
+ 
+      int               id;
+      int               pid;
+@@ -64,10 +64,9 @@ typedef struct {
+ 
+ /******************************************************************************/
+ 
+-static Fusionee *lookup_fusionee (FusionDev *dev, int id);
+-
+-static Fusionee *lock_fusionee   (FusionDev *dev, int id);
+-static void      unlock_fusionee (Fusionee *fusionee);
++static int  lookup_fusionee (FusionDev *dev, int id, Fusionee **ret_fusionee);
++static int  lock_fusionee   (FusionDev *dev, int id, Fusionee **ret_fusionee);
++static void unlock_fusionee (Fusionee *fusionee);
+ 
+ /******************************************************************************/
+ 
+@@ -79,7 +78,8 @@ fusionees_read_proc(char *buf, char **start, off_t offset,
+      FusionDev  *dev     = private;
+      int         written = 0;
+ 
+-     spin_lock (&dev->fusionee.lock);
++     if (down_interruptible (&dev->fusionee.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->fusionee.list) {
+           Fusionee *fusionee = (Fusionee*) l;
+@@ -95,7 +95,7 @@ fusionees_read_proc(char *buf, char **start, off_t offset,
+                break;
+      }
+ 
+-     spin_unlock (&dev->fusionee.lock);
++     up (&dev->fusionee.lock);
+ 
+      *start = buf + offset;
+      written -= offset;
+@@ -113,8 +113,8 @@ fusionee_init (FusionDev *dev)
+ {
+      init_waitqueue_head (&dev->fusionee.wait);
+ 
+-     dev->fusionee.lock = SPIN_LOCK_UNLOCKED;
+-     
++     init_MUTEX (&dev->fusionee.lock);
++
+      create_proc_read_entry("fusionees", 0, dev->proc_dir,
+                             fusionees_read_proc, dev);
+ 
+@@ -126,10 +126,10 @@ fusionee_deinit (FusionDev *dev)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->fusionee.lock);
++     down (&dev->fusionee.lock);
+ 
+      remove_proc_entry ("fusionees", dev->proc_dir);
+-     
++
+      l = dev->fusionee.list;
+      while (l) {
+           FusionLink *next     = l->next;
+@@ -146,7 +146,7 @@ fusionee_deinit (FusionDev *dev)
+           l = next;
+      }
+ 
+-     spin_unlock (&dev->fusionee.lock);
++     up (&dev->fusionee.lock);
+ }
+ 
+ /******************************************************************************/
+@@ -156,23 +156,27 @@ fusionee_new (FusionDev *dev, int *id)
+ {
+      Fusionee *fusionee;
+ 
+-     fusionee = kmalloc (sizeof(Fusionee), GFP_ATOMIC);
++     fusionee = kmalloc (sizeof(Fusionee), GFP_KERNEL);
+      if (!fusionee)
+           return -ENOMEM;
+ 
+      memset (fusionee, 0, sizeof(Fusionee));
+ 
+-     spin_lock (&dev->fusionee.lock);
++     if (down_interruptible (&dev->fusionee.lock)) {
++          kfree (fusionee);
++          return -EINTR;
++     }
++
++     fusionee->id  = ++dev->fusionee.last_id;
++     fusionee->pid = current->pid;
+ 
+-     fusionee->id   = ++dev->fusionee.last_id;
+-     fusionee->pid  = current->pid;
+-     fusionee->lock = SPIN_LOCK_UNLOCKED;
++     init_MUTEX (&fusionee->lock);
+ 
+      init_waitqueue_head (&fusionee->wait);
+ 
+      fusion_list_prepend (&dev->fusionee.list, &fusionee->link);
+ 
+-     spin_unlock (&dev->fusionee.lock);
++     up (&dev->fusionee.lock);
+ 
+      *id = fusionee->id;
+ 
+@@ -184,30 +188,32 @@ fusionee_send_message (FusionDev *dev, int id, int recipient,
+                        FusionMessageType msg_type, int msg_id,
+                        int msg_size, const void *msg_data)
+ {
++     int       ret;
+      Message  *message;
+      Fusionee *sender   = NULL;
+-     Fusionee *fusionee = lock_fusionee (dev, recipient);
++     Fusionee *fusionee;
+ 
+      DEBUG( "fusionee_send_message (%d -> %d, type %d, id %d, size %d)\n",
+             id, recipient, msg_type, msg_id, msg_size );
+ 
+-     if (!fusionee)
+-          return -EINVAL;
++     ret = lock_fusionee (dev, recipient, &fusionee);
++     if (ret)
++          return ret;
+ 
+      if (id) {
+           if (id == recipient) {
+                sender = fusionee;
+           }
+           else {
+-               sender = lock_fusionee (dev, id);
+-               if (!sender) {
++               ret = lock_fusionee (dev, id, &sender);
++               if (ret) {
+                     unlock_fusionee (fusionee);
+-                    return -EIO;
++                    return ret == -EINVAL ? -EIO : ret;
+                }
+           }
+      }
+ 
+-     message = kmalloc (sizeof(Message) + msg_size, GFP_ATOMIC);
++     message = kmalloc (sizeof(Message) + msg_size, GFP_KERNEL);
+      if (!message) {
+           if (sender && sender != fusionee)
+                unlock_fusionee (sender);
+@@ -251,11 +257,13 @@ int
+ fusionee_get_messages (FusionDev *dev,
+                        int id, void *buf, int buf_size, bool block)
+ {
++     int       ret;
+      int       written  = 0;
+-     Fusionee *fusionee = lock_fusionee (dev, id);
++     Fusionee *fusionee;
+ 
+-     if (!fusionee)
+-          return -EINVAL;
++     ret = lock_fusionee (dev, id, &fusionee);
++     if (ret)
++          return ret;
+ 
+      while (!fusionee->messages.count) {
+           if (!block) {
+@@ -268,9 +276,9 @@ fusionee_get_messages (FusionDev *dev,
+           if (signal_pending(current))
+                return -ERESTARTSYS;
+ 
+-          fusionee = lock_fusionee (dev, id);
+-          if (!fusionee)
+-               return -EINVAL;
++          ret = lock_fusionee (dev, id, &fusionee);
++          if (ret)
++               return ret;
+      }
+ 
+      while (fusionee->messages.count) {
+@@ -314,10 +322,12 @@ fusionee_get_messages (FusionDev *dev,
+ unsigned int
+ fusionee_poll (FusionDev *dev, int id, struct file *file, poll_table * wait)
+ {
+-     Fusionee *fusionee = lock_fusionee (dev, id);
++     int       ret;
++     Fusionee *fusionee;
+ 
+-     if (!fusionee)
+-          return -EINVAL;
++     ret = lock_fusionee (dev, id, &fusionee);
++     if (ret)
++          return ret;
+ 
+      unlock_fusionee (fusionee);
+ 
+@@ -325,7 +335,9 @@ fusionee_poll (FusionDev *dev, int id, struct file *file, poll_table * wait)
+      poll_wait (file, &fusionee->wait, wait);
+ 
+ 
+-     fusionee = lock_fusionee (dev, id);
++     ret = lock_fusionee (dev, id, &fusionee);
++     if (ret)
++          return ret;
+ 
+      if (!fusionee)
+           return -EINVAL;
+@@ -347,12 +359,14 @@ fusionee_kill (FusionDev *dev, int id, int target, int signal, int timeout_ms)
+      long timeout = -1;
+ 
+      while (true) {
++          int         ret;
+           FusionLink *l;
+-          Fusionee   *fusionee = lookup_fusionee (dev, id);
++          Fusionee   *fusionee;
+           int         killed   = 0;
+ 
+-          if (!fusionee)
+-               return -EINVAL;
++          ret = lookup_fusionee (dev, id, &fusionee);
++          if (ret)
++               return ret;
+ 
+           fusion_list_foreach (l, dev->fusionee.list) {
+                Fusionee *f = (Fusionee*) l;
+@@ -369,7 +383,7 @@ fusionee_kill (FusionDev *dev, int id, int target, int signal, int timeout_ms)
+           if (timeout_ms) {
+                switch (timeout) {
+                     case 0:  /* timed out */
+-                         spin_unlock (&dev->fusionee.lock);
++                         up (&dev->fusionee.lock);
+                          return -ETIMEDOUT;
+ 
+                     case -1: /* setup timeout */
+@@ -392,7 +406,7 @@ fusionee_kill (FusionDev *dev, int id, int target, int signal, int timeout_ms)
+                return -ERESTARTSYS;
+      }
+ 
+-     spin_unlock (&dev->fusionee.lock);
++     up (&dev->fusionee.lock);
+ 
+      return 0;
+ }
+@@ -400,18 +414,20 @@ fusionee_kill (FusionDev *dev, int id, int target, int signal, int timeout_ms)
+ int
+ fusionee_destroy (FusionDev *dev, int id)
+ {
+-     Fusionee *fusionee = lookup_fusionee (dev, id);
++     int       ret;
++     Fusionee *fusionee;
+ 
+-     if (!fusionee)
+-          return -EINVAL;
++     ret = lookup_fusionee (dev, id, &fusionee);
++     if (ret)
++          return ret;
+ 
+-     spin_lock (&fusionee->lock);
++     down (&fusionee->lock);
+ 
+      fusion_list_remove (&dev->fusionee.list, &fusionee->link);
+ 
+      wake_up_interruptible_all (&dev->fusionee.wait);
+ 
+-     spin_unlock (&dev->fusionee.lock);
++     up (&dev->fusionee.lock);
+ 
+ 
+      fusion_call_destroy_all (dev, id);
+@@ -426,50 +442,66 @@ fusionee_destroy (FusionDev *dev, int id)
+           kfree (message);
+      }
+ 
+-     spin_unlock (&fusionee->lock);
++     up (&fusionee->lock);
+ 
+      kfree (fusionee);
+ 
+-     return 0;
++     return ret;
+ }
+ 
+ /******************************************************************************/
+ 
+-static Fusionee *
+-lookup_fusionee (FusionDev *dev, int id)
++static int
++lookup_fusionee (FusionDev *dev, int id, Fusionee **ret_fusionee)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->fusionee.lock);
++     if (down_interruptible (&dev->fusionee.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->fusionee.list) {
+           Fusionee *fusionee = (Fusionee *) l;
+ 
+-          if (fusionee->id == id)
+-               return fusionee;
++          if (fusionee->id == id) {
++               *ret_fusionee = fusionee;
++               return 0;
++          }
+      }
+ 
+-     spin_unlock (&dev->fusionee.lock);
++     up (&dev->fusionee.lock);
+ 
+-     return NULL;
++     return -EINVAL;
+ }
+ 
+-static Fusionee *
+-lock_fusionee (FusionDev *dev, int id)
++static int
++lock_fusionee (FusionDev *dev, int id, Fusionee **ret_fusionee)
+ {
+-     Fusionee *fusionee = lookup_fusionee (dev, id);
++     int       ret;
++     Fusionee *fusionee;
++
++     ret = lookup_fusionee (dev, id, &fusionee);
++     if (ret)
++          return ret;
+ 
+      if (fusionee) {
+-          spin_lock (&fusionee->lock);
+-          spin_unlock (&dev->fusionee.lock);
++          fusion_list_move_to_front (&dev->fusionee.list, &fusionee->link);
++
++          if (down_interruptible (&fusionee->lock)) {
++               up (&dev->fusionee.lock);
++               return -EINTR;
++          }
++
++          up (&dev->fusionee.lock);
+      }
+ 
+-     return fusionee;
++     *ret_fusionee = fusionee;
++
++     return 0;
+ }
+ 
+ static void
+ unlock_fusionee (Fusionee *fusionee)
+ {
+-     spin_unlock (&fusionee->lock);
++     up (&fusionee->lock);
+ }
+ 
+diff --git a/drivers/char/fusion/property.c b/drivers/char/fusion/property.c
+index 8e18448..37e87a7 100644
+--- a/drivers/char/fusion/property.c
++++ b/drivers/char/fusion/property.c
+@@ -35,7 +35,7 @@ typedef enum {
+ typedef struct {
+      FusionLink          link;
+ 
+-     spinlock_t          lock;
++     struct semaphore    lock;
+ 
+      int                 id;
+      int                 pid;
+@@ -50,10 +50,9 @@ typedef struct {
+ 
+ /******************************************************************************/
+ 
+-static FusionProperty *lookup_property     (FusionDev *dev, int id);
+-
+-static FusionProperty *lock_property       (FusionDev *dev, int id);
+-static void            unlock_property     (FusionProperty *property);
++static int  lookup_property (FusionDev *dev, int id, FusionProperty **ret_property);
++static int  lock_property   (FusionDev *dev, int id, FusionProperty **ret_property);
++static void unlock_property (FusionProperty *property);
+ 
+ /******************************************************************************/
+ 
+@@ -65,7 +64,8 @@ properties_read_proc(char *buf, char **start, off_t offset,
+      FusionDev  *dev     = private;
+      int         written = 0;
+ 
+-     spin_lock (&dev->property.lock);
++     if (down_interruptible (&dev->property.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->property.list) {
+           FusionProperty *property = (FusionProperty*) l;
+@@ -91,7 +91,7 @@ properties_read_proc(char *buf, char **start, off_t offset,
+                break;
+      }
+ 
+-     spin_unlock (&dev->property.lock);
++     up (&dev->property.lock);
+ 
+      *start = buf + offset;
+      written -= offset;
+@@ -107,7 +107,7 @@ properties_read_proc(char *buf, char **start, off_t offset,
+ int
+ fusion_property_init (FusionDev *dev)
+ {
+-     dev->property.lock = SPIN_LOCK_UNLOCKED;
++     init_MUTEX (&dev->property.lock);
+ 
+      create_proc_read_entry("properties", 0, dev->proc_dir,
+                             properties_read_proc, dev);
+@@ -120,10 +120,10 @@ fusion_property_deinit (FusionDev *dev)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->property.lock);
++     down (&dev->property.lock);
+ 
+      remove_proc_entry ("properties", dev->proc_dir);
+-     
++
+      l = dev->property.list;
+      while (l) {
+           FusionLink     *next     = l->next;
+@@ -134,7 +134,7 @@ fusion_property_deinit (FusionDev *dev)
+           l = next;
+      }
+ 
+-     spin_unlock (&dev->property.lock);
++     up (&dev->property.lock);
+ }
+ 
+ /******************************************************************************/
+@@ -144,23 +144,27 @@ fusion_property_new (FusionDev *dev, int *id)
+ {
+      FusionProperty *property;
+ 
+-     property = kmalloc (sizeof(FusionProperty), GFP_ATOMIC);
++     property = kmalloc (sizeof(FusionProperty), GFP_KERNEL);
+      if (!property)
+           return -ENOMEM;
+ 
+      memset (property, 0, sizeof(FusionProperty));
+ 
+-     spin_lock (&dev->property.lock);
++     if (down_interruptible (&dev->property.lock)) {
++          kfree (property);
++          return -EINTR;
++     }
+ 
+      property->id   = dev->property.ids++;
+      property->pid  = current->pid;
+-     property->lock = SPIN_LOCK_UNLOCKED;
++
++     init_MUTEX (&property->lock);
+ 
+      init_waitqueue_head (&property->wait);
+ 
+      fusion_list_prepend (&dev->property.list, &property->link);
+ 
+-     spin_unlock (&dev->property.lock);
++     up (&dev->property.lock);
+ 
+      *id = property->id;
+ 
+@@ -174,11 +178,13 @@ fusion_property_lease (FusionDev *dev, int id, int fusion_id)
+      signed long     timeout = -1;
+ 
+      dev->stat.property_lease_purchase++;
+-     
++
+      while (true) {
+-          property = lock_property (dev, id);
+-          if (!property)
+-               return -EINVAL;
++          int ret;
++
++          ret = lock_property (dev, id, &property);
++          if (ret)
++               return ret;
+ 
+           switch (property->state) {
+                case FUSION_PROPERTY_AVAILABLE:
+@@ -234,11 +240,13 @@ fusion_property_purchase (FusionDev *dev, int id, int fusion_id)
+      signed long     timeout = -1;
+ 
+      dev->stat.property_lease_purchase++;
+-     
++
+      while (true) {
+-          property = lock_property (dev, id);
+-          if (!property)
+-               return -EINVAL;
++          int ret;
++
++          ret = lock_property (dev, id, &property);
++          if (ret)
++               return ret;
+ 
+           switch (property->state) {
+                case FUSION_PROPERTY_AVAILABLE:
+@@ -293,13 +301,15 @@ fusion_property_purchase (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_property_cede (FusionDev *dev, int id, int fusion_id)
+ {
++     int             ret;
+      bool            purchased;
+-     FusionProperty *property = lock_property (dev, id);
++     FusionProperty *property;
++
++     ret = lock_property (dev, id, &property);
++     if (ret)
++          return ret;
+ 
+      dev->stat.property_cede++;
+-     
+-     if (!property)
+-          return -EINVAL;
+ 
+      if (property->fusion_id != fusion_id) {
+           unlock_property (property);
+@@ -325,10 +335,12 @@ fusion_property_cede (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_property_holdup (FusionDev *dev, int id, int fusion_id)
+ {
+-     FusionProperty *property = lock_property (dev, id);
++     int             ret;
++     FusionProperty *property;
+ 
+-     if (!property)
+-          return -EINVAL;
++     ret = lock_property (dev, id, &property);
++     if (ret)
++          return ret;
+ 
+      if (property->state == FUSION_PROPERTY_PURCHASED) {
+           if (property->fusion_id == fusion_id) {
+@@ -347,20 +359,25 @@ fusion_property_holdup (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_property_destroy (FusionDev *dev, int id)
+ {
+-     FusionProperty *property = lookup_property (dev, id);
++     int             ret;
++     FusionProperty *property;
+ 
+-     if (!property)
+-          return -EINVAL;
++     ret = lookup_property (dev, id, &property);
++     if (ret)
++          return ret;
+ 
+-     spin_lock (&property->lock);
++     if (down_interruptible (&property->lock)) {
++          up (&dev->property.lock);
++          return -EINTR;
++     }
+ 
+      fusion_list_remove (&dev->property.list, &property->link);
+ 
+      wake_up_interruptible_all (&property->wait);
+ 
+-     spin_unlock (&dev->property.lock);
++     up (&dev->property.lock);
+ 
+-     spin_unlock (&property->lock);
++     up (&property->lock);
+ 
+      kfree (property);
+ 
+@@ -372,12 +389,12 @@ fusion_property_cede_all (FusionDev *dev, int fusion_id)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->property.lock);
++     down (&dev->property.lock);
+ 
+      fusion_list_foreach (l, dev->property.list) {
+           FusionProperty *property = (FusionProperty *) l;
+ 
+-          spin_lock (&property->lock);
++          down (&property->lock);
+ 
+           if (property->fusion_id == fusion_id) {
+                property->state     = FUSION_PROPERTY_AVAILABLE;
+@@ -387,50 +404,65 @@ fusion_property_cede_all (FusionDev *dev, int fusion_id)
+                wake_up_interruptible_all (&property->wait);
+           }
+ 
+-          spin_unlock (&property->lock);
++          up (&property->lock);
+      }
+ 
+-     spin_unlock (&dev->property.lock);
++     up (&dev->property.lock);
+ }
+ 
+ /******************************************************************************/
+ 
+-static FusionProperty *
+-lookup_property (FusionDev *dev, int id)
++static int
++lookup_property (FusionDev *dev, int id, FusionProperty **ret_property)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->property.lock);
++     if (down_interruptible (&dev->property.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->property.list) {
+           FusionProperty *property = (FusionProperty *) l;
+ 
+-          if (property->id == id)
+-               return property;
++          if (property->id == id) {
++               *ret_property = property;
++               return 0;
++          }
+      }
+ 
+-     spin_unlock (&dev->property.lock);
++     up (&dev->property.lock);
+ 
+-     return NULL;
++     return -EINVAL;
+ }
+ 
+-static FusionProperty *
+-lock_property (FusionDev *dev, int id)
++static int
++lock_property (FusionDev *dev, int id, FusionProperty **ret_property)
+ {
+-     FusionProperty *property = lookup_property (dev, id);
++     int             ret;
++     FusionProperty *property;
++
++     ret = lookup_property (dev, id, &property);
++     if (ret)
++          return ret;
+ 
+      if (property) {
+           fusion_list_move_to_front (&dev->property.list, &property->link);
+ 
+-          spin_lock (&property->lock);
+-          spin_unlock (&dev->property.lock);
++          if (down_interruptible (&property->lock)) {
++               up (&dev->property.lock);
++               return -EINTR;
++          }
++
++          up (&dev->property.lock);
+      }
+ 
+-     return property;
++     *ret_property = property;
++
++     return 0;
+ }
+ 
+ static void
+ unlock_property (FusionProperty *property)
+ {
+-     spin_unlock (&property->lock);
++     up (&property->lock);
+ }
++
+diff --git a/drivers/char/fusion/reactor.c b/drivers/char/fusion/reactor.c
+index 828c0ce..1eba3f1 100644
+--- a/drivers/char/fusion/reactor.c
++++ b/drivers/char/fusion/reactor.c
+@@ -37,7 +37,7 @@ typedef struct {
+ typedef struct {
+      FusionLink         link;
+ 
+-     spinlock_t         lock;
++     struct semaphore   lock;
+ 
+      int                id;
+      int                pid;
+@@ -47,16 +47,15 @@ typedef struct {
+ 
+ /******************************************************************************/
+ 
+-static FusionReactor *lookup_reactor     (FusionDev *dev, int id);
++static int  lookup_reactor (FusionDev *dev, int id, FusionReactor **ret_reactor);
++static int  lock_reactor   (FusionDev *dev, int id, FusionReactor **ret_reactor);
++static void unlock_reactor (FusionReactor *reactor);
+ 
+-static FusionReactor *lock_reactor       (FusionDev *dev, int id);
+-static void           unlock_reactor     (FusionReactor *reactor);
+-
+-static ReactorNode   *get_node           (FusionReactor *reactor,
+-                                          int            fusion_id);
+-static void           remove_node        (FusionReactor *reactor,
+-                                          int            fusion_id);
+-static void           free_all_nodes     (FusionReactor *reactor);
++static ReactorNode *get_node           (FusionReactor *reactor,
++                                        int            fusion_id);
++static void         remove_node        (FusionReactor *reactor,
++                                        int            fusion_id);
++static void         free_all_nodes     (FusionReactor *reactor);
+ 
+ /******************************************************************************/
+ 
+@@ -68,7 +67,8 @@ reactors_read_proc(char *buf, char **start, off_t offset,
+      FusionDev  *dev     = private;
+      int         written = 0;
+ 
+-     spin_lock (&dev->reactor.lock);
++     if (down_interruptible (&dev->reactor.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->reactor.list) {
+           FusionReactor *reactor = (FusionReactor*) l;
+@@ -84,7 +84,7 @@ reactors_read_proc(char *buf, char **start, off_t offset,
+                break;
+      }
+ 
+-     spin_unlock (&dev->reactor.lock);
++     up (&dev->reactor.lock);
+ 
+      *start = buf + offset;
+      written -= offset;
+@@ -100,7 +100,7 @@ reactors_read_proc(char *buf, char **start, off_t offset,
+ int
+ fusion_reactor_init (FusionDev *dev)
+ {
+-     dev->reactor.lock = SPIN_LOCK_UNLOCKED;
++     init_MUTEX (&dev->reactor.lock);
+ 
+      create_proc_read_entry("reactors", 0, dev->proc_dir,
+                             reactors_read_proc, dev);
+@@ -113,10 +113,10 @@ fusion_reactor_deinit (FusionDev *dev)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->reactor.lock);
++     down (&dev->reactor.lock);
+ 
+      remove_proc_entry ("reactors", dev->proc_dir);
+-     
++
+      l = dev->reactor.list;
+      while (l) {
+           FusionLink    *next    = l->next;
+@@ -129,7 +129,7 @@ fusion_reactor_deinit (FusionDev *dev)
+           l = next;
+      }
+ 
+-     spin_unlock (&dev->reactor.lock);
++     up (&dev->reactor.lock);
+ }
+ 
+ /******************************************************************************/
+@@ -139,21 +139,25 @@ fusion_reactor_new (FusionDev *dev, int *id)
+ {
+      FusionReactor *reactor;
+ 
+-     reactor = kmalloc (sizeof(FusionReactor), GFP_ATOMIC);
++     reactor = kmalloc (sizeof(FusionReactor), GFP_KERNEL);
+      if (!reactor)
+           return -ENOMEM;
+ 
+      memset (reactor, 0, sizeof(FusionReactor));
+ 
+-     spin_lock (&dev->reactor.lock);
++     if (down_interruptible (&dev->reactor.lock)) {
++          kfree (reactor);
++          return -EINTR;
++     }
+ 
+-     reactor->id   = dev->reactor.ids++;
+-     reactor->pid  = current->pid;
+-     reactor->lock = SPIN_LOCK_UNLOCKED;
++     reactor->id  = dev->reactor.ids++;
++     reactor->pid = current->pid;
++
++     init_MUTEX (&reactor->lock);
+ 
+      fusion_list_prepend (&dev->reactor.list, &reactor->link);
+ 
+-     spin_unlock (&dev->reactor.lock);
++     up (&dev->reactor.lock);
+ 
+      *id = reactor->id;
+ 
+@@ -163,17 +167,19 @@ fusion_reactor_new (FusionDev *dev, int *id)
+ int
+ fusion_reactor_attach (FusionDev *dev, int id, int fusion_id)
+ {
++     int            ret;
+      ReactorNode   *node;
+-     FusionReactor *reactor = lock_reactor (dev, id);
++     FusionReactor *reactor;
+ 
+-     dev->stat.reactor_attach++;
++     ret = lock_reactor (dev, id, &reactor);
++     if (ret)
++          return ret;
+ 
+-     if (!reactor)
+-          return -EINVAL;
++     dev->stat.reactor_attach++;
+ 
+      node = get_node (reactor, fusion_id);
+      if (!node) {
+-          node = kmalloc (sizeof(ReactorNode), GFP_ATOMIC);
++          node = kmalloc (sizeof(ReactorNode), GFP_KERNEL);
+           if (!node) {
+                unlock_reactor (reactor);
+                return -ENOMEM;
+@@ -195,13 +201,15 @@ fusion_reactor_attach (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_reactor_detach (FusionDev *dev, int id, int fusion_id)
+ {
++     int            ret;
+      ReactorNode   *node;
+-     FusionReactor *reactor = lock_reactor (dev, id);
++     FusionReactor *reactor;
++
++     ret = lock_reactor (dev, id, &reactor);
++     if (ret)
++          return ret;
+ 
+      dev->stat.reactor_detach++;
+-     
+-     if (!reactor)
+-          return -EINVAL;
+ 
+      node = get_node (reactor, fusion_id);
+      if (!node) {
+@@ -223,11 +231,13 @@ int
+ fusion_reactor_dispatch (FusionDev *dev, int id, int fusion_id,
+                          int msg_size, const void *msg_data)
+ {
++     int            ret;
+      FusionLink    *l;
+-     FusionReactor *reactor = lock_reactor (dev, id);
++     FusionReactor *reactor;
+ 
+-     if (!reactor)
+-          return -EINVAL;
++     ret = lock_reactor (dev, id, &reactor);
++     if (ret)
++          return ret;
+ 
+      fusion_list_foreach (l, reactor->nodes) {
+           ReactorNode *node = (ReactorNode *) l;
+@@ -247,20 +257,25 @@ fusion_reactor_dispatch (FusionDev *dev, int id, int fusion_id,
+ int
+ fusion_reactor_destroy (FusionDev *dev, int id)
+ {
+-     FusionReactor *reactor = lookup_reactor (dev, id);
++     int            ret;
++     FusionReactor *reactor;
+ 
+-     if (!reactor)
+-          return -EINVAL;
++     ret = lookup_reactor (dev, id, &reactor);
++     if (ret)
++          return ret;
+ 
+-     spin_lock (&reactor->lock);
++     if (down_interruptible (&reactor->lock)) {
++          up (&dev->reactor.lock);
++          return -EINTR;
++     }
+ 
+      fusion_list_remove (&dev->reactor.list, &reactor->link);
+ 
+-     spin_unlock (&dev->reactor.lock);
++     up (&dev->reactor.lock);
+ 
+      free_all_nodes (reactor);
+ 
+-     spin_unlock (&reactor->lock);
++     up (&reactor->lock);
+ 
+      kfree (reactor);
+ 
+@@ -272,7 +287,7 @@ fusion_reactor_detach_all (FusionDev *dev, int fusion_id)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->reactor.lock);
++     down (&dev->reactor.lock);
+ 
+      fusion_list_foreach (l, dev->reactor.list) {
+           FusionReactor *reactor = (FusionReactor *) l;
+@@ -280,49 +295,63 @@ fusion_reactor_detach_all (FusionDev *dev, int fusion_id)
+           remove_node (reactor, fusion_id);
+      }
+ 
+-     spin_unlock (&dev->reactor.lock);
++     up (&dev->reactor.lock);
+ }
+ 
+ /******************************************************************************/
+ 
+-static FusionReactor *
+-lookup_reactor (FusionDev *dev, int id)
++static int
++lookup_reactor (FusionDev *dev, int id, FusionReactor **ret_reactor)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->reactor.lock);
++     if (down_interruptible (&dev->reactor.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->reactor.list) {
+           FusionReactor *reactor = (FusionReactor *) l;
+ 
+-          if (reactor->id == id)
+-               return reactor;
++          if (reactor->id == id) {
++               *ret_reactor = reactor;
++               return 0;
++          }
+      }
+ 
+-     spin_unlock (&dev->reactor.lock);
++     up (&dev->reactor.lock);
+ 
+-     return NULL;
++     return -EINVAL;
+ }
+ 
+-static FusionReactor *
+-lock_reactor (FusionDev *dev, int id)
++static int
++lock_reactor (FusionDev *dev, int id, FusionReactor **ret_reactor)
+ {
+-     FusionReactor *reactor = lookup_reactor (dev, id);
++     int         ret;
++     FusionReactor *reactor;
++
++     ret = lookup_reactor (dev, id, &reactor);
++     if (ret)
++          return ret;
+ 
+      if (reactor) {
+           fusion_list_move_to_front (&dev->reactor.list, &reactor->link);
+ 
+-          spin_lock (&reactor->lock);
+-          spin_unlock (&dev->reactor.lock);
++          if (down_interruptible (&reactor->lock)) {
++               up (&dev->reactor.lock);
++               return -EINTR;
++          }
++
++          up (&dev->reactor.lock);
+      }
+ 
+-     return reactor;
++     *ret_reactor = reactor;
++
++     return 0;
+ }
+ 
+ static void
+ unlock_reactor (FusionReactor *reactor)
+ {
+-     spin_unlock (&reactor->lock);
++     up (&reactor->lock);
+ }
+ 
+ static ReactorNode *
+@@ -346,7 +375,7 @@ remove_node (FusionReactor *reactor, int fusion_id)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&reactor->lock);
++     down (&reactor->lock);
+ 
+      fusion_list_foreach (l, reactor->nodes) {
+           ReactorNode *node = (ReactorNode *) l;
+@@ -357,7 +386,7 @@ remove_node (FusionReactor *reactor, int fusion_id)
+           }
+      }
+ 
+-     spin_unlock (&reactor->lock);
++     up (&reactor->lock);
+ }
+ 
+ static void
+diff --git a/drivers/char/fusion/ref.c b/drivers/char/fusion/ref.c
+index d84743d..72f2102 100644
+--- a/drivers/char/fusion/ref.c
++++ b/drivers/char/fusion/ref.c
+@@ -35,7 +35,7 @@ typedef struct {
+ typedef struct {
+      FusionLink         link;
+ 
+-     spinlock_t         lock;
++     struct semaphore   lock;
+ 
+      int                id;
+      int                pid;
+@@ -56,16 +56,15 @@ typedef struct {
+ 
+ /******************************************************************************/
+ 
+-static FusionRef *lookup_ref     (FusionDev *dev, int id);
++static int  lookup_ref (FusionDev *dev, int id, FusionRef **ret_ref);
++static int  lock_ref   (FusionDev *dev, int id, FusionRef **ret_ref);
++static void unlock_ref (FusionRef *ref);
+ 
+-static FusionRef *lock_ref       (FusionDev *dev, int id);
+-static void       unlock_ref     (FusionRef *ref);
++static int  add_local      (FusionRef *ref, int fusion_id, int add);
++static void clear_local    (FusionDev *dev, FusionRef *ref, int fusion_id);
++static void free_all_local (FusionRef *ref);
+ 
+-static int        add_local      (FusionRef *ref, int fusion_id, int add);
+-static void       clear_local    (FusionDev *dev, FusionRef *ref, int fusion_id);
+-static void       free_all_local (FusionRef *ref);
+-
+-static void       notify_ref     (FusionDev *dev, FusionRef *ref);
++static void notify_ref     (FusionDev *dev, FusionRef *ref);
+ 
+ /******************************************************************************/
+ 
+@@ -77,7 +76,8 @@ refs_read_proc(char *buf, char **start, off_t offset,
+      FusionDev  *dev     = private;
+      int         written = 0;
+ 
+-     spin_lock (&dev->ref.lock);
++     if (down_interruptible (&dev->ref.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->ref.list) {
+           FusionRef *ref = (FusionRef*) l;
+@@ -98,7 +98,7 @@ refs_read_proc(char *buf, char **start, off_t offset,
+                break;
+      }
+ 
+-     spin_unlock (&dev->ref.lock);
++     up (&dev->ref.lock);
+ 
+      *start = buf + offset;
+      written -= offset;
+@@ -114,7 +114,7 @@ refs_read_proc(char *buf, char **start, off_t offset,
+ int
+ fusion_ref_init (FusionDev *dev)
+ {
+-     dev->ref.lock = SPIN_LOCK_UNLOCKED;
++     init_MUTEX (&dev->ref.lock);
+ 
+      create_proc_read_entry("refs", 0, dev->proc_dir,
+                             refs_read_proc, dev);
+@@ -127,10 +127,10 @@ fusion_ref_deinit (FusionDev *dev)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->ref.lock);
++     down (&dev->ref.lock);
+ 
+      remove_proc_entry ("refs", dev->proc_dir);
+-     
++
+      l = dev->ref.list;
+      while (l) {
+           FusionLink *next = l->next;
+@@ -143,7 +143,7 @@ fusion_ref_deinit (FusionDev *dev)
+           l = next;
+      }
+ 
+-     spin_unlock (&dev->ref.lock);
++     up (&dev->ref.lock);
+ }
+ 
+ /******************************************************************************/
+@@ -153,23 +153,27 @@ fusion_ref_new (FusionDev *dev, int *id)
+ {
+      FusionRef *ref;
+ 
+-     ref = kmalloc (sizeof(FusionRef), GFP_ATOMIC);
++     ref = kmalloc (sizeof(FusionRef), GFP_KERNEL);
+      if (!ref)
+           return -ENOMEM;
+ 
+      memset (ref, 0, sizeof(FusionRef));
+ 
+-     spin_lock (&dev->ref.lock);
++     if (down_interruptible (&dev->ref.lock)) {
++          kfree (ref);
++          return -EINTR;
++     }
+ 
+      ref->id   = dev->ref.ids++;
+      ref->pid  = current->pid;
+-     ref->lock = SPIN_LOCK_UNLOCKED;
++
++     init_MUTEX (&ref->lock);
+ 
+      init_waitqueue_head (&ref->wait);
+ 
+      fusion_list_prepend (&dev->ref.list, &ref->link);
+ 
+-     spin_unlock (&dev->ref.lock);
++     up (&dev->ref.lock);
+ 
+      *id = ref->id;
+ 
+@@ -179,12 +183,14 @@ fusion_ref_new (FusionDev *dev, int *id)
+ int
+ fusion_ref_up (FusionDev *dev, int id, int fusion_id)
+ {
+-     FusionRef *ref = lock_ref (dev, id);
++     int        ret;
++     FusionRef *ref;
++
++     ret = lock_ref (dev, id, &ref);
++     if (ret)
++          return ret;
+ 
+      dev->stat.ref_up++;
+-     
+-     if (!ref)
+-          return -EINVAL;
+ 
+      if (ref->locked) {
+           unlock_ref (ref);
+@@ -213,12 +219,14 @@ fusion_ref_up (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_ref_down (FusionDev *dev, int id, int fusion_id)
+ {
+-     FusionRef *ref = lock_ref (dev, id);
++     int        ret;
++     FusionRef *ref;
++
++     ret = lock_ref (dev, id, &ref);
++     if (ret)
++          return ret;
+ 
+      dev->stat.ref_down++;
+-     
+-     if (!ref)
+-          return -EINVAL;
+ 
+      if (ref->locked) {
+           unlock_ref (ref);
+@@ -257,12 +265,13 @@ fusion_ref_down (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_ref_zero_lock (FusionDev *dev, int id, int fusion_id)
+ {
++     int        ret;
+      FusionRef *ref;
+ 
+      while (true) {
+-          ref = lock_ref (dev, id);
+-          if (!ref)
+-               return -EINVAL;
++          ret = lock_ref (dev, id, &ref);
++          if (ret)
++               return ret;
+ 
+           if (ref->watched) {
+                unlock_ref (ref);
+@@ -294,11 +303,12 @@ fusion_ref_zero_lock (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_ref_zero_trylock (FusionDev *dev, int id, int fusion_id)
+ {
+-     int        ret = 0;
+-     FusionRef *ref = lock_ref (dev, id);
++     int        ret;
++     FusionRef *ref;
+ 
+-     if (!ref)
+-          return -EINVAL;
++     ret = lock_ref (dev, id, &ref);
++     if (ret)
++          return ret;
+ 
+      if (ref->locked) {
+           unlock_ref (ref);
+@@ -318,10 +328,12 @@ fusion_ref_zero_trylock (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_ref_unlock (FusionDev *dev, int id, int fusion_id)
+ {
+-     FusionRef *ref = lock_ref (dev, id);
++     int        ret;
++     FusionRef *ref;
+ 
+-     if (!ref)
+-          return -EINVAL;
++     ret = lock_ref (dev, id, &ref);
++     if (ret)
++          return ret;
+ 
+      if (ref->locked != fusion_id) {
+           unlock_ref (ref);
+@@ -338,10 +350,12 @@ fusion_ref_unlock (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_ref_stat (FusionDev *dev, int id, int *refs)
+ {
+-     FusionRef *ref = lock_ref (dev, id);
++     int        ret;
++     FusionRef *ref;
+ 
+-     if (!ref)
+-          return -EINVAL;
++     ret = lock_ref (dev, id, &ref);
++     if (ret)
++          return ret;
+ 
+      *refs = ref->global + ref->local;
+ 
+@@ -356,10 +370,12 @@ fusion_ref_watch (FusionDev      *dev,
+                   int             call_id,
+                   int             call_arg)
+ {
+-     FusionRef *ref = lock_ref (dev, id);
++     int        ret;
++     FusionRef *ref;
+ 
+-     if (!ref)
+-          return -EINVAL;
++     ret = lock_ref (dev, id, &ref);
++     if (ret)
++          return ret;
+ 
+      if (ref->pid != current->pid) {
+           unlock_ref (ref);
+@@ -379,9 +395,9 @@ fusion_ref_watch (FusionDev      *dev,
+      ref->watched  = true;
+      ref->call_id  = call_id;
+      ref->call_arg = call_arg;
+-     
++
+      wake_up_interruptible_all (&ref->wait);
+-     
++
+      unlock_ref (ref);
+ 
+      return 0;
+@@ -390,22 +406,27 @@ fusion_ref_watch (FusionDev      *dev,
+ int
+ fusion_ref_destroy (FusionDev *dev, int id)
+ {
+-     FusionRef *ref = lookup_ref (dev, id);
++     int        ret;
++     FusionRef *ref;
+ 
+-     if (!ref)
+-          return -EINVAL;
++     ret = lookup_ref (dev, id, &ref);
++     if (ret)
++          return ret;
+ 
+-     spin_lock (&ref->lock);
++     if (down_interruptible (&ref->lock)) {
++          up (&dev->ref.lock);
++          return -EINTR;
++     }
+ 
+      fusion_list_remove (&dev->ref.list, &ref->link);
+ 
+      wake_up_interruptible_all (&ref->wait);
+ 
+-     spin_unlock (&dev->ref.lock);
++     up (&dev->ref.lock);
+ 
+      free_all_local (ref);
+ 
+-     spin_unlock (&ref->lock);
++     up (&ref->lock);
+ 
+      kfree (ref);
+ 
+@@ -417,7 +438,7 @@ fusion_ref_clear_all_local (FusionDev *dev, int fusion_id)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->ref.lock);
++     down (&dev->ref.lock);
+ 
+      fusion_list_foreach (l, dev->ref.list) {
+           FusionRef *ref = (FusionRef *) l;
+@@ -425,49 +446,63 @@ fusion_ref_clear_all_local (FusionDev *dev, int fusion_id)
+           clear_local (dev, ref, fusion_id);
+      }
+ 
+-     spin_unlock (&dev->ref.lock);
++     up (&dev->ref.lock);
+ }
+ 
+ /******************************************************************************/
+ 
+-static FusionRef *
+-lookup_ref (FusionDev *dev, int id)
++static int
++lookup_ref (FusionDev *dev, int id, FusionRef **ret_ref)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->ref.lock);
++     if (down_interruptible (&dev->ref.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->ref.list) {
+           FusionRef *ref = (FusionRef *) l;
+ 
+-          if (ref->id == id)
+-               return ref;
++          if (ref->id == id) {
++               *ret_ref = ref;
++               return 0;
++          }
+      }
+ 
+-     spin_unlock (&dev->ref.lock);
++     up (&dev->ref.lock);
+ 
+-     return NULL;
++     return -EINVAL;
+ }
+ 
+-static FusionRef *
+-lock_ref (FusionDev *dev, int id)
++static int
++lock_ref (FusionDev *dev, int id, FusionRef **ret_ref)
+ {
+-     FusionRef *ref = lookup_ref (dev, id);
++     int         ret;
++     FusionRef *ref;
++
++     ret = lookup_ref (dev, id, &ref);
++     if (ret)
++          return ret;
+ 
+      if (ref) {
+           fusion_list_move_to_front (&dev->ref.list, &ref->link);
+ 
+-          spin_lock (&ref->lock);
+-          spin_unlock (&dev->ref.lock);
++          if (down_interruptible (&ref->lock)) {
++               up (&dev->ref.lock);
++               return -EINTR;
++          }
++
++          up (&dev->ref.lock);
+      }
+ 
+-     return ref;
++     *ret_ref = ref;
++
++     return 0;
+ }
+ 
+ static void
+ unlock_ref (FusionRef *ref)
+ {
+-     spin_unlock (&ref->lock);
++     up (&ref->lock);
+ }
+ 
+ static int
+@@ -488,7 +523,7 @@ add_local (FusionRef *ref, int fusion_id, int add)
+           }
+      }
+ 
+-     local = kmalloc (sizeof(LocalRef), GFP_ATOMIC);
++     local = kmalloc (sizeof(LocalRef), GFP_KERNEL);
+      if (!local)
+           return -ENOMEM;
+ 
+@@ -505,7 +540,7 @@ clear_local (FusionDev *dev, FusionRef *ref, int fusion_id)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&ref->lock);
++     down (&ref->lock);
+ 
+      if (ref->locked == fusion_id)
+           ref->locked = 0;
+@@ -525,7 +560,7 @@ clear_local (FusionDev *dev, FusionRef *ref, int fusion_id)
+           }
+      }
+ 
+-     spin_unlock (&ref->lock);
++     up (&ref->lock);
+ }
+ 
+ static void
+diff --git a/drivers/char/fusion/skirmish.c b/drivers/char/fusion/skirmish.c
+index ce1c9fd..03ada64 100644
+--- a/drivers/char/fusion/skirmish.c
++++ b/drivers/char/fusion/skirmish.c
+@@ -29,7 +29,7 @@
+ typedef struct {
+      FusionLink         link;
+ 
+-     spinlock_t         lock;
++     struct semaphore   lock;
+ 
+      int                id;
+      int                pid;
+@@ -43,10 +43,9 @@ typedef struct {
+ 
+ /******************************************************************************/
+ 
+-static FusionSkirmish *lookup_skirmish     (FusionDev *dev, int id);
+-
+-static FusionSkirmish *lock_skirmish       (FusionDev *dev, int id);
+-static void            unlock_skirmish     (FusionSkirmish *skirmish);
++static int  lookup_skirmish (FusionDev *dev, int id, FusionSkirmish **ret_skirmish);
++static int  lock_skirmish   (FusionDev *dev, int id, FusionSkirmish **ret_skirmish);
++static void unlock_skirmish (FusionSkirmish *skirmish);
+ 
+ /******************************************************************************/
+ 
+@@ -58,7 +57,8 @@ skirmishs_read_proc(char *buf, char **start, off_t offset,
+      FusionDev  *dev     = private;
+      int         written = 0;
+ 
+-     spin_lock (&dev->skirmish.lock);
++     if (down_interruptible (&dev->skirmish.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->skirmish.list) {
+           FusionSkirmish *skirmish = (FusionSkirmish*) l;
+@@ -81,7 +81,7 @@ skirmishs_read_proc(char *buf, char **start, off_t offset,
+                break;
+      }
+ 
+-     spin_unlock (&dev->skirmish.lock);
++     up (&dev->skirmish.lock);
+ 
+      *start = buf + offset;
+      written -= offset;
+@@ -97,7 +97,7 @@ skirmishs_read_proc(char *buf, char **start, off_t offset,
+ int
+ fusion_skirmish_init (FusionDev *dev)
+ {
+-     dev->skirmish.lock = SPIN_LOCK_UNLOCKED;
++     init_MUTEX (&dev->skirmish.lock);
+ 
+      create_proc_read_entry("skirmishs", 0, dev->proc_dir,
+                             skirmishs_read_proc, dev);
+@@ -110,7 +110,7 @@ fusion_skirmish_deinit (FusionDev *dev)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->skirmish.lock);
++     down (&dev->skirmish.lock);
+ 
+      remove_proc_entry ("skirmishs", dev->proc_dir);
+ 
+@@ -124,7 +124,7 @@ fusion_skirmish_deinit (FusionDev *dev)
+           l = next;
+      }
+ 
+-     spin_unlock (&dev->skirmish.lock);
++     up (&dev->skirmish.lock);
+ }
+ 
+ /******************************************************************************/
+@@ -134,23 +134,27 @@ fusion_skirmish_new (FusionDev *dev, int *id)
+ {
+      FusionSkirmish *skirmish;
+ 
+-     skirmish = kmalloc (sizeof(FusionSkirmish), GFP_ATOMIC);
++     skirmish = kmalloc (sizeof(FusionSkirmish), GFP_KERNEL);
+      if (!skirmish)
+           return -ENOMEM;
+ 
+      memset (skirmish, 0, sizeof(FusionSkirmish));
+ 
+-     spin_lock (&dev->skirmish.lock);
++     if (down_interruptible (&dev->skirmish.lock)) {
++          kfree (skirmish);
++          return -EINTR;
++     }
+ 
+      skirmish->id   = dev->skirmish.ids++;
+      skirmish->pid  = current->pid;
+-     skirmish->lock = SPIN_LOCK_UNLOCKED;
++
++     init_MUTEX (&skirmish->lock);
+ 
+      init_waitqueue_head (&skirmish->wait);
+ 
+      fusion_list_prepend (&dev->skirmish.list, &skirmish->link);
+ 
+-     spin_unlock (&dev->skirmish.lock);
++     up (&dev->skirmish.lock);
+ 
+      *id = skirmish->id;
+ 
+@@ -160,14 +164,15 @@ fusion_skirmish_new (FusionDev *dev, int *id)
+ int
+ fusion_skirmish_prevail (FusionDev *dev, int id, int fusion_id)
+ {
++     int             ret;
+      FusionSkirmish *skirmish;
+ 
+      dev->stat.skirmish_prevail_swoop++;
+-     
++
+      while (true) {
+-          skirmish = lock_skirmish (dev, id);
+-          if (!skirmish)
+-               return -EINVAL;
++          ret = lock_skirmish (dev, id, &skirmish);
++          if (ret)
++               return ret;
+ 
+           if (skirmish->lock_fid) {
+                if (skirmish->lock_pid == current->pid) {
+@@ -197,12 +202,14 @@ fusion_skirmish_prevail (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_skirmish_swoop (FusionDev *dev, int id, int fusion_id)
+ {
+-     FusionSkirmish *skirmish = lock_skirmish (dev, id);
++     int             ret;
++     FusionSkirmish *skirmish;
++
++     ret = lock_skirmish (dev, id, &skirmish);
++     if (ret)
++          return ret;
+ 
+      dev->stat.skirmish_prevail_swoop++;
+-     
+-     if (!skirmish)
+-          return -EINVAL;
+ 
+      if (skirmish->lock_fid) {
+           if (skirmish->lock_pid == current->pid) {
+@@ -228,12 +235,14 @@ fusion_skirmish_swoop (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_skirmish_dismiss (FusionDev *dev, int id, int fusion_id)
+ {
+-     FusionSkirmish *skirmish = lock_skirmish (dev, id);
++     int             ret;
++     FusionSkirmish *skirmish;
++
++     ret = lock_skirmish (dev, id, &skirmish);
++     if (ret)
++          return ret;
+ 
+      dev->stat.skirmish_dismiss++;
+-     
+-     if (!skirmish)
+-          return -EINVAL;
+ 
+      if (skirmish->lock_pid != current->pid) {
+           unlock_skirmish (skirmish);
+@@ -255,20 +264,25 @@ fusion_skirmish_dismiss (FusionDev *dev, int id, int fusion_id)
+ int
+ fusion_skirmish_destroy (FusionDev *dev, int id)
+ {
+-     FusionSkirmish *skirmish = lookup_skirmish (dev, id);
++     int             ret;
++     FusionSkirmish *skirmish;
+ 
+-     if (!skirmish)
+-          return -EINVAL;
++     ret = lookup_skirmish (dev, id, &skirmish);
++     if (ret)
++          return ret;
+ 
+-     spin_lock (&skirmish->lock);
++     if (down_interruptible (&skirmish->lock)) {
++          up (&dev->skirmish.lock);
++          return -EINTR;
++     }
+ 
+      fusion_list_remove (&dev->skirmish.list, &skirmish->link);
+ 
+-     spin_unlock (&dev->skirmish.lock);
++     up (&dev->skirmish.lock);
+ 
+      wake_up_interruptible_all (&skirmish->wait);
+ 
+-     spin_unlock (&skirmish->lock);
++     up (&skirmish->lock);
+ 
+      kfree (skirmish);
+ 
+@@ -280,12 +294,12 @@ fusion_skirmish_dismiss_all (FusionDev *dev, int fusion_id)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->skirmish.lock);
++     down (&dev->skirmish.lock);
+ 
+      fusion_list_foreach (l, dev->skirmish.list) {
+           FusionSkirmish *skirmish = (FusionSkirmish *) l;
+ 
+-          spin_lock (&skirmish->lock);
++          down (&skirmish->lock);
+ 
+           if (skirmish->lock_fid == fusion_id) {
+                skirmish->lock_fid   = 0;
+@@ -295,50 +309,65 @@ fusion_skirmish_dismiss_all (FusionDev *dev, int fusion_id)
+                wake_up_interruptible_all (&skirmish->wait);
+           }
+ 
+-          spin_unlock (&skirmish->lock);
++          up (&skirmish->lock);
+      }
+ 
+-     spin_unlock (&dev->skirmish.lock);
++     up (&dev->skirmish.lock);
+ }
+ 
+ /******************************************************************************/
+ 
+-static FusionSkirmish *
+-lookup_skirmish (FusionDev *dev, int id)
++static int
++lookup_skirmish (FusionDev *dev, int id, FusionSkirmish **ret_skirmish)
+ {
+      FusionLink *l;
+ 
+-     spin_lock (&dev->skirmish.lock);
++     if (down_interruptible (&dev->skirmish.lock))
++          return -EINTR;
+ 
+      fusion_list_foreach (l, dev->skirmish.list) {
+           FusionSkirmish *skirmish = (FusionSkirmish *) l;
+ 
+-          if (skirmish->id == id)
+-               return skirmish;
++          if (skirmish->id == id) {
++               *ret_skirmish = skirmish;
++               return 0;
++          }
+      }
+ 
+-     spin_unlock (&dev->skirmish.lock);
++     up (&dev->skirmish.lock);
+ 
+-     return NULL;
++     return -EINVAL;
+ }
+ 
+-static FusionSkirmish *
+-lock_skirmish (FusionDev *dev, int id)
++static int
++lock_skirmish (FusionDev *dev, int id, FusionSkirmish **ret_skirmish)
+ {
+-     FusionSkirmish *skirmish = lookup_skirmish (dev, id);
++     int         ret;
++     FusionSkirmish *skirmish;
++
++     ret = lookup_skirmish (dev, id, &skirmish);
++     if (ret)
++          return ret;
+ 
+      if (skirmish) {
+           fusion_list_move_to_front (&dev->skirmish.list, &skirmish->link);
+ 
+-          spin_lock (&skirmish->lock);
+-          spin_unlock (&dev->skirmish.lock);
++          if (down_interruptible (&skirmish->lock)) {
++               up (&dev->skirmish.lock);
++               return -EINTR;
++          }
++
++          up (&dev->skirmish.lock);
+      }
+ 
+-     return skirmish;
++     *ret_skirmish = skirmish;
++
++     return 0;
+ }
+ 
+ static void
+ unlock_skirmish (FusionSkirmish *skirmish)
+ {
+-     spin_unlock (&skirmish->lock);
++     up (&skirmish->lock);
+ }
++
+-- 
+1.7.3.3
+

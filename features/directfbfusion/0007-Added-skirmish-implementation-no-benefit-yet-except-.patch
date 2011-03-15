@@ -1,0 +1,514 @@
+From 129ca8d56d98cf14475132daddac46c39a2e77ae Mon Sep 17 00:00:00 2001
+From: Denis Oliver Kropp <dok@directfb.org>
+Date: Sat, 2 Nov 2002 01:28:29 +0000
+Subject: [PATCH] Added skirmish implementation, no benefit yet except speed (600k -> 700k prevail/dismiss per second).
+
+SIGSTOP defering/blocking could be added.
+---
+ drivers/char/fusion/Makefile    |    2 +-
+ drivers/char/fusion/fusiondev.c |   37 +++++
+ drivers/char/fusion/fusionee.c  |    2 +
+ drivers/char/fusion/skirmish.c  |  318 +++++++++++++++++++++++++++++++++++++++
+ drivers/char/fusion/skirmish.h  |   40 +++++
+ include/linux/fusion.h          |    6 +
+ 6 files changed, 404 insertions(+), 1 deletions(-)
+ create mode 100644 drivers/char/fusion/skirmish.c
+ create mode 100644 drivers/char/fusion/skirmish.h
+
+diff --git a/drivers/char/fusion/Makefile b/drivers/char/fusion/Makefile
+index 6bc5bd3..2775139 100644
+--- a/drivers/char/fusion/Makefile
++++ b/drivers/char/fusion/Makefile
+@@ -1,6 +1,6 @@
+ O_TARGET := fusion.o
+ 
+-obj-y   := fusiondev.o fusionee.o list.o ref.o
++obj-y   := fusiondev.o fusionee.o list.o ref.o skirmish.o
+ obj-m   := $(O_TARGET)
+ 
+ include $(TOPDIR)/Rules.make
+diff --git a/drivers/char/fusion/fusiondev.c b/drivers/char/fusion/fusiondev.c
+index 2cae47e..6228429 100644
+--- a/drivers/char/fusion/fusiondev.c
++++ b/drivers/char/fusion/fusiondev.c
+@@ -28,6 +28,7 @@
+ #include "fusiondev.h"
+ #include "fusionee.h"
+ #include "ref.h"
++#include "skirmish.h"
+ 
+ #define DEBUG(x...)  printk (KERN_DEBUG "Fusion: " x)
+ 
+@@ -134,6 +135,34 @@ fusion_ioctl (struct inode *inode, struct file *file,
+ 
+       return fusion_ref_destroy (id);
+ 
++    case FUSION_SKIRMISH_NEW:
++      ret = fusion_skirmish_new (&id);
++      if (ret)
++        return ret;
++
++      put_user (id, (int*) arg);
++      break;
++
++    case FUSION_SKIRMISH_PREVAIL:
++      get_user (id, (int*) arg);
++
++      return fusion_skirmish_prevail (id, fusion_id);
++
++    case FUSION_SKIRMISH_SWOOP:
++      get_user (id, (int*) arg);
++
++      return fusion_skirmish_swoop (id, fusion_id);
++
++    case FUSION_SKIRMISH_DISMISS:
++      get_user (id, (int*) arg);
++
++      return fusion_skirmish_dismiss (id, fusion_id);
++
++    case FUSION_SKIRMISH_DESTROY:
++      get_user (id, (int*) arg);
++
++      return fusion_skirmish_destroy (id);
++
+     default:
+       return -ENOTTY;
+     }
+@@ -171,6 +200,10 @@ fusion_init(void)
+   if (ret)
+     goto error_ref;
+ 
++  ret = fusion_skirmish_init();
++  if (ret)
++    goto error_skirmish;
++
+   ret = misc_register (&fusion_miscdev);
+   if (ret)
+     goto error_misc;
+@@ -179,6 +212,9 @@ fusion_init(void)
+ 
+ 
+  error_misc:
++  fusion_skirmish_cleanup();
++
++ error_skirmish:
+   fusion_ref_cleanup();
+ 
+  error_ref:
+@@ -193,6 +229,7 @@ fusion_exit(void)
+ {
+   misc_deregister (&fusion_miscdev);
+   
++  fusion_skirmish_cleanup();
+   fusion_ref_cleanup();
+   fusionee_cleanup();
+ }
+diff --git a/drivers/char/fusion/fusionee.c b/drivers/char/fusion/fusionee.c
+index 05e8ce2..9e5c809 100644
+--- a/drivers/char/fusion/fusionee.c
++++ b/drivers/char/fusion/fusionee.c
+@@ -24,6 +24,7 @@
+ #include "fusiondev.h"
+ #include "fusionee.h"
+ #include "ref.h"
++#include "skirmish.h"
+ 
+ 
+ typedef struct {
+@@ -159,6 +160,7 @@ fusionee_destroy (int id)
+ 
+   fusion_list_remove (&fusionees, &fusionee->link);
+ 
++  fusion_skirmish_dismiss_all (id);
+   fusion_ref_clear_all_local (id);
+ 
+   spin_unlock (&fusionees_lock);
+diff --git a/drivers/char/fusion/skirmish.c b/drivers/char/fusion/skirmish.c
+new file mode 100644
+index 0000000..9a9cd49
+--- /dev/null
++++ b/drivers/char/fusion/skirmish.c
+@@ -0,0 +1,318 @@
++/*
++ *	Fusion Kernel Module
++ *
++ *	(c) Copyright 2002  convergence integrated media GmbH
++ *
++ *      Written by Denis Oliver Kropp <dok@directfb.org>
++ *
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ */
++ 
++#include <linux/config.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/smp_lock.h>
++#include <linux/sched.h>
++
++#include <linux/fusion.h>
++
++#include "fusiondev.h"
++#include "fusionee.h"
++#include "list.h"
++#include "skirmish.h"
++
++typedef struct {
++  FusionLink         link;
++
++  spinlock_t         lock;
++
++  int                id;
++  int                pid;
++
++  int                fusion_id;  /* non-zero if locked */
++
++  wait_queue_head_t  wait;
++} FusionSkirmish;
++
++/******************************************************************************/
++
++static FusionSkirmish *lookup_skirmish     (int id);
++
++static FusionSkirmish *lock_skirmish       (int id);
++static void            unlock_skirmish     (FusionSkirmish *skirmish);
++
++/******************************************************************************/
++
++static int         ids            = 0;
++static FusionLink *skirmishs      = NULL;
++static spinlock_t  skirmishs_lock = SPIN_LOCK_UNLOCKED;
++
++/******************************************************************************/
++
++static int
++fusion_skirmish_read_proc(char *buf, char **start, off_t offset,
++                     int len, int *eof, void *private)
++{
++  FusionLink *l;
++  int written = 0;
++
++  spin_lock (&skirmishs_lock);
++
++  fusion_list_foreach (l, skirmishs)
++    {
++      FusionSkirmish *skirmish = (FusionSkirmish*) l;
++
++      written += sprintf(buf+written, "(%5d) 0x%08x %s\n",
++                         skirmish->pid, skirmish->id,
++                         skirmish->fusion_id ? "(locked)" : "");
++      if (written < offset)
++        {
++          offset -= written;
++          written = 0;
++        }
++
++      if (written >= len)
++        break;
++    }
++
++  spin_unlock (&skirmishs_lock);
++
++  *start = buf + offset;
++  written -= offset;
++  if(written > len)
++    {
++      *eof = 0;
++      return len;
++    }
++
++  *eof = 1;
++  return (written<0) ? 0 : written;
++}
++
++int
++fusion_skirmish_init()
++{
++  create_proc_read_entry("skirmishs", 0, proc_fusion_dir,
++                         fusion_skirmish_read_proc, NULL);
++
++  return 0;
++}
++
++void
++fusion_skirmish_cleanup()
++{
++  FusionLink *l = skirmishs;
++
++  while (l)
++    {
++      FusionLink     *next     = l->next;
++      FusionSkirmish *skirmish = (FusionSkirmish *) l;
++
++      kfree (skirmish);
++
++      l = next;
++    }
++
++  skirmishs = NULL;
++
++  remove_proc_entry ("skirmishs", proc_fusion_dir);
++}
++
++/******************************************************************************/
++
++int
++fusion_skirmish_new (int *id)
++{
++  FusionSkirmish *skirmish;
++
++  skirmish = kmalloc (sizeof(FusionSkirmish), GFP_KERNEL);
++  if (!skirmish)
++    return -ENOMEM;
++
++  memset (skirmish, 0, sizeof(FusionSkirmish));
++
++  spin_lock (&skirmishs_lock);
++
++  skirmish->id   = ids++;
++  skirmish->pid  = current->pid;
++  skirmish->lock = SPIN_LOCK_UNLOCKED;
++
++  init_waitqueue_head (&skirmish->wait);
++
++  fusion_list_prepend (&skirmishs, &skirmish->link);
++
++  spin_unlock (&skirmishs_lock);
++
++  *id = skirmish->id;
++
++  return 0;
++}
++
++int
++fusion_skirmish_prevail (int id, int fusion_id)
++{
++  FusionSkirmish *skirmish;
++
++  while (true)
++    {
++      skirmish = lock_skirmish (id);
++      if (!skirmish)
++        return -EINVAL;
++
++      if (skirmish->fusion_id)
++        {
++          unlock_skirmish (skirmish);
++
++          interruptible_sleep_on (&skirmish->wait);
++
++          if (signal_pending(current))
++            return -ERESTARTSYS;
++        }
++      else
++        break;
++    }
++
++  skirmish->fusion_id = fusion_id;
++
++  unlock_skirmish (skirmish);
++
++  return 0;
++}
++
++int
++fusion_skirmish_swoop (int id, int fusion_id)
++{
++  FusionSkirmish *skirmish = lock_skirmish (id);
++
++  if (!skirmish)
++    return -EINVAL;
++
++  if (skirmish->fusion_id)
++    {
++      unlock_skirmish (skirmish);
++      return -EAGAIN;
++    }
++
++  skirmish->fusion_id = fusion_id;
++
++  unlock_skirmish (skirmish);
++
++  return 0;
++}
++
++int
++fusion_skirmish_dismiss (int id, int fusion_id)
++{
++  FusionSkirmish *skirmish = lock_skirmish (id);
++
++  if (!skirmish)
++    return -EINVAL;
++
++  if (skirmish->fusion_id != fusion_id)
++    {
++      unlock_skirmish (skirmish);
++      return -EIO;
++    }
++
++  skirmish->fusion_id = 0;
++
++  wake_up_interruptible_all (&skirmish->wait);
++
++  unlock_skirmish (skirmish);
++
++  return 0;
++}
++
++int
++fusion_skirmish_destroy (int id)
++{
++  FusionSkirmish *skirmish = lookup_skirmish (id);
++
++  if (!skirmish)
++    return -EINVAL;
++
++  spin_lock (&skirmish->lock);
++
++  fusion_list_remove (&skirmishs, &skirmish->link);
++
++  wake_up_interruptible_all (&skirmish->wait);
++
++  spin_unlock (&skirmishs_lock);
++
++  kfree (skirmish);
++
++  return 0;
++}
++
++void
++fusion_skirmish_dismiss_all (int fusion_id)
++{
++  FusionLink *l;
++
++  spin_lock (&skirmishs_lock);
++
++  fusion_list_foreach (l, skirmishs)
++    {
++      FusionSkirmish *skirmish = (FusionSkirmish *) l;
++
++      spin_lock (&skirmish->lock);
++
++      if (skirmish->fusion_id == fusion_id)
++        {
++          skirmish->fusion_id = 0;
++
++          wake_up_interruptible_all (&skirmish->wait);
++        }
++
++      spin_unlock (&skirmish->lock);
++    }
++
++  spin_unlock (&skirmishs_lock);
++}
++
++/******************************************************************************/
++
++static FusionSkirmish *
++lookup_skirmish (int id)
++{
++  FusionLink *l;
++
++  spin_lock (&skirmishs_lock);
++
++  fusion_list_foreach (l, skirmishs)
++    {
++      FusionSkirmish *skirmish = (FusionSkirmish *) l;
++
++      if (skirmish->id == id)
++        return skirmish;
++    }
++
++  spin_unlock (&skirmishs_lock);
++
++  return NULL;
++}
++
++static FusionSkirmish *
++lock_skirmish (int id)
++{
++  FusionSkirmish *skirmish = lookup_skirmish (id);
++
++  if (skirmish)
++    {
++      spin_lock (&skirmish->lock);
++      spin_unlock (&skirmishs_lock);
++    }
++
++  return skirmish;
++}
++
++static void
++unlock_skirmish (FusionSkirmish *skirmish)
++{
++  spin_unlock (&skirmish->lock);
++}
+diff --git a/drivers/char/fusion/skirmish.h b/drivers/char/fusion/skirmish.h
+new file mode 100644
+index 0000000..3a1fc24
+--- /dev/null
++++ b/drivers/char/fusion/skirmish.h
+@@ -0,0 +1,40 @@
++/*
++ *	Fusion Kernel Module
++ *
++ *	(c) Copyright 2002  convergence integrated media GmbH
++ *
++ *      Written by Denis Oliver Kropp <dok@directfb.org>
++ *
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ */
++ 
++#ifndef __FUSION__SKIRMISH_H__
++#define __FUSION__SKIRMISH_H__
++
++#include "types.h"
++
++
++/* module init/cleanup */
++
++int  fusion_skirmish_init (void);
++void fusion_skirmish_cleanup (void);
++
++
++/* public API */
++
++int fusion_skirmish_new (int *id);
++int fusion_skirmish_prevail (int id, int fusion_id);
++int fusion_skirmish_swoop (int id, int fusion_id);
++int fusion_skirmish_dismiss (int id, int fusion_id);
++int fusion_skirmish_destroy (int id);
++
++
++/* internal functions */
++
++void fusion_skirmish_dismiss_all (int fusion_id);
++
++#endif
+diff --git a/include/linux/fusion.h b/include/linux/fusion.h
+index 288dae5..3f0edbf 100644
+--- a/include/linux/fusion.h
++++ b/include/linux/fusion.h
+@@ -17,5 +17,11 @@
+ #define FUSION_REF_STAT                 _IOR('F', 0x18, sizeof(int))
+ #define FUSION_REF_DESTROY              _IOW('F', 0x19, sizeof(int))
+ 
++#define FUSION_SKIRMISH_NEW             _IOW('F', 0x20, sizeof(int))
++#define FUSION_SKIRMISH_PREVAIL         _IOW('F', 0x21, sizeof(int))
++#define FUSION_SKIRMISH_SWOOP           _IOW('F', 0x22, sizeof(int))
++#define FUSION_SKIRMISH_DISMISS         _IOW('F', 0x23, sizeof(int))
++#define FUSION_SKIRMISH_DESTROY         _IOW('F', 0x24, sizeof(int))
++
+ #endif
+ 
+-- 
+1.7.3.3
+
