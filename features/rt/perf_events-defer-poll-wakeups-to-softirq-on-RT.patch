@@ -1,0 +1,206 @@
+From 6d11a9d6ba8a9b2857c55ede575827498543108a Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 25 Aug 2009 15:51:05 +0200
+Subject: [PATCH] perf_events: defer poll() wakeups to softirq on RT
+
+commit 0a764c16d61b4d5ec9a9fadae931c79484a274cd in tip, also see
+merge artefact 2e5f15f4c51efd5fdb1ea97380c38d3f8c32d3e9 in tip.
+
+Normally pending work is work that cannot be done from NMI context, such
+as wakeups and disabling the counter. The pending work is a single
+linked list using atomic ops so that it functions from NMI context.
+
+Normally this is called from IRQ context through use of an self-IPI
+(x86) or upon enabling hard interrupts (powerpc). Architectures that do
+not implement perf_event_set_pending() nor call
+perf_event_do_pending() upon leaving NMI context will get a polling
+fallback from the timer softirq.
+
+However, in -rt we cannot do the wakeup from IRQ context because its a
+wait_queue wakup, which can be O(n), so defer all wakeups to the softirq
+fallback by creating a second pending list that's only processed from
+there.
+
+Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Arnaldo Carvalho de Melo <acme@ghostprotocols.net>
+LKML-Reference: <1251208265.7538.1157.camel@twins>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+---
+ include/linux/perf_event.h |    5 +++
+ kernel/perf_event.c        |   59 +++++++++++++++++++++++++++++++++++--------
+ kernel/timer.c             |    1 +
+ 3 files changed, 54 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index eea9188..fdc1f04 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -655,6 +655,9 @@ struct perf_event {
+ 	int				pending_kill;
+ 	int				pending_disable;
+ 	struct perf_pending_entry	pending;
++#ifdef CONFIG_PREEMPT_RT
++	struct perf_pending_entry	pending_softirq;
++#endif
+ 
+ 	atomic_t			event_limit;
+ 
+@@ -763,6 +766,7 @@ extern void perf_event_exit_task(struct task_struct *child);
+ extern void perf_event_free_task(struct task_struct *task);
+ extern void set_perf_event_pending(void);
+ extern void perf_event_do_pending(void);
++extern void perf_event_do_pending_softirq(void);
+ extern void perf_event_print_debug(void);
+ extern void __perf_disable(void);
+ extern bool __perf_enable(void);
+@@ -960,6 +964,7 @@ static inline int perf_event_init_task(struct task_struct *child)	{ return 0; }
+ static inline void perf_event_exit_task(struct task_struct *child)	{ }
+ static inline void perf_event_free_task(struct task_struct *task)	{ }
+ static inline void perf_event_do_pending(void)				{ }
++static inline void perf_event_do_pending_softirq(void)		{ }
+ static inline void perf_event_print_debug(void)				{ }
+ static inline void perf_disable(void)					{ }
+ static inline void perf_enable(void)					{ }
+diff --git a/kernel/perf_event.c b/kernel/perf_event.c
+index 2357b19..8d13adc 100644
+--- a/kernel/perf_event.c
++++ b/kernel/perf_event.c
+@@ -2751,11 +2751,26 @@ static void perf_pending_event(struct perf_pending_entry *entry)
+ 		__perf_event_disable(event);
+ 	}
+ 
++#ifndef CONFIG_PREEMPT_RT
+ 	if (event->pending_wakeup) {
+ 		event->pending_wakeup = 0;
+ 		perf_event_wakeup(event);
+ 	}
++#endif
++}
++
++#ifdef CONFIG_PREEMPT_RT
++static void perf_pending_counter_softirq(struct perf_pending_entry *entry)
++{
++	struct perf_event *counter = container_of(entry,
++			struct perf_event, pending_softirq);
++
++	if (counter->pending_wakeup) {
++		counter->pending_wakeup = 0;
++		perf_event_wakeup(counter);
++	}
+ }
++#endif
+ 
+ #define PENDING_TAIL ((struct perf_pending_entry *)-1UL)
+ 
+@@ -2763,33 +2778,42 @@ static DEFINE_PER_CPU(struct perf_pending_entry *, perf_pending_head) = {
+ 	PENDING_TAIL,
+ };
+ 
+-static void perf_pending_queue(struct perf_pending_entry *entry,
+-			       void (*func)(struct perf_pending_entry *))
+-{
+-	struct perf_pending_entry **head;
++static DEFINE_PER_CPU(struct perf_pending_entry *, perf_pending_softirq_head) = {
++	PENDING_TAIL,
++};
+ 
++static void __perf_pending_queue(struct perf_pending_entry **head,
++				 struct perf_pending_entry *entry,
++			         void (*func)(struct perf_pending_entry *))
++{
+ 	if (cmpxchg(&entry->next, NULL, PENDING_TAIL) != NULL)
+ 		return;
+ 
+ 	entry->func = func;
+ 
+-	head = &get_cpu_var(perf_pending_head);
+-
+ 	do {
+ 		entry->next = *head;
+ 	} while (cmpxchg(head, entry->next, entry) != entry->next);
++}
+ 
+-	set_perf_event_pending();
++static void perf_pending_queue(struct perf_pending_entry *entry,
++			       void (*func)(struct perf_pending_entry *))
++{
++	struct perf_pending_entry **head;
+ 
++	head = &get_cpu_var(perf_pending_head);
++	__perf_pending_queue(head, entry, func);
+ 	put_cpu_var(perf_pending_head);
++
++	set_perf_event_pending();
+ }
+ 
+-static int __perf_pending_run(void)
++static int __perf_pending_run(struct perf_pending_entry **head)
+ {
+ 	struct perf_pending_entry *list;
+ 	int nr = 0;
+ 
+-	list = xchg(&__get_cpu_var(perf_pending_head), PENDING_TAIL);
++	list = xchg(head, PENDING_TAIL);
+ 	while (list != PENDING_TAIL) {
+ 		void (*func)(struct perf_pending_entry *);
+ 		struct perf_pending_entry *entry = list;
+@@ -2819,7 +2843,8 @@ static inline int perf_not_pending(struct perf_event *event)
+ 	 * need to wait.
+ 	 */
+ 	get_cpu();
+-	__perf_pending_run();
++	__perf_pending_run(&__get_cpu_var(perf_pending_head));
++	__perf_pending_run(&__get_cpu_var(perf_pending_softirq_head));
+ 	put_cpu();
+ 
+ 	/*
+@@ -2837,7 +2862,13 @@ static void perf_pending_sync(struct perf_event *event)
+ 
+ void perf_event_do_pending(void)
+ {
+-	__perf_pending_run();
++	__perf_pending_run(&__get_cpu_var(perf_pending_head));
++}
++
++void perf_event_do_pending_softirq(void)
++{
++	__perf_pending_run(&__get_cpu_var(perf_pending_head));
++	__perf_pending_run(&__get_cpu_var(perf_pending_softirq_head));
+ }
+ 
+ /*
+@@ -2881,12 +2912,18 @@ static void perf_output_wakeup(struct perf_output_handle *handle)
+ {
+ 	atomic_set(&handle->data->poll, POLL_IN);
+ 
++#ifndef CONFIG_PREEMPT_RT
+ 	if (handle->nmi) {
+ 		handle->event->pending_wakeup = 1;
+ 		perf_pending_queue(&handle->event->pending,
+ 				   perf_pending_event);
+ 	} else
+ 		perf_event_wakeup(handle->event);
++#else
++	__perf_pending_queue(&__get_cpu_var(perf_pending_softirq_head),
++			&handle->event->pending_softirq,
++			perf_pending_counter_softirq);
++#endif
+ }
+ 
+ /*
+diff --git a/kernel/timer.c b/kernel/timer.c
+index 7fcbfd7..e107f35 100644
+--- a/kernel/timer.c
++++ b/kernel/timer.c
+@@ -1280,6 +1280,7 @@ static void run_timer_softirq(struct softirq_action *h)
+ 
+ 	printk_tick();
+ 	hrtimer_run_pending();
++	perf_event_do_pending_softirq();
+ 
+ 	if (time_after_eq(jiffies, base->timer_jiffies))
+ 		__run_timers(base);
+-- 
+1.7.0.4
+

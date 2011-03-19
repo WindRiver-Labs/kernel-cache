@@ -1,0 +1,164 @@
+From 0da1c8592077092b16b3057ee6a0b0d0197dcce3 Mon Sep 17 00:00:00 2001
+From: Gregory Haskins <ghaskins@novell.com>
+Date: Fri, 3 Jul 2009 08:44:28 -0500
+Subject: [PATCH] seqlock: serialize against writers
+
+commit 01c7b4356a44817a0a7027ca46371b2c7355d9c0 in tip.
+
+There are currently several problems in -rt w.r.t. seqlock objects. RT
+moves mainline seqlock_t to "raw_seqlock_t", and creates a new seqlock_t
+object that is fully preemptible.  Being preemptible is a great step
+towards deterministic behavior, but there are a few areas that need
+additional measures to protect new vulnerabilities created by the
+preemptible code. For the purposes of demonstration, consider three tasks
+of different priority: A, B, and C.  A is the logically highest, and C is
+the lowest.  A is trying to acquire a seqlock read critical section, while
+C is involved in write locks.
+
+Problem 1) If A spins in seqbegin due to writer contention retries, it may
+prevent C from running even if C currently holds the write lock.  This
+is a deadlock.
+
+Problem 2) B may preempt C, preventing it from releasing the write
+critical section.  In this case, A becomes inverted behind B.
+
+Problem 3) Lower priority tasks such as C may continually acquire the write
+section which subsequently causes A to continually retry and thus fail to
+make forward progress.  Since C is lower priority it ideally should not
+cause delays in A. E.g. C should block if A is in a read-lock and C is <= A.
+
+This patch addresses Problems 1 & 2, and leaves 3 for a later time.
+
+This patch changes the internal seqlock_t implementation to substitute
+a rwlock for the basic spinlock previously used, and forces the readers
+to serialize with the writers under contention.  Blocking on the read_lock
+simultaneously sleeps A (preventing problem 1), while boosting C to A's
+priority (preventing problem 2).  Non reader-to-writer contended
+acquisitions, which are the predominant mode, remain free of atomic
+operations.  Therefore the fast path should not be perturbed by this
+change.
+
+This fixes a real-world deadlock discovered under testing where all
+high priority readers were hogging the cpus and preventing a writer
+from releasing the lock (i.e. problem 1).
+
+Signed-off-by: Gregory Haskins <ghaskins@novell.com>
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+---
+ include/linux/seqlock.h |   36 ++++++++++++++++++++++++------------
+ 1 files changed, 24 insertions(+), 12 deletions(-)
+
+diff --git a/include/linux/seqlock.h b/include/linux/seqlock.h
+index 0c38f7c..a6de405 100644
+--- a/include/linux/seqlock.h
++++ b/include/linux/seqlock.h
+@@ -3,9 +3,11 @@
+ /*
+  * Reader/writer consistent mechanism without starving writers. This type of
+  * lock for data where the reader wants a consistent set of information
+- * and is willing to retry if the information changes.  Readers never
+- * block but they may have to retry if a writer is in
+- * progress. Writers do not wait for readers. 
++ * and is willing to retry if the information changes. Readers block
++ * on write contention (and where applicable, pi-boost the writer).
++ * Readers without contention on entry acquire the critical section
++ * without any atomic operations, but they may have to retry if a writer
++ * enters before the critical section ends. Writers do not wait for readers.
+  *
+  * This is not as cache friendly as brlock. Also, this will not work
+  * for data that contains pointers, because any writer could
+@@ -24,6 +26,8 @@
+  *
+  * Based on x86_64 vsyscall gettimeofday 
+  * by Keith Owens and Andrea Arcangeli
++ *
++ * Priority inheritance and live-lock avoidance by Gregory Haskins
+  */
+ 
+ #include <linux/spinlock.h>
+@@ -36,7 +40,7 @@ typedef struct {
+ 
+ typedef struct {
+ 	unsigned sequence;
+-	spinlock_t lock;
++	rwlock_t lock;
+ } seqlock_t;
+ 
+ /*
+@@ -56,7 +60,7 @@ typedef struct {
+ 	raw_seqlock_t x = __RAW_SEQLOCK_UNLOCKED(x)
+ 
+ #define __SEQLOCK_UNLOCKED(lockname) \
+-	{ 0, __SPIN_LOCK_UNLOCKED(lockname) }
++	{ 0, __RW_LOCK_UNLOCKED(lockname) }
+ 
+ #define SEQLOCK_UNLOCKED \
+ 	__SEQLOCK_UNLOCKED(old_style_seqlock_init)
+@@ -64,7 +68,7 @@ typedef struct {
+ #define seqlock_init(x)					\
+ 	do {						\
+ 		(x)->sequence = 0;			\
+-		spin_lock_init(&(x)->lock);		\
++		rwlock_init(&(x)->lock);		\
+ 	} while (0)
+ 
+ #define DEFINE_SEQLOCK(x) \
+@@ -83,7 +87,7 @@ static inline void write_raw_seqlock(raw_seqlock_t *sl)
+ 
+ static inline void write_seqlock(seqlock_t *sl)
+ {
+-	spin_lock(&sl->lock);
++	write_lock(&sl->lock);
+ 	++sl->sequence;
+ 	smp_wmb();
+ }
+@@ -99,12 +103,12 @@ static inline void write_sequnlock(seqlock_t *sl)
+ {
+ 	smp_wmb();
+ 	sl->sequence++;
+-	spin_unlock(&sl->lock);
++	write_unlock(&sl->lock);
+ }
+ 
+ static inline int write_tryseqlock(seqlock_t *sl)
+ {
+-	int ret = spin_trylock(&sl->lock);
++	int ret = write_trylock(&sl->lock);
+ 
+ 	if (ret) {
+ 		++sl->sequence;
+@@ -129,18 +133,26 @@ repeat:
+ 	return ret;
+ }
+ 
+-static __always_inline unsigned read_seqbegin(const seqlock_t *sl)
++static __always_inline unsigned read_seqbegin(seqlock_t *sl)
+ {
+ 	unsigned ret;
+ 
+-repeat:
+ 	ret = sl->sequence;
+ 	smp_rmb();
+ 	if (unlikely(ret & 1)) {
+ 		cpu_relax();
+-		goto repeat;
++		/*
++		 * Serialze with the writer which will ensure they are
++		 * pi-boosted if necessary and prevent us from starving
++		 * them.
++		 */
++		read_lock(&sl->lock);
++		ret = sl->sequence;
++		read_unlock(&sl->lock);
+ 	}
+ 
++	BUG_ON(ret & 1);
++
+ 	return ret;
+ }
+ 
+-- 
+1.7.0.4
+
