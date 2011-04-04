@@ -1,0 +1,767 @@
+From 3a28e3e111b4003880008e9b490a55533bb54088 Mon Sep 17 00:00:00 2001
+From: Gregory Haskins <ghaskins@novell.com>
+Date: Fri, 14 Aug 2009 10:44:58 -0400
+Subject: [PATCH 023/119] vbus: add fastcall support to the kvm-host logic
+
+The implements the host-side of the fastcall protocol.  FASTCALL allows
+a direct hypercall from guest to host-kernel.  The guest establishes
+an arbitrary number of fastcall channels (typically one per CPU) and
+each channel can be used concurrently with other channels.
+
+Signed-off-by: Gregory Haskins <ghaskins@novell.com>
+---
+ include/linux/vbus_kvm.h |   30 +++-
+ kernel/vbus/kvm.c        |  444 ++++++++++++++++++++++++++++-----------------
+ 2 files changed, 301 insertions(+), 173 deletions(-)
+
+diff --git a/include/linux/vbus_kvm.h b/include/linux/vbus_kvm.h
+index 1abc8d3..baa8064 100644
+--- a/include/linux/vbus_kvm.h
++++ b/include/linux/vbus_kvm.h
+@@ -28,27 +28,47 @@
+ #include <linux/vbus_pci.h>
+ 
+ #define VBUS_KVM_ABI_MAGIC 0x34f0ab23
+-#define VBUS_KVM_ABI_VERSION 1
++#define VBUS_KVM_ABI_VERSION 2
+ 
+ struct vbus_kvm_negotiate {
+ 	__u32 magic;
+ 	__u32 version;
+-	__s32 vmfd;
+ 	__u64 capabilities;
+ };
+ 
++struct vbus_kvm_open {
++	__u32 flags;
++	__s32 vmfd;
++	__u8  pad[56];
++};
++
+ struct vbus_kvm_eventq_assign {
++	__u32 flags;
+ 	__u32 queue;
+ 	__s32 fd;
++	__u32 count;
++	__u64 ring;
++	__u64 data;
++	__u8  pad[32];
+ };
+ 
+ #define VBUS_KVM_MAGIC 'K'
+ 
+ #define VBUS_KVM_NEGOTIATE \
+   _IOWR(VBUS_KVM_MAGIC, 0x00, struct vbus_kvm_negotiate)
++#define VBUS_KVM_OPEN \
++  _IOW(VBUS_KVM_MAGIC, 0x01, struct vbus_kvm_open)
++#define VBUS_KVM_SIGADDR_ASSIGN \
++  _IOW(VBUS_KVM_MAGIC, 0x02, __u32)
+ #define VBUS_KVM_EVENTQ_ASSIGN \
+-  _IOWR(VBUS_KVM_MAGIC, 0x01, struct vbus_kvm_eventq_assign)
+-#define VBUS_KVM_HYPERCALL \
+-  _IOWR(VBUS_KVM_MAGIC, 0x02, struct vbus_pci_hypercall)
++  _IOW(VBUS_KVM_MAGIC, 0x03, struct vbus_kvm_eventq_assign)
++#define VBUS_KVM_READY\
++  _IO(VBUS_KVM_MAGIC, 0x04)
++#define VBUS_KVM_SLOWCALL \
++  _IOW(VBUS_KVM_MAGIC, 0x05, struct vbus_pci_call_desc)
++#define VBUS_KVM_FCC_ASSIGN \
++  _IOW(VBUS_KVM_MAGIC, 0x06, struct vbus_pci_call_desc)
++#define VBUS_KVM_FCC_DEASSIGN \
++  _IOW(VBUS_KVM_MAGIC, 0x07, __u32)
+ 
+ #endif /* _LINUX_VBUS_KVM_H */
+diff --git a/kernel/vbus/kvm.c b/kernel/vbus/kvm.c
+index 9ad41ed..51ab923 100644
+--- a/kernel/vbus/kvm.c
++++ b/kernel/vbus/kvm.c
+@@ -8,6 +8,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/spinlock.h>
+ #include <linux/module.h>
++#include <linux/kvm_host.h>
+ #include <linux/kvm_xinterface.h>
+ 
+ #include <linux/vbus.h>
+@@ -30,10 +31,7 @@ struct _eventq {
+ 	struct ioq_notifier notifier;
+ 	struct vbus_shm    *shm;
+ 	struct shm_signal   signal;
+-	struct {
+-		struct file        *input;
+-		struct eventfd_ctx *output;
+-	} eventfd;
++	struct eventfd_ctx *eventfd;
+ 	struct list_head    backlog;
+ 	struct {
+ 		u64               gpa;
+@@ -41,19 +39,35 @@ struct _eventq {
+ 	} ringdata;
+ 	struct work_struct  wakeup;
+ 	int                 backpressure:1;
+-	int                 active:1;
+ };
+ 
+ enum _state {
+-	_state_init,
+-	_state_registration,
+-	_state_running,
++       _state_init,
++       _state_open,
++       _state_connect,
++       _state_ready,
++};
++
++struct _fastcall_channel {
++	unsigned int                   id;
++	struct list_head               list;
++	struct vbus_shm               *shm;
++	struct vbus_pci_fastcall_desc *desc;
+ };
+ 
+ struct vbus_kvm {
+ 	struct kref             kref;
+ 	struct mutex	        lock;
++	struct srcu_struct      srcu;
+ 	struct kvm_xinterface  *kvm;
++	struct kvm_xioevent    *shmsignals;
++	struct {
++		struct kvm_xioevent   *ioevent;
++		struct {
++			struct radix_tree_root radix;
++			struct list_head       list;
++		} channels;
++	} fastcalls;
+ 	enum _state             state;
+ 	struct vbus            *vbus;
+ 	struct vbus_client     *client;
+@@ -80,6 +94,10 @@ _vbus_kvm_release(struct kref *kref)
+ 
+ 	if (vkvm->kvm)
+ 		kvm_xinterface_put(vkvm->kvm);
++
++	synchronize_srcu(&vkvm->srcu);
++	cleanup_srcu_struct(&vkvm->srcu);
++
+ 	kfree(vkvm);
+ }
+ 
+@@ -522,7 +540,7 @@ eventq_signal_inject(struct shm_signal *signal)
+ {
+ 	struct _eventq *eventq = signal_to_eventq(signal);
+ 
+-	eventfd_signal(eventq->eventfd.output, 1);
++	eventfd_signal(eventq->eventfd, 1);
+ 
+ 	return 0;
+ }
+@@ -533,11 +551,9 @@ eventq_signal_release(struct shm_signal *signal)
+ 	struct _eventq *eventq = signal_to_eventq(signal);
+ 	struct vbus_kvm        *vkvm  = eventq_to_bus(eventq);
+ 
+-	eventq->active = false;
+-
+ 	flush_work(&eventq->wakeup);
+ 
+-	eventfd_ctx_put(eventq->eventfd.output);
++	eventfd_ctx_put(eventq->eventfd);
+ 	vbus_shm_put(eventq->shm);
+ 	eventq->shm = NULL;
+ 
+@@ -721,7 +737,7 @@ _eventq_init(struct _eventq *eventq, int prio)
+ }
+ 
+ static int
+-_eventq_attach(struct vbus_kvm *vkvm, struct _eventq *eventq,
++_eventq_attach(struct vbus_kvm *vkvm, struct _eventq *eventq, struct file *filp,
+ 	       u32 count, u64 ring, u64 data)
+ {
+ 	struct kvm_xinterface *kvm = vkvm->kvm;
+@@ -732,9 +748,6 @@ _eventq_attach(struct vbus_kvm *vkvm, struct _eventq *eventq,
+ 	struct kvm_xvmap *xvmap;
+ 	int ret;
+ 
+-	if (eventq->active)
+-		return -EINVAL;
+-
+ 	_shm = _shm_map(vkvm, ring, len);
+ 	if (IS_ERR(_shm))
+ 		return PTR_ERR(_shm);
+@@ -752,7 +765,7 @@ _eventq_attach(struct vbus_kvm *vkvm, struct _eventq *eventq,
+ 	eventq->shm = &_shm->shm; /* we hold the baseline ref already */
+ 	vbus_kvm_get(vkvm);
+ 
+-	ret = shm_signal_eventfd_bindfile(&eventq->signal, eventq->eventfd.input);
++	ret = shm_signal_eventfd_bindfile(&eventq->signal, filp);
+ 	if (ret < 0) {
+ 		shm_signal_put(&eventq->signal);
+ 		vbus_shm_put(&_shm->shm);
+@@ -795,12 +808,6 @@ _eventq_attach(struct vbus_kvm *vkvm, struct _eventq *eventq,
+ 	eventq->ringdata.xvmap = xvmap;
+ 	eventq->ringdata.gpa   = data;
+ 
+-	/* We are done with the file now */
+-	fput(eventq->eventfd.input);
+-	eventq->eventfd.input = NULL;
+-
+-	eventq->active = true;
+-
+ 	return 0;
+ }
+ 
+@@ -808,7 +815,6 @@ static void
+ _eventq_detach(struct _eventq *eventq)
+ {
+ 	struct ioq *ioq;
+-	struct file *file;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&eventq->lock, flags);
+@@ -816,16 +822,10 @@ _eventq_detach(struct _eventq *eventq)
+ 	ioq = eventq->ioq;
+ 	eventq->ioq = NULL;
+ 
+-	file = eventq->eventfd.input;
+-	eventq->eventfd.input = NULL;
+-
+ 	spin_unlock_irqrestore(&eventq->lock, flags);
+ 
+ 	if (ioq)
+ 		ioq_put(ioq);
+-
+-	if (file)
+-		fput(file);
+ }
+ 
+ /*
+@@ -835,56 +835,6 @@ _eventq_detach(struct _eventq *eventq)
+  */
+ 
+ static int
+-hc_negotiate(struct vbus_kvm *vkvm, void *vargs)
+-{
+-	struct vbus_pci_negotiate *args = vargs;
+-
+-	if (args->magic != VBUS_PCI_ABI_MAGIC)
+-		return -EINVAL;
+-
+-	if (args->version != VBUS_PCI_ABI_VERSION)
+-		return -EINVAL;
+-
+-	/*
+-	 * We have no extended capabilities yet, so we dont care if they set
+-	 * any option bits.  Just clear them all.
+-	 */
+-	args->capabilities = 0;
+-
+-	vkvm->state = _state_registration;
+-	return 0;
+-}
+-
+-static int
+-hc_busreg(struct vbus_kvm *vkvm, void *vargs)
+-{
+-	struct vbus_pci_busreg *args = vargs;
+-	struct vbus_pci_eventqreg *qreg = &args->eventq[0];
+-	int i;
+-	int ret;
+-
+-	if (args->count != vkvm->eventq.count)
+-		return -EINVAL;
+-
+-	for (i = 0; i < args->count; i++) {
+-		ret = _eventq_attach(vkvm,
+-				     &vkvm->eventq.queues[i],
+-				     qreg->count,
+-				     qreg->ring,
+-				     qreg->data);
+-		if (ret < 0)
+-			return ret;
+-	}
+-
+-	ret = vbus_notifier_register(vkvm->vbus, &vkvm->vbusnotify);
+-	if (ret < 0)
+-		return ret;
+-
+-	vkvm->state = _state_running;
+-	return 0;
+-}
+-
+-static int
+ hc_deviceopen(struct vbus_kvm *vkvm, void *vargs)
+ {
+ 	struct vbus_pci_deviceopen *args = vargs;
+@@ -922,6 +872,7 @@ hc_deviceshm(struct vbus_kvm *vkvm, void *vargs)
+ 	struct shm_signal     *signal = NULL;
+ 	struct _shm           *_shm;
+ 	long                   ret;
++	unsigned int           handle;
+ 
+ 	_shm = _shm_map(vkvm, args->datap, args->len);
+ 	if (IS_ERR(_shm))
+@@ -947,42 +898,14 @@ hc_deviceshm(struct vbus_kvm *vkvm, void *vargs)
+ 	}
+ 
+ 	ret = c->ops->deviceshm(c, args->devh, args->id,
+-				&_shm->shm, signal, args->flags, NULL);
++				&_shm->shm, signal, args->flags, &handle);
+ 	if (ret < 0)
+ 		goto out;
+ 
+-	if (signal) {
+-		struct file *file;
+-		int fd;
+-
+-		fd = get_unused_fd();
+-		if (fd < 0) {
+-			ret = fd;
+-			goto out;
+-		}
+-
+-		file = eventfd_file_create(0, 0);
+-		if (IS_ERR(file)) {
+-			put_unused_fd(fd);
+-			ret = PTR_ERR(file);
+-			goto out;
+-		}
+-
+-		ret = shm_signal_eventfd_bindfile(signal, file);
+-		if (ret < 0) {
+-			put_unused_fd(fd);
+-			fput(file);
+-			goto out;
+-		}
+-
+-		shm_signal_get(signal); /* take another for eventfd */
+-
+-		fd_install(fd, file); /* cannot fail after installing the fd */
+-
+-		return fd;
+-	}
++	if (signal)
++		ret = handle;
+ 
+-	return 0;
++	return ret;
+ 
+ out:
+ 	if (signal)
+@@ -999,19 +922,6 @@ struct hc_op {
+ 	int (*func)(struct vbus_kvm *vkvm, void *args);
+ };
+ 
+-static struct hc_op _hc_negotiate = {
+-	.nr = VBUS_PCI_HC_NEGOTIATE,
+-	.len = sizeof(struct vbus_pci_negotiate),
+-	.dirty = 1,
+-	.func = &hc_negotiate,
+-};
+-
+-static struct hc_op _hc_busreg = {
+-	.nr = VBUS_PCI_HC_BUSREG,
+-	.len = sizeof(struct vbus_pci_busreg),
+-	.func = &hc_busreg,
+-};
+-
+ static struct hc_op _hc_devopen = {
+ 	.nr = VBUS_PCI_HC_DEVOPEN,
+ 	.len = sizeof(struct vbus_pci_deviceopen),
+@@ -1039,14 +949,85 @@ static struct hc_op _hc_devshm = {
+ };
+ 
+ static struct hc_op *hc_ops[] = {
+-	&_hc_negotiate,
+-	&_hc_busreg,
+ 	&_hc_devopen,
+ 	&_hc_devclose,
+ 	&_hc_devcall,
+ 	&_hc_devshm,
+ };
+ 
++static int
++_hypercall_execute(struct vbus_kvm *vkvm, struct hc_op *op, void *data)
++{
++	struct vbus_memctx *ctx = vkvm->ctx;
++	char                buf[op->len];
++	int                 ret;
++
++	ret = ctx->ops->copy_from(ctx, buf, data, op->len);
++	if (ret != 0)
++		return -EFAULT;
++
++	ret = op->func(vkvm, buf);
++
++	if (ret >= 0 && op->dirty)
++		if (ctx->ops->copy_to(ctx, data, buf, op->len))
++			return -EFAULT;
++
++	return ret;
++}
++
++static int
++hypercall_execute(struct vbus_kvm *vkvm, struct vbus_pci_call_desc *args)
++{
++	struct hc_op *op;
++
++	if (args->vector >= VBUS_PCI_HC_MAX)
++		return -EINVAL;
++
++	op = hc_ops[args->vector];
++
++	if (args->len != op->len)
++		return -EINVAL;
++
++	return _hypercall_execute(vkvm, op, (void *)args->datap);
++}
++
++/*
++ * The fastcall-channel-id is passed in by val
++ */
++static void
++fastcall_ioevent(struct kvm_xioevent *ioevent, const void *val)
++{
++	struct vbus_kvm *vkvm = (struct vbus_kvm *)ioevent->priv;
++	unsigned int fccid = *(unsigned int *)val;
++	struct _fastcall_channel *fcc;
++	int idx;
++
++	idx = srcu_read_lock(&vkvm->srcu);
++
++	fcc = radix_tree_lookup(&vkvm->fastcalls.channels.radix, fccid);
++	if (fcc) {
++		int ret;
++
++		ret = hypercall_execute(vkvm, &fcc->desc->call);
++		fcc->desc->result = ret;
++	}
++
++	srcu_read_unlock(&vkvm->srcu, idx);
++}
++
++/*
++ * The shmsignal-handle is passed in by val
++ */
++static void
++shmsignal_ioevent(struct kvm_xioevent *ioevent, const void *val)
++{
++	struct vbus_kvm    *vkvm   = (struct vbus_kvm *)ioevent->priv;
++	struct vbus_client *c      = vkvm->client;
++	unsigned int        handle = *(unsigned int *)val;
++
++	c->ops->shmsignal(c, handle);
++}
++
+ /*
+  * ------------------
+  * chardev implementation
+@@ -1079,6 +1060,9 @@ vbus_kvm_chardev_open(struct inode *inode, struct file *filp)
+ 
+ 	kref_init(&vkvm->kref);
+ 	mutex_init(&vkvm->lock);
++	init_srcu_struct(&vkvm->srcu);
++	INIT_RADIX_TREE(&vkvm->fastcalls.channels.radix, GFP_KERNEL);
++	INIT_LIST_HEAD(&vkvm->fastcalls.channels.list);
+ 	vkvm->state  = _state_init;
+ 	vkvm->vbus   = vbus;
+ 	vkvm->client = client;
+@@ -1095,10 +1079,11 @@ vbus_kvm_chardev_open(struct inode *inode, struct file *filp)
+ 	return 0;
+ }
+ 
+-static long
++static int
+ _negotiate_ioctl(struct vbus_kvm *vkvm, struct vbus_kvm_negotiate *args)
+ {
+-	struct kvm_xinterface *kvm;
++	if (vkvm->state != _state_init)
++		return -EINVAL;
+ 
+ 	if (args->magic != VBUS_KVM_ABI_MAGIC)
+ 		return -EINVAL;
+@@ -1112,24 +1097,89 @@ _negotiate_ioctl(struct vbus_kvm *vkvm, struct vbus_kvm_negotiate *args)
+ 	 */
+ 	args->capabilities = 0;
+ 
++	vkvm->state = _state_open;
++
++	return 0;
++}
++
++#define sigoffset(pos) offsetof(struct vbus_pci_signals, pos)
++
++static int
++_open_ioctl(struct vbus_kvm *vkvm, struct vbus_kvm_open *args)
++{
++	struct kvm_xinterface *kvm;
++
++	if (args->flags != 0)
++		return -EINVAL;
++
++	if (vkvm->state != _state_open)
++		return -EINVAL;
++
+ 	kvm = kvm_xinterface_bind(args->vmfd);
+ 	if (IS_ERR(kvm))
+ 		return PTR_ERR(kvm);
+ 
+ 	vkvm->kvm = kvm;
++	vkvm->state = _state_connect;
++
++	return VBUS_PCI_HC_VERSION;
++}
++
++static int
++_sigaddr_assign_ioctl(struct vbus_kvm *vkvm, int addr)
++{
++	struct kvm_xinterface *kvm = vkvm->kvm;
++	struct kvm_xioevent   *ioevent;
++
++	if (vkvm->state != _state_connect)
++		return -EINVAL;
++
++	if (vkvm->fastcalls.ioevent || vkvm->shmsignals)
++		return -EEXIST;
++
++	ioevent = kvm->ops->ioevent(kvm,
++				    addr + sigoffset(fastcall),
++				    sizeof(u32),
++				    KVM_XIOEVENT_FLAG_PIO);
++	if (IS_ERR(ioevent))
++		return PTR_ERR(ioevent);
++
++	ioevent->signal = &fastcall_ioevent;
++	ioevent->priv   = vkvm;
++
++	vkvm->fastcalls.ioevent = ioevent;
++
++	ioevent = kvm->ops->ioevent(kvm,
++				    addr + sigoffset(shmsignal),
++				    sizeof(u32),
++				    KVM_XIOEVENT_FLAG_PIO);
++	if (IS_ERR(ioevent))
++		return PTR_ERR(ioevent);
++
++	ioevent->signal = &shmsignal_ioevent;
++	ioevent->priv   = vkvm;
++
++	vkvm->shmsignals = ioevent;
+ 
+ 	return 0;
+ }
+ 
+ static int
+-_event_assign_ioctl(struct vbus_kvm *vkvm,
+-		    struct vbus_kvm_eventq_assign *args)
++_eventq_assign_ioctl(struct vbus_kvm *vkvm,
++		     struct vbus_kvm_eventq_assign *args)
+ {
+ 	struct file *input = NULL;
+ 	struct eventfd_ctx *output = NULL;
++	struct _eventq *eventq;
+ 	int fd = 0;
+ 	int ret = 0;
+ 
++	if (args->flags != 0)
++		return -EINVAL;
++
++	if (vkvm->state != _state_connect)
++		return -EINVAL;
++
+ 	mutex_lock(&vkvm->lock);
+ 
+ 	if (args->queue != vkvm->eventq.count
+@@ -1138,6 +1188,8 @@ _event_assign_ioctl(struct vbus_kvm *vkvm,
+ 		goto fail;
+ 	}
+ 
++	eventq = &vkvm->eventq.queues[args->queue];
++
+ 	output = eventfd_ctx_fdget(args->fd);
+ 	if (IS_ERR(output)) {
+ 		ret = PTR_ERR(output);
+@@ -1156,11 +1208,15 @@ _event_assign_ioctl(struct vbus_kvm *vkvm,
+ 		goto fail;
+ 	}
+ 
++	ret = _eventq_attach(vkvm, eventq, input,
++			     args->count, args->ring, args->data);
++	if (ret < 0)
++		goto fail;
++
+ 	get_file(input);
+ 	fd_install(fd, input); /* cannot fail after installing the fd */
+ 
+-	vkvm->eventq.queues[args->queue].eventfd.input  = input;
+-	vkvm->eventq.queues[args->queue].eventfd.output = output;
++	eventq->eventfd = output;
+ 	vkvm->eventq.count++;
+ 
+ 	mutex_unlock(&vkvm->lock);
+@@ -1183,52 +1239,82 @@ fail:
+ }
+ 
+ static int
+-_hypercall_execute(struct vbus_kvm *vkvm, struct hc_op *op, void *data)
++_ready_ioctl(struct vbus_kvm *vkvm)
+ {
+-	struct vbus_memctx *ctx = vkvm->ctx;
+-	char                buf[op->len];
+-	int                 ret;
++	int ret;
+ 
+-	ret = ctx->ops->copy_from(ctx, buf, data, op->len);
+-	if (ret != 0)
+-		return -EFAULT;
++	if (vkvm->state != _state_connect)
++		return -EINVAL;
+ 
+-	ret = op->func(vkvm, buf);
++	ret = vbus_notifier_register(vkvm->vbus, &vkvm->vbusnotify);
++	if (ret < 0)
++		return ret;
+ 
+-	if (ret >= 0 && op->dirty)
+-		if (ctx->ops->copy_to(ctx, data, buf, op->len))
+-			return -EFAULT;
++	vkvm->state = _state_ready;
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static int
+-_hypercall_ioctl(struct vbus_kvm *vkvm, struct vbus_pci_hypercall *args)
++_fcc_assign_ioctl(struct vbus_kvm *vkvm,
++		  struct vbus_pci_call_desc *args)
+ {
+-	struct hc_op *op;
++	struct _fastcall_channel *_fcc;
++	struct _shm *_shm;
++	int ret;
+ 
+-	if (args->vector >= VBUS_PCI_HC_MAX)
++	_fcc = kzalloc(sizeof(*_fcc), GFP_KERNEL);
++	if (!_fcc)
++		return -ENOMEM;
++
++	if (args->len != sizeof(struct vbus_pci_fastcall_desc))
+ 		return -EINVAL;
+ 
+-	switch (vkvm->state) {
+-	case _state_init:
+-		if (args->vector != VBUS_PCI_HC_NEGOTIATE)
+-			return -EINVAL;
+-		break;
+-	case _state_registration:
+-		if (args->vector != VBUS_PCI_HC_BUSREG)
+-			return -EINVAL;
+-		break;
+-	default:
+-		break;
++	_shm = _shm_map(vkvm, args->datap, args->len);
++	if (IS_ERR(_shm)) {
++		kfree(_fcc);
++		return PTR_ERR(_shm);
+ 	}
+ 
+-	op = hc_ops[args->vector];
++	_fcc->shm  = &_shm->shm;
++	_fcc->desc = (struct vbus_pci_fastcall_desc *)_fcc->shm->ptr;
+ 
+-	if (args->len != op->len)
+-		return -EINVAL;
++	mutex_lock(&vkvm->lock);
+ 
+-	return _hypercall_execute(vkvm, op, (void *)args->datap);
++	ret = radix_tree_insert(&vkvm->fastcalls.channels.radix,
++				args->vector, _fcc);
++	if (ret < 0) {
++		vbus_shm_put(_fcc->shm);
++		kfree(_fcc);
++	}
++
++	list_add_tail(&_fcc->list, &vkvm->fastcalls.channels.list);
++
++	mutex_unlock(&vkvm->lock);
++
++	return ret;
++}
++
++static int
++_fcc_deassign(struct vbus_kvm *vkvm, int id)
++{
++	struct _fastcall_channel *_fcc;
++
++	mutex_lock(&vkvm->lock);
++	_fcc = radix_tree_delete(&vkvm->fastcalls.channels.radix, id);
++	if (_fcc)
++		list_del(&_fcc->list);
++	mutex_unlock(&vkvm->lock);
++
++	if (!_fcc)
++		return -ENOENT;
++
++	synchronize_srcu(&vkvm->srcu);
++
++	vbus_shm_put(_fcc->shm);
++	kfree(_fcc);
++
++	return 0;
+ }
+ 
+ static ssize_t
+@@ -1240,17 +1326,38 @@ vbus_kvm_chardev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+ 	case VBUS_KVM_NEGOTIATE:
+ 		return _negotiate_ioctl(vkvm,
+ 					(struct vbus_kvm_negotiate *)arg);
++	case VBUS_KVM_OPEN:
++		return _open_ioctl(vkvm, (struct vbus_kvm_open *)arg);
++	case VBUS_KVM_SIGADDR_ASSIGN:
++		return _sigaddr_assign_ioctl(vkvm, *(__u32 *)arg);
+ 	case VBUS_KVM_EVENTQ_ASSIGN:
+-		return _event_assign_ioctl(vkvm,
+-					   (struct vbus_kvm_eventq_assign *)arg);
+-	case VBUS_KVM_HYPERCALL:
+-		return _hypercall_ioctl(vkvm,
+-					(struct vbus_pci_hypercall *)arg);
++		return _eventq_assign_ioctl(vkvm,
++					    (struct vbus_kvm_eventq_assign *)arg);
++	case VBUS_KVM_READY:
++		return _ready_ioctl(vkvm);
++	case VBUS_KVM_SLOWCALL:
++		return hypercall_execute(vkvm,
++					 (struct vbus_pci_call_desc *)arg);
++	case VBUS_KVM_FCC_ASSIGN:
++		return _fcc_assign_ioctl(vkvm,
++					 (struct vbus_pci_call_desc *)arg);
++	case VBUS_KVM_FCC_DEASSIGN:
++		return _fcc_deassign(vkvm, *(__u32 *)arg);
+ 	default:
+ 		return -EINVAL;
+ 	}
+ }
+ 
++static void
++_fastcall_channels_release(struct vbus_kvm *vkvm)
++{
++	struct _fastcall_channel *_fcc, *tmp;
++	struct list_head *head = &vkvm->fastcalls.channels.list;
++
++	list_for_each_entry_safe(_fcc, tmp, head, list)
++		_fcc_deassign(vkvm, _fcc->id);
++}
++
+ static int
+ vbus_kvm_chardev_release(struct inode *inode, struct file *filp)
+ {
+@@ -1260,6 +1367,7 @@ vbus_kvm_chardev_release(struct inode *inode, struct file *filp)
+ 	for (i = 0; i < vkvm->eventq.count; i++)
+ 		_eventq_detach(&vkvm->eventq.queues[i]);
+ 
++	_fastcall_channels_release(vkvm);
+ 	vbus_memctx_put(vkvm->ctx);
+ 	vbus_client_put(vkvm->client);
+ 	vbus_notifier_unregister(vkvm->vbus, &vkvm->vbusnotify);
+-- 
+1.6.5.2
+

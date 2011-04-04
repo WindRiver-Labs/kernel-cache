@@ -1,0 +1,173 @@
+From 08786319a04c9193c3d8cd0f5b1a86ddbe95c79d Mon Sep 17 00:00:00 2001
+From: Chase Venters <chase.venters at clientec.com>
+Date: Fri, 28 May 2010 15:56:33 -0400
+Subject: [PATCH 08/15] ck: watermarks
+
+Add a background scanning timer to restore the watermarks to the pages_lots
+level and only call on it if kswapd has not been called upon for the last 5
+seconds. This allows us to balance all zones to the more generous pages_lots
+watermark at a time unrelated to page allocation thus leading to lighter
+levels of vm load when called upon under page allocation.
+
+Signed-off-by: Con Kolivas <kernel@kolivas.org>
+
+The -ck patches modify mm/vmscan.c and add a timer to wake up kswapd every 5
+seconds. This timer is initialized after the creation of the kswapd thread.
+
+The kswapd() thread function calls mod_timer at the front of its infinite
+service loop (to reset the timer to 5 seconds in the future). mod_timer()
+includes a BUG_ON() to assert that the timer's callback function is set.
+
+Since the wakeup timer is initialized after the kswapd thread is created, if
+kswapd gets scheduled before kswapd_run() has prepared the timer, the
+BUG_ON() check will throw a stack trace and immediately terminate the kswapd
+thread.
+
+This patch modifies the kswapd_run() function in mm/vmscan.c to initialize the
+watermark timer before starting the kswapd thread.
+
+Signed-off-by: Chase Venters <chase.venters at clientec.com>
+
+ include/linux/mmzone.h |    6 +++++-
+ mm/vmscan.c            |   42 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 47 insertions(+), 1 deletion(-)
+---
+ include/linux/mmzone.h |    6 +++++-
+ mm/vmscan.c            |   42 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 47 insertions(+), 1 deletions(-)
+
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 785acaa..4a9c550 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -15,6 +15,7 @@
+ #include <linux/seqlock.h>
+ #include <linux/nodemask.h>
+ #include <linux/pageblock-flags.h>
++#include <linux/timer.h>
+ #include <generated/bounds.h>
+ #include <asm/atomic.h>
+ #include <asm/page.h>
+@@ -159,12 +160,14 @@ enum zone_watermarks {
+ 	WMARK_MIN,
+ 	WMARK_LOW,
+ 	WMARK_HIGH,
++	WMARK_LOTS,
+ 	NR_WMARK
+ };
+ 
+ #define min_wmark_pages(z) (z->watermark[WMARK_MIN])
+ #define low_wmark_pages(z) (z->watermark[WMARK_LOW])
+ #define high_wmark_pages(z) (z->watermark[WMARK_HIGH])
++#define lots_wmark_pages(z) (z->watermark[WMARK_LOTS])
+ 
+ struct per_cpu_pages {
+ 	int count;		/* number of pages in the list */
+@@ -325,7 +328,7 @@ struct zone {
+ 	ZONE_PADDING(_pad1_)
+ 
+ 	/* Fields commonly accessed by the page reclaim scanner */
+-	spinlock_t		lru_lock;	
++	spinlock_t		lru_lock;
+ 	struct zone_lru {
+ 		struct list_head list;
+ 	} lru[NR_LRU_LISTS];
+@@ -628,6 +631,7 @@ typedef struct pglist_data {
+ 	wait_queue_head_t kswapd_wait;
+ 	struct task_struct *kswapd;
+ 	int kswapd_max_order;
++	struct timer_list watermark_timer;
+ } pg_data_t;
+ 
+ #define node_present_pages(nid)	(NODE_DATA(nid)->node_present_pages)
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 7e6c087..580af7a 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -36,6 +36,7 @@
+ #include <linux/rwsem.h>
+ #include <linux/delay.h>
+ #include <linux/kthread.h>
++#include <linux/timer.h>
+ #include <linux/freezer.h>
+ #include <linux/memcontrol.h>
+ #include <linux/delayacct.h>
+@@ -2236,6 +2237,8 @@ out:
+ 	return sc.nr_reclaimed;
+ }
+ 
++#define WT_EXPIRY	(HZ * 5)	/* Time to wakeup watermark_timer */
++
+ /*
+  * The background pageout daemon, started as a kernel thread
+  * from the init process.
+@@ -2286,6 +2289,8 @@ static int kswapd(void *p)
+ 		unsigned long new_order;
+ 		int ret;
+ 
++		/* kswapd has been busy so delay watermark_timer */
++		mod_timer(&pgdat->watermark_timer, jiffies + WT_EXPIRY);
+ 		prepare_to_wait(&pgdat->kswapd_wait, &wait, TASK_INTERRUPTIBLE);
+ 		new_order = pgdat->kswapd_max_order;
+ 		pgdat->kswapd_max_order = 0;
+@@ -2467,20 +2472,57 @@ static int __devinit cpu_callback(struct notifier_block *nfb,
+ }
+ 
+ /*
++ * We wake up kswapd every WT_EXPIRY till free ram is above pages_lots
++ */
++static void watermark_wakeup(unsigned long data)
++{
++	pg_data_t *pgdat = (pg_data_t *)data;
++	struct timer_list *wt = &pgdat->watermark_timer;
++	int i;
++
++	if (!waitqueue_active(&pgdat->kswapd_wait) || above_background_load())
++		goto out;
++	for (i = pgdat->nr_zones - 1; i >= 0; i--) {
++		struct zone *z = pgdat->node_zones + i;
++
++		if (!populated_zone(z) || is_highmem(z)) {
++			/* We are better off leaving highmem full */
++			continue;
++		}
++		if (!zone_watermark_ok(z, 0, lots_wmark_pages(z), 0, 0)) {
++			wake_up_interruptible(&pgdat->kswapd_wait);
++			goto out;
++		}
++	}
++out:
++	mod_timer(wt, jiffies + WT_EXPIRY);
++	return;
++}
++
++/*
+  * This kswapd start function will be called by init and node-hot-add.
+  * On node-hot-add, kswapd will moved to proper cpus if cpus are hot-added.
+  */
+ int kswapd_run(int nid)
+ {
+ 	pg_data_t *pgdat = NODE_DATA(nid);
++	struct timer_list *wt;
+ 	int ret = 0;
+ 
+ 	if (pgdat->kswapd)
+ 		return 0;
+ 
++	wt = &pgdat->watermark_timer;
++	init_timer(wt);
++	wt->data = (unsigned long)pgdat;
++	wt->function = watermark_wakeup;
++	wt->expires = jiffies + WT_EXPIRY;
++	add_timer(wt);
++
+ 	pgdat->kswapd = kthread_run(kswapd, pgdat, "kswapd%d", nid);
+ 	if (IS_ERR(pgdat->kswapd)) {
+ 		/* failure at boot is fatal */
++		del_timer(wt);
+ 		BUG_ON(system_state == SYSTEM_BOOTING);
+ 		printk("Failed to start kswapd on node %d\n",nid);
+ 		ret = -1;
+-- 
+1.6.5.2
+

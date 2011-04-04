@@ -1,0 +1,595 @@
+From dc7946d858ab457cb29e47020fd0adfa09206eb9 Mon Sep 17 00:00:00 2001
+From: Zumeng Chen <zumeng.chen@windriver.com>
+Date: Thu, 13 May 2010 10:16:22 +0800
+Subject: [PATCH 015/119] KVM: introduce "xinterface" API for external interaction with guests
+
+What: xinterface is a mechanism that allows kernel modules external to
+the kvm.ko proper to interface with a running guest.  It accomplishes
+this by creating an abstracted interface which does not expose any
+private details of the guest or its related KVM structures, and provides
+a mechanism to find and bind to this interface at run-time.
+
+Why: There are various subsystems that would like to interact with a KVM
+guest which are ideally suited to exist outside the domain of the kvm.ko
+core logic. For instance, external pci-passthrough, virtual-bus, and
+virtio-net modules are currently under development.  In order for these
+modules to successfully interact with the guest, they need, at the very
+least, various interfaces for signaling IO events, pointer translation,
+and possibly memory mapping.
+
+The signaling case is covered by the recent introduction of the
+irqfd/ioeventfd mechanisms.  This patch provides a mechanism to cover the
+other cases.  Note that today we only expose pointer-translation related
+functions, but more could be added at a future date as needs arise.
+
+Security considerations: This concept is not believed to expose KVM to
+any kind of additional security risk, as the interface is only available
+within the kernel.  Therefore the xinterface admission policy is delegated
+to the kernel/lkm admission policy, which must be assumed secure or the
+system is already compromised independent of this work.
+
+Example usage: QEMU instantiates a guest, and an external module "foo"
+that desires the ability to interface with the guest (say via
+open("/dev/foo")).  QEMU may then pass the kvmfd to foo via an
+ioctl, such as: ioctl(foofd, FOO_SET_VMID, &kvmfd).  Upon receipt, the
+foo module can issue kvm_xinterface_bind(kvmfd) to acquire
+the proper context.  Internally, the struct kvm* and associated
+struct module* will remain pinned at least until the foo module calls
+kvm_xinterface_put().
+
+Signed-off-by: Gregory Haskins <ghaskins@novell.com>
+Integrated-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ arch/x86/kvm/Makefile          |    2 +-
+ include/linux/kvm_host.h       |    3 +
+ include/linux/kvm_xinterface.h |  114 ++++++++++++++
+ kernel/fork.c                  |    1 +
+ virt/kvm/kvm_main.c            |   24 +++
+ virt/kvm/xinterface.c          |  336 ++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 479 insertions(+), 1 deletions(-)
+ create mode 100644 include/linux/kvm_xinterface.h
+ create mode 100644 virt/kvm/xinterface.c
+
+diff --git a/arch/x86/kvm/Makefile b/arch/x86/kvm/Makefile
+index 31a7035..0449d6e 100644
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@ -7,7 +7,7 @@ CFLAGS_vmx.o := -I.
+ 
+ kvm-y			+= $(addprefix ../../../virt/kvm/, kvm_main.o ioapic.o \
+ 				coalesced_mmio.o irq_comm.o eventfd.o \
+-				assigned-dev.o)
++				assigned-dev.o xinterface.o)
+ kvm-$(CONFIG_IOMMU_API)	+= $(addprefix ../../../virt/kvm/, iommu.o)
+ 
+ kvm-y			+= x86.o mmu.o emulate.o i8259.o irq.o lapic.o \
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 55e6b75..3183e6d 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -387,6 +387,9 @@ void kvm_arch_sync_events(struct kvm *kvm);
+ int kvm_cpu_has_pending_timer(struct kvm_vcpu *vcpu);
+ void kvm_vcpu_kick(struct kvm_vcpu *vcpu);
+ 
++struct kvm_xinterface *
++kvm_xinterface_alloc(struct kvm *kvm, struct module *owner);
++
+ int kvm_is_mmio_pfn(pfn_t pfn);
+ 
+ struct kvm_irq_ack_notifier {
+diff --git a/include/linux/kvm_xinterface.h b/include/linux/kvm_xinterface.h
+new file mode 100644
+index 0000000..01f092b
+--- /dev/null
++++ b/include/linux/kvm_xinterface.h
+@@ -0,0 +1,114 @@
++#ifndef __KVM_XINTERFACE_H
++#define __KVM_XINTERFACE_H
++
++/*
++ * This work is licensed under the terms of the GNU GPL, version 2.  See
++ * the COPYING file in the top-level directory.
++ */
++
++#include <linux/kref.h>
++#include <linux/module.h>
++#include <linux/file.h>
++
++struct kvm_xinterface;
++struct kvm_xvmap;
++
++struct kvm_xinterface_ops {
++	unsigned long (*copy_to)(struct kvm_xinterface *intf,
++				 unsigned long gpa, const void *src,
++				 unsigned long len);
++	unsigned long (*copy_from)(struct kvm_xinterface *intf, void *dst,
++				   unsigned long gpa, unsigned long len);
++	struct kvm_xvmap* (*vmap)(struct kvm_xinterface *intf,
++				  unsigned long gpa,
++				  unsigned long len);
++	void (*release)(struct kvm_xinterface *);
++};
++
++struct kvm_xinterface {
++	struct module                   *owner;
++	struct kref                      kref;
++	const struct kvm_xinterface_ops *ops;
++};
++
++static inline void
++kvm_xinterface_get(struct kvm_xinterface *intf)
++{
++	kref_get(&intf->kref);
++}
++
++static inline void
++_kvm_xinterface_release(struct kref *kref)
++{
++	struct kvm_xinterface *intf;
++	struct module *owner;
++
++	intf = container_of(kref, struct kvm_xinterface, kref);
++
++	owner = intf->owner;
++	rmb();
++
++	intf->ops->release(intf);
++	module_put(owner);
++}
++
++static inline void
++kvm_xinterface_put(struct kvm_xinterface *intf)
++{
++	kref_put(&intf->kref, _kvm_xinterface_release);
++}
++
++struct kvm_xvmap_ops {
++	void (*release)(struct kvm_xvmap *vmap);
++};
++
++struct kvm_xvmap {
++	struct kref                 kref;
++	const struct kvm_xvmap_ops *ops;
++	struct kvm_xinterface      *intf;
++	void                       *addr;
++	size_t                      len;
++};
++
++static inline void
++kvm_xvmap_init(struct kvm_xvmap *vmap, const struct kvm_xvmap_ops *ops,
++	       struct kvm_xinterface *intf)
++{
++	memset(vmap, 0, sizeof(vmap));
++	kref_init(&vmap->kref);
++	vmap->ops = ops;
++	vmap->intf = intf;
++
++	kvm_xinterface_get(intf);
++}
++
++static inline void
++kvm_xvmap_get(struct kvm_xvmap *vmap)
++{
++	kref_get(&vmap->kref);
++}
++
++static inline void
++_kvm_xvmap_release(struct kref *kref)
++{
++	struct kvm_xvmap *vmap;
++	struct kvm_xinterface *intf;
++
++	vmap = container_of(kref, struct kvm_xvmap, kref);
++
++	intf = vmap->intf;
++	rmb();
++
++	vmap->ops->release(vmap);
++	kvm_xinterface_put(intf);
++}
++
++static inline void
++kvm_xvmap_put(struct kvm_xvmap *vmap)
++{
++	kref_put(&vmap->kref, _kvm_xvmap_release);
++}
++
++struct kvm_xinterface *kvm_xinterface_bind(int fd);
++
++#endif /* __KVM_XINTERFACE_H */
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 98cbcfa..15e81ed 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -179,6 +179,7 @@ void __put_task_struct(struct task_struct *tsk)
+ 	if (!profile_handoff_task(tsk))
+ 		free_task(tsk);
+ }
++EXPORT_SYMBOL_GPL(__put_task_struct);
+ 
+ /*
+  * macro override instead of weak attribute alias, to workaround
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index c82ae24..5fab4c6 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -46,6 +46,7 @@
+ #include <linux/srcu.h>
+ #include <linux/hugetlb.h>
+ #include <linux/slab.h>
++#include <linux/kvm_xinterface.h>
+ 
+ #include <asm/processor.h>
+ #include <asm/io.h>
+@@ -2294,3 +2295,26 @@ void kvm_exit(void)
+ 	__free_page(bad_page);
+ }
+ EXPORT_SYMBOL_GPL(kvm_exit);
++
++struct kvm_xinterface *
++kvm_xinterface_bind(int fd)
++{
++	struct kvm_xinterface *intf;
++	struct file *file;
++
++	file = fget(fd);
++	if (!file)
++		return ERR_PTR(-EBADF);
++
++	if (file->f_op != &kvm_vm_fops) {
++		fput(file);
++		return ERR_PTR(-EINVAL);
++	}
++
++	intf = kvm_xinterface_alloc(file->private_data, file->f_op->owner);
++
++	fput(file);
++
++	return intf;
++}
++EXPORT_SYMBOL_GPL(kvm_xinterface_bind);
+diff --git a/virt/kvm/xinterface.c b/virt/kvm/xinterface.c
+new file mode 100644
+index 0000000..6b130b7
+--- /dev/null
++++ b/virt/kvm/xinterface.c
+@@ -0,0 +1,336 @@
++/*
++ * KVM module interface - Allows external modules to interface with a guest
++ *
++ * This code is designed to be statically linked to the kernel, regardless
++ * of the configuration of kvm.ko.  This allows the kvm_xinterface_find
++ * routine to be stably exported without dependencies on, or race conditions
++ * against acquiring the kvm.ko module itself.
++ *
++ * Copyright 2009 Novell.  All Rights Reserved.
++ *
++ * Author:
++ *      Gregory Haskins <ghaskins@novell.com>
++ *
++ * This file is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA.
++ */
++
++#include <linux/mm.h>
++#include <linux/vmalloc.h>
++#include <linux/highmem.h>
++#include <linux/module.h>
++#include <linux/kvm_host.h>
++#include <linux/kvm_xinterface.h>
++
++struct _xinterface {
++	struct kvm            *kvm;
++	struct task_struct    *task;
++	struct mm_struct      *mm;
++	struct kvm_xinterface  intf;
++};
++
++struct _xvmap {
++	struct kvm_memory_slot    *memslot;
++	unsigned long              npages;
++	struct kvm_xvmap           vmap;
++};
++
++static struct _xinterface *
++to_intf(struct kvm_xinterface *intf)
++{
++	return container_of(intf, struct _xinterface, intf);
++}
++
++/* assumes slots_lock held for read */
++static unsigned long
++gpa_to_hva(struct _xinterface *_intf, unsigned long gpa)
++{
++	unsigned long addr;
++
++	addr = gfn_to_hva(_intf->kvm, gpa >> PAGE_SHIFT);
++	if (kvm_is_error_hva(addr))
++		return 0;
++
++	return addr + offset_in_page(gpa);
++}
++
++/*------------------------------------------------------------------------*/
++
++/* assumes slots_lock held for read */
++static void *
++_vmap(struct _xinterface *_intf, unsigned long gpa, unsigned long npages)
++{
++	struct task_struct *p = _intf->task;
++	struct mm_struct *mm = _intf->mm;
++	struct page **page_list;
++	void *ptr = NULL;
++	unsigned long addr;
++	int ret;
++
++	addr = gpa_to_hva(_intf, gpa);
++
++	if (npages > (PAGE_SIZE / sizeof(struct page *)))
++		return NULL;
++
++	page_list = (struct page **) __get_free_page(GFP_KERNEL);
++	if (!page_list)
++		return NULL;
++
++	down_write(&mm->mmap_sem);
++
++	ret = get_user_pages(p, mm, addr, npages, 1, 0, page_list, NULL);
++	if (ret < 0)
++		goto out;
++
++	ptr = vmap(page_list, npages, VM_MAP, PAGE_KERNEL);
++	if (ptr)
++		mm->locked_vm += npages;
++
++	ptr = ptr + offset_in_page(gpa);
++
++out:
++	up_write(&mm->mmap_sem);
++
++	free_page((unsigned long)page_list);
++
++	return ptr;
++}
++
++static void
++_vunmap(struct _xinterface *_intf, void *addr, size_t npages)
++{
++	down_write(&_intf->mm->mmap_sem);
++
++	vunmap((void *)((unsigned long)addr & PAGE_MASK));
++	_intf->mm->locked_vm -= npages;
++
++	up_write(&_intf->mm->mmap_sem);
++}
++
++static void
++xvmap_release(struct kvm_xvmap *vmap)
++{
++	struct _xvmap *_xvmap = container_of(vmap, struct _xvmap, vmap);
++	struct _xinterface *_intf = to_intf(_xvmap->vmap.intf);
++
++	_vunmap(_intf, _xvmap->vmap.addr, _xvmap->npages);
++	atomic_dec(&_xvmap->memslot->refs);
++	kfree(_xvmap);
++}
++
++const static struct kvm_xvmap_ops _xvmap_ops = {
++	.release = xvmap_release,
++};
++
++/*------------------------------------------------------------------------*/
++
++static unsigned long
++xinterface_copy_to(struct kvm_xinterface *intf, unsigned long gpa,
++		   const void *src, unsigned long n)
++{
++	struct _xinterface *_intf = to_intf(intf);
++	struct task_struct *p = _intf->task;
++	struct mm_struct *mm = _intf->mm;
++	unsigned long dst;
++
++	down_read(&_intf->kvm->slots_lock);
++
++	dst = gpa_to_hva(_intf, gpa);
++
++	while (dst && n) {
++		unsigned long offset = offset_in_page(dst);
++		unsigned long len = PAGE_SIZE - offset;
++		int ret;
++		struct page *pg;
++		void *maddr;
++
++		if (len > n)
++			len = n;
++
++		down_read(&mm->mmap_sem);
++		ret = get_user_pages(p, mm, dst, 1, 1, 0, &pg, NULL);
++
++		if (ret != 1) {
++			up_read(&mm->mmap_sem);
++			break;
++		}
++
++		maddr = kmap_atomic(pg, KM_USER0);
++		memcpy(maddr + offset, src, len);
++		kunmap_atomic(maddr, KM_USER0);
++		set_page_dirty_lock(pg);
++		put_page(pg);
++		up_read(&mm->mmap_sem);
++
++		src += len;
++		dst += len;
++		n -= len;
++	}
++
++	up_read(&_intf->kvm->slots_lock);
++
++	return n;
++}
++
++static unsigned long
++xinterface_copy_from(struct kvm_xinterface *intf, void *dst,
++		     unsigned long gpa, unsigned long n)
++{
++	struct _xinterface *_intf = to_intf(intf);
++	struct task_struct *p = _intf->task;
++	struct mm_struct *mm = _intf->mm;
++	unsigned long src;
++
++	down_read(&_intf->kvm->slots_lock);
++
++	src = gpa_to_hva(_intf, gpa);
++
++	while (src && n) {
++		unsigned long offset = offset_in_page(src);
++		unsigned long len = PAGE_SIZE - offset;
++		int ret;
++		struct page *pg;
++		void *maddr;
++
++		if (len > n)
++			len = n;
++
++		down_read(&mm->mmap_sem);
++		ret = get_user_pages(p, mm, src, 1, 1, 0, &pg, NULL);
++
++		if (ret != 1) {
++			up_read(&mm->mmap_sem);
++			break;
++		}
++
++		maddr = kmap_atomic(pg, KM_USER0);
++		memcpy(dst, maddr + offset, len);
++		kunmap_atomic(maddr, KM_USER0);
++		put_page(pg);
++		up_read(&mm->mmap_sem);
++
++		src += len;
++		dst += len;
++		n -= len;
++	}
++
++	up_read(&_intf->kvm->slots_lock);
++
++	return n;
++}
++
++static struct kvm_xvmap *
++xinterface_vmap(struct kvm_xinterface *intf,
++		unsigned long gpa,
++		unsigned long len)
++{
++	struct _xinterface         *_intf = to_intf(intf);
++	struct _xvmap               *_xvmap;
++	struct kvm_memory_slot     *memslot;
++	struct kvm                 *kvm = _intf->kvm;
++	int                         ret = -EINVAL;
++	void                       *addr = NULL;
++	off_t                       offset = offset_in_page(gpa);
++	unsigned long               npages;
++
++	down_read(&kvm->slots_lock);
++
++	memslot = gfn_to_memslot(kvm, gpa >> PAGE_SHIFT);
++	if (!memslot)
++		goto fail;
++
++	/* Check if the request walks off the end of the slot */
++	if ((offset + len) > (memslot->npages << PAGE_SHIFT))
++		goto fail;
++
++	npages = PAGE_ALIGN(len + offset) >> PAGE_SHIFT;
++
++	addr = _vmap(_intf, gpa, npages);
++	if (!addr) {
++		ret = -EFAULT;
++		goto fail;
++	}
++
++	_xvmap = kzalloc(sizeof(*_xvmap), GFP_KERNEL);
++	if (!_xvmap) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++
++	atomic_inc(&memslot->refs);
++
++	_xvmap->memslot = memslot;
++	_xvmap->npages  = npages;
++
++	kvm_xvmap_init(&_xvmap->vmap, &_xvmap_ops, intf);
++	_xvmap->vmap.addr = addr;
++	_xvmap->vmap.len  = len;
++
++	up_read(&kvm->slots_lock);
++
++	return &_xvmap->vmap;
++
++fail:
++	if (addr)
++		_vunmap(_intf, addr, len);
++
++	up_read(&kvm->slots_lock);
++
++	return ERR_PTR(ret);
++}
++
++static void
++xinterface_release(struct kvm_xinterface *intf)
++{
++	struct _xinterface *_intf = to_intf(intf);
++
++	mmput(_intf->mm);
++	put_task_struct(_intf->task);
++	kvm_put_kvm(_intf->kvm);
++	kfree(_intf);
++}
++
++struct kvm_xinterface_ops _xinterface_ops = {
++	.copy_to     = xinterface_copy_to,
++	.copy_from   = xinterface_copy_from,
++	.vmap        = xinterface_vmap,
++	.release     = xinterface_release,
++};
++
++struct kvm_xinterface *
++kvm_xinterface_alloc(struct kvm *kvm, struct module *owner)
++{
++	struct _xinterface *_intf;
++	struct kvm_xinterface *intf;
++
++	_intf = kzalloc(sizeof(*_intf), GFP_KERNEL);
++	if (!_intf)
++		return ERR_PTR(-ENOMEM);
++
++	intf = &_intf->intf;
++
++	__module_get(owner);
++	intf->owner = owner;
++	kref_init(&intf->kref);
++	intf->ops = &_xinterface_ops;
++
++	kvm_get_kvm(kvm);
++	_intf->kvm = kvm;
++
++	_intf->task = current;
++	get_task_struct(_intf->task);
++
++	_intf->mm = get_task_mm(_intf->task);
++
++	return intf;
++}
+-- 
+1.6.5.2
+

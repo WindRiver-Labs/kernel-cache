@@ -1,0 +1,906 @@
+From 96234ed042ec1fb9404d94872f8038e38a3c4bc1 Mon Sep 17 00:00:00 2001
+From: Gregory Haskins <ghaskins@novell.com>
+Date: Tue, 22 Sep 2009 23:29:57 -0400
+Subject: [PATCH 054/119] venettap: add zerocopy support
+
+This adds the ability to directly map a guests pages into a paged-skb
+instead of copying the data, saving the overhead and cache-thrashing
+normally associated with copying data into a host specific skb.
+
+This feature requires "TXC" (transmit-complete events) support in the
+guest to be enabled before zero-copy can be enabled.  This patch adds
+a new attribute to the device-model called "zcthresh" which sets the
+threshold between normal copy and zero-copy operation.  Setting this
+threshold to '0' disables zero-copy.
+
+Signed-off-by: Gregory Haskins <ghaskins@novell.com>
+---
+ kernel/vbus/devices/venet/device.c      |  543 +++++++++++++++++++++++++------
+ kernel/vbus/devices/venet/tap.c         |    1 +
+ kernel/vbus/devices/venet/venetdevice.h |   13 +-
+ 3 files changed, 453 insertions(+), 104 deletions(-)
+
+diff --git a/kernel/vbus/devices/venet/device.c b/kernel/vbus/devices/venet/device.c
+index 75e91ed..f7c85fd 100644
+--- a/kernel/vbus/devices/venet/device.c
++++ b/kernel/vbus/devices/venet/device.c
+@@ -41,6 +41,7 @@
+ #include <linux/kthread.h>
+ #include <linux/mmu_context.h>
+ #include <linux/ktime.h>
++#include <linux/highmem.h>
+ 
+ #include "venetdevice.h"
+ 
+@@ -62,7 +63,7 @@ module_param(maxcount, int, 0600);
+ MODULE_PARM_DESC(maxcount, "maximum size for rx/tx ioq ring");
+ 
+ /* This must be defined as the largest event we can generate */
+-#define EVQ_EVSIZE sizeof(struct venet_event_linkstate)
++#define EVQ_EVSIZE sizeof(struct venet_event_txc)
+ 
+ #define PMTD_POOL_ID 100
+ #define EVQ_DPOOL_ID 101
+@@ -74,6 +75,11 @@ static int venetdev_tx_thread(void *__priv);
+ 
+ static void evq_send_linkstatus(struct venetdev *priv, bool status);
+ 
++struct _venetdev_skb {
++	struct venetdev *priv;
++	u64 cookie;
++};
++
+ static int
+ venetdev_queue_init(struct venetdev_queue *q,
+ 		    struct vbus_shm *shm,
+@@ -300,7 +306,8 @@ venetdev_change_mtu(struct net_device *dev, int new_mtu)
+  */
+ 
+ static void
+-evq_send_event(struct venetdev *priv, struct venet_event_header *header)
++evq_send_event(struct venetdev *priv, struct venet_event_header *header,
++	       bool signal)
+ {
+ 	struct ioq_iterator         iter;
+ 	struct ioq                 *ioq = priv->vbus.evq.queue.queue;
+@@ -341,7 +348,8 @@ evq_send_event(struct venetdev *priv, struct venet_event_header *header)
+ out:
+ 	spin_unlock_irqrestore(&priv->vbus.evq.lock, flags);
+ 
+-	ioq_signal(ioq, 0);
++	if (signal)
++		ioq_signal(ioq, 0);
+ }
+ 
+ static void
+@@ -355,7 +363,22 @@ evq_send_linkstatus(struct venetdev *priv, bool status)
+ 		.state = status ? 1 : 0,
+ 	};
+ 
+-	evq_send_event(priv, &event.header);
++	evq_send_event(priv, &event.header, true);
++}
++
++static void
++evq_send_txc(struct venetdev *priv, u64 cookie)
++{
++	struct venet_event_txc event = {
++		.header = {
++			.size = sizeof(struct venet_event_txc),
++			.id = VENET_EVENT_TXC,
++		},
++		.txqid = 0, /* we do not yet support multi-queue */
++		.cookie = cookie,
++	};
++
++	evq_send_event(priv, &event.header, false);
+ }
+ 
+ /*
+@@ -365,17 +388,19 @@ evq_send_linkstatus(struct venetdev *priv, bool status)
+  */
+ 
+ /* assumes reference to priv->vbus.conn held */
+-static int
+-venetdev_sg_decode(struct venetdev *priv, void *ptr, int len)
++static struct venet_sg *
++venetdev_sg_desc_get(struct venetdev *priv, void *ptr, int len)
+ {
+ 	struct venet_sg *vsg = (struct venet_sg *)priv->vbus.sg.buf;
++	int total = 0;
+ 	int ret;
++	int i;
+ 
+ 	PDEBUG("desc: %p/%d\n", ptr, len);
+ 
+ 	if (unlikely(len < sizeof(*vsg) || len > MAX_VSG_DESC_SIZE)) {
+ 		PDEBUG("invalid len: %d\n", len);
+-		return -1;
++		return NULL;
+ 	}
+ 
+ 	/*
+@@ -392,7 +417,7 @@ venetdev_sg_decode(struct venetdev *priv, void *ptr, int len)
+ 		if ((offset + len) > priv->vbus.pmtd.shm->len) {
+ 			PDEBUG("offset overrun: %d+%d > %d\n",
+ 			       offset, len, priv->vbus.pmtd.shm->len);
+-			return -1;
++			return NULL;
+ 		}
+ 
+ 		/*
+@@ -408,21 +433,29 @@ venetdev_sg_decode(struct venetdev *priv, void *ptr, int len)
+ 		ret = ctx->ops->copy_from(ctx, vsg, ptr, len);
+ 		if (ret) {
+ 			PDEBUG("copy_from: EFAULT\n");
+-			return -1;
++			return NULL;
+ 		}
+ 	}
+ 
++	priv->vbus.sg.len = len;
++
+ 	PDEBUG("pmtd-pool:%p, vsg=%p\n", priv->vbus.pmtd.shm->ptr, vsg);
+ 
++	/*
++	 * ---------------------------
++	 * Validate all of the lengths
++	 * ---------------------------
++	 */
++
+ 	if (len < VSG_DESC_SIZE(vsg->count)) {
+ 		PDEBUG("%d < %d\n", len, VSG_DESC_SIZE(vsg->count));
+-		return -1;
++		return NULL;
+ 	}
+ 
+ 	if (vsg->flags & VENET_SG_FLAG_GSO) {
+ 		/* GSO packets shall not exceed 64k frames */
+ 		if (vsg->len > 65536)
+-			return -1;
++			return NULL;
+ 
+ 	} else
+ 		/*
+@@ -430,11 +463,204 @@ venetdev_sg_decode(struct venetdev *priv, void *ptr, int len)
+ 		 * on the host
+ 		 */
+ 		if (vsg->len > (priv->netif.dev->mtu + ETH_HLEN))
+-			return -1;
++			return NULL;
+ 
+-	priv->vbus.sg.len = len;
++	/*
++	 * We cannot support more fragments than our SKBs allow
++	 */
++	if (vsg->count > MAX_SKB_FRAGS)
++		return NULL;
++
++	PDEBUG("Importing %d bytes in %d segments\n", vsg->len, vsg->count);
++
++	/*
++	 * And finally, our total length computed from the IOV should
++	 * match the submitted total length.
++	 */
++	for (i = 0; i < vsg->count; i++) {
++		struct venet_iov *iov = &vsg->iov[i];
++
++		PDEBUG("Segment %d: %d bytes\n", i, iov->len);
++		total += iov->len;
++	}
++
++	if (total != vsg->len)
++		return NULL;
++
++	return vsg;
++}
++
++struct venet_sg_iterator {
++	struct venet_sg    *vsg;
++	struct vbus_memctx *ctx;
++	int                 index;
++	int                 offset;
++	int                 pos;
++};
++
++static void
++venet_sg_iter_init(struct venet_sg_iterator *iter,
++		   struct venet_sg *vsg, struct vbus_memctx *ctx)
++{
++	memset(iter, 0, sizeof(*iter));
++	iter->vsg = vsg;
++	iter->ctx = ctx;
++}
++
++static void *
++venet_sg_iter(struct venet_sg_iterator *iter, size_t *len)
++{
++	struct venet_iov *iov = &iter->vsg->iov[iter->index];
++	int remain = iov->len - iter->offset;
++	int consume = *len < remain ? *len : remain;
++	void *ptr;
++
++	if (iter->pos >= iter->vsg->len) {
++		*len = 0;
++		return NULL;
++	}
++
++	ptr = (void *)iov->ptr + iter->offset;
++	*len = consume;
++
++	iter->offset += consume;
++	iter->pos    += consume;
++	if (iter->offset == iov->len) {
++		iter->index++;
++		iter->offset = 0;
++	}
++
++	return ptr;
++}
++
++static int
++venet_sg_iter_copy(struct venet_sg_iterator *iter, char *dst, size_t len)
++{
++	struct vbus_memctx *ctx = iter->ctx;
++	int ret;
++
++	while (len) {
++		size_t bytestocopy = len;
++		void *src = venet_sg_iter(iter, &bytestocopy);
++
++		if (!src)
++			return len;
++
++		ret = ctx->ops->copy_from(ctx, dst, src, bytestocopy);
++		if (ret)
++			return -EFAULT;
++
++		dst += bytestocopy;
++		len -= bytestocopy;
++	}
++
++	return len;
++}
++
++static void venetdev_skb_release(struct sk_buff *skb);
++
++static int
++venetdev_sg_import_zc(struct venetdev *priv,
++			struct venet_sg *vsg,
++			struct sk_buff *skb)
++{
++	struct vbus_memctx *ctx = priv->vbus.ctx;
++	struct venet_sg_iterator iter;
++	struct scatterlist sgl[vsg->count];
++	struct scatterlist *sg;
++	struct _venetdev_skb *_skb;
++	int nr_addrs = 0;
++	int i;
++	int ret;
++
++	venet_sg_iter_init(&iter, vsg, priv->vbus.ctx);
++
++	/* First import the header */
++	if (skb_headlen(skb)) {
++		PDEBUG("SG: Importing %d byte header\n", skb_headlen(skb));
++
++		ret = venet_sg_iter_copy(&iter, skb->data, skb_headlen(skb));
++		if (ret) {
++			kfree_skb(skb);
++			return ret > 0 ? -EINVAL : ret;
++		}
++	}
++
++	sg_init_table(sgl, vsg->count);
++
++	/* And then any remaining payload is paged in */
++	for_each_sg(sgl, sg, vsg->count, i) {
++		size_t len = PAGE_SIZE;
++		void *ptr;
++
++		ptr = venet_sg_iter(&iter, &len);
++		if (!ptr)
++			break;
++
++		sg_dma_address(sg) = (dma_addr_t)ptr;
++		sg_dma_len(sg)     = len;
++
++		nr_addrs++;
++	}
++
++	sg_mark_end(&sgl[nr_addrs-1]);
++
++	ret = ctx->ops->sg_map(ctx, sgl, nr_addrs);
++	if (ret < 0) {
++		kfree_skb(skb);
++		return ret;
++	}
++
++	for_each_sg(sgl, sg, nr_addrs, i) {
++		skb_frag_t *f = &skb_shinfo(skb)->frags[i];
++
++		f->page = sg_page(sg);
++
++		f->page_offset = sg->offset;
++		f->size        = sg->length;
++
++		PDEBUG("SG: Importing %d byte page[%i]\n", f->size, i);
++
++		skb->data_len += f->size;
++		skb->len      += f->size;
++		skb->truesize += f->size;
++		skb_shinfo(skb)->nr_frags++;
++	}
++
++
++	_skb = kzalloc(sizeof(*_skb), GFP_ATOMIC);
++	if (!_skb) {
++		kfree_skb(skb);
++		return -ENOMEM;
++
++	}
++
++	_skb->priv   = priv;
++	_skb->cookie = vsg->cookie;
++
++	skb_shinfo(skb)->priv    = _skb;
++	skb_shinfo(skb)->release = &venetdev_skb_release;
++
++	atomic_inc(&priv->netif.rxq.outstanding);
++
++	return 0;
++}
++
++static int
++venetdev_sg_import_copy(struct venetdev *priv,
++			struct venet_sg *vsg,
++			struct sk_buff *skb)
++{
++	struct venet_sg_iterator iter;
++	int ret;
+ 
+-	return vsg->len;
++	venet_sg_iter_init(&iter, vsg, priv->vbus.ctx);
++
++	ret = venet_sg_iter_copy(&iter, skb->data, vsg->len);
++	if (ret)
++		kfree_skb(skb);
++
++	return ret > 0 ? -EINVAL : ret;
+ }
+ 
+ /*
+@@ -442,39 +668,64 @@ venetdev_sg_decode(struct venetdev *priv, void *ptr, int len)
+  *
+  * assumes reference to priv->vbus.conn held
+  */
+-static int
+-venetdev_sg_import(struct venetdev *priv, struct sk_buff *skb,
+-		   void *ptr, int len)
++static struct sk_buff *
++venetdev_sg_import(struct venetdev *priv, void *ptr, int len)
+ {
+-	struct venet_sg *vsg = (struct venet_sg *)priv->vbus.sg.buf;
+-	struct vbus_memctx *ctx = priv->vbus.ctx;
+-	int remain = len;
++	struct venet_sg *vsg;
++	struct sk_buff *skb;
++	size_t linear;
+ 	int ret;
+-	int i;
+-
+-	PDEBUG("Importing %d bytes in %d segments\n", len, vsg->count);
++	bool zc = false;
+ 
+-	for (i = 0; i < vsg->count; i++) {
+-		struct venet_iov *iov = &vsg->iov[i];
++	vsg = venetdev_sg_desc_get(priv, ptr, len);
++	if (unlikely(!vsg)) {
++		priv->netif.stats.rx_length_errors++;
++		return NULL;
++	}
+ 
+-		if (remain < iov->len)
+-			return -EINVAL;
++	/*
++	 * A packet is eligible for zero-copy handling if it both exceeds
++	 * the zcthresh limit AND is of a GSO type packet.  When this state
++	 * is detected, we only want to allocate just enough linear space
++	 * for the header.  The rest we will load as paged data
++	 */
++	if (priv->vbus.ctx->ops->sg_map
++	    && priv->vbus.evq.txc
++	    && priv->zcthresh
++	    && vsg->len >= priv->zcthresh
++	    && vsg->flags & VENET_SG_FLAG_GSO) {
++		zc = true;
++		linear = vsg->gso.hdrlen;
++	} else
++		linear = vsg->len;
++
++	skb = dev_alloc_skb(linear + NET_IP_ALIGN);
++	if (unlikely(!skb)) {
++		printk(KERN_INFO "VENETDEV: skb alloc failed:"	\
++		       " memory squeeze.\n");
++		priv->netif.stats.rx_dropped++;
++		return NULL;
++	}
+ 
+-		PDEBUG("Segment %d: %p/%d\n", i, iov->ptr, iov->len);
++	/* align IP on 16B boundary */
++	skb_reserve(skb, NET_IP_ALIGN);
++	skb_put(skb, linear);
+ 
+-		ret = ctx->ops->copy_from(ctx, skb_tail_pointer(skb),
+-					 (void *)iov->ptr,
+-					 iov->len);
+-		if (ret)
+-			return -EFAULT;
++	if (zc)
++		ret = venetdev_sg_import_zc(priv, vsg, skb);
++	else
++		ret = venetdev_sg_import_copy(priv, vsg, skb);
+ 
+-		skb_put(skb, iov->len);
+-		remain -= iov->len;
++	if (ret < 0) {
++		kfree_skb(skb);
++		return NULL;
+ 	}
+ 
+ 	if (vsg->flags & VENET_SG_FLAG_NEEDS_CSUM
+-	    && !skb_partial_csum_set(skb, vsg->csum.start, vsg->csum.offset))
+-		return -EINVAL;
++	    && !skb_partial_csum_set(skb, vsg->csum.start, vsg->csum.offset)) {
++		kfree_skb(skb);
++		return NULL;
++	}
+ 
+ 	if (vsg->flags & VENET_SG_FLAG_GSO) {
+ 		struct skb_shared_info *sinfo = skb_shinfo(skb);
+@@ -495,18 +746,18 @@ venetdev_sg_import(struct venetdev *priv, struct sk_buff *skb,
+ 			PDEBUG("Illegal GSO type: %d\n", vsg->gso.type);
+ 			priv->netif.stats.rx_frame_errors++;
+ 			kfree_skb(skb);
+-			return -EINVAL;
++			return NULL;
+ 		}
+ 
+ 		if (vsg->flags & VENET_SG_FLAG_ECN)
+ 			sinfo->gso_type |= SKB_GSO_TCP_ECN;
+ 
+ 		sinfo->gso_size = vsg->gso.size;
+-		if (skb_shinfo(skb)->gso_size == 0) {
++		if (sinfo->gso_size == 0) {
+ 			PDEBUG("Illegal GSO size: %d\n", vsg->gso.size);
+ 			priv->netif.stats.rx_frame_errors++;
+ 			kfree_skb(skb);
+-			return -EINVAL;
++			return NULL;
+ 		}
+ 
+ 		/* Header must be checked, and gso_segs computed. */
+@@ -514,11 +765,10 @@ venetdev_sg_import(struct venetdev *priv, struct sk_buff *skb,
+ 		skb_shinfo(skb)->gso_segs = 0;
+ 	}
+ 
+-	return 0;
++	return skb;
+ }
+ 
+ static struct venetdev_rx_ops venetdev_sg_rx_ops = {
+-	.decode = venetdev_sg_decode,
+ 	.import = venetdev_sg_import,
+ };
+ 
+@@ -528,49 +778,93 @@ static struct venetdev_rx_ops venetdev_sg_rx_ops = {
+  * ---------------------------
+  */
+ 
+-/* assumes reference to priv->vbus.conn held */
+-static int
+-venetdev_flat_decode(struct venetdev *priv, void *ptr, int len)
+-{
+-	size_t maxlen = priv->netif.dev->mtu + ETH_HLEN;
+-
+-	if (len > maxlen)
+-		return -1;
+-
+-	/*
+-	 * If SG is *not* enabled, the length is simply the
+-	 * descriptor length
+-	 */
+-
+-	return len;
+-}
+-
+ /*
+  * venetdev_rx_flat - import an skb in non scatter-gather mode
+  *
+  * assumes reference to priv->vbus.conn held
+  */
+-static int
+-venetdev_flat_import(struct venetdev *priv, struct sk_buff *skb,
+-		     void *ptr, int len)
++static struct sk_buff *
++venetdev_flat_import(struct venetdev *priv, void *ptr, int len)
+ {
+ 	struct vbus_memctx *ctx = priv->vbus.ctx;
++	size_t maxlen = priv->netif.dev->mtu + ETH_HLEN;
++	struct sk_buff *skb;
+ 	int ret;
+ 
++	if (len > maxlen) {
++		priv->netif.stats.rx_length_errors++;
++		return NULL;
++	}
++
++	skb = dev_alloc_skb(len + NET_IP_ALIGN);
++	if (unlikely(!skb)) {
++		printk(KERN_INFO "VENETDEV: skb alloc failed:"	\
++		       " memory squeeze.\n");
++		priv->netif.stats.rx_dropped++;
++		return NULL;
++	}
++
++	/* align IP on 16B boundary */
++	skb_reserve(skb, NET_IP_ALIGN);
++
+ 	ret = ctx->ops->copy_from(ctx, skb_tail_pointer(skb), ptr, len);
+-	if (ret)
+-		return -EFAULT;
++	if (ret) {
++		kfree_skb(skb);
++		return NULL;
++	}
+ 
+ 	skb_put(skb, len);
+ 
+-	return 0;
++	return skb;
+ }
+ 
+ static struct venetdev_rx_ops venetdev_flat_rx_ops = {
+-	.decode = venetdev_flat_decode,
+ 	.import = venetdev_flat_import,
+ };
+ 
++static void
++venetdev_skb_release(struct sk_buff *skb)
++{
++	struct _venetdev_skb *_skb
++		= (struct _venetdev_skb *)skb_shinfo(skb)->priv;
++	struct venetdev *priv = _skb->priv;
++	unsigned long flags;
++	bool signal = false;
++
++	spin_lock_irqsave(&priv->lock, flags);
++
++	evq_send_txc(priv, _skb->cookie);
++
++	if (atomic_dec_and_test(&priv->netif.rxq.outstanding)) {
++		/*
++		 * We reset the 'completed' count once we successfully drain
++		 * the queue
++		 */
++		priv->netif.rxq.completed = 0;
++		if (waitqueue_active(&priv->netif.rxq.wq))
++			wake_up(&priv->netif.rxq.wq);
++	} else
++		priv->netif.rxq.completed++;
++
++	/*
++	 * If txmitigation is disabled, or if we hit the txmitigation threshold,
++	 * we need to send a signal to drain the evq
++	 *
++	 * We will also get a positive on txmitigation if this was the last
++	 * packet since we reset 'completed' above.
++	 */
++	if (!priv->txmitigation
++	    || !(priv->netif.rxq.completed % priv->txmitigation))
++		signal = true;
++
++	spin_unlock_irqrestore(&priv->lock, flags);
++
++	if (signal)
++		ioq_signal(priv->vbus.evq.queue.queue, 0);
++
++	kfree(_skb);
++}
++
+ /*
+  * default out to netif_rx_ni.
+  */
+@@ -592,6 +886,7 @@ static int
+ venetdev_rx(struct venetdev *priv)
+ {
+ 	struct ioq                 *ioq;
++	struct ioq                 *sioq;
+ 	struct vbus_memctx         *ctx;
+ 	int                         npackets = 0;
+ 	int                         dirty = 0;
+@@ -621,6 +916,11 @@ venetdev_rx(struct venetdev *priv)
+ 	vbus_connection_get(conn);
+ 
+ 	ioq = priv->vbus.rxq.queue;
++	if (priv->vbus.evq.txc)
++		sioq = priv->vbus.evq.queue.queue;
++	else
++		sioq = priv->vbus.rxq.queue;
++
+ 	ctx = priv->vbus.ctx;
+ 
+ 	rx_ops = priv->vbus.rx_ops;
+@@ -639,53 +939,62 @@ venetdev_rx(struct venetdev *priv)
+ 	 * the north side
+ 	 */
+ 	while (iter.desc->sown) {
+-		struct sk_buff *skb = NULL;
+-		int len;
++		struct sk_buff *skb;
++		bool txc = false;
++		bool async = false;
++		u64 cookie = 0;
+ 
+-		len = rx_ops->decode(priv,
++		skb = rx_ops->import(priv,
+ 				     (void *)iter.desc->ptr,
+ 				     iter.desc->len);
+-
+-		if (unlikely(len < 0)) {
+-			priv->netif.stats.rx_errors++;
+-			priv->netif.stats.rx_length_errors++;
+-			goto next;
+-		}
+-
+-		skb = dev_alloc_skb(len + NET_IP_ALIGN);
+ 		if (unlikely(!skb)) {
+-			printk(KERN_INFO "VENETDEV: skb alloc failed:"	\
+-			       " memory squeeze.\n");
+ 			priv->netif.stats.rx_errors++;
+-			priv->netif.stats.rx_dropped++;
+ 			goto next;
+ 		}
+ 
+-		/* align IP on 16B boundary */
+-		skb_reserve(skb, NET_IP_ALIGN);
+-
+-		ret = rx_ops->import(priv, skb, (void *)iter.desc->ptr, len);
+-		if (unlikely(ret < 0)) {
+-			priv->netif.stats.rx_errors++;
+-			goto next;
++		if (priv->vbus.evq.txc) {
++			if (skb_shinfo(skb)->release)
++				async = true;
++			else {
++				/*
++				 * If txc is enabled, and this packet does not
++				 * have a deferred completion handler, it means
++				 * we need to transmit a completion event on
++				 * our own.
++				 */
++				if (priv->vbus.sg.enabled) {
++					struct venet_sg *vsg;
++
++					vsg = (struct venet_sg *)priv->vbus.sg.buf;
++					cookie = vsg->cookie;
++				} else
++					cookie = iter.desc->cookie;
++
++				txc = true;
++			}
+ 		}
+ 
+ 		/* Maintain stats */
+ 		npackets++;
+ 		priv->netif.stats.rx_packets++;
+-		priv->netif.stats.rx_bytes += len;
++		priv->netif.stats.rx_bytes += skb->len;
+ 
+ 		priv->netif.out(priv, skb);
+ next:
+-		dirty = 1;
++		if (!async)
++			dirty = 1;
+ 
+ 		/* Advance the in-use head */
+ 		ret = ioq_iter_pop(&iter, 0);
+ 		BUG_ON(ret < 0);
+ 
++		if (txc)
++			evq_send_txc(priv, cookie);
++
+ 		/* send up to N packets before sending tx-complete */
+-		if (!priv->txmitigation || !(npackets % priv->txmitigation)) {
+-			ioq_signal(ioq, 0);
++		if (dirty && (priv->txmitigation
++			      || !(npackets % priv->txmitigation))) {
++			ioq_signal(sioq, 0);
+ 			dirty = 0;
+ 		}
+ 
+@@ -694,7 +1003,7 @@ next:
+ 	PDEBUG("poll: %d packets received\n", npackets);
+ 
+ 	if (dirty)
+-		ioq_signal(ioq, 0);
++		ioq_signal(sioq, 0);
+ 
+ 	/*
+ 	 * If we processed all packets we're done, so reenable ints
+@@ -1205,7 +1514,7 @@ venetdev_negcap_sg(struct venetdev *priv, u32 requested)
+ static u32
+ venetdev_negcap_evq(struct venetdev *priv, u32 requested)
+ {
+-	u32 available = VENET_CAP_EVQ_LINKSTATE;
++	u32 available = VENET_CAP_EVQ_LINKSTATE|VENET_CAP_EVQ_TXC;
+ 	u32 ret;
+ 
+ 	ret = available & requested;
+@@ -1215,6 +1524,8 @@ venetdev_negcap_evq(struct venetdev *priv, u32 requested)
+ 
+ 		if (ret & VENET_CAP_EVQ_LINKSTATE)
+ 			priv->vbus.evq.linkstate = true;
++		if (ret & VENET_CAP_EVQ_TXC)
++			priv->vbus.evq.txc = true;
+ 	}
+ 
+ 	return ret;
+@@ -1335,6 +1646,7 @@ void venetdev_init(struct venetdev *device, struct net_device *dev)
+ 	init_waitqueue_head(&device->vbus.rx_empty);
+ 	device->burst.thresh     = 0; /* microseconds, 0 = disabled */
+ 	device->txmitigation     = 10; /* nr-packets, 0 = disabled */
++	device->zcthresh         = 512; /* bytes */
+ 
+ 	/*
+ 	 * netif init
+@@ -1342,6 +1654,10 @@ void venetdev_init(struct venetdev *device, struct net_device *dev)
+ 	skb_queue_head_init(&device->netif.txq.list);
+ 	device->netif.txq.len = 0;
+ 
++	atomic_set(&device->netif.rxq.outstanding, 0);
++	device->netif.rxq.completed = 0;
++	init_waitqueue_head(&device->netif.rxq.wq);
++
+ 	device->netif.dev = dev;
+ 	device->netif.out = venetdev_out;
+ 
+@@ -1466,18 +1782,14 @@ void
+ venetdev_vlink_close(struct vbus_connection *conn)
+ {
+ 	struct venetdev *priv = conn_to_priv(conn);
+-	DEFINE_WAIT(wait);
+ 	unsigned long flags;
+ 
+ 	PDEBUG("connection closed\n");
+ 
+-	/* Block until all posted packets from the client have been processed */
+-	prepare_to_wait(&priv->vbus.rx_empty, &wait, TASK_UNINTERRUPTIBLE);
+-
+-	while (test_bit(RX_SCHED, &priv->flags))
+-		schedule();
+-
+-	finish_wait(&priv->vbus.rx_empty, &wait);
++	/* Block until all posted packets have been processed */
++	wait_event(priv->vbus.rx_empty, (!test_bit(RX_SCHED, &priv->flags)));
++	wait_event(priv->netif.rxq.wq,
++		   (!atomic_read(&priv->netif.rxq.outstanding)));
+ 
+ 	spin_lock_irqsave(&priv->lock, flags);
+ 
+@@ -1519,6 +1831,7 @@ venetdev_vlink_release(struct vbus_connection *conn)
+ 	priv->vbus.evq.shm = NULL;
+ 	priv->vbus.evq.enabled = false;
+ 	priv->vbus.evq.linkstate = false;
++	priv->vbus.evq.txc = false;
+ }
+ 
+ /*
+@@ -1678,6 +1991,34 @@ struct vbus_device_attribute attr_txmitigation =
+ 	__ATTR(txmitigation, S_IRUGO | S_IWUSR, txmitigation_show, txmitigation_store);
+ 
+ ssize_t
++zcthresh_show(struct vbus_device *dev, struct vbus_device_attribute *attr,
++	      char *buf)
++{
++	struct venetdev *priv = vdev_to_priv(dev);
++
++	return snprintf(buf, PAGE_SIZE, "%d\n", priv->zcthresh);
++}
++
++ssize_t
++zcthresh_store(struct vbus_device *dev, struct vbus_device_attribute *attr,
++	       const char *buf, size_t count)
++{
++	struct venetdev *priv = vdev_to_priv(dev);
++	int val = -1;
++
++	if (count > 0)
++		sscanf(buf, "%d", &val);
++
++	if (val >= 0)
++		priv->zcthresh = val;
++
++	return count;
++}
++
++struct vbus_device_attribute attr_zcthresh =
++	__ATTR(zcthresh, S_IRUGO | S_IWUSR, zcthresh_show, zcthresh_store);
++
++ssize_t
+ ifname_show(struct vbus_device *dev, struct vbus_device_attribute *attr,
+ 	   char *buf)
+ {
+diff --git a/kernel/vbus/devices/venet/tap.c b/kernel/vbus/devices/venet/tap.c
+index b7612ee..b40c315 100644
+--- a/kernel/vbus/devices/venet/tap.c
++++ b/kernel/vbus/devices/venet/tap.c
+@@ -206,6 +206,7 @@ static struct attribute *attrs[] = {
+ 	&attr_enabled.attr,
+ 	&attr_burstthresh.attr,
+ 	&attr_txmitigation.attr,
++	&attr_zcthresh.attr,
+ 	&attr_ifname.attr,
+ 	NULL,
+ };
+diff --git a/kernel/vbus/devices/venet/venetdevice.h b/kernel/vbus/devices/venet/venetdevice.h
+index 97bd630..f9b0b2c 100644
+--- a/kernel/vbus/devices/venet/venetdevice.h
++++ b/kernel/vbus/devices/venet/venetdevice.h
+@@ -25,6 +25,7 @@
+ #define _LINUX_VENETDEVICE_H
+ 
+ #include <linux/venet.h>
++#include <linux/list.h>
+ 
+ struct venetdev_queue {
+ 	struct ioq              *queue;
+@@ -34,8 +35,7 @@ struct venetdev_queue {
+ struct venetdev;
+ 
+ struct venetdev_rx_ops {
+-	int (*decode)(struct venetdev *priv, void *ptr, int len);
+-	int (*import)(struct venetdev *, struct sk_buff *, void *, int);
++	struct sk_buff *(*import)(struct venetdev *, void *, int);
+ };
+ 
+ #define MAX_VSG_DESC_SIZE VSG_DESC_SIZE(MAX_SKB_FRAGS)
+@@ -64,6 +64,11 @@ struct venetdev {
+ 			size_t               len;
+ 			int                  irqdepth;
+ 		} txq;
++		struct {
++			atomic_t             outstanding;
++			size_t               completed;
++			wait_queue_head_t    wq;
++		} rxq;
+ 		int                          enabled:1;
+ 		int                          link:1;
+ 	} netif;
+@@ -92,6 +97,7 @@ struct venetdev {
+ 			struct venetdev_queue  queue;
+ 			int                    enabled:1;
+ 			int                    linkstate:1;
++			int                    txc:1;
+ 		} evq;
+ 		int                          connected:1;
+ 		int                          opened:1;
+@@ -103,7 +109,7 @@ struct venetdev {
+ 		ktime_t                      expires;
+ 	} burst;
+ 	int                                  txmitigation;
+-
++	int                                  zcthresh;
+ };
+ 
+ static inline struct venetdev *conn_to_priv(struct vbus_connection *conn)
+@@ -154,5 +160,6 @@ extern struct vbus_device_attribute attr_enabled;
+ extern struct vbus_device_attribute attr_burstthresh;
+ extern struct vbus_device_attribute attr_ifname;
+ extern struct vbus_device_attribute attr_txmitigation;
++extern struct vbus_device_attribute attr_zcthresh;
+ 
+ #endif
+-- 
+1.6.5.2
+
