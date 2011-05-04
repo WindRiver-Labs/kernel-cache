@@ -1,0 +1,158 @@
+From f1ecdcb3495e8717f2632cf8c9443879e68c0dd3 Mon Sep 17 00:00:00 2001
+From: Phil Staub <Phil.Staub@windriver.com>
+Date: Thu, 10 Mar 2011 11:39:05 -0800
+Subject: [PATCH 09/13] Cavium: Avoid atomic ops in manipulating active cores.
+
+Source: Cavium sdk_2.0.0_updates_p4.tgz
+
+Modify some routines to to avoid use of atomic functions. Take the
+core state lock instead.
+
+Signed-off-by: Phil Staub <Phil.Staub@windriver.com>
+Signed-off-by: ltian <le.tian@windriver.com>
+---
+ drivers/net/octeon/ethernet-rx.c |   65 +++++++++++++++++++++++++++++---------
+ 1 files changed, 50 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/octeon/ethernet-rx.c b/drivers/net/octeon/ethernet-rx.c
+index 6becdc4..31435ef 100644
+--- a/drivers/net/octeon/ethernet-rx.c
++++ b/drivers/net/octeon/ethernet-rx.c
+@@ -64,14 +64,24 @@
+ 
+ struct cvm_napi_wrapper {
+ 	struct napi_struct napi;
+-	atomic_t available;
++	int available;
+ } ____cacheline_aligned_in_smp;
+ 
+ static struct cvm_napi_wrapper cvm_oct_napi[NR_CPUS] __cacheline_aligned_in_smp;
+ 
+ struct cvm_oct_core_state {
+ 	int baseline_cores;
+-	atomic_t active_cores;
++	/*
++	 * We want to read this without having to acquire the lock,
++	 * make it volatile so we are likely to get a fairly current
++	 * value.
++	 */
++	volatile int active_cores;
++	/*
++	 * cvm_napi_wrapper.available and active_cores must be kept
++	 * consistent with this lock.
++	 */
++	spinlock_t lock;
+ } ____cacheline_aligned_in_smp;
+ 
+ static struct cvm_oct_core_state core_state __cacheline_aligned_in_smp;
+@@ -86,30 +96,42 @@ static void cvm_oct_enable_one_cpu(void)
+ {
+ 	int v;
+ 	int cpu;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&core_state.lock, flags);
+ 	/* ... if a CPU is available, Turn on NAPI polling for that CPU.  */
+ 	for_each_online_cpu(cpu) {
+-		if (atomic_sub_if_positive(1, &cvm_oct_napi[cpu].available) >= 0) {
+-			atomic_inc(&core_state.active_cores);
++		if (cvm_oct_napi[cpu].available > 0) {
++			cvm_oct_napi[cpu].available--;
++			core_state.active_cores++;
++			spin_unlock_irqrestore(&core_state.lock, flags);
+ 			v = smp_call_function_single(cpu, cvm_oct_enable_napi,
+ 						     &cvm_oct_napi[cpu].napi, 0);
+ 			if (v)
+ 				panic("Can't enable NAPI.");
+-			break;
++			goto out;
+ 		}
+ 	}
++	spin_unlock_irqrestore(&core_state.lock, flags);
++out:
++	return;
+ }
+ 
+ static void cvm_oct_no_more_work(struct napi_struct *napi)
+ {
+ 	struct cvm_napi_wrapper *nr = container_of(napi, struct cvm_napi_wrapper, napi);
+-	int current_active, napi_state;
++	int current_active;
++	unsigned long flags;
+ 
+-	current_active = atomic_dec_return(&core_state.active_cores);
+ 
+-	napi_state = atomic_inc_return(&nr->available);
++	spin_lock_irqsave(&core_state.lock, flags);
+ 
+-	BUG_ON(napi_state != 1);
++	core_state.active_cores--;
++	current_active = core_state.active_cores;
++	nr->available++;
++	BUG_ON(nr->available != 1);
++
++	spin_unlock_irqrestore(&core_state.lock, flags);
+ 
+ 	if (current_active == 0) {
+ 		/*
+@@ -130,17 +152,22 @@ static void cvm_oct_no_more_work(struct napi_struct *napi)
+ static irqreturn_t cvm_oct_do_interrupt(int cpl, void *dev_id)
+ {
+ 	int cpu = smp_processor_id();
++	unsigned long flags;
+ 
+ 	/* Disable the IRQ and start napi_poll. */
+ 	disable_irq_nosync(OCTEON_IRQ_WORKQ0 + pow_receive_group);
+ 
++	spin_lock_irqsave(&core_state.lock, flags);
++
+ 	/* ... and NAPI better not be running on this CPU.  */
+-	if (atomic_sub_if_positive(1, &cvm_oct_napi[cpu].available) < 0)
+-		BUG();
++	BUG_ON(cvm_oct_napi[cpu].available != 1);
++	cvm_oct_napi[cpu].available--;
+ 
+ 	/* There better be cores available...  */
+-	if (atomic_inc_return(&core_state.active_cores) > core_state.baseline_cores)
+-		BUG();
++	core_state.active_cores++;
++	BUG_ON(core_state.active_cores > core_state.baseline_cores);
++
++	spin_unlock_irqrestore(&core_state.lock, flags);
+ 
+ 	cvm_oct_enable_napi(&cvm_oct_napi[cpu].napi);
+ 
+@@ -329,7 +356,8 @@ static int cvm_oct_napi_poll(struct napi_struct *napi, int budget)
+ 			 */
+ 			union cvmx_pow_wq_int_cntx counts;
+ 			int backlog;
+-			int cores_in_use = atomic_read(&core_state.active_cores);
++			int cores_in_use = core_state.active_cores;
++
+ 			counts.u64 = cvmx_read_csr(CVMX_POW_WQ_INT_CNTX(pow_receive_group));
+ 			backlog = counts.s.iq_cnt + counts.s.ds_cnt;
+ 			if (backlog > budget * cores_in_use &&
+@@ -644,12 +672,19 @@ void cvm_oct_rx_initialize(void)
+ 		core_state.baseline_cores = num_online_cpus();
+ 
+ 	for_each_possible_cpu(i) {
+-		atomic_set(&cvm_oct_napi[i].available, 1);
++		cvm_oct_napi[i].available = 1;
+ 		netif_napi_add(dev_for_napi, &cvm_oct_napi[i].napi,
+ 			       cvm_oct_napi_poll, rx_napi_weight);
+ 		napi_enable(&cvm_oct_napi[i].napi);
+ 	}
+ 	
++	/*
++	 * Before interrupts are enabled, no RX processing will occur,
++	 * so we can initialize all those things out side of the
++	 * lock.
++	 */
++	spin_lock_init(&core_state.lock);
++
+ 	/* Register an IRQ hander for to receive POW interrupts */
+ #ifdef  CONFIG_PREEMPT_HARDIRQS
+ 	irq_flags = IRQF_NODELAY;
+-- 
+1.7.0.4
+
