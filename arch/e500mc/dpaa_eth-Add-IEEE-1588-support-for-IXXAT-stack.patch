@@ -1,0 +1,1281 @@
+From acb15574deee09683788751c2c5b1d0fb8bc5e79 Mon Sep 17 00:00:00 2001
+From: Mingkai Hu <Mingkai.hu@freescale.com>
+Date: Tue, 10 May 2011 10:06:12 +0800
+Subject: [PATCH 121/233] dpaa_eth: Add IEEE 1588 support for IXXAT stack
+
+Extracted from vendor drop QorIQ-DPAA-SDK-V1-20110609-systembuilder.iso
+0151-dpaa_eth-Add-IEEE-1588-support-for-IXXAT-stack.patch
+
+The P4080 silicon supports IEEE 1588 function in all Gbps modes and all
+full-duplex 10/100 modes except SGMII and in 10GEC. The driver supports
+RGMII and SGMII IEEE 1588 function only.
+
+Signed-off-by: Mingkai Hu <Mingkai.hu@freescale.com>
+---
+ drivers/net/dpa/Makefile          |    1 +
+ drivers/net/dpa/dpaa_1588.c       |  635 +++++++++++++++++++++++++++++++++++++
+ drivers/net/dpa/dpaa_1588.h       |  158 +++++++++
+ drivers/net/dpa/dpaa_eth-common.h |    4 +-
+ drivers/net/dpa/dpaa_eth.c        |   81 +++++-
+ drivers/net/dpa/dpaa_eth.h        |    1 +
+ drivers/net/dpa/mac-api.c         |  137 ++++++++
+ drivers/net/dpa/mac.h             |    8 +
+ drivers/net/dpa/offline_port.c    |    2 +-
+ drivers/staging/fsl_qbman/Kconfig |    5 +
+ 10 files changed, 1022 insertions(+), 10 deletions(-)
+ create mode 100644 drivers/net/dpa/dpaa_1588.c
+ create mode 100644 drivers/net/dpa/dpaa_1588.h
+
+diff --git a/drivers/net/dpa/Makefile b/drivers/net/dpa/Makefile
+index e5d7c42..22a0a03 100644
+--- a/drivers/net/dpa/Makefile
++++ b/drivers/net/dpa/Makefile
+@@ -10,6 +10,7 @@ EXTRA_CFLAGS += -I$(NET_DPA)
+ 
+ #Netcomm SW tree
+ obj-$(CONFIG_FSL_FMAN) += NetCommSw/
++obj-$(CONFIG_FSL_DPA_1588) += dpaa_1588.o
+ obj-$(CONFIG_DPA) += fsl-mac.o fsl-dpa.o
+ obj-$(CONFIG_DPA_OFFLINE_PORTS) += fsl-oh.o
+ 
+diff --git a/drivers/net/dpa/dpaa_1588.c b/drivers/net/dpa/dpaa_1588.c
+new file mode 100644
+index 0000000..35dfbb5
+--- /dev/null
++++ b/drivers/net/dpa/dpaa_1588.c
+@@ -0,0 +1,635 @@
++/*
++ * drivers/net/dpa/dpaa_1588.c
++ *
++ * Copyright (C) 2011 Freescale Semiconductor, Inc.
++ * Copyright (C) 2009 IXXAT Automation, GmbH
++ *
++ * DPAA Ethernet Driver -- IEEE 1588 interface functionality
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ */
++#include <linux/io.h>
++#include <linux/device.h>
++#include <linux/fs.h>
++#include <linux/vmalloc.h>
++#include <linux/spinlock.h>
++#include <linux/ip.h>
++#include <linux/udp.h>
++#include <asm/div64.h>
++#include "dpaa_eth.h"
++#include "dpaa_1588.h"
++
++static DECLARE_WAIT_QUEUE_HEAD(ptp_rx_ts_wait);
++static DECLARE_WAIT_QUEUE_HEAD(ptp_tx_ts_wait);
++#define PTP_GET_RX_TIMEOUT      (HZ/10)
++#define PTP_GET_TX_TIMEOUT      (HZ/10)
++
++static int dpa_ptp_init_circ(struct circ_buf *ptp_buf, int size)
++{
++	ptp_buf->buf = vmalloc(sizeof(struct dpa_ptp_data_t) * size);
++
++	if (!ptp_buf->buf)
++		return 1;
++	ptp_buf->head = 0;
++	ptp_buf->tail = 0;
++
++	return 0;
++}
++
++static void dpa_ptp_reset_circ(struct circ_buf *ptp_buf)
++{
++	ptp_buf->head = 0;
++	ptp_buf->tail = 0;
++}
++
++static int dpa_ptp_insert(struct circ_buf *ptp_buf,
++			  struct dpa_ptp_data_t *data,
++			  struct ptp_tsu *tsu,
++			  int size)
++{
++	struct dpa_ptp_data_t *tmp;
++	unsigned long flags;
++	int head, tail;
++
++	spin_lock_irqsave(&tsu->ptp_lock, flags);
++
++	head = ptp_buf->head;
++	tail = ptp_buf->tail;
++
++	if (CIRC_SPACE(head, tail, size) <= 0) {
++		spin_unlock_irqrestore(&tsu->ptp_lock, flags);
++		return 1;
++	}
++
++	tmp = (struct dpa_ptp_data_t *)(ptp_buf->buf) + head;
++	tmp->key = data->key;
++	memcpy(tmp->spid, data->spid, 10);
++	tmp->ts_time.high = data->ts_time.high;
++	tmp->ts_time.low = data->ts_time.low;
++
++	ptp_buf->head = (head + 1) & (size - 1);
++
++	spin_unlock_irqrestore(&tsu->ptp_lock, flags);
++
++	return 0;
++}
++
++static int dpa_ptp_find_and_remove(struct circ_buf *ptp_buf,
++				   struct dpa_ptp_data_t *data,
++				   struct ptp_tsu *tsu,
++				   int size)
++{
++	int head, tail, idx;
++	unsigned long flags;
++	struct dpa_ptp_data_t *tmp;
++
++	spin_lock_irqsave(&tsu->ptp_lock, flags);
++
++	head = ptp_buf->head;
++	tail = idx = ptp_buf->tail;
++
++	if (CIRC_CNT_TO_END(head, tail, size) == 0) {
++		spin_unlock_irqrestore(&tsu->ptp_lock, flags);
++		return 1;
++	}
++
++	while (idx != head) {
++		tmp = (struct dpa_ptp_data_t *)(ptp_buf->buf) + idx;
++		if (tmp->key == data->key &&
++				!memcmp(tmp->spid, data->spid, 10))
++			break;
++		idx = (idx + 1) & (size - 1);
++	}
++
++	if (idx == head) {
++		ptp_buf->tail = head;
++		spin_unlock_irqrestore(&tsu->ptp_lock, flags);
++		return 1;
++	}
++
++	data->ts_time.high = tmp->ts_time.high;
++	data->ts_time.low = tmp->ts_time.low;
++
++	ptp_buf->tail = (idx + 1) & (size - 1);
++
++	spin_unlock_irqrestore(&tsu->ptp_lock, flags);
++
++	return 0;
++}
++
++int dpa_ptp_do_txstamp(struct sk_buff *skb)
++{
++	struct iphdr *iph;
++	struct udphdr *udph;
++
++	if (skb->len > 44) {
++		iph = ip_hdr(skb);
++		if (iph == NULL || iph->protocol != IPPROTO_UDP)
++			return 0;
++
++		udph = udp_hdr(skb);
++		if (udph != NULL && ntohs(udph->dest) == 319)
++			return 1;
++	}
++
++	return 0;
++}
++
++static int dpa_ptp_get_time(const struct qm_fd *fd, u32 *high, u32 *low)
++{
++	dma_addr_t addr = qm_fd_addr(fd);
++	u8 *ts_addr = (u8 *)phys_to_virt(addr);
++	u32 sec, nsec, mod;
++	u64 tmp;
++
++	ts_addr += DPA_PTP_TIMESTAMP_OFFSET;
++	sec = *((u32 *)ts_addr);
++	nsec = *(((u32 *)ts_addr) + 1);
++	tmp = ((u64)sec << 32 | nsec) * DPA_PTP_NOMINAL_FREQ_PERIOD;
++
++	mod = do_div(tmp, NANOSEC_PER_SECOND);
++	*high = (u32)tmp;
++	*low = mod;
++
++	return 0;
++}
++
++void dpa_ptp_store_txstamp(struct net_device *dev, struct sk_buff *skb,
++			   const struct qm_fd *fd)
++{
++	struct dpa_priv_s *priv = netdev_priv(dev);
++	struct ptp_tsu *tsu = priv->tsu;
++	int msg_type, seq_id, control;
++	struct dpa_ptp_data_t tmp_tx_time;
++	unsigned char *sp_id;
++	unsigned short portnum;
++	u32 high, low;
++
++	seq_id = *((u16 *)(skb->data + PTP_SEQ_ID_OFFS));
++	control = *((u8 *)(skb->data + PTP_CTRL_OFFS));
++	sp_id = skb->data + PTP_SPORT_ID_OFFS;
++	portnum = ntohs(*((unsigned short *)(sp_id + 8)));
++
++	tmp_tx_time.key = ntohs(seq_id);
++	memcpy(tmp_tx_time.spid, sp_id, 8);
++	memcpy(tmp_tx_time.spid + 8, (unsigned char *)&portnum, 2);
++	dpa_ptp_get_time(fd, &high, &low);
++	tmp_tx_time.ts_time.high = (u64)high;
++	tmp_tx_time.ts_time.low = low;
++
++	switch (control) {
++	case PTP_MSG_SYNC:
++		dpa_ptp_insert(&(tsu->tx_time_sync), &tmp_tx_time, tsu,
++				tsu->tx_time_queue_size);
++		break;
++
++	case PTP_MSG_DEL_REQ:
++		dpa_ptp_insert(&(tsu->tx_time_del_req), &tmp_tx_time, tsu,
++				tsu->tx_time_queue_size);
++		break;
++
++	case PTP_MSG_ALL_OTHER:
++		msg_type = (*((u8 *)(skb->data + PTP_MSG_TYPE_OFFS))) & 0x0F;
++		switch (msg_type) {
++		case PTP_MSG_P_DEL_REQ:
++			dpa_ptp_insert(&(tsu->tx_time_pdel_req), &tmp_tx_time,
++					tsu, tsu->tx_time_queue_size);
++			break;
++		case PTP_MSG_P_DEL_RESP:
++			dpa_ptp_insert(&(tsu->tx_time_pdel_resp), &tmp_tx_time,
++					tsu, tsu->tx_time_queue_size);
++			break;
++		default:
++			break;
++		}
++		break;
++	default:
++		break;
++	}
++
++	wake_up_interruptible(&ptp_tx_ts_wait);
++}
++
++void dpa_ptp_store_rxstamp(struct net_device *dev, struct sk_buff *skb,
++			   const struct qm_fd *fd)
++{
++	struct dpa_priv_s *priv = netdev_priv(dev);
++	struct ptp_tsu *tsu = priv->tsu;
++	int msg_type, seq_id, control;
++	struct dpa_ptp_data_t tmp_rx_time;
++	struct iphdr *iph;
++	struct udphdr *udph;
++	unsigned char *sp_id;
++	unsigned short portnum;
++	u32 high, low;
++
++	/* Check for UDP, and Check if port is 319 for PTP Event */
++	iph = (struct iphdr *)(skb->data + PTP_IP_OFFS);
++	if (iph->protocol != IPPROTO_UDP)
++		return;
++
++	udph = (struct udphdr *)(skb->data + PTP_UDP_OFFS);
++	if (ntohs(udph->dest) != 319)
++		return;
++
++	seq_id = *((u16 *)(skb->data + PTP_SEQ_ID_OFFS));
++	control = *((u8 *)(skb->data + PTP_CTRL_OFFS));
++	sp_id = skb->data + PTP_SPORT_ID_OFFS;
++	portnum = ntohs(*((unsigned short *)(sp_id + 8)));
++
++	tmp_rx_time.key = ntohs(seq_id);
++	memcpy(tmp_rx_time.spid, sp_id, 8);
++	memcpy(tmp_rx_time.spid + 8, (unsigned char *)&portnum, 2);
++	dpa_ptp_get_time(fd, &high, &low);
++	tmp_rx_time.ts_time.high = (u64)high;
++	tmp_rx_time.ts_time.low = low;
++
++	switch (control) {
++
++	case PTP_MSG_SYNC:
++		dpa_ptp_insert(&(tsu->rx_time_sync), &tmp_rx_time, tsu,
++				tsu->rx_time_queue_size);
++		break;
++
++	case PTP_MSG_DEL_REQ:
++		dpa_ptp_insert(&(tsu->rx_time_del_req), &tmp_rx_time, tsu,
++				tsu->rx_time_queue_size);
++		break;
++
++	case PTP_MSG_ALL_OTHER:
++		msg_type = (*((u8 *)(skb->data + PTP_MSG_TYPE_OFFS))) & 0x0F;
++		switch (msg_type) {
++		case PTP_MSG_P_DEL_REQ:
++			dpa_ptp_insert(&(tsu->rx_time_pdel_req), &tmp_rx_time,
++					tsu, tsu->rx_time_queue_size);
++			break;
++		case PTP_MSG_P_DEL_RESP:
++			dpa_ptp_insert(&(tsu->rx_time_pdel_resp), &tmp_rx_time,
++					tsu, tsu->rx_time_queue_size);
++			break;
++		default:
++			break;
++		}
++		break;
++	default:
++		break;
++	}
++
++	wake_up_interruptible(&ptp_rx_ts_wait);
++}
++
++static uint8_t dpa_get_tx_timestamp(struct ptp_tsu *ptp_tsu,
++				    struct ptp_ts_data *pts,
++				    struct ptp_time *tx_time)
++{
++	struct ptp_tsu *tsu = ptp_tsu;
++	struct dpa_ptp_data_t tmp;
++	int flag;
++	u8 mode;
++
++	tmp.key = pts->seq_id;
++	memcpy(tmp.spid, pts->spid, 10);
++
++	mode = pts->message_type;
++	switch (mode) {
++	case PTP_MSG_SYNC:
++		flag = dpa_ptp_find_and_remove(&(tsu->tx_time_sync), &tmp,
++				tsu, tsu->tx_time_queue_size);
++		break;
++	case PTP_MSG_DEL_REQ:
++		flag = dpa_ptp_find_and_remove(&(tsu->tx_time_del_req), &tmp,
++				tsu, tsu->tx_time_queue_size);
++		break;
++
++	case PTP_MSG_P_DEL_REQ:
++		flag = dpa_ptp_find_and_remove(&(tsu->tx_time_pdel_req), &tmp,
++				tsu, tsu->tx_time_queue_size);
++		break;
++	case PTP_MSG_P_DEL_RESP:
++		flag = dpa_ptp_find_and_remove(&(tsu->tx_time_pdel_resp), &tmp,
++				tsu, tsu->tx_time_queue_size);
++		break;
++
++	default:
++		flag = 1;
++		printk(KERN_ERR "ERROR\n");
++		break;
++	}
++
++	if (!flag) {
++		tx_time->high = tmp.ts_time.high;
++		tx_time->low = tmp.ts_time.low;
++		return 0;
++	} else {
++		wait_event_interruptible_timeout(ptp_tx_ts_wait, 0,
++					PTP_GET_TX_TIMEOUT);
++
++		switch (mode) {
++		case PTP_MSG_SYNC:
++			flag = dpa_ptp_find_and_remove(&(tsu->tx_time_sync),
++					&tmp, tsu, tsu->tx_time_queue_size);
++			break;
++		case PTP_MSG_DEL_REQ:
++			flag = dpa_ptp_find_and_remove(&(tsu->tx_time_del_req),
++					&tmp, tsu, tsu->tx_time_queue_size);
++			break;
++		case PTP_MSG_P_DEL_REQ:
++			flag = dpa_ptp_find_and_remove(
++					&(tsu->tx_time_pdel_req), &tmp, tsu,
++					tsu->tx_time_queue_size);
++			break;
++		case PTP_MSG_P_DEL_RESP:
++			flag = dpa_ptp_find_and_remove(
++					&(tsu->tx_time_pdel_resp), &tmp, tsu,
++					tsu->tx_time_queue_size);
++			break;
++		}
++
++		if (flag == 0) {
++			tx_time->high = tmp.ts_time.high;
++			tx_time->low = tmp.ts_time.low;
++			return 0;
++		}
++
++		return -1;
++	}
++}
++
++static uint8_t dpa_get_rx_timestamp(struct ptp_tsu *ptp_tsu,
++				    struct ptp_ts_data *pts,
++				    struct ptp_time *rx_time)
++{
++	struct ptp_tsu *tsu = ptp_tsu;
++	struct dpa_ptp_data_t tmp;
++	int flag;
++	u8 mode;
++
++	tmp.key = pts->seq_id;
++	memcpy(tmp.spid, pts->spid, 10);
++
++	mode = pts->message_type;
++	switch (mode) {
++	case PTP_MSG_SYNC:
++		flag = dpa_ptp_find_and_remove(&(tsu->rx_time_sync), &tmp,
++				tsu, tsu->rx_time_queue_size);
++		break;
++	case PTP_MSG_DEL_REQ:
++		flag = dpa_ptp_find_and_remove(&(tsu->rx_time_del_req), &tmp,
++				tsu, tsu->rx_time_queue_size);
++		break;
++
++	case PTP_MSG_P_DEL_REQ:
++		flag = dpa_ptp_find_and_remove(&(tsu->rx_time_pdel_req), &tmp,
++				tsu, tsu->rx_time_queue_size);
++		break;
++	case PTP_MSG_P_DEL_RESP:
++		flag = dpa_ptp_find_and_remove(&(tsu->rx_time_pdel_resp), &tmp,
++				tsu, tsu->rx_time_queue_size);
++		break;
++
++	default:
++		flag = 1;
++		printk(KERN_ERR "ERROR\n");
++		break;
++	}
++
++	if (!flag) {
++		rx_time->high = tmp.ts_time.high;
++		rx_time->low = tmp.ts_time.low;
++		return 0;
++	} else {
++		wait_event_interruptible_timeout(ptp_rx_ts_wait, 0,
++					PTP_GET_RX_TIMEOUT);
++
++		switch (mode) {
++		case PTP_MSG_SYNC:
++			flag = dpa_ptp_find_and_remove(&(tsu->rx_time_sync),
++				&tmp, tsu, tsu->rx_time_queue_size);
++			break;
++		case PTP_MSG_DEL_REQ:
++			flag = dpa_ptp_find_and_remove(
++				&(tsu->rx_time_del_req), &tmp,
++				tsu, tsu->rx_time_queue_size);
++			break;
++		case PTP_MSG_P_DEL_REQ:
++			flag = dpa_ptp_find_and_remove(
++				&(tsu->rx_time_pdel_req), &tmp,
++				tsu, tsu->rx_time_queue_size);
++			break;
++		case PTP_MSG_P_DEL_RESP:
++			flag = dpa_ptp_find_and_remove(
++				&(tsu->rx_time_pdel_resp), &tmp,
++				tsu, tsu->rx_time_queue_size);
++			break;
++		}
++
++		if (flag == 0) {
++			rx_time->high = tmp.ts_time.high;
++			rx_time->low = tmp.ts_time.low;
++			return 0;
++		}
++
++		return -1;
++	}
++}
++
++static void dpa_flush_timestamp(struct ptp_tsu *tsu)
++{
++	dpa_ptp_reset_circ(&tsu->rx_time_sync);
++	dpa_ptp_reset_circ(&tsu->tx_time_sync);
++
++	dpa_ptp_reset_circ(&tsu->rx_time_del_req);
++	dpa_ptp_reset_circ(&tsu->tx_time_del_req);
++
++	dpa_ptp_reset_circ(&tsu->rx_time_pdel_req);
++	dpa_ptp_reset_circ(&tsu->tx_time_pdel_req);
++
++	dpa_ptp_reset_circ(&tsu->rx_time_pdel_resp);
++	dpa_ptp_reset_circ(&tsu->tx_time_pdel_resp);
++}
++
++static void dpa_get_curr_cnt(struct ptp_tsu *tsu, struct ptp_time *curr_time)
++{
++	struct mac_device *mac_dev = tsu->dpa_priv->mac_dev;
++	u64 tmp;
++	u32 mod;
++
++	if (mac_dev->fm_rtc_get_cnt)
++		mac_dev->fm_rtc_get_cnt(tsu->dpa_priv->net_dev, &tmp);
++
++	mod = do_div(tmp, NANOSEC_PER_SECOND);
++	curr_time->high = (u32)tmp;
++	curr_time->low = mod;
++}
++
++static void dpa_set_1588cnt(struct ptp_tsu *tsu, struct ptp_time *cnt_time)
++{
++	struct mac_device *mac_dev = tsu->dpa_priv->mac_dev;
++	u64 tmp;
++
++	tmp = (u64)cnt_time->high * NANOSEC_PER_SECOND + (u64)cnt_time->low;
++
++	if (mac_dev->fm_rtc_set_cnt)
++		mac_dev->fm_rtc_set_cnt(tsu->dpa_priv->net_dev, tmp);
++}
++
++static void dpa_get_drift(struct ptp_tsu *tsu, struct ptp_get_comp *comp)
++{
++	struct mac_device *mac_dev = tsu->dpa_priv->mac_dev;
++	u32 drift;
++
++	if (mac_dev->fm_rtc_get_drift)
++		mac_dev->fm_rtc_get_drift(tsu->dpa_priv->net_dev, &drift);
++
++	comp->dw_origcomp = drift;
++}
++
++static void dpa_set_drift(struct ptp_tsu *tsu, struct ptp_set_comp *comp)
++{
++	struct mac_device *mac_dev = tsu->dpa_priv->mac_dev;
++	u32 drift = comp->freq_compensation;
++
++	if (mac_dev->fm_rtc_set_drift)
++		mac_dev->fm_rtc_set_drift(tsu->dpa_priv->net_dev, drift);
++}
++
++static int ptp_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
++		     unsigned long arg)
++{
++	struct net_device *dev = __dev_get_by_name(&init_net, "eth0");
++	struct dpa_priv_s *priv = netdev_priv(dev);
++	struct ptp_tsu *tsu = priv->tsu;
++	struct ptp_ts_data *p_ts;
++	struct ptp_time rx_time, tx_time, curr_time;
++	struct ptp_time *cnt;
++	struct ptp_set_comp *set_comp;
++	struct ptp_get_comp *get_comp;
++	int retval = 0;
++
++	switch (cmd) {
++	case PTP_GET_RX_TIMESTAMP:
++		p_ts = (struct ptp_ts_data *)arg;
++		retval = dpa_get_rx_timestamp(tsu, p_ts, &rx_time);
++		if (retval == 0)
++			copy_to_user((void __user *)(&(p_ts->ts)), &rx_time,
++					sizeof(rx_time));
++		break;
++	case PTP_GET_TX_TIMESTAMP:
++		p_ts = (struct ptp_ts_data *)arg;
++		dpa_get_tx_timestamp(tsu, p_ts, &tx_time);
++		copy_to_user((void __user *)(&(p_ts->ts)), &tx_time,
++				sizeof(tx_time));
++		break;
++	case PTP_GET_CURRENT_TIME:
++		dpa_get_curr_cnt(tsu, &curr_time);
++		copy_to_user((void __user *)arg, &curr_time, sizeof(curr_time));
++		break;
++	case PTP_SET_RTC_TIME:
++		cnt = (struct ptp_time *)arg;
++		dpa_set_1588cnt(tsu, cnt);
++		break;
++	case PTP_FLUSH_TIMESTAMP:
++		dpa_flush_timestamp(tsu);
++		break;
++	case PTP_SET_COMPENSATION:
++		set_comp = (struct ptp_set_comp *)arg;
++		dpa_set_drift(tsu, set_comp);
++		break;
++	case PTP_GET_ORIG_COMP:
++		get_comp = (struct ptp_get_comp *)arg;
++		dpa_get_drift(tsu, get_comp);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return retval;
++}
++
++static const struct file_operations ptp_fops = {
++	.owner	= THIS_MODULE,
++	.ioctl	= ptp_ioctl,
++};
++
++int dpa_ptp_init(struct dpa_priv_s *priv)
++{
++	struct ptp_tsu *tsu;
++
++	if (register_chrdev(PTP_MAJOR, "ptp", &ptp_fops)) {
++		printk(KERN_ERR "Unable to register PTP device as char\n");
++		return 1;
++	} else {
++		printk(KERN_INFO "Register PTP device as char /dev/ptp\n");
++	}
++
++	/* Allocate memory for PTP structure */
++	tsu = kzalloc(sizeof(struct ptp_tsu), GFP_KERNEL);
++	if (!tsu)
++		return -ENOMEM;
++
++	memset(tsu, 0, sizeof(*tsu));
++	tsu->valid = TRUE;
++	tsu->dpa_priv = priv;
++	tsu->rx_time_queue_size = DEFAULT_RX_QUEUE_SIZE;
++	tsu->tx_time_queue_size = DEFAULT_TX_QUEUE_SIZE;
++
++	dpa_ptp_init_circ(&(tsu->rx_time_sync), tsu->rx_time_queue_size);
++	dpa_ptp_init_circ(&(tsu->rx_time_del_req), tsu->rx_time_queue_size);
++	dpa_ptp_init_circ(&(tsu->rx_time_pdel_req), tsu->rx_time_queue_size);
++	dpa_ptp_init_circ(&(tsu->rx_time_pdel_resp), tsu->rx_time_queue_size);
++	dpa_ptp_init_circ(&(tsu->tx_time_sync), tsu->tx_time_queue_size);
++	dpa_ptp_init_circ(&(tsu->tx_time_del_req), tsu->tx_time_queue_size);
++	dpa_ptp_init_circ(&(tsu->tx_time_pdel_req), tsu->tx_time_queue_size);
++	dpa_ptp_init_circ(&(tsu->tx_time_pdel_resp), tsu->tx_time_queue_size);
++
++	spin_lock_init(&tsu->ptp_lock);
++
++	priv->tsu = tsu;
++
++	return 0;
++}
++EXPORT_SYMBOL(dpa_ptp_init);
++
++void dpa_ptp_cleanup(struct dpa_priv_s *priv)
++{
++	struct ptp_tsu *tsu = priv->tsu;
++
++	tsu->valid = FALSE;
++	vfree(tsu->rx_time_sync.buf);
++	vfree(tsu->rx_time_del_req.buf);
++	vfree(tsu->rx_time_pdel_req.buf);
++	vfree(tsu->rx_time_pdel_resp.buf);
++	vfree(tsu->tx_time_sync.buf);
++	vfree(tsu->tx_time_del_req.buf);
++	vfree(tsu->tx_time_pdel_req.buf);
++	vfree(tsu->tx_time_pdel_resp.buf);
++	kfree(tsu);
++
++	/* Unregister the PTP device */
++	unregister_chrdev(PTP_MAJOR, "ptp");
++}
++EXPORT_SYMBOL(dpa_ptp_cleanup);
++
++static int __init __cold dpa_ptp_load(void)
++{
++	return 0;
++}
++module_init(dpa_ptp_load);
++
++static void __exit __cold dpa_ptp_unload(void)
++{
++}
++module_exit(dpa_ptp_unload);
+diff --git a/drivers/net/dpa/dpaa_1588.h b/drivers/net/dpa/dpaa_1588.h
+new file mode 100644
+index 0000000..a88e3e7
+--- /dev/null
++++ b/drivers/net/dpa/dpaa_1588.h
+@@ -0,0 +1,158 @@
++/*
++ * drivers/net/dpa/dpaa_1588.h
++ *
++ * Copyright (C) 2011 Freescale Semiconductor, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ */
++#ifndef __DPAA_1588_H__
++#define __DPAA_1588_H__
++
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/circ_buf.h>
++#include <linux/fsl_qman.h>
++
++/* The temporary major number used by PTP driver */
++#define PTP_MAJOR			232
++
++#define DEFAULT_RX_QUEUE_SIZE		2048
++#define DEFAULT_TX_QUEUE_SIZE		16
++
++#define PTP_MSG_SYNC			0x0
++#define PTP_MSG_DEL_REQ			0x1
++#define PTP_MSG_P_DEL_REQ		0x2
++#define PTP_MSG_P_DEL_RESP		0x3
++#define PTP_MSG_DEL_RESP		0x4
++#define PTP_MSG_ALL_OTHER		0x5
++
++/* IOCTL macro */
++#define PTP_GET_TX_TIMESTAMP		0x1
++#define PTP_GET_RX_TIMESTAMP		0x9
++#define PTP_SET_RTC_TIME		0x3
++#define PTP_SET_COMPENSATION		0x4
++#define PTP_GET_CURRENT_TIME		0x5
++#define PTP_FLUSH_TIMESTAMP		0x6
++#define PTP_ADJ_ADDEND			0x7
++#define PTP_GET_ORIG_COMP		0x8
++#define PTP_GET_ADDEND			0xB
++#define PTP_GET_RX_TIMESTAMP_PDELAY_REQ		0xC
++#define PTP_GET_RX_TIMESTAMP_PDELAY_RESP	0xD
++
++/* byte offset of data in the PTP V2 headers */
++#define k_OFFS_MSG_TYPE			0
++#define k_OFFS_VER_PTP			1
++#define k_OFFS_MSG_LEN			2
++#define k_OFFS_DOM_NMB			4
++#define k_OFFS_FLAGS			6
++#define k_OFFS_CORFIELD			8
++#define k_OFFS_SRCPRTID			20
++#define k_OFFS_SEQ_ID			30
++#define k_OFFS_CTRL			32
++#define k_OFFS_LOGMEAN			33
++
++#define PTP_IP_OFFS			14
++#define PTP_UDP_OFFS			34
++#define PTP_HEADER_OFFS			42
++#define PTP_MSG_TYPE_OFFS		(PTP_HEADER_OFFS + k_OFFS_MSG_TYPE)
++#define PTP_SPORT_ID_OFFS		(PTP_HEADER_OFFS + k_OFFS_SRCPRTID)
++#define PTP_SEQ_ID_OFFS			(PTP_HEADER_OFFS + k_OFFS_SEQ_ID)
++#define PTP_CTRL_OFFS			(PTP_HEADER_OFFS + k_OFFS_CTRL)
++
++#define DPA_PTP_TIMESTAMP_OFFSET	0x30
++#define DPA_PTP_NOMINAL_FREQ_PERIOD	0xa /* 10ns -> 100M */
++#define NANOSEC_PER_SECOND		1000000000
++
++/* PTP standard time representation structure */
++struct ptp_time{
++	u64 high;
++	u32 low;
++};
++
++/* Structure for PTP Time Stamp */
++struct dpa_ptp_data_t {
++	u8		spid[10];
++	int		key;
++	struct ptp_time	ts_time;
++};
++
++/* Interface for PTP driver command GET_TX_TIME */
++struct ptp_ts_data {
++	/* PTP version */
++	u8 version;
++	/* PTP source port ID */
++	u8 spid[10];
++	/* PTP sequence ID */
++	u16 seq_id;
++	/* PTP message type */
++	u8 message_type;
++	/* PTP timestamp */
++	struct ptp_time ts;
++} __attribute__((packed));
++
++/* Interface for PTP driver command SET_RTC_TIME/GET_CURRENT_TIME */
++struct ptp_rtc_time {
++	struct ptp_time rtc_time;
++};
++
++/* Interface for PTP driver command SET_COMPENSATION */
++struct ptp_set_comp {
++	u32 drift;
++	bool o_ops;
++	u32 freq_compensation;
++};
++
++/* Interface for PTP driver command GET_ORIG_COMP */
++struct ptp_get_comp {
++	/* the initial compensation value */
++	u32 dw_origcomp;
++	/* the minimum compensation value */
++	u32 dw_mincomp;
++	/*the max compensation value*/
++	u32 dw_maxcomp;
++	/*the min drift applying min compensation value in ppm*/
++	u32 dw_mindrift;
++	/*the max drift applying max compensation value in ppm*/
++	u32 dw_maxdrift;
++};
++
++/* PTP TSU control structure */
++struct ptp_tsu {
++	struct dpa_priv_s *dpa_priv;
++	bool valid;
++	struct circ_buf rx_time_sync;
++	struct circ_buf rx_time_del_req;
++	struct circ_buf rx_time_pdel_req;
++	struct circ_buf rx_time_pdel_resp;
++	struct circ_buf tx_time_sync;
++	struct circ_buf tx_time_del_req;
++	struct circ_buf tx_time_pdel_req;
++	struct circ_buf tx_time_pdel_resp;
++	spinlock_t ptp_lock;
++
++	u32 rx_time_queue_size;
++	u32 tx_time_queue_size;
++};
++
++extern int dpa_ptp_init(struct dpa_priv_s *priv);
++extern void dpa_ptp_cleanup(struct dpa_priv_s *priv);
++extern int dpa_ptp_do_txstamp(struct sk_buff *skb);
++extern void dpa_ptp_store_txstamp(struct net_device *dev, struct sk_buff *skb,
++				  const struct qm_fd *fd);
++extern void dpa_ptp_store_rxstamp(struct net_device *dev, struct sk_buff *skb,
++				  const struct qm_fd *fd);
++
++#endif
+diff --git a/drivers/net/dpa/dpaa_eth-common.h b/drivers/net/dpa/dpaa_eth-common.h
+index 48e2c35..3cba416 100644
+--- a/drivers/net/dpa/dpaa_eth-common.h
++++ b/drivers/net/dpa/dpaa_eth-common.h
+@@ -139,14 +139,16 @@ enum {RX, TX};
+ #define DPA_PRIV_DATA_SIZE 16
+ #define DPA_PARSE_RESULTS_SIZE sizeof(t_FmPrsResult)
+ #define DPA_HASH_RESULTS_SIZE 16
++#define DPA_TIME_STAMP_SIZE 8
+ 
+-#define dpaa_eth_init_port(type, port, param, errq_id, defq_id) \
++#define dpaa_eth_init_port(type, port, param, errq_id, defq_id, has_timer) \
+ { \
+ 	param.errq = errq_id; \
+ 	param.defq = defq_id; \
+ 	param.priv_data_size = DPA_PRIV_DATA_SIZE; \
+ 	param.parse_results = true; \
+ 	param.hash_results = true; \
++	param.time_stamp = has_timer; \
+ 	fm_set_##type##_port_params(port, &param); \
+ }
+ 
+diff --git a/drivers/net/dpa/dpaa_eth.c b/drivers/net/dpa/dpaa_eth.c
+index 4bbf9a0..dd23b99 100644
+--- a/drivers/net/dpa/dpaa_eth.c
++++ b/drivers/net/dpa/dpaa_eth.c
+@@ -59,6 +59,7 @@
+ 
+ #include "mac.h"
+ #include "dpaa_eth.h"
++#include "dpaa_1588.h"
+ 
+ #define ARRAY2_SIZE(arr)	(ARRAY_SIZE(arr) * ARRAY_SIZE((arr)[0]))
+ 
+@@ -154,7 +155,7 @@ struct dpa_fq {
+ #endif
+ 
+ #define DPA_BP_HEAD (DPA_PRIV_DATA_SIZE + DPA_PARSE_RESULTS_SIZE + \
+-			DPA_HASH_RESULTS_SIZE)
++			DPA_HASH_RESULTS_SIZE + DPA_TIME_STAMP_SIZE)
+ #define DPA_BP_SIZE(s)	(DPA_BP_HEAD + (s) + NET_IP_ALIGN)
+ 
+ #define DPAA_ETH_MAX_PAD (L1_CACHE_BYTES * 8)
+@@ -848,6 +849,11 @@ static void __hot _dpa_rx(struct net_device *net_dev,
+ 
+ 	prefetch(skb_shinfo(skb));
+ 
++#ifdef CONFIG_FSL_DPA_1588
++	if (priv->tsu && priv->tsu->valid)
++		dpa_ptp_store_rxstamp(net_dev, skb, fd);
++#endif
++
+ 	skb->protocol = eth_type_trans(skb, net_dev);
+ 
+ 	percpu_priv->stats.rx_packets++;
+@@ -968,6 +974,11 @@ static void __hot _dpa_tx(struct net_device		*net_dev,
+ 	skbh = (struct sk_buff **)phys_to_virt(addr);
+ 	skb = *skbh;
+ 
++#ifdef CONFIG_FSL_DPA_1588
++	if (priv->tsu && priv->tsu->valid && dpa_ptp_do_txstamp(skb))
++		dpa_ptp_store_txstamp(net_dev, skb, fd);
++#endif
++
+ 	dma_unmap_single(bp->dev, addr, bp->size, DMA_TO_DEVICE);
+ 
+ 	dev_kfree_skb(skb);
+@@ -1203,7 +1214,8 @@ static int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+ 	queue_mapping = skb_get_queue_mapping(skb);
+ 
+ 	needed_headroom = (DPA_PRIV_DATA_SIZE + DPA_PARSE_RESULTS_SIZE +
+-				NET_IP_ALIGN + sizeof(skbh));
++				NET_IP_ALIGN + sizeof(skbh) +
++				DPA_TIME_STAMP_SIZE);
+ 
+ 	if (headroom < needed_headroom) {
+ 		struct sk_buff *skb_new;
+@@ -1258,6 +1270,11 @@ static int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+ 	fd.length20 = skb->len;
+ 	fd.offset = headroom - (NET_IP_ALIGN + cache_fudge);
+ 
++#ifdef CONFIG_FSL_DPA_1588
++	if (priv->tsu && priv->tsu->valid && dpa_ptp_do_txstamp(skb))
++		fd.cmd |= FM_FD_CMD_UPD;
++#endif
++
+ 	if (likely(skb_is_recycleable(skb, dpa_bp->skb_size)
+ 			&& (*countptr + 1 <= dpa_bp->count))) {
+ 		fd.cmd |= FM_FD_CMD_FCO;
+@@ -1563,6 +1580,13 @@ static int __cold dpa_start(struct net_device *net_dev)
+ 	if (!mac_dev)
+ 		goto no_mac;
+ 
++	if (priv->tsu && priv->tsu->valid) {
++		if (mac_dev->fm_rtc_enable)
++			mac_dev->fm_rtc_enable(net_dev);
++		if (mac_dev->ptp_enable)
++			mac_dev->ptp_enable(mac_dev);
++	}
++
+ 	dpaa_eth_napi_enable(priv);
+ 
+ 	err = mac_dev->init_phy(net_dev);
+@@ -1611,6 +1635,13 @@ static int __cold dpa_stop(struct net_device *net_dev)
+ 	if (!mac_dev)
+ 		return 0;
+ 
++	if (priv->tsu && priv->tsu->valid) {
++		if (mac_dev->fm_rtc_disable)
++			mac_dev->fm_rtc_disable(net_dev);
++		if (mac_dev->ptp_disable)
++			mac_dev->ptp_disable(mac_dev);
++	}
++
+ 	_errno = mac_dev->stop(mac_dev);
+ 	if (unlikely(_errno < 0))
+ 		if (netif_msg_ifdown(priv))
+@@ -1818,6 +1849,11 @@ dpa_mac_probe(struct of_device *_of_dev)
+ 	const phandle		*phandle_prop;
+ 	struct of_device	*of_dev;
+ 	struct mac_device	*mac_dev;
++#ifdef CONFIG_FSL_DPA_1588
++	struct net_device	*net_dev = NULL;
++	struct dpa_priv_s	*priv = NULL;
++	struct device_node	*timer_node;
++#endif
+ 
+ 	phandle_prop = of_get_property(_of_dev->node, "fsl,fman-mac", &lenp);
+ 	if (phandle_prop == NULL)
+@@ -1851,6 +1887,24 @@ dpa_mac_probe(struct of_device *_of_dev)
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
++#ifdef CONFIG_FSL_DPA_1588
++	phandle_prop = of_get_property(mac_node, "ptimer-handle", &lenp);
++	if (phandle_prop) {
++		if ((mac_dev->phy_if != PHY_INTERFACE_MODE_SGMII) ||
++			((mac_dev->phy_if == PHY_INTERFACE_MODE_SGMII) &&
++			 (mac_dev->speed == SPEED_1000))) {
++			timer_node = of_find_node_by_phandle(*phandle_prop);
++			if (timer_node) {
++				net_dev = dev_get_drvdata(dpa_dev);
++				priv = netdev_priv(net_dev);
++				if (!dpa_ptp_init(priv))
++					dpaa_eth_info(dev, "%s: ptp-timer "
++					    "enabled\n", mac_node->full_name);
++			}
++		}
++	}
++#endif
++
+ 	return mac_dev;
+ }
+ 
+@@ -2152,16 +2206,17 @@ static void dpa_setup_ingress_queues(struct dpa_priv_s *priv,
+ 
+ static void __devinit
+ dpaa_eth_init_tx_port(struct fm_port *port, struct dpa_fq *errq,
+-			struct dpa_fq *defq)
++		struct dpa_fq *defq, bool has_timer)
+ {
+ 	struct fm_port_non_rx_params tx_port_param;
+ 
+-	dpaa_eth_init_port(tx, port, tx_port_param, errq->fqid, defq->fqid);
++	dpaa_eth_init_port(tx, port, tx_port_param, errq->fqid, defq->fqid,
++			has_timer);
+ }
+ 
+ static void __devinit
+ dpaa_eth_init_rx_port(struct fm_port *port, struct dpa_bp *bp, size_t count,
+-			struct dpa_fq *errq, struct dpa_fq *defq)
++		struct dpa_fq *errq, struct dpa_fq *defq, bool has_timer)
+ {
+ 	struct fm_port_rx_params rx_port_param;
+ 	int i;
+@@ -2176,7 +2231,8 @@ dpaa_eth_init_rx_port(struct fm_port *port, struct dpa_bp *bp, size_t count,
+ 		rx_port_param.pool_param[i].size = bp[i].size;
+ 	}
+ 
+-	dpaa_eth_init_port(rx, port, rx_port_param, errq->fqid, defq->fqid);
++	dpaa_eth_init_port(rx, port, rx_port_param, errq->fqid, defq->fqid,
++			has_timer);
+ }
+ 
+ static void dpa_rx_fq_init(struct dpa_priv_s *priv, struct list_head *head,
+@@ -2555,10 +2611,14 @@ dpaa_eth_probe(struct of_device *_of_dev, const struct of_device_id *match)
+ 	/* All real interfaces need their ports initialized */
+ 	if (mac_dev) {
+ 		struct fm_port_pcd_param rx_port_pcd_param;
++		bool has_timer = FALSE;
++
++		if (priv->tsu && priv->tsu->valid)
++			has_timer = TRUE;
+ 
+ 		dpaa_eth_init_rx_port(rxport, dpa_bp, count, rxerror,
+-				rxdefault);
+-		dpaa_eth_init_tx_port(txport, txerror, txdefault);
++				rxdefault, has_timer);
++		dpaa_eth_init_tx_port(txport, txerror, txdefault, has_timer);
+ 
+ 		rx_port_pcd_param.cb = dpa_alloc_pcd_fqids;
+ 		rx_port_pcd_param.dev = dev;
+@@ -2660,6 +2720,11 @@ static int __devexit __cold dpa_remove(struct of_device *of_dev)
+ 	debugfs_remove(priv->debugfs_file);
+ #endif
+ 
++#ifdef CONFIG_FSL_DPA_1588
++	if (priv->tsu && priv->tsu->valid)
++		dpa_ptp_cleanup(priv);
++#endif
++
+ 	free_netdev(net_dev);
+ 
+ 	return err;
+diff --git a/drivers/net/dpa/dpaa_eth.h b/drivers/net/dpa/dpaa_eth.h
+index e4d544d..2779d43 100644
+--- a/drivers/net/dpa/dpaa_eth.h
++++ b/drivers/net/dpa/dpaa_eth.h
+@@ -103,6 +103,7 @@ struct dpa_priv_s {
+ #endif
+ 
+ 	uint32_t		 msg_enable;	/* net_device message level */
++	struct ptp_tsu		 *tsu;
+ };
+ 
+ extern const struct ethtool_ops dpa_ethtool_ops;
+diff --git a/drivers/net/dpa/mac-api.c b/drivers/net/dpa/mac-api.c
+index 1511f67..11b9ab2 100644
+--- a/drivers/net/dpa/mac-api.c
++++ b/drivers/net/dpa/mac-api.c
+@@ -42,6 +42,7 @@
+ 
+ #include "error_ext.h"	/* GET_ERROR_TYPE, E_OK */
+ #include "fm_mac_ext.h"
++#include "fm_rtc_ext.h"
+ 
+ #define MAC_DESCRIPTION "FSL FMan MAC API based driver"
+ 
+@@ -448,6 +449,134 @@ static int __cold uninit(struct mac_device *mac_dev)
+ 	return _errno;
+ }
+ 
++static int __cold ptp_enable(struct mac_device *mac_dev)
++{
++	int			 _errno;
++	t_Error			 err;
++	const struct mac_priv_s	*priv;
++
++	priv = macdev_priv(mac_dev);
++
++	err = FM_MAC_Enable1588TimeStamp(priv->mac);
++	_errno = -GET_ERROR_TYPE(err);
++	if (unlikely(_errno < 0))
++		dpaa_eth_err(mac_dev->dev, "FM_MAC_Enable1588TimeStamp()"
++				"= 0x%08x\n", err);
++	return _errno;
++}
++
++static int __cold ptp_disable(struct mac_device *mac_dev)
++{
++	int			 _errno;
++	t_Error			 err;
++	const struct mac_priv_s	*priv;
++
++	priv = macdev_priv(mac_dev);
++
++	err = FM_MAC_Disable1588TimeStamp(priv->mac);
++	_errno = -GET_ERROR_TYPE(err);
++	if (unlikely(_errno < 0))
++		dpaa_eth_err(mac_dev->dev, "FM_MAC_Disable1588TimeStamp()"
++				"= 0x%08x\n", err);
++	return _errno;
++}
++
++static int __cold fm_rtc_enable(struct net_device *net_dev)
++{
++	struct dpa_priv_s *priv = netdev_priv(net_dev);
++	struct mac_device *mac_dev = priv->mac_dev;
++	int			 _errno;
++	t_Error			 err;
++
++	err = FM_RTC_Enable(fm_get_rtc_handle(mac_dev->fm_dev), 0);
++	_errno = -GET_ERROR_TYPE(err);
++	if (unlikely(_errno < 0))
++		dpaa_eth_err(mac_dev->dev, "FM_RTC_Enable = 0x%08x\n", err);
++
++	return _errno;
++}
++
++static int __cold fm_rtc_disable(struct net_device *net_dev)
++{
++	struct dpa_priv_s *priv = netdev_priv(net_dev);
++	struct mac_device *mac_dev = priv->mac_dev;
++	int			 _errno;
++	t_Error			 err;
++
++	err = FM_RTC_Disable(fm_get_rtc_handle(mac_dev->fm_dev));
++	_errno = -GET_ERROR_TYPE(err);
++	if (unlikely(_errno < 0))
++		dpaa_eth_err(mac_dev->dev, "FM_RTC_Disable = 0x%08x\n", err);
++
++	return _errno;
++}
++
++static int __cold fm_rtc_get_cnt(struct net_device *net_dev, uint64_t *ts)
++{
++	struct dpa_priv_s *priv = netdev_priv(net_dev);
++	struct mac_device *mac_dev = priv->mac_dev;
++	int _errno;
++	t_Error	err;
++
++	err = FM_RTC_GetCurrentTime(fm_get_rtc_handle(mac_dev->fm_dev), ts);
++	_errno = -GET_ERROR_TYPE(err);
++	if (unlikely(_errno < 0))
++		dpaa_eth_err(mac_dev->dev, "FM_RTC_GetCurrentTime = 0x%08x\n",
++				err);
++
++	return _errno;
++}
++
++static int __cold fm_rtc_set_cnt(struct net_device *net_dev, uint64_t ts)
++{
++	struct dpa_priv_s *priv = netdev_priv(net_dev);
++	struct mac_device *mac_dev = priv->mac_dev;
++	int _errno;
++	t_Error	err;
++
++	err = FM_RTC_SetCurrentTime(fm_get_rtc_handle(mac_dev->fm_dev), ts);
++	_errno = -GET_ERROR_TYPE(err);
++	if (unlikely(_errno < 0))
++		dpaa_eth_err(mac_dev->dev, "FM_RTC_SetCurrentTime = 0x%08x\n",
++				err);
++
++	return _errno;
++}
++
++static int __cold fm_rtc_get_drift(struct net_device *net_dev, uint32_t *drift)
++{
++	struct dpa_priv_s *priv = netdev_priv(net_dev);
++	struct mac_device *mac_dev = priv->mac_dev;
++	int _errno;
++	t_Error	err;
++
++	err = FM_RTC_GetFreqCompensation(fm_get_rtc_handle(mac_dev->fm_dev),
++			drift);
++	_errno = -GET_ERROR_TYPE(err);
++	if (unlikely(_errno < 0))
++		dpaa_eth_err(mac_dev->dev, "FM_RTC_GetFreqCompensation ="
++				"0x%08x\n", err);
++
++	return _errno;
++}
++
++static int __cold fm_rtc_set_drift(struct net_device *net_dev, uint32_t drift)
++{
++	struct dpa_priv_s *priv = netdev_priv(net_dev);
++	struct mac_device *mac_dev = priv->mac_dev;
++	int _errno;
++	t_Error	err;
++
++	err = FM_RTC_SetFreqCompensation(fm_get_rtc_handle(mac_dev->fm_dev),
++			drift);
++	_errno = -GET_ERROR_TYPE(err);
++	if (unlikely(_errno < 0))
++		dpaa_eth_err(mac_dev->dev, "FM_RTC_SetFreqCompensation ="
++				"0x%08x\n", err);
++
++	return _errno;
++}
++
+ static void __devinit __cold setup_dtsec(struct mac_device *mac_dev)
+ {
+ 	mac_dev->init_phy	= dtsec_init_phy;
+@@ -458,6 +587,14 @@ static void __devinit __cold setup_dtsec(struct mac_device *mac_dev)
+ 	mac_dev->change_addr    = change_addr;
+ 	mac_dev->set_multi      = set_multi;
+ 	mac_dev->uninit		= uninit;
++	mac_dev->ptp_enable		= ptp_enable;
++	mac_dev->ptp_disable		= ptp_disable;
++	mac_dev->fm_rtc_enable		= fm_rtc_enable;
++	mac_dev->fm_rtc_disable		= fm_rtc_disable;
++	mac_dev->fm_rtc_get_cnt		= fm_rtc_get_cnt;
++	mac_dev->fm_rtc_set_cnt		= fm_rtc_set_cnt;
++	mac_dev->fm_rtc_get_drift	= fm_rtc_get_drift;
++	mac_dev->fm_rtc_set_drift	= fm_rtc_set_drift;
+ }
+ 
+ static void __devinit __cold setup_xgmac(struct mac_device *mac_dev)
+diff --git a/drivers/net/dpa/mac.h b/drivers/net/dpa/mac.h
+index 93d767c..6b65779 100644
+--- a/drivers/net/dpa/mac.h
++++ b/drivers/net/dpa/mac.h
+@@ -83,6 +83,14 @@ struct mac_device {
+ 	int (*change_addr)(struct mac_device *mac_dev, uint8_t *addr);
+ 	int (*set_multi)(struct net_device *net_dev);
+ 	int (*uninit)(struct mac_device *mac_dev);
++	int (*ptp_enable)(struct mac_device *mac_dev);
++	int (*ptp_disable)(struct mac_device *mac_dev);
++	int (*fm_rtc_enable)(struct net_device *net_dev);
++	int (*fm_rtc_disable)(struct net_device *net_dev);
++	int (*fm_rtc_get_cnt)(struct net_device *net_dev, uint64_t *ts);
++	int (*fm_rtc_set_cnt)(struct net_device *net_dev, uint64_t ts);
++	int (*fm_rtc_get_drift)(struct net_device *net_dev, uint32_t *drift);
++	int (*fm_rtc_set_drift)(struct net_device *net_dev, uint32_t drift);
+ };
+ 
+ struct mac_address {
+diff --git a/drivers/net/dpa/offline_port.c b/drivers/net/dpa/offline_port.c
+index 4e97e95..7147484 100644
+--- a/drivers/net/dpa/offline_port.c
++++ b/drivers/net/dpa/offline_port.c
+@@ -246,7 +246,7 @@ oh_port_probe(struct of_device *_of_dev, const struct of_device_id *match)
+ 
+ 	/* Set Tx params */
+ 	dpaa_eth_init_port(tx, oh_config->oh_port, oh_port_tx_params,
+-		oh_config->error_fqid, oh_config->default_fqid);
++		oh_config->error_fqid, oh_config->default_fqid, FALSE);
+ 	/* Set PCD params */
+ 	oh_port_pcd_params.cb = alloc_oh_pcd_fqids;
+ 	oh_port_pcd_params.dev = dpa_oh_dev;
+diff --git a/drivers/staging/fsl_qbman/Kconfig b/drivers/staging/fsl_qbman/Kconfig
+index f9c3e9d..62ffae1 100644
+--- a/drivers/staging/fsl_qbman/Kconfig
++++ b/drivers/staging/fsl_qbman/Kconfig
+@@ -302,3 +302,8 @@ config FSL_QMAN_FQ_LOOKUP
+ endif # FSL_QMAN
+ 
+ endmenu
++
++config FSL_DPA_1588
++	tristate "IEEE 1588-compliant timestamping"
++	depends on FSL_DPA
++	default n
+-- 
+1.7.0.4
+
