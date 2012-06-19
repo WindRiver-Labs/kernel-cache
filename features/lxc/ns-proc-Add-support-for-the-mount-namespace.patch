@@ -1,0 +1,228 @@
+From d19219eea2d12bb5644ef21c0bfefd92434f2673 Mon Sep 17 00:00:00 2001
+From: "Eric W. Biederman" <ebiederm@xmission.com>
+Date: Sun, 7 Mar 2010 18:49:36 -0800
+Subject: [PATCH 05/16] ns proc: Add support for the mount namespace
+
+setns support for the mount namespace is a little tricky as an
+arbitrary decision must be made about what to set fs->root and
+fs->pwd to, as there is no expectation of a relationship between
+the two mount namespaces.  Therefore I arbitrarily find the root
+mount point, and follow every mount on top of it to find the top
+of the mount stack.  Then I set fs->root and fs->pwd to that
+location.  The topmost root of the mount stack seems like a
+reasonable place to be.
+
+Bind mount support for the mount namespace inodes has the
+possibility of creating circular dependencies between mount
+namespaces.  Circular dependencies can result in loops that
+prevent mount namespaces from every being freed.  I avoid
+creating those circular dependencies by adding a sequence number
+to the mount namespace and require all bind mounts be of a
+younger mount namespace into an older mount namespace.
+
+Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+
+[YS: Original patch taken from http://lxc.sourceforge.net/patches/linux/3.0.0/3.0.0-lxc1/patches/;
+Context modified to WR kernel tree]
+
+Signed-off-by: Yang Shi <yang.shi@windriver.com>
+---
+ fs/mount.h              |    2 +
+ fs/namespace.c          |  103 +++++++++++++++++++++++++++++++++++++++++++++++
+ fs/proc/namespaces.c    |    1 +
+ include/linux/proc_fs.h |    1 +
+ 4 files changed, 107 insertions(+)
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 4ef36d9..746e968 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -4,6 +4,8 @@
+ 
+ struct mnt_namespace {
+ 	atomic_t		count;
++	unsigned int		proc_inum;
++	u64			seq;
+ 	struct mount *	root;
+ 	struct list_head	list;
+ 	wait_queue_head_t poll;
+diff --git a/fs/namespace.c b/fs/namespace.c
+index e608199..3e8816e 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -19,6 +19,7 @@
+ #include <linux/ramfs.h>	/* init_rootfs */
+ #include <linux/fs_struct.h>	/* get_fs_root et.al. */
+ #include <linux/fsnotify.h>	/* fsnotify_vfsmount_delete */
++#include <linux/proc_fs.h>
+ #include <linux/uaccess.h>
+ #include "pnode.h"
+ #include "internal.h"
+@@ -1251,6 +1252,26 @@ static int mount_is_safe(struct path *path)
+ #endif
+ }
+ 
++static bool mnt_ns_loop(struct path *path)
++{
++	/* Could bind mounting the mount namespace inode cause a
++	 * mount namespace loop?
++	 */
++	struct inode *inode = path->dentry->d_inode;
++	struct proc_inode *ei;
++	struct mnt_namespace *mnt_ns;
++
++	if (!proc_ns_inode(inode))
++		return false;
++
++	ei = PROC_I(inode);
++	if (ei->ns_ops != &mntns_operations)
++		return false;
++
++	mnt_ns = ei->ns;
++	return current->nsproxy->mnt_ns->seq >= mnt_ns->seq;
++}
++
+ struct mount *copy_tree(struct mount *mnt, struct dentry *dentry,
+ 					int flag)
+ {
+@@ -1593,6 +1614,10 @@ static int do_loopback(struct path *path, char *old_name,
+ 	if (err)
+ 		return err;
+ 
++	err = -EINVAL;
++	if (mnt_ns_loop(&old_path))
++		goto out; 
++
+ 	err = lock_mount(path);
+ 	if (err)
+ 		goto out;
+@@ -2192,13 +2217,22 @@ dput_out:
+ 	return retval;
+ }
+ 
++static atomic64_t mnt_ns_seq = ATOMIC64_INIT(1);
++
+ static struct mnt_namespace *alloc_mnt_ns(void)
+ {
+ 	struct mnt_namespace *new_ns;
++	int ret;
+ 
+ 	new_ns = kmalloc(sizeof(struct mnt_namespace), GFP_KERNEL);
+ 	if (!new_ns)
+ 		return ERR_PTR(-ENOMEM);
++	ret = proc_alloc_inum(&new_ns->proc_inum);
++	if (ret) {
++		kfree(new_ns);
++		return ERR_PTR(ret);
++	}
++	new_ns->seq = atomic64_add_return(1, &mnt_ns_seq);
+ 	atomic_set(&new_ns->count, 1);
+ 	new_ns->root = NULL;
+ 	INIT_LIST_HEAD(&new_ns->list);
+@@ -2601,6 +2635,7 @@ void put_mnt_ns(struct mnt_namespace *ns)
+ 	br_write_unlock(vfsmount_lock);
+ 	up_write(&namespace_sem);
+ 	release_mounts(&umount_list);
++	proc_free_inum(ns->proc_inum);
+ 	kfree(ns);
+ }
+ 
+@@ -2633,3 +2668,71 @@ bool our_mnt(struct vfsmount *mnt)
+ {
+ 	return check_mnt(real_mount(mnt));
+ }
++
++static void *mntns_get(struct task_struct *task)
++{
++	struct mnt_namespace *ns = NULL;
++	struct nsproxy *nsproxy;
++
++	rcu_read_lock();
++	nsproxy = task_nsproxy(task);
++	if (nsproxy) {
++		ns = nsproxy->mnt_ns;
++		get_mnt_ns(ns);
++	}
++	rcu_read_unlock();
++
++	return ns;
++}
++
++static void mntns_put(void *ns)
++{
++	put_mnt_ns(ns);
++}
++
++static int mntns_install(struct nsproxy *nsproxy, void *ns)
++{
++	struct fs_struct *fs = current->fs;
++	struct mnt_namespace *mnt_ns = ns;
++	struct path root;
++
++	if (fs->users != 1)
++		return -EINVAL;
++
++	get_mnt_ns(mnt_ns);
++	put_mnt_ns(nsproxy->mnt_ns);
++	nsproxy->mnt_ns = mnt_ns;
++
++	/* Find the root */
++	root.mnt    = mnt_ns->root;
++	root.dentry = mnt_ns->root->mnt_root;
++	path_get(&root);
++	while(d_mountpoint(root.dentry) && follow_down(&root))
++		;
++
++	/* Update the pwd and root */
++	path_get(&root);
++	path_get(&root);
++	path_put(&fs->root);
++	path_put(&fs->pwd);
++	fs->root = root;
++	fs->pwd  = root;
++	path_put(&root);
++
++	return 0;
++}
++
++static unsigned int mntns_inum(void *ns)
++{
++	struct mnt_namespace *mnt_ns = ns;
++	return mnt_ns->proc_inum;
++}
++
++const struct proc_ns_operations mntns_operations = {
++	.name		= "mnt",
++	.type		= CLONE_NEWNS,
++	.get		= mntns_get,
++	.put		= mntns_put,
++	.install	= mntns_install,
++	.inum		= mntns_inum,
++};
+diff --git a/fs/proc/namespaces.c b/fs/proc/namespaces.c
+index e8780d6..2432a1e 100644
+--- a/fs/proc/namespaces.c
++++ b/fs/proc/namespaces.c
+@@ -24,6 +24,7 @@ static const struct proc_ns_operations *ns_entries[] = {
+ #ifdef CONFIG_IPC_NS
+ 	&ipcns_operations,
+ #endif
++	&mntns_operations,
+ };
+ 
+ static const struct file_operations ns_file_operations = {
+diff --git a/include/linux/proc_fs.h b/include/linux/proc_fs.h
+index 1eb43a0..8f19e5fc 100644
+--- a/include/linux/proc_fs.h
++++ b/include/linux/proc_fs.h
+@@ -271,6 +271,7 @@ struct proc_ns_operations {
+ extern const struct proc_ns_operations netns_operations;
+ extern const struct proc_ns_operations utsns_operations;
+ extern const struct proc_ns_operations ipcns_operations;
++extern const struct proc_ns_operations mntns_operations;
+ 
+ union proc_op {
+ 	int (*proc_get_link)(struct dentry *, struct path *);
+-- 
+1.7.9.7
+
