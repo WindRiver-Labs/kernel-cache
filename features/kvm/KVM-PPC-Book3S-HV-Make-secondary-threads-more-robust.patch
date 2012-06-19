@@ -1,0 +1,364 @@
+From 0d5c78cc6a35e3611e9b18ddd5a45ec074a5190d Mon Sep 17 00:00:00 2001
+From: Paul Mackerras <paulus@samba.org>
+Date: Fri, 3 Feb 2012 00:54:17 +0000
+Subject: [PATCH 39/63] KVM: PPC: Book3S HV: Make secondary threads more
+ robust against stray IPIs
+
+commit f0888f70151c7f53de2b45ee20ff1905837943e8 upstream.
+
+Currently on POWER7, if we are running the guest on a core and we don't
+need all the hardware threads, we do nothing to ensure that the unused
+threads aren't executing in the kernel (other than checking that they
+are offline).  We just assume they're napping and we don't do anything
+to stop them trying to enter the kernel while the guest is running.
+This means that a stray IPI can wake up the hardware thread and it will
+then try to enter the kernel, but since the core is in guest context,
+it will execute code from the guest in hypervisor mode once it turns the
+MMU on, which tends to lead to crashes or hangs in the host.
+
+This fixes the problem by adding two new one-byte flags in the
+kvmppc_host_state structure in the PACA which are used to interlock
+between the primary thread and the unused secondary threads when entering
+the guest.  With these flags, the primary thread can ensure that the
+unused secondaries are not already in kernel mode (i.e. handling a stray
+IPI) and then indicate that they should not try to enter the kernel
+if they do get woken for any reason.  Instead they will go into KVM code,
+find that there is no vcpu to run, acknowledge and clear the IPI and go
+back to nap mode.
+
+Signed-off-by: Paul Mackerras <paulus@samba.org>
+Signed-off-by: Alexander Graf <agraf@suse.de>
+Signed-off-by: Avi Kivity <avi@redhat.com>
+Signed-off-by: Thomas Tai <thomas.tai@windriver.com>
+---
+ arch/powerpc/include/asm/kvm_book3s_asm.h |    8 +++
+ arch/powerpc/kernel/asm-offsets.c         |    2 +
+ arch/powerpc/kernel/exceptions-64s.S      |   12 ++--
+ arch/powerpc/kernel/idle_power7.S         |    7 +++
+ arch/powerpc/kvm/book3s_hv.c              |   49 ++++++++++++++-
+ arch/powerpc/kvm/book3s_hv_rmhandlers.S   |   92 +++++++++++++++++------------
+ 6 files changed, 124 insertions(+), 46 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s_asm.h b/arch/powerpc/include/asm/kvm_book3s_asm.h
+index 1f2f5b6..88609b2 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_asm.h
++++ b/arch/powerpc/include/asm/kvm_book3s_asm.h
+@@ -79,6 +79,9 @@ struct kvmppc_host_state {
+ 	u8 napping;
+ 
+ #ifdef CONFIG_KVM_BOOK3S_64_HV
++	u8 hwthread_req;
++	u8 hwthread_state;
++
+ 	struct kvm_vcpu *kvm_vcpu;
+ 	struct kvmppc_vcore *kvm_vcore;
+ 	unsigned long xics_phys;
+@@ -122,4 +125,9 @@ struct kvmppc_book3s_shadow_vcpu {
+ 
+ #endif /*__ASSEMBLY__ */
+ 
++/* Values for kvm_state */
++#define KVM_HWTHREAD_IN_KERNEL	0
++#define KVM_HWTHREAD_IN_NAP	1
++#define KVM_HWTHREAD_IN_KVM	2
++
+ #endif /* __ASM_KVM_BOOK3S_ASM_H__ */
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index bbede58..2abcf7d 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -540,6 +540,8 @@ int main(void)
+ 	HSTATE_FIELD(HSTATE_IN_GUEST, in_guest);
+ 	HSTATE_FIELD(HSTATE_RESTORE_HID5, restore_hid5);
+ 	HSTATE_FIELD(HSTATE_NAPPING, napping);
++	HSTATE_FIELD(HSTATE_HWTHREAD_REQ, hwthread_req);
++	HSTATE_FIELD(HSTATE_HWTHREAD_STATE, hwthread_state);
+ 
+ #ifdef CONFIG_KVM_BOOK3S_64_HV
+ 	HSTATE_FIELD(HSTATE_KVM_VCPU, kvm_vcpu);
+diff --git a/arch/powerpc/kernel/exceptions-64s.S b/arch/powerpc/kernel/exceptions-64s.S
+index 8f880bc..925bd6d 100644
+--- a/arch/powerpc/kernel/exceptions-64s.S
++++ b/arch/powerpc/kernel/exceptions-64s.S
+@@ -63,11 +63,13 @@ BEGIN_FTR_SECTION
+ 	GET_PACA(r13)
+ 
+ #ifdef CONFIG_KVM_BOOK3S_64_HV
+-	lbz	r0,PACAPROCSTART(r13)
+-	cmpwi	r0,0x80
+-	bne	1f
+-	li	r0,1
+-	stb	r0,PACAPROCSTART(r13)
++	li	r0,KVM_HWTHREAD_IN_KERNEL
++	stb	r0,HSTATE_HWTHREAD_STATE(r13)
++	/* Order setting hwthread_state vs. testing hwthread_req */
++	sync
++	lbz	r0,HSTATE_HWTHREAD_REQ(r13)
++	cmpwi	r0,0
++	beq	1f
+ 	b	kvm_start_guest
+ 1:
+ #endif
+diff --git a/arch/powerpc/kernel/idle_power7.S b/arch/powerpc/kernel/idle_power7.S
+index 0cdc9a3..7140d83 100644
+--- a/arch/powerpc/kernel/idle_power7.S
++++ b/arch/powerpc/kernel/idle_power7.S
+@@ -16,6 +16,7 @@
+ #include <asm/asm-offsets.h>
+ #include <asm/ppc-opcode.h>
+ #include <asm/hw_irq.h>
++#include <asm/kvm_book3s_asm.h>
+ 
+ #undef DEBUG
+ 
+@@ -81,6 +82,12 @@ _GLOBAL(power7_idle)
+ 	std	r9,_MSR(r1)
+ 	std	r1,PACAR1(r13)
+ 
++#ifdef CONFIG_KVM_BOOK3S_64_HV
++	/* Tell KVM we're napping */
++	li	r4,KVM_HWTHREAD_IN_NAP
++	stb	r4,HSTATE_HWTHREAD_STATE(r13)
++#endif
++
+ 	/* Magic NAP mode enter sequence */
+ 	std	r0,0(r1)
+ 	ptesync
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 108d1f5..c22ef5e 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -569,6 +569,45 @@ static void kvmppc_remove_runnable(struct kvmppc_vcore *vc,
+ 	list_del(&vcpu->arch.run_list);
+ }
+ 
++static int kvmppc_grab_hwthread(int cpu)
++{
++	struct paca_struct *tpaca;
++	long timeout = 1000;
++
++	tpaca = &paca[cpu];
++
++	/* Ensure the thread won't go into the kernel if it wakes */
++	tpaca->kvm_hstate.hwthread_req = 1;
++
++	/*
++	 * If the thread is already executing in the kernel (e.g. handling
++	 * a stray interrupt), wait for it to get back to nap mode.
++	 * The smp_mb() is to ensure that our setting of hwthread_req
++	 * is visible before we look at hwthread_state, so if this
++	 * races with the code at system_reset_pSeries and the thread
++	 * misses our setting of hwthread_req, we are sure to see its
++	 * setting of hwthread_state, and vice versa.
++	 */
++	smp_mb();
++	while (tpaca->kvm_hstate.hwthread_state == KVM_HWTHREAD_IN_KERNEL) {
++		if (--timeout <= 0) {
++			pr_err("KVM: couldn't grab cpu %d\n", cpu);
++			return -EBUSY;
++		}
++		udelay(1);
++	}
++	return 0;
++}
++
++static void kvmppc_release_hwthread(int cpu)
++{
++	struct paca_struct *tpaca;
++
++	tpaca = &paca[cpu];
++	tpaca->kvm_hstate.hwthread_req = 0;
++	tpaca->kvm_hstate.kvm_vcpu = NULL;
++}
++
+ static void kvmppc_start_thread(struct kvm_vcpu *vcpu)
+ {
+ 	int cpu;
+@@ -588,8 +627,7 @@ static void kvmppc_start_thread(struct kvm_vcpu *vcpu)
+ 	smp_wmb();
+ #if defined(CONFIG_PPC_ICP_NATIVE) && defined(CONFIG_SMP)
+ 	if (vcpu->arch.ptid) {
+-		tpaca->cpu_start = 0x80;
+-		wmb();
++		kvmppc_grab_hwthread(cpu);
+ 		xics_wake_cpu(cpu);
+ 		++vc->n_woken;
+ 	}
+@@ -639,7 +677,7 @@ static int kvmppc_run_core(struct kvmppc_vcore *vc)
+ 	struct kvm_vcpu *vcpu, *vcpu0, *vnext;
+ 	long ret;
+ 	u64 now;
+-	int ptid;
++	int ptid, i;
+ 
+ 	/* don't start if any threads have a signal pending */
+ 	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list)
+@@ -686,12 +724,17 @@ static int kvmppc_run_core(struct kvmppc_vcore *vc)
+ 	vc->napping_threads = 0;
+ 	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list)
+ 		kvmppc_start_thread(vcpu);
++	/* Grab any remaining hw threads so they can't go into the kernel */
++	for (i = ptid; i < threads_per_core; ++i)
++		kvmppc_grab_hwthread(vc->pcpu + i);
+ 
+ 	preempt_disable();
+ 	spin_unlock(&vc->lock);
+ 
+ 	kvm_guest_enter();
+ 	__kvmppc_vcore_entry(NULL, vcpu0);
++	for (i = 0; i < threads_per_core; ++i)
++		kvmppc_release_hwthread(vc->pcpu + i);
+ 
+ 	spin_lock(&vc->lock);
+ 	/* disable sending of IPIs on virtual external irqs */
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index b70bf22..d595033 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -26,6 +26,7 @@
+ #include <asm/hvcall.h>
+ #include <asm/asm-offsets.h>
+ #include <asm/exception-64s.h>
++#include <asm/kvm_book3s_asm.h>
+ 
+ /*****************************************************************************
+  *                                                                           *
+@@ -82,6 +83,7 @@ _GLOBAL(kvmppc_hv_entry_trampoline)
+ 
+ #define XICS_XIRR		4
+ #define XICS_QIRR		0xc
++#define XICS_IPI		2	/* interrupt source # for IPIs */
+ 
+ /*
+  * We come in here when wakened from nap mode on a secondary hw thread.
+@@ -94,26 +96,54 @@ kvm_start_guest:
+ 	subi	r1,r1,STACK_FRAME_OVERHEAD
+ 	ld	r2,PACATOC(r13)
+ 
+-	/* were we napping due to cede? */
+-	lbz	r0,HSTATE_NAPPING(r13)
+-	cmpwi	r0,0
+-	bne	kvm_end_cede
++	li	r0,KVM_HWTHREAD_IN_KVM
++	stb	r0,HSTATE_HWTHREAD_STATE(r13)
+ 
+-	/* get vcpu pointer */
+-	ld	r4, HSTATE_KVM_VCPU(r13)
++	/* NV GPR values from power7_idle() will no longer be valid */
++	li	r0,1
++	stb	r0,PACA_NAPSTATELOST(r13)
+ 
+-	/* We got here with an IPI; clear it */
+-	ld	r5, HSTATE_XICS_PHYS(r13)
+-	li	r0, 0xff
+-	li	r6, XICS_QIRR
+-	li	r7, XICS_XIRR
+-	lwzcix	r8, r5, r7		/* ack the interrupt */
++	/* get vcpu pointer, NULL if we have no vcpu to run */
++	ld	r4,HSTATE_KVM_VCPU(r13)
++	cmpdi	cr1,r4,0
++
++	/* Check the wake reason in SRR1 to see why we got here */
++	mfspr	r3,SPRN_SRR1
++	rlwinm	r3,r3,44-31,0x7		/* extract wake reason field */
++	cmpwi	r3,4			/* was it an external interrupt? */
++	bne	27f
++
++	/*
++	 * External interrupt - for now assume it is an IPI, since we
++	 * should never get any other interrupts sent to offline threads.
++	 * Only do this for secondary threads.
++	 */
++	beq	cr1,25f
++	lwz	r3,VCPU_PTID(r4)
++	cmpwi	r3,0
++	beq	27f
++25:	ld	r5,HSTATE_XICS_PHYS(r13)
++	li	r0,0xff
++	li	r6,XICS_QIRR
++	li	r7,XICS_XIRR
++	lwzcix	r8,r5,r7		/* get and ack the interrupt */
+ 	sync
+-	stbcix	r0, r5, r6		/* clear it */
+-	stwcix	r8, r5, r7		/* EOI it */
++	clrldi.	r9,r8,40		/* get interrupt source ID. */
++	beq	27f			/* none there? */
++	cmpwi	r9,XICS_IPI
++	bne	26f
++	stbcix	r0,r5,r6		/* clear IPI */
++26:	stwcix	r8,r5,r7		/* EOI the interrupt */
+ 
+-	/* NV GPR values from power7_idle() will no longer be valid */
+-	stb	r0, PACA_NAPSTATELOST(r13)
++27:	/* XXX should handle hypervisor maintenance interrupts etc. here */
++
++	/* if we have no vcpu to run, go back to sleep */
++	beq	cr1,kvm_no_guest
++
++	/* were we napping due to cede? */
++	lbz	r0,HSTATE_NAPPING(r13)
++	cmpwi	r0,0
++	bne	kvm_end_cede
+ 
+ .global kvmppc_hv_entry
+ kvmppc_hv_entry:
+@@ -1445,8 +1475,8 @@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_206)
+ 	 * Take a nap until a decrementer or external interrupt occurs,
+ 	 * with PECE1 (wake on decr) and PECE0 (wake on external) set in LPCR
+ 	 */
+-	li	r0,0x80
+-	stb	r0,PACAPROCSTART(r13)
++	li	r0,1
++	stb	r0,HSTATE_HWTHREAD_REQ(r13)
+ 	mfspr	r5,SPRN_LPCR
+ 	ori	r5,r5,LPCR_PECE0 | LPCR_PECE1
+ 	mtspr	SPRN_LPCR,r5
+@@ -1463,26 +1493,7 @@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_206)
+ kvm_end_cede:
+ 	/* Woken by external or decrementer interrupt */
+ 	ld	r1, HSTATE_HOST_R1(r13)
+-	ld	r2, PACATOC(r13)
+ 
+-	/* If we're a secondary thread and we got here by an IPI, ack it */
+-	ld	r4,HSTATE_KVM_VCPU(r13)
+-	lwz	r3,VCPU_PTID(r4)
+-	cmpwi	r3,0
+-	beq	27f
+-	mfspr	r3,SPRN_SRR1
+-	rlwinm	r3,r3,44-31,0x7		/* extract wake reason field */
+-	cmpwi	r3,4			/* was it an external interrupt? */
+-	bne	27f
+-	ld	r5, HSTATE_XICS_PHYS(r13)
+-	li	r0,0xff
+-	li	r6,XICS_QIRR
+-	li	r7,XICS_XIRR
+-	lwzcix	r8,r5,r7		/* ack the interrupt */
+-	sync
+-	stbcix	r0,r5,r6		/* clear it */
+-	stwcix	r8,r5,r7		/* EOI it */
+-27:
+ 	/* load up FP state */
+ 	bl	kvmppc_load_fp
+ 
+@@ -1580,12 +1591,17 @@ secondary_nap:
+ 	stwcx.	r3, 0, r4
+ 	bne	51b
+ 
++kvm_no_guest:
++	li	r0, KVM_HWTHREAD_IN_NAP
++	stb	r0, HSTATE_HWTHREAD_STATE(r13)
++	li	r0, 0
++	std	r0, HSTATE_KVM_VCPU(r13)
++
+ 	li	r3, LPCR_PECE0
+ 	mfspr	r4, SPRN_LPCR
+ 	rlwimi	r4, r3, 0, LPCR_PECE0 | LPCR_PECE1
+ 	mtspr	SPRN_LPCR, r4
+ 	isync
+-	li	r0, 0
+ 	std	r0, HSTATE_SCRATCH0(r13)
+ 	ptesync
+ 	ld	r0, HSTATE_SCRATCH0(r13)
+-- 
+1.7.9.7
+
