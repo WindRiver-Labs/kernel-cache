@@ -1,0 +1,191 @@
+From cbe568f3600f3311e2128160cd5da1ea5248120f Mon Sep 17 00:00:00 2001
+From: Li Wang <li.wang@windriver.com>
+Date: Mon, 31 Oct 2011 14:41:13 +0800
+Subject: [PATCH] net: Batch network namespace destruction.
+
+upstream commit id: 2b035b39970740722598f7a9d548835f9bdd730f
+
+It is fairly common to kill several network namespaces at once.  Either
+because they are nested one inside the other or because they are cooperating
+in multiple machine networking experiments.  As the network stack control logic
+does not parallelize easily batch up multiple network namespaces existing
+together.
+
+To get the full benefit of batching the virtual network devices to be
+removed must be all removed in one batch.  For that purpose I have added
+a loop after the last network device operations have run that batches
+up all remaining network devices and deletes them.
+
+An extra benefit is that the reorganization slightly shrinks the size
+of the per network namespace data structures replaceing a work_struct
+with a list_head.
+
+In a trivial test with 4K namespaces this change reduced the cost of
+a destroying 4K namespaces from 7+ minutes (at 12% cpu) to 44 seconds
+(at 60% cpu).  The bulk of that 44s was spent in inet_twsk_purge.
+
+Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Integrated-by: Li Wang <li.wang@windriver.com>
+---
+ include/linux/netdevice.h   |    2 +
+ include/net/net_namespace.h |    2 +-
+ net/core/net_namespace.c    |   65 +++++++++++++++++++++++++++++++++++++-----
+ 3 files changed, 60 insertions(+), 9 deletions(-)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 75a8c53..4bfd495 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -877,6 +877,8 @@ extern rwlock_t				dev_base_lock;		/* Device list lock */
+ 
+ #define for_each_netdev(net, d)		\
+ 		list_for_each_entry(d, &(net)->dev_base_head, dev_list)
++#define for_each_netdev_reverse(net, d) \
++		list_for_each_entry_reverse(d, &(net)->dev_base_head, dev_list)
+ #define for_each_netdev_safe(net, d, n)	\
+ 		list_for_each_entry_safe(d, n, &(net)->dev_base_head, dev_list)
+ #define for_each_netdev_continue(net, d)		\
+diff --git a/include/net/net_namespace.h b/include/net/net_namespace.h
+index a8eb43c..92f06a1 100644
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@ -33,7 +33,7 @@ struct net {
+ 						 */
+ #endif
+ 	struct list_head	list;		/* list of network namespaces */
+-	struct work_struct	work;		/* work struct for freeing */
++	struct list_head	cleanup_list;	/* namespaces on death row */
+ 
+ 	struct proc_dir_entry 	*proc_net;
+ 	struct proc_dir_entry 	*proc_net_stat;
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+index 656f6fb..1e564f9 100644
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -6,8 +6,10 @@
+ #include <linux/delay.h>
+ #include <linux/sched.h>
+ #include <linux/idr.h>
++#include <linux/netdevice.h>
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
++#include <net/rtnetlink.h>
+ 
+ /*
+  *	Our network namespace constructor/destructor lists
+@@ -24,6 +26,21 @@ EXPORT_SYMBOL(init_net);
+ 
+ #define INITIAL_NET_GEN_PTRS	13 /* +1 for len +2 for rcu_head */
+ 
++
++static void unregister_netdevices(struct net *net)
++{
++	struct net_device *dev;
++	/* At exit all network devices most be removed from a network
++	 * namespace.  Do this in the reverse order of registeration.
++	 */
++	for_each_netdev_reverse(net, dev) {
++		if (dev->rtnl_link_ops)
++			dev->rtnl_link_ops->dellink(dev);
++		else
++			unregister_netdevice(dev);
++	}
++}
++
+ /*
+  * setup_net runs the initializers for the network namespace object.
+  */
+@@ -67,6 +84,12 @@ out_undo:
+ 	list_for_each_entry_continue_reverse(ops, &pernet_list, list) {
+ 		if (ops->exit)
+ 			ops->exit(net);
++		if (&ops->list == first_device) {
++			LIST_HEAD(dev_kill_list);
++			rtnl_lock();
++			unregister_netdevices(net);
++			rtnl_unlock();
++		}
+ 	}
+ 
+ 	rcu_barrier();
+@@ -135,27 +158,44 @@ out:
+ 	return new_net;
+ }
+ 
++static DEFINE_SPINLOCK(cleanup_list_lock);
++static LIST_HEAD(cleanup_list);  /* Must hold cleanup_list_lock to touch */
++
+ static void cleanup_net(struct work_struct *work)
+ {
+ 	struct pernet_operations *ops;
+-	struct net *net;
++	struct net *net, *tmp;
++	LIST_HEAD(net_kill_list);
+ 
+ 	/* Be very certain incoming network packets will not find us */
+ 	rcu_barrier();
+ 
+-	net = container_of(work, struct net, work);
++	/* Atomically snapshot the list of namespaces to cleanup */
++	spin_lock_irq(&cleanup_list_lock);
++	list_replace_init(&cleanup_list, &net_kill_list);
++	spin_unlock_irq(&cleanup_list_lock);
+ 
+ 	mutex_lock(&net_mutex);
+ 
+ 	/* Don't let anyone else find us. */
+ 	rtnl_lock();
+-	list_del(&net->list);
++	list_for_each_entry(net, &net_kill_list, cleanup_list)
++		list_del(&net->list);
+ 	rtnl_unlock();
+ 
+ 	/* Run all of the network namespace exit methods */
+ 	list_for_each_entry_reverse(ops, &pernet_list, list) {
+-		if (ops->exit)
+-			ops->exit(net);
++		if (ops->exit) {
++			list_for_each_entry(net, &net_kill_list, cleanup_list)
++				ops->exit(net);
++		}
++		if (&ops->list == first_device) {
++			LIST_HEAD(dev_kill_list);
++			rtnl_lock();
++			list_for_each_entry(net, &net_kill_list, cleanup_list)
++				unregister_netdevices(net);
++			rtnl_unlock();
++		}
+ 	}
+ 
+ 	mutex_unlock(&net_mutex);
+@@ -166,14 +206,23 @@ static void cleanup_net(struct work_struct *work)
+ 	rcu_barrier();
+ 
+ 	/* Finally it is safe to free my network namespace structure */
+-	net_free(net);
++	list_for_each_entry_safe(net, tmp, &net_kill_list, cleanup_list) {
++		list_del_init(&net->cleanup_list);
++		net_free(net);
++	}
+ }
++static DECLARE_WORK(net_cleanup_work, cleanup_net);
+ 
+ void __put_net(struct net *net)
+ {
+ 	/* Cleanup the network namespace in process context */
+-	INIT_WORK(&net->work, cleanup_net);
+-	queue_work(netns_wq, &net->work);
++	unsigned long flags;
++
++	spin_lock_irqsave(&cleanup_list_lock, flags);
++	list_add(&net->cleanup_list, &cleanup_list);
++	spin_unlock_irqrestore(&cleanup_list_lock, flags);
++
++	queue_work(netns_wq, &net_cleanup_work);
+ }
+ EXPORT_SYMBOL_GPL(__put_net);
+ 
+-- 
+1.7.0.2
+
