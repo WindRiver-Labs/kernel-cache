@@ -1,0 +1,491 @@
+From 01167c6913bffc17ff865660bd9df03000069ff7 Mon Sep 17 00:00:00 2001
+From: Zhong Hongbo <hongbo.zhong@windriver.com>
+Date: Fri, 13 Jan 2012 15:33:10 +0800
+Subject: [PATCH 07/16] Add kgdboe support for kbc_km2m806
+
+Add kgdboe support for kbc_km2m806
+
+Signed-off-by: Jason Wessel <jason.wessel@windriver.com>
+Integrated-by: Zhong Hongbo <hongbo.zhong@windriver.com>
+---
+ arch/x86/kernel/kgdb.c             |   31 +++++++++-
+ drivers/net/kgdboe.c               |  107 +++++++++++++++++++++++++++++++++++-
+ drivers/net/pch_gbe/pch_gbe_main.c |   35 +++++++++++-
+ include/linux/kgdb.h               |   19 ++++++
+ include/linux/netdevice.h          |    4 +
+ include/linux/netpoll.h            |   12 ++++
+ kernel/debug/debug_core.c          |   26 ++++++++-
+ kernel/irq/handle.c                |    1 +
+ 8 files changed, 224 insertions(+), 11 deletions(-)
+
+diff --git a/arch/x86/kernel/kgdb.c b/arch/x86/kernel/kgdb.c
+index 42ac846..82b5759 100644
+--- a/arch/x86/kernel/kgdb.c
++++ b/arch/x86/kernel/kgdb.c
+@@ -449,6 +449,7 @@ void kgdb_roundup_cpus(unsigned long flags)
+ }
+ #endif
+ 
++static unsigned long kgdb_saved_IF;
+ /**
+  *	kgdb_arch_handle_exception - Handle architecture specific GDB packets.
+  *	@vector: The error vector of the exception that happened.
+@@ -484,13 +485,17 @@ int kgdb_arch_handle_exception(int e_vector, int signo, int err_code,
+ 	case 'k':
+ 		newPC = linux_regs->ip;
+ 
+-		/* clear the trace bit */
+-		linux_regs->flags &= ~X86_EFLAGS_TF;
+-		atomic_set(&kgdb_cpu_doing_single_step, -1);
+-
++		if (atomic_read(&kgdb_cpu_doing_single_step) != -1) {
++			/* clear the trace bit */
++			linux_regs->flags &= ~X86_EFLAGS_TF;
++			linux_regs->flags |= kgdb_saved_IF;
++			atomic_set(&kgdb_cpu_doing_single_step, -1);
++		}
+ 		/* set the trace bit if we're stepping */
+ 		if (remcomInBuffer[0] == 's') {
++			kgdb_saved_IF = linux_regs->flags & X86_EFLAGS_IF;
+ 			linux_regs->flags |= X86_EFLAGS_TF;
++			linux_regs->flags &= ~X86_EFLAGS_IF;
+ 			atomic_set(&kgdb_cpu_doing_single_step,
+ 				   raw_smp_processor_id());
+ 		}
+@@ -525,6 +530,7 @@ single_step_cont(struct pt_regs *regs, struct die_args *args)
+ }
+ 
+ static int was_in_debug_nmi[NR_CPUS];
++static int kgdb_debug_nmi[NR_CPUS];
+ 
+ static int __kgdb_notify(struct die_args *args, unsigned long cmd)
+ {
+@@ -533,6 +539,22 @@ static int __kgdb_notify(struct die_args *args, unsigned long cmd)
+ 	switch (cmd) {
+ 	case DIE_NMI:
+ 		if (atomic_read(&kgdb_active) != -1) {
++			if (use_kgdb_failsafe &&
++				atomic_read(&kgdb_active) ==
++						raw_smp_processor_id()) {
++				/* This is only used for debugging the
++				 * debugger
++				 */
++				kgdb_debug_nmi[raw_smp_processor_id()]++;
++				if (kgdb_debug_nmi[raw_smp_processor_id()]) {
++					printk(KERN_INFO "D%i=",
++						raw_smp_processor_id());
++					dump_stack();
++					kgdb_debug_nmi[raw_smp_processor_id()]
++								= 0;
++				}
++				/* End only used for debugging the debugger */
++			}
+ 			/* KGDB CPU roundup */
+ 			kgdb_nmicallback(raw_smp_processor_id(), regs);
+ 			was_in_debug_nmi[raw_smp_processor_id()] = 1;
+@@ -584,6 +606,7 @@ static int __kgdb_notify(struct die_args *args, unsigned long cmd)
+ 		return NOTIFY_DONE;
+ #endif /* CONFIG_USE_IMMEDIATE */
+ 
++	kgdb_debug_nmi[raw_smp_processor_id()] = 0;
+ 	if (kgdb_handle_exception(args->trapnr, args->signr, cmd, regs))
+ 		return NOTIFY_DONE;
+ 
+diff --git a/drivers/net/kgdboe.c b/drivers/net/kgdboe.c
+index d2f9ec2..d9e5cb3 100644
+--- a/drivers/net/kgdboe.c
++++ b/drivers/net/kgdboe.c
+@@ -100,11 +100,110 @@ static struct netpoll np = {
+ 	.remote_mac = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff },
+ };
+ 
++static int do_lock;
++
++static void loop_in_debugger(struct work_struct *dummy)
++{
++	unsigned long flags;
++	preempt_disable();
++	local_irq_save(flags);
++	debugger_safe_entry();
++	local_irq_restore(flags);
++	preempt_enable();
++}
++
++static bool work_init_complete;
++static DEFINE_PER_CPU(struct work_struct, dbg_loop);
++
++static int get_eth_lock(void)
++{
++	int loops;
++	struct irq_desc *desc = irq_desc + np.dev->irq;
++	int napi_cnt = 0;
++	int i;
++	struct napi_struct *napi;
++
++	if (!work_init_complete) {
++		for_each_possible_cpu(i)
++			INIT_WORK(&per_cpu(dbg_loop, i), loop_in_debugger);
++		work_init_complete = true;
++	}
++
++	/* Try to get the slave processors into a safe place */
++	for_each_online_cpu(i)
++		schedule_work_on(i, &per_cpu(dbg_loop, i));
++
++	/*
++	 * Try waiting waiting a few jiffies to see if the slave
++	 * processors can make it to a good place.
++	 */
++	loops = jiffies_to_usecs(1)*10;
++	atomic_inc(&in_kgdb_cpu_safe);
++	while (--loops &&
++	       atomic_add_return(0, &in_kgdb_cpu_safe) != num_online_cpus()) {
++		cpu_relax();
++		udelay(1);
++	}
++	atomic_dec(&in_kgdb_cpu_safe);
++
++	if (!np.dev->irq || np.dev->irq >= NR_IRQS ||
++	    !np.dev->dbg_exclusion_lock || !np.dev->dbg_exclusion_cnt)
++		return -1;
++	/* Try and wait up to 2 seconds to sync required locks */
++	loops = 200000;
++	while (--loops) {
++		if (!raw_spin_trylock(&desc->lock))
++			goto out1;
++		if (!spin_trylock(np.dev->dbg_exclusion_lock))
++			goto out2;
++		/* get all the napi locks */
++		list_for_each_entry(napi, &np.dev->napi_list, dev_list) {
++			if (!spin_trylock(&napi->poll_lock))
++				goto out3;
++			napi_cnt++;
++		}
++		smp_mb();
++		if (atomic_add_return(0, np.dev->dbg_exclusion_cnt))
++			goto out3;
++
++		return 0;
++out3:
++		list_for_each_entry(napi, &np.dev->napi_list, dev_list) {
++			if (!napi_cnt)
++				break;
++			spin_unlock(&napi->poll_lock);
++		}
++		spin_unlock(np.dev->dbg_exclusion_lock);
++out2:
++		raw_spin_unlock(&desc->lock);
++out1:
++		udelay(10);
++	}
++
++	WARN_ON(1);
++	return -1;
++}
++
++static void eth_post_master_handler(void)
++{
++	struct napi_struct *napi;
++	struct irq_desc *desc;
++
++	if (do_lock) {
++		desc = irq_desc + np.dev->irq;
++		spin_unlock(np.dev->dbg_exclusion_lock);
++		raw_spin_unlock(&desc->lock);
++		list_for_each_entry(napi, &np.dev->napi_list, dev_list)
++			spin_unlock(&napi->poll_lock);
++	}
++}
++
+ static void eth_pre_exception_handler(void)
+ {
+ 	/* Increment the module count when the debugger is active */
+ 	if (!kgdb_connected)
+ 		try_module_get(THIS_MODULE);
++	do_lock = !get_eth_lock();
+ 	netpoll_set_trap(1);
+ }
+ 
+@@ -120,9 +219,10 @@ static int eth_get_char(void)
+ {
+ 	int chr;
+ 
+-	while (atomic_read(&in_count) == 0)
++	while (atomic_read(&in_count) == 0) {
+ 		netpoll_poll(&np);
+-
++		cpu_relax();
++	}
+ 	chr = in_buf[in_tail++];
+ 	in_tail &= (IN_BUF_SIZE - 1);
+ 	atomic_dec(&in_count);
+@@ -273,7 +373,8 @@ static struct kgdb_io local_kgdb_io_ops = {
+ 	.write_char = eth_put_char,
+ 	.flush = eth_flush_buf,
+ 	.pre_exception = eth_pre_exception_handler,
+-	.post_exception = eth_post_exception_handler
++	.post_exception = eth_post_exception_handler,
++	.post_master = eth_post_master_handler,
+ };
+ 
+ module_init(init_kgdboe);
+diff --git a/drivers/net/pch_gbe/pch_gbe_main.c b/drivers/net/pch_gbe/pch_gbe_main.c
+index f4a42ce..170c923 100644
+--- a/drivers/net/pch_gbe/pch_gbe_main.c
++++ b/drivers/net/pch_gbe/pch_gbe_main.c
+@@ -39,6 +39,7 @@
+ #include <linux/ip.h>
+ #include <linux/tcp.h>
+ #include <linux/udp.h>
++#include <linux/kgdb.h>
+ #include <net/ip.h>
+ 
+ #include "pch_debug.h"
+@@ -1142,12 +1143,17 @@ static int pch_gbe_napi_poll(struct napi_struct *napi, int budget)
+ static void pch_gbe_netpoll(struct net_device *netdev)
+ {
+  struct pch_gbe_adapter *adapter = netdev_priv(netdev);
++ int do_enable = 0;
+ 
+  DPRINTK(PROBE, DEBUG, "\n");
+ 
+- disable_irq(adapter->pdev->irq);
++ if (!in_dbg_master()) {
++	disable_irq(adapter->pdev->irq);
++	do_enable = 1;
++ }
+  pch_gbe_intr_netpoll(adapter->pdev->irq, netdev);
+- enable_irq(adapter->pdev->irq);
++ if (do_enable)
++	enable_irq(adapter->pdev->irq);
+ }
+ #endif
+ 
+@@ -1497,6 +1503,11 @@ void pch_gbe_reset(struct pch_gbe_adapter *adapter)
+   DPRINTK(DRV, ERR, "Hardware Error\n");
+ }
+ 
++#if defined(CONFIG_KGDBOE_MODULE) || defined(CONFIG_KGDBOE)
++static DEFINE_SPINLOCK(dbg_in_pch);
++static atomic_t dbg_cnt_pch;
++#endif
++
+ /*!
+  * @ingroup Linux driver internal function
+  * @fn      static int pch_gbe_request_irq(struct pch_gbe_adapter *adapter)
+@@ -2563,7 +2574,7 @@ static irqreturn_t pch_gbe_intr_netpoll(int irq, void *data)
+  * @param   data  [INOUT] Pointer to a network interface device structure
+  * @return  None
+  */
+-static irqreturn_t pch_gbe_intr(int irq, void *data)
++static inline irqreturn_t _pch_gbe_intr(int irq, void *data)
+ {
+  struct net_device *netdev = data;
+  struct pch_gbe_adapter *adapter = netdev_priv(netdev);
+@@ -2631,6 +2642,24 @@ static irqreturn_t pch_gbe_intr(int irq, void *data)
+  return IRQ_HANDLED;
+ }
+ 
++#if defined(CONFIG_KGDBOE_MODULE) || defined(CONFIG_KGDBOE)
++static irqreturn_t pch_gbe_intr(int irq, void *data)
++{
++       irqreturn_t ret;
++       atomic_inc(&dbg_cnt_pch);
++       spin_lock(&dbg_in_pch);
++       ret = _pch_gbe_intr(irq, data);
++       spin_unlock(&dbg_in_pch);
++       atomic_dec(&dbg_cnt_pch);
++       return ret;
++}
++#else /* ! (CONFIG_KGDBOE_MODULE || CONFIG_KGDBOE) */
++static irqreturn_t pch_gbe_intr(int irq, void *data)
++{
++       return _pch_gbe_intr(irq, data);
++}
++#endif /* ! (CONFIG_KGDBOE_MODULE || CONFIG_KGDBOE) */
++
+ /*!
+  * @ingroup Linux driver internal function
+  * @fn      static unsigned char pch_gbe_clean_tx(struct pch_gbe_adapter *adapter,
+diff --git a/include/linux/kgdb.h b/include/linux/kgdb.h
+index aad7a1b..30274d5 100644
+--- a/include/linux/kgdb.h
++++ b/include/linux/kgdb.h
+@@ -275,6 +275,9 @@ struct kgdb_io {
+ 	int			(*init) (void);
+ 	void			(*pre_exception) (void);
+ 	void			(*post_exception) (void);
++	void			(*post_master) (void);
++	int			(*extra_locks_lock) (void);
++	void			(*extra_locks_unlock) (void);
+ 	int			is_console;
+ };
+ 
+@@ -301,6 +304,7 @@ extern int kgdb_nmicallback(int cpu, void *regs);
+ 
+ extern int			kgdb_single_step;
+ extern atomic_t			kgdb_active;
++extern int			use_kgdb_failsafe;
+ #endif /* CONFIG_KGDB */
+ 
+ /* Common to all that include kgdb.h */
+@@ -320,6 +324,21 @@ struct dbg_kms_ops {
+ #ifdef CONFIG_KGDB
+ #define in_dbg_master() \
+ 	(raw_smp_processor_id() == atomic_read(&kgdb_active))
++extern raw_spinlock_t               dbg_master_lock;
++extern atomic_t                        in_kgdb_cpu_safe;
++#define in_debugger_entry() (raw_spin_is_locked(&dbg_master_lock) && \
++			atomic_read(&kgdb_active) != raw_smp_processor_id())
++
++static inline void debugger_safe_entry(void)
++{
++	while (unlikely(in_debugger_entry())) {
++		atomic_inc(&in_kgdb_cpu_safe);
++		while (in_debugger_entry())
++			cpu_relax();
++		atomic_dec(&in_kgdb_cpu_safe);
++	}
++}
++
+ extern bool dbg_is_early;
+ extern void __init dbg_late_init(void);
+ 
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 88cb591..3fde52e 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -980,6 +980,10 @@ struct net_device {
+ #endif
+ 	/* n-tuple filter list attached to this device */
+ 	struct ethtool_rx_ntuple_list ethtool_ntuple_list;
++#if defined(CONFIG_KGDBOE_MODULE) || defined(CONFIG_KGDBOE)
++	spinlock_t *dbg_exclusion_lock;
++	atomic_t *dbg_exclusion_cnt;
++#endif
+ };
+ #define to_net_dev(d) container_of(d, struct net_device, dev)
+ 
+diff --git a/include/linux/netpoll.h b/include/linux/netpoll.h
+index 808728d..50de2c8 100644
+--- a/include/linux/netpoll.h
++++ b/include/linux/netpoll.h
+@@ -11,6 +11,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/rcupdate.h>
+ #include <linux/list.h>
++#include <linux/kgdb.h>
+ 
+ struct netpoll {
+ 	struct net_device *dev;
+@@ -90,6 +91,12 @@ static inline void *netpoll_poll_lock(struct napi_struct *napi)
+ 
+ 	rcu_read_lock(); /* deal with race on ->npinfo */
+ 	if (dev && dev->npinfo) {
++#if defined(CONFIG_KGDBOE_MODULE) || defined(CONFIG_KGDBOE)
++		if (dev->dbg_exclusion_cnt) {
++			atomic_inc(dev->dbg_exclusion_cnt);
++			smp_mb();
++		}
++#endif
+ 		spin_lock(&napi->poll_lock);
+ 		napi->poll_owner = smp_processor_id();
+ 		return napi;
+@@ -102,6 +109,11 @@ static inline void netpoll_poll_unlock(void *have)
+ 	struct napi_struct *napi = have;
+ 
+ 	if (napi) {
++#if defined(CONFIG_KGDBOE_MODULE) || defined(CONFIG_KGDBOE)
++		struct net_device *dev = napi->dev;
++		if (dev->dbg_exclusion_cnt)
++			atomic_dec(dev->dbg_exclusion_cnt);
++#endif
+ 		napi->poll_owner = -1;
+ 		spin_unlock(&napi->poll_lock);
+ 	}
+diff --git a/kernel/debug/debug_core.c b/kernel/debug/debug_core.c
+index 220e708..7c73dc9 100644
+--- a/kernel/debug/debug_core.c
++++ b/kernel/debug/debug_core.c
+@@ -111,8 +111,10 @@ static struct kgdb_bkpt		kgdb_break[KGDB_MAX_BREAKPOINTS] = {
+  */
+ atomic_t			kgdb_active = ATOMIC_INIT(-1);
+ EXPORT_SYMBOL_GPL(kgdb_active);
+-static DEFINE_RAW_SPINLOCK(dbg_master_lock);
++DEFINE_RAW_SPINLOCK(dbg_master_lock);
++EXPORT_SYMBOL_GPL(dbg_master_lock);
+ static DEFINE_RAW_SPINLOCK(dbg_slave_lock);
++int use_kgdb_failsafe;
+ 
+ /*
+  * We use NR_CPUs not PERCPU, in case kgdb is used to debug early
+@@ -122,6 +124,8 @@ static atomic_t			masters_in_kgdb;
+ static atomic_t			slaves_in_kgdb;
+ static atomic_t			kgdb_break_tasklet_var;
+ atomic_t			kgdb_setting_breakpoint;
++atomic_t                       in_kgdb_cpu_safe;
++EXPORT_SYMBOL_GPL(in_kgdb_cpu_safe);
+ 
+ struct task_struct		*kgdb_usethread;
+ struct task_struct		*kgdb_contthread;
+@@ -465,6 +469,7 @@ static int kgdb_cpu_enter(struct kgdb_state *ks, struct pt_regs *regs,
+ 	int cpu;
+ 	int trace_on = 0;
+ 	int online_cpus = num_online_cpus();
++	int big = 0;
+ 
+ 	kgdb_info[ks->cpu].enter_kgdb++;
+ 	kgdb_info[ks->cpu].exception_state |= exception_state;
+@@ -514,6 +519,15 @@ cpu_loop:
+ 				break;
+ 			}
+ 		} else if (kgdb_info[cpu].exception_state & DCPU_IS_SLAVE) {
++			if (use_kgdb_failsafe) {
++				udelay(1);
++				if (big++ == 10000000) {
++					printk(KERN_INFO "D%i=",
++						raw_smp_processor_id());
++					WARN_ON(1);
++					kgdb_roundup_cpus(flags);
++				}
++			}
+ 			if (!raw_spin_is_locked(&dbg_slave_lock))
+ 				goto return_normal;
+ 		} else {
+@@ -601,6 +615,9 @@ return_normal:
+ 	if (trace_on)
+ 		tracing_off();
+ 
++	if (dbg_io_ops->post_master)
++		dbg_io_ops->post_master();
++
+ 	while (1) {
+ cpu_master_loop:
+ 		if (dbg_kdb_mode) {
+@@ -1035,4 +1052,11 @@ static int __init opt_kgdb_wait(char *str)
+ 	return 0;
+ }
+ 
++static int __init opt_kgdbfailsafe(char *str)
++{
++	use_kgdb_failsafe = 1;
++	return 0;
++}
++
+ early_param("kgdbwait", opt_kgdb_wait);
++early_param("kgdbfailsafe", opt_kgdbfailsafe);
+diff --git a/kernel/irq/handle.c b/kernel/irq/handle.c
+index b54ba0b..ab3a885 100644
+--- a/kernel/irq/handle.c
++++ b/kernel/irq/handle.c
+@@ -250,6 +250,7 @@ struct irq_desc irq_desc[NR_IRQS] __cacheline_aligned_in_smp = {
+ 		.lock = __RAW_SPIN_LOCK_UNLOCKED(irq_desc->lock),
+ 	}
+ };
++EXPORT_SYMBOL_GPL(irq_desc);
+ 
+ static unsigned int kstat_irqs_all[NR_IRQS][NR_CPUS];
+ int __init early_irq_init(void)
+-- 
+1.7.0
+

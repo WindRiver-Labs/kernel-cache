@@ -1,0 +1,168 @@
+From 211dcfeec42bb0d89b9f27eee38c005605e18b3f Mon Sep 17 00:00:00 2001
+From: Zhong Hongbo <hongbo.zhong@windriver.com>
+Date: Mon, 13 Feb 2012 17:22:48 +0800
+Subject: [PATCH 11/16] Fix interrupt handling in the pca953x GPIO driver
+
+Source: SDK 1.6 for Kontron M2M Smart Services Developer Kit
+
+i2c functions could not be called from interrupt context (from the GPE
+handler that is). As "threaded GPE handlers" are not supported, pull
+some code implementing threaded irq handlers into the driver.
+
+Signed-off-by: Michael Brunner <michael.brunner@kontron.com>
+Integrated-by: Zhong Hongbo <hongbo.zhong@windriver.com>
+---
+ drivers/gpio/pca953x.c |   85 +++++++++++++++++++++++++++++++++++++++++------
+ 1 files changed, 74 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpio/pca953x.c b/drivers/gpio/pca953x.c
+index 5c6c151..67386d6 100644
+--- a/drivers/gpio/pca953x.c
++++ b/drivers/gpio/pca953x.c
+@@ -19,6 +19,7 @@
+ #include <linux/irq.h>
+ #include <linux/i2c.h>
+ #include <linux/i2c/pca953x.h>
++#include <linux/kthread.h>
+ #include <linux/slab.h>
+ #ifdef CONFIG_OF_GPIO
+ #include <linux/of_platform.h>
+@@ -460,22 +461,68 @@ static irqreturn_t pca953x_irq_handler(int irq, void *devid)
+ 
+ #else
+ 
+-static u32 pca95xx_gpe_test_chip(struct pca953x_chip *chip)
++static struct task_struct *pca95xx_irq_thread;
++
++static void pca95xx_gpe_test_chip(struct pca953x_chip *chip)
+ {
+ 	uint16_t pending;
+ 	uint16_t level;
+ 
+ 	pending = pca953x_irq_pending(chip);
+ 	if (!pending)
+-		return ACPI_INTERRUPT_NOT_HANDLED;
++		return;
+ 
+ 	do {
+ 		level = __ffs(pending);
+ 		handle_nested_irq(level + chip->irq_base);
+ 		pending &= ~(1 << level);
+ 	} while (pending);
++}
+ 
+-	return ACPI_INTERRUPT_HANDLED;
++static unsigned long flgs;
++enum {
++	FLGS_RUNTHREAD,
++	FLGS_DIED
++};
++
++static int pca95xx_wait_for_gpe(void)
++{
++	struct sched_param param = { .sched_priority = MAX_USER_RT_PRIO / 2, };
++
++	sched_setscheduler(current, SCHED_FIFO, &param);
++
++	while (!kthread_should_stop()) {
++		set_current_state(TASK_INTERRUPTIBLE);
++
++		if (test_and_clear_bit(FLGS_RUNTHREAD, &flgs)) {
++			__set_current_state(TASK_RUNNING);
++			return 0;
++		}
++		schedule();
++	}
++	return -1;
++}
++
++static int pca95xx_gpe_test_chips(void *data)
++{
++	int i;
++
++	while (!pca95xx_wait_for_gpe()) {
++		for (i = 0; i < fri2_chip_count; i++)
++			pca95xx_gpe_test_chip(fri2_chips[i]);
++	}
++
++	return 0;
++}
++
++static int pca95xx_irq_thread_setup(void)
++{
++	pca95xx_irq_thread = kthread_create(pca95xx_gpe_test_chips,
++		fri2_chips, "pca95xx-irq");
++	if (IS_ERR(pca95xx_irq_thread))
++		return PTR_ERR(pca95xx_irq_thread);
++	else
++		return 0;
+ }
+ 
+ /*
+@@ -484,16 +531,13 @@ static u32 pca95xx_gpe_test_chip(struct pca953x_chip *chip)
+  */
+ static u32 pca95xx_gpe_handler(void *context)
+ {
+-	int i;
+-	int ret = ACPI_INTERRUPT_NOT_HANDLED;
+-
+ 	inb(acpi_gbl_FADT.gpe0_block + GPEC);
+ 	outb(0, acpi_gbl_FADT.gpe0_block + GPEC);
+ 
+-	for (i = 0; i < fri2_chip_count; i++)
+-		if (fri2_chips[i] != NULL)
+-			ret |= pca95xx_gpe_test_chip(fri2_chips[i]);
+-	return ret;
++	set_bit(FLGS_RUNTHREAD, &flgs);
++	wake_up_process(pca95xx_irq_thread);
++
++	return ACPI_INTERRUPT_HANDLED;
+ }
+ 
+ #endif
+@@ -549,6 +593,13 @@ static int pca953x_irq_setup(struct pca953x_chip *chip,
+ #else
+ 		/* install handler only once - for te first pca9555 chip. */
+ 		if (fri2_chip_count == 1) {
++			ret = pca95xx_irq_thread_setup();
++			if (ret) {
++				printk(KERN_WARNING
++				     "pca95xx: unable to create GPE thread\n");
++				goto out_failed;
++			}
++
+ 			ret = acpi_install_gpe_handler(NULL,
+ 					   GPIO_GPE,
+ 					   ACPI_GPE_EDGE_TRIGGERED,
+@@ -572,6 +623,11 @@ static int pca953x_irq_setup(struct pca953x_chip *chip,
+ 	return 0;
+ 
+ out_failed:
++	if (pca95xx_irq_thread) {
++		kthread_stop(pca95xx_irq_thread);
++		kfree(pca95xx_irq_thread);
++		pca95xx_irq_thread = 0;
++	}
+ 	chip->irq_base = 0;
+ 	return ret;
+ }
+@@ -582,8 +638,15 @@ static void pca953x_irq_teardown(struct pca953x_chip *chip)
+ 	if (chip->irq_base)
+ 		free_irq(chip->client->irq, chip);
+ #else
+-	if (fri2_chip_count-- == 0)
++	if (fri2_chip_count-- == 0) {
+ 		acpi_remove_gpe_handler(NULL, GPIO_GPE, &pca95xx_gpe_handler);
++
++		if (pca95xx_irq_thread) {
++			kthread_stop(pca95xx_irq_thread);
++			kfree(pca95xx_irq_thread);
++			pca95xx_irq_thread = 0;
++		}
++	}
+ #endif
+ }
+ #else /* CONFIG_GPIO_PCA953X_IRQ */
+-- 
+1.7.0
+
