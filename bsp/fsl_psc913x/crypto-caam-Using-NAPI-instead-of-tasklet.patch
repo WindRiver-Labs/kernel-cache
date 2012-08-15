@@ -1,0 +1,173 @@
+From f84a65aea2dfb9a03be891a0304ba390a96192f4 Mon Sep 17 00:00:00 2001
+From: Sandeep Singh <Sandeep@freescale.com>
+Date: Mon, 28 Nov 2011 11:35:52 +0000
+Subject: [PATCH 39/92] crypto: caam - Using NAPI instead of tasklet.
+
+Extracted from 913x_WUSDK_REL_0.9.tar.gz vendor drop.
+
+This patch updates the current tasklet implementation to NAPI so as
+the system is more balanced in the terms that the packet submission
+and the packet forwarding after being processed can be done at
+the same priority. This is required since two flow traffic used to
+stop at higher data rate.
+
+Signed-off-by: Sandeep Singh <Sandeep@freescale.com>
+Integrated-by: Jiang Bin <bin.jiang@windriver.com>
+---
+ drivers/crypto/caam/intern.h |    7 ++++-
+ drivers/crypto/caam/jr.c     |   69 +++++++++++++++++++++++++++++++++++-------
+ 2 files changed, 64 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/crypto/caam/intern.h b/drivers/crypto/caam/intern.h
+index d13bd7a..7290280 100644
+--- a/drivers/crypto/caam/intern.h
++++ b/drivers/crypto/caam/intern.h
+@@ -29,6 +29,10 @@
+ #include <linux/uio_driver.h>
+ 
+ 
++#define MAX_DESC_LEN	    512
++#define MAX_RECYCLE_DESC	64
++#define CAAM_NAPI_WEIGHT	12
++
+ /*
+  * Storage for tracking each in-process entry moving across a ring
+  * Each entry on an output ring needs one of these
+@@ -46,7 +50,8 @@ struct caam_drv_private_jr {
+ 	struct device *parentdev;	/* points back to controller dev */
+ 	int ridx;
+ 	struct caam_job_ring __iomem *rregs;	/* JobR's register space */
+-	struct tasklet_struct irqtask[NR_CPUS];
++	struct napi_struct *irqtask;
++	struct net_device *net_dev;
+ 	int irq;			/* One per queue */
+ 	int assign;			/* busy/free */
+ 
+diff --git a/drivers/crypto/caam/jr.c b/drivers/crypto/caam/jr.c
+index 0755e31..d105ada 100644
+--- a/drivers/crypto/caam/jr.c
++++ b/drivers/crypto/caam/jr.c
+@@ -45,22 +45,24 @@ static irqreturn_t caam_jr_interrupt(int irq, void *st_dev)
+ 	wr_reg32(&jrp->rregs->jrintstatus, irqstate);
+ 
+ 	preempt_disable();
+-	tasklet_schedule(&jrp->irqtask[smp_processor_id()]);
++	if (napi_schedule_prep(per_cpu_ptr(jrp->irqtask, smp_processor_id())))
++		__napi_schedule(per_cpu_ptr(jrp->irqtask, smp_processor_id()));
+ 	preempt_enable();
+ 
+ 	return IRQ_HANDLED;
+ }
+ 
+ /* Deferred service handler, run as interrupt-fired tasklet */
+-static void caam_jr_dequeue(unsigned long devarg)
++static int caam_jr_dequeue(struct napi_struct *napi, int budget)
+ {
+ 	int hw_idx, sw_idx, i, head, tail;
+-	struct device *dev = (struct device *)devarg;
++	struct device *dev = &napi->dev->dev;
+ 	struct caam_drv_private_jr *jrp = dev_get_drvdata(dev);
+ 	void (*usercall)(struct device *dev, u32 *desc, u32 status, void *arg);
+ 	u32 *userdesc, userstatus;
+ 	void *userarg;
+ 	unsigned long flags;
++	u8 count = 0, ret = 1;
+ 
+ 	spin_lock_irqsave(&jrp->outlock, flags);
+ 
+@@ -68,7 +70,7 @@ static void caam_jr_dequeue(unsigned long devarg)
+ 	sw_idx = tail = jrp->tail;
+ 
+ 	while (CIRC_CNT(head, tail, JOBR_DEPTH) >= 1 &&
+-	       rd_reg32(&jrp->rregs->outring_used)) {
++	       rd_reg32(&jrp->rregs->outring_used) && (count < budget)) {
+ 
+ 		hw_idx = jrp->out_ring_read_index;
+ 		for (i = 0; CIRC_CNT(head, tail + i, JOBR_DEPTH) >= 1; i++) {
+@@ -129,12 +131,22 @@ static void caam_jr_dequeue(unsigned long devarg)
+ 
+ 		head = ACCESS_ONCE(jrp->head);
+ 		sw_idx = tail = jrp->tail;
++		count++;
++	}
++
++	if (CIRC_CNT(head, tail, JOBR_DEPTH) >= 1)
++		ret = 1;
++
++	if (count < budget) {
++		napi_complete(per_cpu_ptr(jrp->irqtask, smp_processor_id()));
++		clrbits32(&jrp->rregs->rconfig_lo, JRCFG_IMSK);
++		ret = 0;
++
+ 	}
+ 
+ 	spin_unlock_irqrestore(&jrp->outlock, flags);
+ 
+-	/* reenable / unmask IRQs */
+-	clrbits32(&jrp->rregs->rconfig_lo, JRCFG_IMSK);
++	return ret;
+ }
+ 
+ /**
+@@ -438,9 +450,38 @@ static int caam_jr_init(struct device *dev)
+ 	jrp = dev_get_drvdata(dev);
+ 
+ 	/* Connect job ring interrupt handler. */
+-	for_each_possible_cpu(i)
+-		tasklet_init(&jrp->irqtask[i], caam_jr_dequeue,
+-			     (unsigned long)dev);
++	jrp->irqtask = alloc_percpu(struct napi_struct);
++	if (jrp->irqtask == NULL) {
++		dev_err(dev, "can't allocate memory while connecting job"
++			" queue interrupt handler\n");
++		kfree(jrp->inpring);
++		kfree(jrp->outring);
++		kfree(jrp->entinfo);
++
++		return -ENOMEM;
++	}
++
++	jrp->net_dev = alloc_percpu(struct net_device);
++	if (jrp->net_dev == NULL) {
++		dev_err(dev, "can't allocate memory while connecting job"
++			" queue interrupt handler\n");
++		kfree(jrp->inpring);
++		kfree(jrp->outring);
++		kfree(jrp->entinfo);
++		free_percpu(jrp->irqtask);
++
++		return -ENOMEM;
++	}
++
++	for_each_possible_cpu(i) {
++		(per_cpu_ptr(jrp->net_dev, i))->dev = *dev;
++		INIT_LIST_HEAD(&per_cpu_ptr(jrp->net_dev, i)->napi_list);
++		netif_napi_add(per_cpu_ptr(jrp->net_dev, i),
++				per_cpu_ptr(jrp->irqtask, i),
++				caam_jr_dequeue, CAAM_NAPI_WEIGHT);
++		napi_enable(per_cpu_ptr(jrp->irqtask, i));
++	}
++
+ 
+ 	error = request_irq(jrp->irq, caam_jr_interrupt, IRQF_SHARED,
+ 			    "caam-jobr", dev);
+@@ -535,8 +576,14 @@ int caam_jr_shutdown(struct device *dev)
+ 
+ 	ret = caam_reset_hw_jr(dev);
+ 
+-	for_each_possible_cpu(i)
+-		tasklet_kill(&jrp->irqtask[i]);
++	for_each_possible_cpu(i) {
++		napi_disable(per_cpu_ptr(jrp->irqtask, i));
++		netif_napi_del(per_cpu_ptr(jrp->irqtask, i));
++	}
++
++	free_percpu(jrp->irqtask);
++	free_percpu(jrp->net_dev);
++
+ 
+ 	/* Release interrupt */
+ 	free_irq(jrp->irq, dev);
+-- 
+1.7.0
+
