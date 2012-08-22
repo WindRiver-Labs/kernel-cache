@@ -1,0 +1,253 @@
+From 906ab57f20ac068046f0a5204b5556d3efad61a3 Mon Sep 17 00:00:00 2001
+From: Luck, Tony <tony.luck@intel.com>
+Date: Thu, 11 Aug 2011 15:14:39 -0700
+Subject: [PATCH 334/479] pstore: defer inserting OOPS entries into pstore
+
+commit 6dda9266913ad57e09afc1a10d6473f10c806a63 upstream
+
+Life is simple for all the kernel terminating types of kmsg_dump
+call backs - pstore just saves the tail end of the console log. But
+for "oops" the situation is more complex - the kernel may carry on
+running (possibly for ever).  So we'd like to make the logged copy
+of the oops appear in the pstore filesystem - so that the user has
+a handle to clear the entry from the persistent backing store (if
+we don't, the store may fill with "oops" entries (that are also
+safely stashed in /var/log/messages) leaving no space for real
+errors.
+
+Current code calls pstore_mkfile() immediately. But this may
+not be safe. The oops could have happened with arbitrary locks
+held, or in interrupt or NMI context. So allocating memory and
+calling into generic filesystem code seems unwise.
+
+This patch defers making the entry appear. At the time
+of the oops, we merely set a flag "pstore_new_entry" noting that
+a new entry has been added. A periodic timer checks once a minute
+to see if the flag is set - if so, it schedules a work queue to
+rescan the backing store and make all new entries appear in the
+pstore filesystem.
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+---
+ fs/pstore/inode.c    |   40 +++++++++++++++++++++++++++++++++---
+ fs/pstore/internal.h |    2 +-
+ fs/pstore/platform.c |   54 +++++++++++++++++++++++++++++++++++++++++--------
+ 3 files changed, 82 insertions(+), 14 deletions(-)
+
+diff --git a/fs/pstore/inode.c b/fs/pstore/inode.c
+index 893b961..379a02d 100644
+--- a/fs/pstore/inode.c
++++ b/fs/pstore/inode.c
+@@ -24,6 +24,7 @@
+ #include <linux/highmem.h>
+ #include <linux/time.h>
+ #include <linux/init.h>
++#include <linux/list.h>
+ #include <linux/string.h>
+ #include <linux/mount.h>
+ #include <linux/ramfs.h>
+@@ -32,13 +33,18 @@
+ #include <linux/magic.h>
+ #include <linux/pstore.h>
+ #include <linux/slab.h>
++#include <linux/spinlock.h>
+ #include <linux/uaccess.h>
+ 
+ #include "internal.h"
+ 
+ #define	PSTORE_NAMELEN	64
+ 
++static DEFINE_SPINLOCK(allpstore_lock);
++static LIST_HEAD(allpstore);
++
+ struct pstore_private {
++	struct list_head list;
+ 	struct pstore_info *psi;
+ 	enum pstore_type_id type;
+ 	u64	id;
+@@ -81,8 +87,16 @@ static int pstore_unlink(struct inode *dir, struct dentry *dentry)
+ 
+ static void pstore_evict_inode(struct inode *inode)
+ {
++	struct pstore_private	*p = inode->i_private;
++	unsigned long		flags;
++
+ 	end_writeback(inode);
+-	kfree(inode->i_private);
++	if (p) {
++		spin_lock_irqsave(&allpstore_lock, flags);
++		list_del(&p->list);
++		spin_unlock_irqrestore(&allpstore_lock, flags);
++		kfree(p);
++	}
+ }
+ 
+ static const struct inode_operations pstore_dir_inode_operations = {
+@@ -182,9 +196,23 @@ int pstore_mkfile(enum pstore_type_id type, char *psname, u64 id,
+ 	struct dentry		*root = pstore_sb->s_root;
+ 	struct dentry		*dentry;
+ 	struct inode		*inode;
+-	int			rc;
++	int			rc = 0;
+ 	char			name[PSTORE_NAMELEN];
+-	struct pstore_private	*private;
++	struct pstore_private	*private, *pos;
++	unsigned long		flags;
++
++	spin_lock_irqsave(&allpstore_lock, flags);
++	list_for_each_entry(pos, &allpstore, list) {
++		if (pos->type == type &&
++		    pos->id == id &&
++		    pos->psi == psi) {
++			rc = -EEXIST;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&allpstore_lock, flags);
++	if (rc)
++		return rc;
+ 
+ 	rc = -ENOMEM;
+ 	inode = pstore_get_inode(pstore_sb, root->d_inode, S_IFREG | 0444, 0);
+@@ -229,6 +257,10 @@ int pstore_mkfile(enum pstore_type_id type, char *psname, u64 id,
+ 
+ 	d_add(dentry, inode);
+ 
++	spin_lock_irqsave(&allpstore_lock, flags);
++	list_add(&private->list, &allpstore);
++	spin_unlock_irqrestore(&allpstore_lock, flags);
++
+ 	mutex_unlock(&root->d_inode->i_mutex);
+ 
+ 	return 0;
+@@ -277,7 +309,7 @@ int pstore_fill_super(struct super_block *sb, void *data, int silent)
+ 		goto fail;
+ 	}
+ 
+-	pstore_get_records();
++	pstore_get_records(0);
+ 
+ 	return 0;
+ fail:
+diff --git a/fs/pstore/internal.h b/fs/pstore/internal.h
+index 611c1b3..3bde461 100644
+--- a/fs/pstore/internal.h
++++ b/fs/pstore/internal.h
+@@ -1,5 +1,5 @@
+ extern void	pstore_set_kmsg_bytes(int);
+-extern void	pstore_get_records(void);
++extern void	pstore_get_records(int);
+ extern int	pstore_mkfile(enum pstore_type_id, char *psname, u64 id,
+ 			      char *data, size_t size,
+ 			      struct timespec time, struct pstore_info *psi);
+diff --git a/fs/pstore/platform.c b/fs/pstore/platform.c
+index c5300ec..ca60ebc 100644
+--- a/fs/pstore/platform.c
++++ b/fs/pstore/platform.c
+@@ -25,12 +25,29 @@
+ #include <linux/module.h>
+ #include <linux/pstore.h>
+ #include <linux/string.h>
++#include <linux/timer.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
++#include <linux/workqueue.h>
+ 
+ #include "internal.h"
+ 
+ /*
++ * We defer making "oops" entries appear in pstore - see
++ * whether the system is actually still running well enough
++ * to let someone see the entry
++ */
++#define	PSTORE_INTERVAL	(60 * HZ)
++
++static int pstore_new_entry;
++
++static void pstore_timefunc(unsigned long);
++static DEFINE_TIMER(pstore_timer, pstore_timefunc, 0, 0);
++
++static void pstore_dowork(struct work_struct *);
++static DECLARE_WORK(pstore_work, pstore_dowork);
++
++/*
+  * pstore_lock just protects "psinfo" during
+  * calls to pstore_register()
+  */
+@@ -100,9 +117,7 @@ static void pstore_dump(struct kmsg_dumper *dumper,
+ 		id = psinfo->write(PSTORE_TYPE_DMESG, part,
+ 				   hsize + l1_cpy + l2_cpy, psinfo);
+ 		if (reason == KMSG_DUMP_OOPS && pstore_is_mounted())
+-			pstore_mkfile(PSTORE_TYPE_DMESG, psinfo->name, id,
+-				      psinfo->buf, hsize + l1_cpy + l2_cpy,
+-				      CURRENT_TIME, psinfo);
++			pstore_new_entry = 1;
+ 		l1 -= l1_cpy;
+ 		l2 -= l2_cpy;
+ 		total += l1_cpy + l2_cpy;
+@@ -148,19 +163,24 @@ int pstore_register(struct pstore_info *psi)
+ 	}
+ 
+ 	if (pstore_is_mounted())
+-		pstore_get_records();
++		pstore_get_records(0);
+ 
+ 	kmsg_dump_register(&pstore_dumper);
+ 
++	pstore_timer.expires = jiffies + PSTORE_INTERVAL;
++	add_timer(&pstore_timer);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(pstore_register);
+ 
+ /*
+- * Read all the records from the persistent store. Create and
+- * file files in our filesystem.
++ * Read all the records from the persistent store. Create
++ * files in our filesystem.  Don't warn about -EEXIST errors
++ * when we are re-scanning the backing store looking to add new
++ * error records.
+  */
+-void pstore_get_records(void)
++void pstore_get_records(int quiet)
+ {
+ 	struct pstore_info *psi = psinfo;
+ 	ssize_t			size;
+@@ -178,8 +198,9 @@ void pstore_get_records(void)
+ 		goto out;
+ 
+ 	while ((size = psi->read(&id, &type, &time, psi)) > 0) {
+-		if (pstore_mkfile(type, psi->name, id, psi->buf, (size_t)size,
+-				  time, psi))
++		rc = pstore_mkfile(type, psi->name, id, psi->buf, (size_t)size,
++				  time, psi);
++		if (rc && (rc != -EEXIST || !quiet))
+ 			failed++;
+ 	}
+ 	psi->close(psi);
+@@ -191,6 +212,21 @@ out:
+ 		       failed, psi->name);
+ }
+ 
++static void pstore_dowork(struct work_struct *work)
++{
++	pstore_get_records(1);
++}
++
++static void pstore_timefunc(unsigned long dummy)
++{
++	if (pstore_new_entry) {
++		pstore_new_entry = 0;
++		schedule_work(&pstore_work);
++	}
++
++	mod_timer(&pstore_timer, jiffies + PSTORE_INTERVAL);
++}
++
+ /*
+  * Call platform driver to write a record to the
+  * persistent store.
+-- 
+1.7.0
+
