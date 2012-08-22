@@ -1,0 +1,188 @@
+From 727b8ff296b6d8a6cee9107bf896b0dca1f1e606 Mon Sep 17 00:00:00 2001
+From: Huang Ying <ying.huang@intel.com>
+Date: Tue, 17 May 2011 16:08:37 +0800
+Subject: [PATCH 256/474] PCI: PCIe AER: add aer_recover_queue
+
+commit 0918472ceeffad234df5589e45b646a94476f835 upstream
+
+In addition to native PCIe AER, now APEI (ACPI Platform Error
+Interface) GHES (Generic Hardware Error Source) can be used to report
+PCIe AER errors too.  To add support to APEI GHES PCIe AER recovery,
+aer_recover_queue is added to export the recovery function in native
+PCIe AER driver.
+
+Recoverable PCIe AER errors are reported via NMI in APEI GHES.  Then
+APEI GHES uses irq_work to delay the error processing into an IRQ
+handler.  But PCIe AER recovery can be very time-consuming, so
+aer_recover_queue, which can be used in IRQ handler, delays the real
+recovery action into the process context, that is, work queue.
+
+Signed-off-by: Huang Ying <ying.huang@intel.com>
+Signed-off-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+---
+ drivers/pci/pcie/aer/aerdrv_core.c     |   76 +++++++++++++++++++++++++++++---
+ drivers/pci/pcie/aer/aerdrv_errprint.c |    3 +-
+ include/linux/aer.h                    |    3 +
+ 3 files changed, 74 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/pci/pcie/aer/aerdrv_core.c b/drivers/pci/pcie/aer/aerdrv_core.c
+index 43421fb..9674e9f 100644
+--- a/drivers/pci/pcie/aer/aerdrv_core.c
++++ b/drivers/pci/pcie/aer/aerdrv_core.c
+@@ -24,6 +24,7 @@
+ #include <linux/suspend.h>
+ #include <linux/delay.h>
+ #include <linux/slab.h>
++#include <linux/kfifo.h>
+ #include "aerdrv.h"
+ 
+ static int forceload;
+@@ -445,8 +446,7 @@ static struct pcie_port_service_driver *find_aer_service(struct pci_dev *dev)
+ 	return drv;
+ }
+ 
+-static pci_ers_result_t reset_link(struct pcie_device *aerdev,
+-		struct pci_dev *dev)
++static pci_ers_result_t reset_link(struct pci_dev *dev)
+ {
+ 	struct pci_dev *udev;
+ 	pci_ers_result_t status;
+@@ -486,7 +486,6 @@ static pci_ers_result_t reset_link(struct pcie_device *aerdev,
+ 
+ /**
+  * do_recovery - handle nonfatal/fatal error recovery process
+- * @aerdev: pointer to a pcie_device data structure of root port
+  * @dev: pointer to a pci_dev data structure of agent detecting an error
+  * @severity: error severity type
+  *
+@@ -494,8 +493,7 @@ static pci_ers_result_t reset_link(struct pcie_device *aerdev,
+  * error detected message to all downstream drivers within a hierarchy in
+  * question and return the returned code.
+  */
+-static void do_recovery(struct pcie_device *aerdev, struct pci_dev *dev,
+-		int severity)
++static void do_recovery(struct pci_dev *dev, int severity)
+ {
+ 	pci_ers_result_t status, result = PCI_ERS_RESULT_RECOVERED;
+ 	enum pci_channel_state state;
+@@ -511,7 +509,7 @@ static void do_recovery(struct pcie_device *aerdev, struct pci_dev *dev,
+ 			report_error_detected);
+ 
+ 	if (severity == AER_FATAL) {
+-		result = reset_link(aerdev, dev);
++		result = reset_link(dev);
+ 		if (result != PCI_ERS_RESULT_RECOVERED)
+ 			goto failed;
+ 	}
+@@ -576,9 +574,73 @@ static void handle_error_source(struct pcie_device *aerdev,
+ 			pci_write_config_dword(dev, pos + PCI_ERR_COR_STATUS,
+ 					info->status);
+ 	} else
+-		do_recovery(aerdev, dev, info->severity);
++		do_recovery(dev, info->severity);
+ }
+ 
++#ifdef CONFIG_ACPI_APEI_PCIEAER
++static void aer_recover_work_func(struct work_struct *work);
++
++#define AER_RECOVER_RING_ORDER		4
++#define AER_RECOVER_RING_SIZE		(1 << AER_RECOVER_RING_ORDER)
++
++struct aer_recover_entry
++{
++	u8	bus;
++	u8	devfn;
++	u16	domain;
++	int	severity;
++};
++
++static DEFINE_KFIFO(aer_recover_ring, struct aer_recover_entry,
++		    AER_RECOVER_RING_SIZE);
++/*
++ * Mutual exclusion for writers of aer_recover_ring, reader side don't
++ * need lock, because there is only one reader and lock is not needed
++ * between reader and writer.
++ */
++static DEFINE_SPINLOCK(aer_recover_ring_lock);
++static DECLARE_WORK(aer_recover_work, aer_recover_work_func);
++
++void aer_recover_queue(int domain, unsigned int bus, unsigned int devfn,
++		       int severity)
++{
++	unsigned long flags;
++	struct aer_recover_entry entry = {
++		.bus		= bus,
++		.devfn		= devfn,
++		.domain		= domain,
++		.severity	= severity,
++	};
++
++	spin_lock_irqsave(&aer_recover_ring_lock, flags);
++	if (kfifo_put(&aer_recover_ring, &entry))
++		schedule_work(&aer_recover_work);
++	else
++		pr_err("AER recover: Buffer overflow when recovering AER for %04x:%02x:%02x:%x\n",
++		       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
++	spin_unlock_irqrestore(&aer_recover_ring_lock, flags);
++}
++EXPORT_SYMBOL_GPL(aer_recover_queue);
++
++static void aer_recover_work_func(struct work_struct *work)
++{
++	struct aer_recover_entry entry;
++	struct pci_dev *pdev;
++
++	while (kfifo_get(&aer_recover_ring, &entry)) {
++		pdev = pci_get_domain_bus_and_slot(entry.domain, entry.bus,
++						   entry.devfn);
++		if (!pdev) {
++			pr_err("AER recover: Can not find pci_dev for %04x:%02x:%02x:%x\n",
++			       entry.domain, entry.bus,
++			       PCI_SLOT(entry.devfn), PCI_FUNC(entry.devfn));
++			continue;
++		}
++		do_recovery(pdev, entry.severity);
++	}
++}
++#endif
++
+ /**
+  * get_device_error_info - read error status from dev and store it to info
+  * @dev: pointer to the device expected to have a error record
+diff --git a/drivers/pci/pcie/aer/aerdrv_errprint.c b/drivers/pci/pcie/aer/aerdrv_errprint.c
+index b07a42e..3ea5173 100644
+--- a/drivers/pci/pcie/aer/aerdrv_errprint.c
++++ b/drivers/pci/pcie/aer/aerdrv_errprint.c
+@@ -204,7 +204,7 @@ void aer_print_port_info(struct pci_dev *dev, struct aer_err_info *info)
+ }
+ 
+ #ifdef CONFIG_ACPI_APEI_PCIEAER
+-static int cper_severity_to_aer(int cper_severity)
++int cper_severity_to_aer(int cper_severity)
+ {
+ 	switch (cper_severity) {
+ 	case CPER_SEV_RECOVERABLE:
+@@ -215,6 +215,7 @@ static int cper_severity_to_aer(int cper_severity)
+ 		return AER_CORRECTABLE;
+ 	}
+ }
++EXPORT_SYMBOL_GPL(cper_severity_to_aer);
+ 
+ void cper_print_aer(const char *prefix, int cper_severity,
+ 		    struct aer_capability_regs *aer)
+diff --git a/include/linux/aer.h b/include/linux/aer.h
+index 8414de2..544abdb 100644
+--- a/include/linux/aer.h
++++ b/include/linux/aer.h
+@@ -51,5 +51,8 @@ static inline int pci_cleanup_aer_uncorrect_error_status(struct pci_dev *dev)
+ 
+ extern void cper_print_aer(const char *prefix, int cper_severity,
+ 			   struct aer_capability_regs *aer);
++extern int cper_severity_to_aer(int cper_severity);
++extern void aer_recover_queue(int domain, unsigned int bus, unsigned int devfn,
++			      int severity);
+ #endif //_AER_H_
+ 
+-- 
+1.7.0
+

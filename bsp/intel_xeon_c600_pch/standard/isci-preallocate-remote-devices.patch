@@ -1,0 +1,346 @@
+From a00f5396a97c968092a3194433aa03107bc92f0b Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Thu, 3 Mar 2011 17:59:32 -0800
+Subject: [PATCH 048/474] isci: preallocate remote devices
+
+upstream: d9c37390c4f02153188a64a7a89fa6798dc3ffc2
+
+Until we synchronize against device removal this limits the damage of
+use after free bugs to the driver's own objects.  Unless we implement
+reference counting we need to ensure at least a subset of a remote
+device is valid at all times.  We follow the lead of other libsas
+drivers that also preallocate devices.
+
+This also enforces maximum remote device accounting at the lldd layer,
+but the core may still run out of RNC's before we hit this limit.
+
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+Integrated-by: Hui Wang <Hui.Wang@windriver.com>
+---
+ drivers/scsi/isci/host.c          |   21 +++++++----
+ drivers/scsi/isci/host.h          |   17 ++++++---
+ drivers/scsi/isci/init.c          |   27 ++++----------
+ drivers/scsi/isci/isci.h          |    1 -
+ drivers/scsi/isci/remote_device.c |   73 ++++++++++++++++++-------------------
+ drivers/scsi/isci/remote_device.h |    2 +-
+ 6 files changed, 68 insertions(+), 73 deletions(-)
+
+diff --git a/drivers/scsi/isci/host.c b/drivers/scsi/isci/host.c
+index 8d25566..ae5d460 100644
+--- a/drivers/scsi/isci/host.c
++++ b/drivers/scsi/isci/host.c
+@@ -378,8 +378,7 @@ static void __iomem *smu_base(struct isci_host *isci_host)
+ 
+ int isci_host_init(struct isci_host *isci_host)
+ {
+-	int err = 0;
+-	int index = 0;
++	int err = 0, i;
+ 	enum sci_status status;
+ 	struct scic_sds_controller *controller;
+ 	union scic_oem_parameters scic_oem_params;
+@@ -509,13 +508,19 @@ int isci_host_init(struct isci_host *isci_host)
+ 	if (!isci_host->dma_pool)
+ 		return -ENOMEM;
+ 
+-	for (index = 0; index < SCI_MAX_PORTS; index++)
+-		isci_port_init(&isci_host->isci_ports[index],
+-			       isci_host,
+-			       index);
++	for (i = 0; i < SCI_MAX_PORTS; i++)
++		isci_port_init(&isci_host->isci_ports[i], isci_host, i);
+ 
+-	for (index = 0; index < SCI_MAX_PHYS; index++)
+-		isci_phy_init(&isci_host->phys[index], isci_host, index);
++	for (i = 0; i < SCI_MAX_PHYS; i++)
++		isci_phy_init(&isci_host->phys[i], isci_host, i);
++
++	for (i = 0; i < SCI_MAX_REMOTE_DEVICES; i++) {
++		struct isci_remote_device *idev = idev_by_id(isci_host, i);
++
++		INIT_LIST_HEAD(&idev->reqs_in_process);
++		INIT_LIST_HEAD(&idev->node);
++		spin_lock_init(&idev->state_lock);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/scsi/isci/host.h b/drivers/scsi/isci/host.h
+index 6a6304c..3c69f1f 100644
+--- a/drivers/scsi/isci/host.h
++++ b/drivers/scsi/isci/host.h
+@@ -61,6 +61,7 @@
+ /*#include "task.h"*/
+ #include "timers.h"
+ #include "remote_device.h"
++#include "scic_remote_device.h"
+ 
+ #define DRV_NAME "isci"
+ #define SCI_PCI_BAR_COUNT 2
+@@ -117,8 +118,18 @@ struct isci_host {
+ 	struct list_head requests_to_complete;
+ 	struct list_head requests_to_abort;
+ 	spinlock_t scic_lock;
++
++	/* careful only access this via idev_by_id */
++	struct isci_remote_device devices[0];
+ };
+ 
++static inline struct isci_remote_device *idev_by_id(struct isci_host *ihost, int i)
++{
++	void *p = ihost->devices;
++
++	return p + i * (sizeof(struct isci_remote_device) +
++			scic_remote_device_get_object_size());
++}
+ 
+ /**
+  * struct isci_pci_info - This class represents the pci function containing the
+@@ -219,11 +230,7 @@ static inline void wait_for_device_start(struct isci_host *ihost, struct isci_re
+ 
+ static inline void wait_for_device_stop(struct isci_host *ihost, struct isci_remote_device *idev)
+ {
+-	/* todo switch to:
+-	 * wait_event(ihost->eventq, !test_bit(IDEV_STOP_PENDING, &idev->flags));
+-	 * once devices are statically allocated
+-	 */
+-	wait_for_completion(idev->cmp);
++	wait_event(ihost->eventq, !test_bit(IDEV_STOP_PENDING, &idev->flags));
+ }
+ 
+ /**
+diff --git a/drivers/scsi/isci/init.c b/drivers/scsi/isci/init.c
+index f1b8a51..2838bef 100644
+--- a/drivers/scsi/isci/init.c
++++ b/drivers/scsi/isci/init.c
+@@ -64,7 +64,6 @@
+ #include "sci_environment.h"
+ 
+ static struct scsi_transport_template *isci_transport_template;
+-struct kmem_cache *isci_kmem_cache;
+ 
+ static DEFINE_PCI_DEVICE_TABLE(isci_id_table) = {
+ 	{ PCI_VDEVICE(INTEL, 0x1D61),},
+@@ -443,7 +442,10 @@ static struct isci_host *isci_host_alloc(struct pci_dev *pdev, int id)
+ 	struct Scsi_Host *shost;
+ 	int err;
+ 
+-	isci_host = devm_kzalloc(&pdev->dev, sizeof(*isci_host), GFP_KERNEL);
++	isci_host = devm_kzalloc(&pdev->dev, sizeof(*isci_host) +
++				 SCI_MAX_REMOTE_DEVICES *
++				 (sizeof(struct isci_remote_device) +
++				  scic_remote_device_get_object_size()), GFP_KERNEL);
+ 	if (!isci_host)
+ 		return NULL;
+ 
+@@ -656,31 +658,17 @@ static void __devexit isci_pci_remove(struct pci_dev *pdev)
+ 
+ static __init int isci_init(void)
+ {
+-	int err = -ENOMEM;
++	int err;
+ 
+ 	pr_info("%s: Intel(R) C600 SAS Controller Driver\n", DRV_NAME);
+ 
+-	isci_kmem_cache = kmem_cache_create(DRV_NAME,
+-					    sizeof(struct isci_remote_device) +
+-					    scic_remote_device_get_object_size(),
+-					    0, 0, NULL);
+-	if (!isci_kmem_cache)
+-		return err;
+-
+ 	isci_transport_template = sas_domain_attach_transport(&isci_transport_ops);
+ 	if (!isci_transport_template)
+-		goto err_kmem;
++		return -ENOMEM;
+ 
+ 	err = pci_register_driver(&isci_pci_driver);
+ 	if (err)
+-		goto err_sas;
+-
+-	return 0;
+-
+- err_sas:
+-	sas_release_transport(isci_transport_template);
+- err_kmem:
+-	kmem_cache_destroy(isci_kmem_cache);
++		sas_release_transport(isci_transport_template);
+ 
+ 	return err;
+ }
+@@ -689,7 +677,6 @@ static __exit void isci_exit(void)
+ {
+ 	pci_unregister_driver(&isci_pci_driver);
+ 	sas_release_transport(isci_transport_template);
+-	kmem_cache_destroy(isci_kmem_cache);
+ }
+ 
+ MODULE_LICENSE("Dual BSD/GPL");
+diff --git a/drivers/scsi/isci/isci.h b/drivers/scsi/isci/isci.h
+index 9b9aa50..24c67b0 100644
+--- a/drivers/scsi/isci/isci.h
++++ b/drivers/scsi/isci/isci.h
+@@ -89,7 +89,6 @@
+ #include "task.h"
+ #include "sata.h"
+ 
+-extern struct kmem_cache *isci_kmem_cache;
+ extern struct isci_firmware *isci_firmware;
+ 
+ #define ISCI_FW_NAME		"isci/isci_firmware.bin"
+diff --git a/drivers/scsi/isci/remote_device.c b/drivers/scsi/isci/remote_device.c
+index db2259c..48556e4 100644
+--- a/drivers/scsi/isci/remote_device.c
++++ b/drivers/scsi/isci/remote_device.c
+@@ -67,40 +67,35 @@
+ 
+ /**
+  * isci_remote_device_deconstruct() - This function frees an isci_remote_device.
+- * @isci_host: This parameter specifies the isci host object.
+- * @isci_device: This parameter specifies the remote device to be freed.
++ * @ihost: This parameter specifies the isci host object.
++ * @idev: This parameter specifies the remote device to be freed.
+  *
+  */
+-static void isci_remote_device_deconstruct(
+-	struct isci_host *isci_host,
+-	struct isci_remote_device *isci_device)
++static void isci_remote_device_deconstruct(struct isci_host *ihost, struct isci_remote_device *idev)
+ {
+-	dev_dbg(&isci_host->pdev->dev,
+-		"%s: isci_device = %p\n", __func__, isci_device);
++	dev_dbg(&ihost->pdev->dev,
++		"%s: isci_device = %p\n", __func__, idev);
+ 
+ 	/* There should not be any outstanding io's. All paths to
+ 	 * here should go through isci_remote_device_nuke_requests.
+ 	 * If we hit this condition, we will need a way to complete
+ 	 * io requests in process */
+-	while (!list_empty(&isci_device->reqs_in_process)) {
++	while (!list_empty(&idev->reqs_in_process)) {
+ 
+-		dev_err(&isci_host->pdev->dev,
++		dev_err(&ihost->pdev->dev,
+ 			"%s: ** request list not empty! **\n", __func__);
+ 		BUG();
+ 	}
+ 
+-	/* Remove all related references to this device and free
+-	 * the cache object.
+-	 */
+-	scic_remote_device_destruct(to_sci_dev(isci_device));
+-	isci_device->domain_dev->lldd_dev = NULL;
+-	list_del(&isci_device->node);
+-
+-	clear_bit(IDEV_STOP_PENDING, &isci_device->flags);
+-	clear_bit(IDEV_START_PENDING, &isci_device->flags);
+-	wake_up(&isci_host->eventq);
+-	complete(isci_device->cmp);
+-	kmem_cache_free(isci_kmem_cache, isci_device);
++	scic_remote_device_destruct(to_sci_dev(idev));
++	idev->domain_dev->lldd_dev = NULL;
++	idev->domain_dev = NULL;
++	idev->isci_port = NULL;
++	list_del_init(&idev->node);
++
++	clear_bit(IDEV_START_PENDING, &idev->flags);
++	clear_bit(IDEV_STOP_PENDING, &idev->flags);
++	wake_up(&ihost->eventq);
+ }
+ 
+ 
+@@ -259,25 +254,27 @@ void isci_remote_device_nuke_requests(
+  * pointer to new isci_remote_device.
+  */
+ static struct isci_remote_device *
+-isci_remote_device_alloc(struct isci_host *isci_host, struct isci_port *port)
++isci_remote_device_alloc(struct isci_host *ihost, struct isci_port *iport)
+ {
+-	struct isci_remote_device *isci_device;
++	struct isci_remote_device *idev;
++	int i;
+ 
+-	isci_device = kmem_cache_zalloc(isci_kmem_cache, GFP_KERNEL);
++	for (i = 0; i < SCI_MAX_REMOTE_DEVICES; i++) {
++		idev = idev_by_id(ihost, i);
++		if (!test_and_set_bit(IDEV_ALLOCATED, &idev->flags))
++			break;
++	}
+ 
+-	if (!isci_device) {
+-		dev_warn(&isci_host->pdev->dev, "%s: failed\n", __func__);
++	if (i >= SCI_MAX_REMOTE_DEVICES) {
++		dev_warn(&ihost->pdev->dev, "%s: failed\n", __func__);
+ 		return NULL;
+ 	}
+ 
+-	INIT_LIST_HEAD(&isci_device->reqs_in_process);
+-	INIT_LIST_HEAD(&isci_device->node);
+-
+-	spin_lock_init(&isci_device->state_lock);
+-	isci_remote_device_change_state(isci_device, isci_freed);
+-
+-	return isci_device;
++	BUG_ON(!list_empty(&idev->reqs_in_process));
++	BUG_ON(!list_empty(&idev->node));
++	isci_remote_device_change_state(idev, isci_freed);
+ 
++	return idev;
+ }
+ 
+ /**
+@@ -381,24 +378,22 @@ enum sci_status isci_remote_device_stop(struct isci_host *ihost, struct isci_rem
+ {
+ 	enum sci_status status;
+ 	unsigned long flags;
+-	DECLARE_COMPLETION_ONSTACK(completion);
+ 
+ 	dev_dbg(&ihost->pdev->dev,
+ 		"%s: isci_device = %p\n", __func__, idev);
+ 
+ 	isci_remote_device_change_state(idev, isci_stopping);
+ 	set_bit(IDEV_STOP_PENDING, &idev->flags);
+-	idev->cmp = &completion;
+ 
+ 	spin_lock_irqsave(&ihost->scic_lock, flags);
+-
+ 	status = scic_remote_device_stop(to_sci_dev(idev), 50);
+-
+ 	spin_unlock_irqrestore(&ihost->scic_lock, flags);
+ 
+ 	/* Wait for the stop complete callback. */
+-	if (status == SCI_SUCCESS)
++	if (status == SCI_SUCCESS) {
+ 		wait_for_device_stop(ihost, idev);
++		clear_bit(IDEV_ALLOCATED, &idev->flags);
++	}
+ 
+ 	dev_dbg(&ihost->pdev->dev,
+ 		"%s: idev = %p - after completion wait\n",
+@@ -469,6 +464,8 @@ int isci_remote_device_found(struct domain_device *domain_dev)
+ 		return -ENODEV;
+ 
+ 	isci_device = isci_remote_device_alloc(isci_host, isci_port);
++	if (!isci_device)
++		return -ENODEV;
+ 
+ 	INIT_LIST_HEAD(&isci_device->node);
+ 	domain_dev->lldd_dev = isci_device;
+diff --git a/drivers/scsi/isci/remote_device.h b/drivers/scsi/isci/remote_device.h
+index 3c22137..f45a5f0 100644
+--- a/drivers/scsi/isci/remote_device.h
++++ b/drivers/scsi/isci/remote_device.h
+@@ -63,8 +63,8 @@ struct isci_remote_device {
+ 	enum isci_status status;
+ 	#define IDEV_START_PENDING 0
+ 	#define IDEV_STOP_PENDING 1
++	#define IDEV_ALLOCATED 2
+ 	unsigned long flags;
+-	struct completion *cmp;
+ 	struct isci_port *isci_port;
+ 	struct domain_device *domain_dev;
+ 	struct list_head node;
+-- 
+1.7.0
+

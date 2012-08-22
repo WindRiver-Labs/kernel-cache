@@ -1,0 +1,642 @@
+From 3eb54075b05cd9571a7441fd7fab0053967abfca Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Wed, 21 Mar 2012 21:09:12 -0700
+Subject: [PATCH 131/474] libsas: suspend / resume support
+
+commit 622b211025552f8269ff7c52699121bfe35c9518 from
+git://git.kernel.org/pub/scm/linux/kernel/git/djbw/isci.git
+
+libsas power management routines to suspend and recover the sas domain
+based on a model where the lldd is allowed and expected to be
+"forgetful".
+
+sas_suspend_ha - disable event processing allowing the lldd to take down
+                 links without concern for causing hotplug events.
+                 Regardless of whether the lldd actually posts link down
+                 messages libsas notifies the lldd that all
+                 domain_devices are gone.
+
+sas_prep_resume_ha - on the way back up before the lldd starts link
+                     training clean out any spurious events that were
+                     generated on the way down, and re-enable event
+                     processing
+
+sas_resume_ha - after the lldd has started and decided that all phys
+		have posted link-up events this routine is called to let
+		libsas start it's own timeout of any phys that did not
+		resume.  After the timeout an lldd can cancel the
+                phy teardown by posting a link-up event.
+
+Storage for ex_change_count (u16) and phy_change_count (u8) are changed
+to int so they can be set to -1 to indicate 'invalidated'.
+
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Reviewed-by: Jacek Danecki <jacek.danecki@intel.com>
+Tested-by: Maciej Patelczyk <maciej.patelczyk@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+---
+ drivers/scsi/libsas/sas_ata.c      |   86 ++++++++++++++++++++++++++++++++++
+ drivers/scsi/libsas/sas_discover.c |   69 +++++++++++++++++++++++----
+ drivers/scsi/libsas/sas_dump.c     |    1 +
+ drivers/scsi/libsas/sas_event.c    |    4 +-
+ drivers/scsi/libsas/sas_init.c     |   90 +++++++++++++++++++++++++++++++++++-
+ drivers/scsi/libsas/sas_internal.h |    1 +
+ drivers/scsi/libsas/sas_phy.c      |   21 ++++++++
+ drivers/scsi/libsas/sas_port.c     |   52 ++++++++++++++++++++-
+ include/scsi/libsas.h              |   20 ++++++--
+ include/scsi/sas_ata.h             |    8 +++-
+ 10 files changed, 332 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/scsi/libsas/sas_ata.c b/drivers/scsi/libsas/sas_ata.c
+index 551385a..3ef04d2 100644
+--- a/drivers/scsi/libsas/sas_ata.c
++++ b/drivers/scsi/libsas/sas_ata.c
+@@ -733,6 +733,92 @@ void sas_probe_sata(struct asd_sas_port *port)
+ 		if (ata_dev_disabled(sas_to_ata_dev(dev)))
+ 			sas_fail_probe(dev, __func__, -ENODEV);
+ 	}
++
++}
++
++static bool sas_ata_flush_pm_eh(struct asd_sas_port *port, const char *func)
++{
++	struct domain_device *dev, *n;
++	bool retry = false;
++
++	list_for_each_entry_safe(dev, n, &port->dev_list, dev_list_node) {
++		int rc;
++
++		if (!dev_is_sata(dev))
++			continue;
++
++		sas_ata_wait_eh(dev);
++		rc = dev->sata_dev.pm_result;
++		if (rc == -EAGAIN)
++			retry = true;
++		else if (rc) {
++			/* since we don't have a
++			 * ->port_{suspend|resume} routine in our
++			 *  ata_port ops, and no entanglements with
++			 *  acpi, suspend should just be mechanical trip
++			 *  through eh, catch cases where these
++			 *  assumptions are invalidated
++			 */
++			WARN_ONCE(1, "failed %s %s error: %d\n", func,
++				 dev_name(&dev->rphy->dev), rc);
++		}
++
++		/* if libata failed to power manage the device, tear it down */
++		if (ata_dev_disabled(sas_to_ata_dev(dev)))
++			sas_fail_probe(dev, func, -ENODEV);
++	}
++
++	return retry;
++}
++
++void sas_suspend_sata(struct asd_sas_port *port)
++{
++	struct domain_device *dev;
++
++ retry:
++	mutex_lock(&port->ha->disco_mutex);
++	list_for_each_entry(dev, &port->dev_list, dev_list_node) {
++		struct sata_device *sata;
++
++		if (!dev_is_sata(dev))
++			continue;
++
++		sata = &dev->sata_dev;
++		if (sata->ap->pm_mesg.event == PM_EVENT_SUSPEND)
++			continue;
++
++		sata->pm_result = -EIO;
++		ata_sas_port_async_suspend(sata->ap, &sata->pm_result);
++	}
++	mutex_unlock(&port->ha->disco_mutex);
++
++	if (sas_ata_flush_pm_eh(port, __func__))
++		goto retry;
++}
++
++void sas_resume_sata(struct asd_sas_port *port)
++{
++	struct domain_device *dev;
++
++ retry:
++	mutex_lock(&port->ha->disco_mutex);
++	list_for_each_entry(dev, &port->dev_list, dev_list_node) {
++		struct sata_device *sata;
++
++		if (!dev_is_sata(dev))
++			continue;
++
++		sata = &dev->sata_dev;
++		if (sata->ap->pm_mesg.event == PM_EVENT_ON)
++			continue;
++
++		sata->pm_result = -EIO;
++		ata_sas_port_async_resume(sata->ap, &sata->pm_result);
++	}
++	mutex_unlock(&port->ha->disco_mutex);
++
++	if (sas_ata_flush_pm_eh(port, __func__))
++		goto retry;
+ }
+ 
+ /**
+diff --git a/drivers/scsi/libsas/sas_discover.c b/drivers/scsi/libsas/sas_discover.c
+index 3e9dc1a..a0c3003 100644
+--- a/drivers/scsi/libsas/sas_discover.c
++++ b/drivers/scsi/libsas/sas_discover.c
+@@ -24,6 +24,7 @@
+ 
+ #include <linux/scatterlist.h>
+ #include <linux/slab.h>
++#include <linux/async.h>
+ #include <scsi/scsi_host.h>
+ #include <scsi/scsi_eh.h>
+ #include "sas_internal.h"
+@@ -180,16 +181,18 @@ int sas_notify_lldd_dev_found(struct domain_device *dev)
+ 	struct Scsi_Host *shost = sas_ha->core.shost;
+ 	struct sas_internal *i = to_sas_internal(shost->transportt);
+ 
+-	if (i->dft->lldd_dev_found) {
+-		res = i->dft->lldd_dev_found(dev);
+-		if (res) {
+-			printk("sas: driver on pcidev %s cannot handle "
+-			       "device %llx, error:%d\n",
+-			       dev_name(sas_ha->dev),
+-			       SAS_ADDR(dev->sas_addr), res);
+-		}
+-		kref_get(&dev->kref);
++	if (!i->dft->lldd_dev_found)
++		return 0;
++
++	res = i->dft->lldd_dev_found(dev);
++	if (res) {
++		printk("sas: driver on pcidev %s cannot handle "
++		       "device %llx, error:%d\n",
++		       dev_name(sas_ha->dev),
++		       SAS_ADDR(dev->sas_addr), res);
+ 	}
++	set_bit(SAS_DEV_FOUND, &dev->state);
++	kref_get(&dev->kref);
+ 	return res;
+ }
+ 
+@@ -200,7 +203,10 @@ void sas_notify_lldd_dev_gone(struct domain_device *dev)
+ 	struct Scsi_Host *shost = sas_ha->core.shost;
+ 	struct sas_internal *i = to_sas_internal(shost->transportt);
+ 
+-	if (i->dft->lldd_dev_gone) {
++	if (!i->dft->lldd_dev_gone)
++		return;
++
++	if (test_and_clear_bit(SAS_DEV_FOUND, &dev->state)) {
+ 		i->dft->lldd_dev_gone(dev);
+ 		sas_put_device(dev);
+ 	}
+@@ -234,6 +240,47 @@ static void sas_probe_devices(struct work_struct *work)
+ 	}
+ }
+ 
++static void sas_suspend_devices(struct work_struct *work)
++{
++	struct asd_sas_phy *phy;
++	struct domain_device *dev;
++	struct sas_discovery_event *ev = to_sas_discovery_event(work);
++	struct asd_sas_port *port = ev->port;
++	struct Scsi_Host *shost = port->ha->core.shost;
++	struct sas_internal *si = to_sas_internal(shost->transportt);
++
++	clear_bit(DISCE_SUSPEND, &port->disc.pending);
++
++	sas_suspend_sata(port);
++
++	/* lldd is free to forget the domain_device across the
++	 * suspension, we force the issue here to keep the reference
++	 * counts aligned
++	 */
++	list_for_each_entry(dev, &port->dev_list, dev_list_node)
++		sas_notify_lldd_dev_gone(dev);
++
++	/* we are suspending, so we know events are disabled and
++	 * phy_list is not being mutated
++	 */
++	list_for_each_entry(phy, &port->phy_list, port_phy_el) {
++		if (si->dft->lldd_port_formed)
++			si->dft->lldd_port_deformed(phy);
++		phy->suspended = 1;
++		port->suspended = 1;
++	}
++}
++
++static void sas_resume_devices(struct work_struct *work)
++{
++	struct sas_discovery_event *ev = to_sas_discovery_event(work);
++	struct asd_sas_port *port = ev->port;
++
++	clear_bit(DISCE_RESUME, &port->disc.pending);
++
++	sas_resume_sata(port);
++}
++
+ /**
+  * sas_discover_end_dev -- discover an end device (SSP, etc)
+  * @end: pointer to domain device of interest
+@@ -530,6 +577,8 @@ void sas_init_disc(struct sas_discovery *disc, struct asd_sas_port *port)
+ 		[DISCE_DISCOVER_DOMAIN] = sas_discover_domain,
+ 		[DISCE_REVALIDATE_DOMAIN] = sas_revalidate_domain,
+ 		[DISCE_PROBE] = sas_probe_devices,
++		[DISCE_SUSPEND] = sas_suspend_devices,
++		[DISCE_RESUME] = sas_resume_devices,
+ 		[DISCE_DESTRUCT] = sas_destruct_devices,
+ 	};
+ 
+diff --git a/drivers/scsi/libsas/sas_dump.c b/drivers/scsi/libsas/sas_dump.c
+index c17c250..2d97d39 100644
+--- a/drivers/scsi/libsas/sas_dump.c
++++ b/drivers/scsi/libsas/sas_dump.c
+@@ -43,6 +43,7 @@ static const char *sas_phye_str[] = {
+ 	[1] = "PHYE_OOB_DONE",
+ 	[2] = "PHYE_OOB_ERROR",
+ 	[3] = "PHYE_SPINUP_HOLD",
++	[4] = "PHYE_RESUME_TIMEOUT",
+ };
+ 
+ void sas_dprint_porte(int phyid, enum port_event pe)
+diff --git a/drivers/scsi/libsas/sas_event.c b/drivers/scsi/libsas/sas_event.c
+index d23af2b..a128a8e 100644
+--- a/drivers/scsi/libsas/sas_event.c
++++ b/drivers/scsi/libsas/sas_event.c
+@@ -135,7 +135,7 @@ static void notify_port_event(struct asd_sas_phy *phy, enum port_event event)
+ 			&phy->port_events[event].work, ha);
+ }
+ 
+-static void notify_phy_event(struct asd_sas_phy *phy, enum phy_event event)
++void sas_notify_phy_event(struct asd_sas_phy *phy, enum phy_event event)
+ {
+ 	struct sas_ha_struct *ha = phy->ha;
+ 
+@@ -160,7 +160,7 @@ int sas_init_events(struct sas_ha_struct *sas_ha)
+ 
+ 	sas_ha->notify_ha_event = notify_ha_event;
+ 	sas_ha->notify_port_event = notify_port_event;
+-	sas_ha->notify_phy_event = notify_phy_event;
++	sas_ha->notify_phy_event = sas_notify_phy_event;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/scsi/libsas/sas_init.c b/drivers/scsi/libsas/sas_init.c
+index 014297c..dbc8a79 100644
+--- a/drivers/scsi/libsas/sas_init.c
++++ b/drivers/scsi/libsas/sas_init.c
+@@ -178,7 +178,7 @@ Undo_phys:
+ 	return error;
+ }
+ 
+-int sas_unregister_ha(struct sas_ha_struct *sas_ha)
++static void sas_disable_events(struct sas_ha_struct *sas_ha)
+ {
+ 	/* Set the state to unregistered to avoid further unchained
+ 	 * events to be queued, and flush any in-progress drainers
+@@ -189,7 +189,11 @@ int sas_unregister_ha(struct sas_ha_struct *sas_ha)
+ 	spin_unlock_irq(&sas_ha->lock);
+ 	__sas_drain_work(sas_ha);
+ 	mutex_unlock(&sas_ha->drain_mutex);
++}
+ 
++int sas_unregister_ha(struct sas_ha_struct *sas_ha)
++{
++	sas_disable_events(sas_ha);
+ 	sas_unregister_ports(sas_ha);
+ 
+ 	/* flush unregistration work */
+@@ -381,6 +385,90 @@ int sas_set_phy_speed(struct sas_phy *phy,
+ 	return ret;
+ }
+ 
++void sas_prep_resume_ha(struct sas_ha_struct *ha)
++{
++	int i;
++
++	set_bit(SAS_HA_REGISTERED, &ha->state);
++
++	/* clear out any stale link events/data from the suspension path */
++	for (i = 0; i < ha->num_phys; i++) {
++		struct asd_sas_phy *phy = ha->sas_phy[i];
++
++		memset(phy->attached_sas_addr, 0, SAS_ADDR_SIZE);
++		phy->port_events_pending = 0;
++		phy->phy_events_pending = 0;
++		phy->frame_rcvd_size = 0;
++	}
++}
++EXPORT_SYMBOL(sas_prep_resume_ha);
++
++static int phys_suspended(struct sas_ha_struct *ha)
++{
++	int i, rc = 0;
++
++	for (i = 0; i < ha->num_phys; i++) {
++		struct asd_sas_phy *phy = ha->sas_phy[i];
++
++		if (phy->suspended)
++			rc++;
++	}
++
++	return rc;
++}
++
++void sas_resume_ha(struct sas_ha_struct *ha)
++{
++	const unsigned long tmo = msecs_to_jiffies(25000);
++	int i;
++
++	/* deform ports on phys that did not resume
++	 * at this point we may be racing the phy coming back (as posted
++	 * by the lldd).  So we post the event and once we are in the
++	 * libsas context check that the phy remains suspended before
++	 * tearing it down.
++	 */
++	i = phys_suspended(ha);
++	if (i)
++		dev_info(ha->dev, "waiting up to 25 seconds for %d phy%s to resume\n",
++			 i, i > 1 ? "s" : "");
++	wait_event_timeout(ha->eh_wait_q, phys_suspended(ha) == 0, tmo);
++	for (i = 0; i < ha->num_phys; i++) {
++		struct asd_sas_phy *phy = ha->sas_phy[i];
++
++		if (phy->suspended) {
++			dev_warn(&phy->phy->dev, "resume timeout\n");
++			sas_notify_phy_event(phy, PHYE_RESUME_TIMEOUT);
++		}
++	}
++
++	/* all phys are back up or timed out, turn on i/o so we can
++	 * flush out disks that did not return
++	 */
++	scsi_unblock_requests(ha->core.shost);
++	sas_drain_work(ha);
++}
++EXPORT_SYMBOL(sas_resume_ha);
++
++void sas_suspend_ha(struct sas_ha_struct *ha)
++{
++	int i;
++
++	sas_disable_events(ha);
++	scsi_block_requests(ha->core.shost);
++	for (i = 0; i < ha->num_phys; i++) {
++		struct asd_sas_port *port = ha->sas_port[i];
++
++		sas_discover_event(port, DISCE_SUSPEND);
++	}
++
++	/* flush suspend events while unregistered */
++	mutex_lock(&ha->drain_mutex);
++	__sas_drain_work(ha);
++	mutex_unlock(&ha->drain_mutex);
++}
++EXPORT_SYMBOL(sas_suspend_ha);
++
+ static void sas_phy_release(struct sas_phy *phy)
+ {
+ 	kfree(phy->hostdata);
+diff --git a/drivers/scsi/libsas/sas_internal.h b/drivers/scsi/libsas/sas_internal.h
+index 2552f60..6751f8e 100644
+--- a/drivers/scsi/libsas/sas_internal.h
++++ b/drivers/scsi/libsas/sas_internal.h
+@@ -93,6 +93,7 @@ int sas_smp_phy_control(struct domain_device *dev, int phy_id,
+ 			enum phy_func phy_func, struct sas_phy_linkrates *);
+ int sas_smp_get_phy_events(struct sas_phy *phy);
+ 
++void sas_notify_phy_event(struct asd_sas_phy *phy, enum phy_event event);
+ void sas_device_set_phy(struct domain_device *dev, struct sas_port *port);
+ struct domain_device *sas_find_dev_by_rphy(struct sas_rphy *rphy);
+ struct domain_device *sas_ex_to_ata(struct domain_device *ex_dev, int phy_id);
+diff --git a/drivers/scsi/libsas/sas_phy.c b/drivers/scsi/libsas/sas_phy.c
+index 521422e..cdee446 100644
+--- a/drivers/scsi/libsas/sas_phy.c
++++ b/drivers/scsi/libsas/sas_phy.c
+@@ -94,6 +94,25 @@ static void sas_phye_spinup_hold(struct work_struct *work)
+ 	i->dft->lldd_control_phy(phy, PHY_FUNC_RELEASE_SPINUP_HOLD, NULL);
+ }
+ 
++static void sas_phye_resume_timeout(struct work_struct *work)
++{
++	struct asd_sas_event *ev = to_asd_sas_event(work);
++	struct asd_sas_phy *phy = ev->phy;
++
++	clear_bit(PHYE_RESUME_TIMEOUT, &phy->phy_events_pending);
++
++	/* phew, lldd got the phy back in the nick of time */
++	if (!phy->suspended) {
++		dev_info(&phy->phy->dev, "resume timeout cancelled\n");
++		return;
++	}
++
++	phy->error = 0;
++	phy->suspended = 0;
++	sas_deform_port(phy, 1);
++}
++
++
+ /* ---------- Phy class registration ---------- */
+ 
+ int sas_register_phys(struct sas_ha_struct *sas_ha)
+@@ -105,6 +124,8 @@ int sas_register_phys(struct sas_ha_struct *sas_ha)
+ 		[PHYE_OOB_DONE] = sas_phye_oob_done,
+ 		[PHYE_OOB_ERROR] = sas_phye_oob_error,
+ 		[PHYE_SPINUP_HOLD] = sas_phye_spinup_hold,
++		[PHYE_RESUME_TIMEOUT] = sas_phye_resume_timeout,
++
+ 	};
+ 
+ 	static const work_func_t sas_port_event_fns[PORT_NUM_EVENTS] = {
+diff --git a/drivers/scsi/libsas/sas_port.c b/drivers/scsi/libsas/sas_port.c
+index c977c92..c133618 100644
+--- a/drivers/scsi/libsas/sas_port.c
++++ b/drivers/scsi/libsas/sas_port.c
+@@ -39,6 +39,49 @@ static bool phy_is_wideport_member(struct asd_sas_port *port, struct asd_sas_phy
+ 	return true;
+ }
+ 
++static void sas_resume_port(struct asd_sas_phy *phy)
++{
++	struct domain_device *dev;
++	struct asd_sas_port *port = phy->port;
++	struct sas_ha_struct *sas_ha = phy->ha;
++	struct sas_internal *si = to_sas_internal(sas_ha->core.shost->transportt);
++
++	if (si->dft->lldd_port_formed)
++		si->dft->lldd_port_formed(phy);
++
++	if (port->suspended)
++		port->suspended = 0;
++	else {
++		/* we only need to handle "link returned" actions once */
++		return;
++	}
++
++	/* if the port came back:
++	 * 1/ presume every device came back
++	 * 2/ force the next revalidation to check all expander phys
++	 */
++	list_for_each_entry(dev, &port->dev_list, dev_list_node) {
++		int i, rc;
++
++		rc = sas_notify_lldd_dev_found(dev);
++		if (rc) {
++			sas_unregister_dev(port, dev);
++			continue;
++		}
++
++		if (dev->dev_type == EDGE_DEV || dev->dev_type == FANOUT_DEV) {
++			dev->ex_dev.ex_change_count = -1;
++			for (i = 0; i < dev->ex_dev.num_phys; i++) {
++				struct ex_phy *phy = &dev->ex_dev.ex_phy[i];
++
++				phy->phy_change_count = -1;
++			}
++		}
++	}
++
++	sas_discover_event(port, DISCE_RESUME);
++}
++
+ /**
+  * sas_form_port -- add this phy to a port
+  * @phy: the phy of interest
+@@ -58,7 +101,14 @@ static void sas_form_port(struct asd_sas_phy *phy)
+ 	if (port) {
+ 		if (!phy_is_wideport_member(port, phy))
+ 			sas_deform_port(phy, 0);
+-		else {
++		else if (phy->suspended) {
++			phy->suspended = 0;
++			sas_resume_port(phy);
++
++			/* phy came back, try to cancel the timeout */
++			wake_up(&sas_ha->eh_wait_q);
++			return;
++		} else {
+ 			SAS_DPRINTK("%s: phy%d belongs to port%d already(%d)!\n",
+ 				    __func__, phy->id, phy->port->id,
+ 				    phy->port->num_phys);
+diff --git a/include/scsi/libsas.h b/include/scsi/libsas.h
+index 6dc55be..f7dacad 100644
+--- a/include/scsi/libsas.h
++++ b/include/scsi/libsas.h
+@@ -79,7 +79,8 @@ enum phy_event {
+ 	PHYE_OOB_DONE         = 1,
+ 	PHYE_OOB_ERROR        = 2,
+ 	PHYE_SPINUP_HOLD      = 3, /* hot plug SATA, no COMWAKE sent */
+-	PHY_NUM_EVENTS        = 4,
++	PHYE_RESUME_TIMEOUT   = 4,
++	PHY_NUM_EVENTS        = 5,
+ };
+ 
+ enum discover_event {
+@@ -87,8 +88,10 @@ enum discover_event {
+ 	DISCE_REVALIDATE_DOMAIN = 1,
+ 	DISCE_PORT_GONE         = 2,
+ 	DISCE_PROBE		= 3,
+-	DISCE_DESTRUCT		= 4,
+-	DISC_NUM_EVENTS		= 5,
++	DISCE_SUSPEND		= 4,
++	DISCE_RESUME		= 5,
++	DISCE_DESTRUCT		= 6,
++	DISC_NUM_EVENTS		= 7,
+ };
+ 
+ /* ---------- Expander Devices ---------- */
+@@ -128,7 +131,7 @@ struct ex_phy {
+ 	u8   attached_sas_addr[SAS_ADDR_SIZE];
+ 	u8   attached_phy_id;
+ 
+-	u8   phy_change_count;
++	int phy_change_count;
+ 	enum routing_attribute routing_attr;
+ 	u8   virtual:1;
+ 
+@@ -141,7 +144,7 @@ struct ex_phy {
+ struct expander_device {
+ 	struct list_head children;
+ 
+-	u16    ex_change_count;
++	int    ex_change_count;
+ 	u16    max_route_indexes;
+ 	u8     num_phys;
+ 
+@@ -167,6 +170,7 @@ struct sata_device {
+         enum   ata_command_set command_set;
+         struct smp_resp        rps_resp; /* report_phy_sata_resp */
+         u8     port_no;        /* port number, if this is a PM (Port) */
++	int    pm_result;
+ 
+ 	struct ata_port *ap;
+ 	struct ata_host ata_host;
+@@ -180,6 +184,7 @@ struct ssp_device {
+ 
+ enum {
+ 	SAS_DEV_GONE,
++	SAS_DEV_FOUND, /* device notified to lldd */
+ 	SAS_DEV_DESTROY,
+ 	SAS_DEV_EH_PENDING,
+ 	SAS_DEV_LU_RESET,
+@@ -271,6 +276,7 @@ struct asd_sas_port {
+ 	enum   sas_linkrate linkrate;
+ 
+ 	struct sas_work work;
++	int suspended;
+ 
+ /* public: */
+ 	int id;
+@@ -319,6 +325,7 @@ struct asd_sas_phy {
+ 	unsigned long phy_events_pending;
+ 
+ 	int error;
++	int suspended;
+ 
+ 	struct sas_phy *phy;
+ 
+@@ -685,6 +692,9 @@ struct sas_domain_function_template {
+ 
+ extern int sas_register_ha(struct sas_ha_struct *);
+ extern int sas_unregister_ha(struct sas_ha_struct *);
++extern void sas_prep_resume_ha(struct sas_ha_struct *sas_ha);
++extern void sas_resume_ha(struct sas_ha_struct *sas_ha);
++extern void sas_suspend_ha(struct sas_ha_struct *sas_ha);
+ 
+ int sas_set_phy_speed(struct sas_phy *phy,
+ 		      struct sas_phy_linkrates *rates);
+diff --git a/include/scsi/sas_ata.h b/include/scsi/sas_ata.h
+index 587de57..ff71a56 100644
+--- a/include/scsi/sas_ata.h
++++ b/include/scsi/sas_ata.h
+@@ -45,6 +45,8 @@ void sas_ata_eh(struct Scsi_Host *shost, struct list_head *work_q,
+ void sas_ata_schedule_reset(struct domain_device *dev);
+ void sas_ata_wait_eh(struct domain_device *dev);
+ void sas_probe_sata(struct asd_sas_port *port);
++void sas_suspend_sata(struct asd_sas_port *port);
++void sas_resume_sata(struct asd_sas_port *port);
+ void sas_ata_end_eh(struct ata_port *ap);
+ #else
+ 
+@@ -82,7 +84,11 @@ static inline void sas_probe_sata(struct asd_sas_port *port)
+ {
+ }
+ 
+-static inline void sas_probe_sata(struct asd_sas_port *port)
++static inline void sas_suspend_sata(struct asd_sas_port *port)
++{
++}
++
++static inline void sas_resume_sata(struct asd_sas_port *port)
+ {
+ }
+ 
+-- 
+1.7.0
+
