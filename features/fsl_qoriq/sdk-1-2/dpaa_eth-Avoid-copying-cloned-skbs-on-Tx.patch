@@ -1,0 +1,456 @@
+From eb8d3c54c033c7f0f843ad043f4da05be0b31eab Mon Sep 17 00:00:00 2001
+From: Ruxandra Radulescu <ruxandra.radulescu@freescale.com>
+Date: Tue, 6 Mar 2012 23:29:25 +0000
+Subject: [PATCH 101/128] dpaa_eth: Avoid copying cloned skbs on Tx
+
+In the current driver code, if a cloned skb is received from the stack,
+it is unshared (data copy), such that the data buffer can be safely
+used to store a backpointer to the skb. This is particularly painful
+for large frames.
+
+To avoid copying the entire skb data, leave the skb shared, but
+send a S/G frame to Fman, with the S/G table containing a single
+entry that points to the skb data buffer. The skb backpointer will
+be stored in the first buffer (the one containing the S/G table),
+leaving the data buffer untouched.
+
+This improves performance significantly for originating TCP traffic
+(~14% for 9.6K jumbo frames).
+
+Signed-off-by: Ioana Radulescu <ruxandra.radulescu@freescale.com>
+[Kevin: Original patch taken from FSL
+QorIQ-SDK-V1.2-SOURCE-20120614-yocto.iso image]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/net/ethernet/freescale/dpa/dpaa_eth.c |  294 +++++++++++++++++++------
+ 1 file changed, 224 insertions(+), 70 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/dpa/dpaa_eth.c b/drivers/net/ethernet/freescale/dpa/dpaa_eth.c
+index 4c7ef08..3dfc609 100644
+--- a/drivers/net/ethernet/freescale/dpa/dpaa_eth.c
++++ b/drivers/net/ethernet/freescale/dpa/dpaa_eth.c
+@@ -76,6 +76,13 @@
+ #define DPA_BP_FINE ((smp_processor_id() << 16))
+ #define DPA_BP_REFILL_NEEDED 1
+ 
++/* S/G table requires at least 256 bytes */
++#define SGT_BUFFER_SIZE		DPA_BP_SIZE(256)
++
++/* Maximum frame size on Tx for which skb copying is preferrable to
++ * creating a S/G frame */
++#define DPA_SKB_COPY_MAX_SIZE	256
++
+ /* Bootarg used to override the Kconfig DPA_MAX_FRM_SIZE value */
+ #define FSL_FMAN_PHY_MAXFRM_BOOTARG	"fsl_fman_phy_max_frm"
+ 
+@@ -612,6 +619,50 @@ dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
+ 		cpu_relax();
+ }
+ 
++/*
++ * Cleanup function for outgoing frame descriptors that were built on Tx path,
++ * either contiguous frames or scatter/gather ones with a single data buffer.
++ * Skb freeing is not handled here.
++ *
++ * This function may be called on error paths in the Tx function, so guard
++ * against cases when not all fd relevant fields were filled in.
++ */
++static void _dpa_cleanup_tx_fd(const struct dpa_priv_s *priv,
++			       const struct qm_fd *fd)
++{
++	dma_addr_t addr = qm_fd_addr(fd);
++	dma_addr_t sg_addr;
++	struct dpa_bp *bp = priv->dpa_bp;
++
++	BUG_ON(!fd);
++
++	if (unlikely(!addr))
++		return;
++
++	if (fd->format == qm_fd_contig)
++		/* For contiguous frames, just unmap data buffer */
++		dma_unmap_single(bp->dev, addr, bp->size, DMA_TO_DEVICE);
++	else {
++		/* For s/g, we need to unmap both the SGT buffer and the
++		 * data buffer, and also free the SGT buffer */
++		struct qm_sg_entry *sg_entry;
++		void *vaddr = phys_to_virt(addr);
++
++		/* Unmap first buffer (contains S/G table) */
++		dma_unmap_single(bp->dev, addr, SGT_BUFFER_SIZE,
++				 DMA_TO_DEVICE);
++
++		/* Unmap data buffer */
++		sg_entry = (struct qm_sg_entry *)(vaddr + fd->offset);
++		sg_addr = qm_sg_addr(sg_entry);
++		if (likely(sg_addr))
++			dma_unmap_single(bp->dev, sg_addr, bp->size,
++					 DMA_TO_DEVICE);
++		/* Free first buffer (which was allocated on Tx) */
++		kfree(vaddr);
++	}
++}
++
+ /* net_device */
+ 
+ #define NN_ALLOCATED_SPACE(net_dev) \
+@@ -835,7 +886,6 @@ static void _dpa_tx_error(struct net_device		*net_dev,
+ 	struct sk_buff *skb;
+ 	struct sk_buff **skbh;
+ 	dma_addr_t addr = qm_fd_addr(fd);
+-	struct dpa_bp *bp = priv->dpa_bp;
+ 
+ 	if (netif_msg_hw(priv) && net_ratelimit())
+ 		cpu_netdev_warn(net_dev, "FD status = 0x%08x\n",
+@@ -845,7 +895,7 @@ static void _dpa_tx_error(struct net_device		*net_dev,
+ 
+ 	skbh = (struct sk_buff **)phys_to_virt(addr);
+ 
+-	dma_unmap_single(bp->dev, addr, bp->size, DMA_TO_DEVICE);
++	_dpa_cleanup_tx_fd(priv, fd);
+ 
+ 	skb = *skbh;
+ 	dev_kfree_skb(skb);
+@@ -997,7 +1047,6 @@ static void __hot _dpa_tx(struct net_device		*net_dev,
+ 	struct sk_buff **skbh;
+ 	struct sk_buff	*skb;
+ 	dma_addr_t addr = qm_fd_addr(fd);
+-	struct dpa_bp *bp = priv->dpa_bp;
+ 
+ 	/* This might not perfectly reflect the reality, if the core dequeueing
+ 	 * the Tx confirmation is different from the one that did the enqueue,
+@@ -1014,14 +1063,13 @@ static void __hot _dpa_tx(struct net_device		*net_dev,
+ 
+ 	skbh = (struct sk_buff **)phys_to_virt(addr);
+ 
+-	dma_unmap_single(bp->dev, addr, bp->size, DMA_TO_DEVICE);
+-	skb = *skbh;
+-
+ #ifdef CONFIG_FSL_DPA_1588
+ 	if (priv->tsu && priv->tsu->valid && priv->tsu->hwts_tx_en_ioctl)
+ 		dpa_ptp_store_txstamp(net_dev, skb, fd);
+ #endif
++	_dpa_cleanup_tx_fd(priv, fd);
+ 
++	skb = *skbh;
+ 	dev_kfree_skb(skb);
+ }
+ 
+@@ -1239,48 +1287,94 @@ static inline void clear_fd(struct qm_fd *fd)
+ 	fd->cmd = 0;
+ }
+ 
+-static int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
++static int skb_to_sg_fd(struct dpa_priv_s *priv,
++		struct sk_buff *skb, struct qm_fd *fd)
+ {
+-	struct dpa_priv_s	*priv;
+-	struct device		*dev;
+-	struct qm_fd		 fd;
+-	unsigned int	headroom;
+-	struct dpa_percpu_priv_s *percpu_priv;
++	struct dpa_bp *dpa_bp = priv->dpa_bp;
++	void *vaddr;
++	dma_addr_t paddr;
+ 	struct sk_buff **skbh;
+-	dma_addr_t addr;
+-	struct dpa_bp *dpa_bp;
+-	int queue_mapping;
++	struct qm_sg_entry *sg_entry;
++	struct net_device *net_dev = priv->net_dev;
+ 	int err;
+-	unsigned int pad;
+ 
+-	priv = netdev_priv(net_dev);
+-	percpu_priv = per_cpu_ptr(priv->percpu_priv, smp_processor_id());
+-	dev = net_dev->dev.parent;
++	/* Allocate the first buffer in the FD (used for storing S/G table) */
++	vaddr = kmalloc(SGT_BUFFER_SIZE, GFP_ATOMIC);
++	if (unlikely(vaddr == NULL)) {
++		if (netif_msg_tx_err(priv) && net_ratelimit())
++			cpu_netdev_err(net_dev, "Memory allocation failed\n");
++		return -ENOMEM;
++	}
++	/* Store skb backpointer at the beginning of the buffer */
++	skbh = (struct sk_buff **)vaddr;
++	*skbh = skb;
+ 
+-	clear_fd(&fd);
+-	fd.format = qm_fd_contig;
++	/* Fill in FD */
++	fd->format = qm_fd_sg;
++	fd->offset = DPA_BP_HEAD;
++	fd->length20 = skb->len;
+ 
+-	headroom = skb_headroom(skb);
+-	queue_mapping = skb_get_queue_mapping(skb);
++	/* Enable hardware checksum computation */
++	err = dpa_enable_tx_csum(priv, skb, fd,
++		(char *)vaddr + DPA_PRIV_DATA_SIZE);
++	if (unlikely(err < 0)) {
++		if (netif_msg_tx_err(priv) && net_ratelimit())
++			cpu_netdev_err(net_dev, "HW csum error: %d\n", err);
++		kfree(vaddr);
++		return err;
++	}
+ 
+-	if (headroom < DPA_BP_HEAD) {
+-		struct sk_buff *skb_new;
++	/* Map the buffer and store its address in the FD */
++	paddr = dma_map_single(dpa_bp->dev, vaddr, SGT_BUFFER_SIZE,
++			       DMA_TO_DEVICE);
++	if (unlikely(dma_mapping_error(dpa_bp->dev, paddr))) {
++		if (netif_msg_tx_err(priv) && net_ratelimit())
++			cpu_netdev_err(net_dev, "DMA mapping failed\n");
++		kfree(vaddr);
++		return -EINVAL;
++	}
+ 
+-		skb_new = skb_realloc_headroom(skb, DPA_BP_HEAD);
+-		if (!skb_new) {
+-			percpu_priv->stats.tx_errors++;
+-			kfree_skb(skb);
+-			return NETDEV_TX_OK;
+-		}
+-		kfree_skb(skb);
+-		skb = skb_new;
+-		headroom = skb_headroom(skb);
++	fd->addr_hi = upper_32_bits(paddr);
++	fd->addr_lo = lower_32_bits(paddr);
++
++	/* Fill in S/G entry */
++	sg_entry = (struct qm_sg_entry *)(vaddr + fd->offset);
++
++	sg_entry->extension = 0;
++	sg_entry->final = 1;
++	sg_entry->length = skb->len;
++	/*
++	 * Put the same offset in the data buffer as in the SGT (first) buffer.
++	 * This is the format for S/G frames generated by FMan; the manual is
++	 * not clear if same is required of Tx S/G frames, but since we know
++	 * for sure we have at least DPA_BP_HEAD bytes of skb headroom, lets not
++	 * take any chances.
++	 */
++	sg_entry->offset = DPA_BP_HEAD;
++
++	paddr = dma_map_single(dpa_bp->dev, skb->data - sg_entry->offset,
++			       dpa_bp->size, DMA_TO_DEVICE);
++	if (unlikely(dma_mapping_error(dpa_bp->dev, paddr))) {
++		if (netif_msg_tx_err(priv) && net_ratelimit())
++			cpu_netdev_err(net_dev, "DMA mapping failed\n");
++		return -EINVAL;
+ 	}
++	sg_entry->addr_hi = upper_32_bits(paddr);
++	sg_entry->addr_lo = lower_32_bits(paddr);
+ 
+-	skb = skb_unshare(skb, GFP_ATOMIC);
++	return 0;
++}
+ 
+-	if (!skb)
+-		return NETDEV_TX_OK;
++static int skb_to_contig_fd(struct dpa_priv_s *priv,
++		struct dpa_percpu_priv_s *percpu_priv,
++		struct sk_buff *skb, struct qm_fd *fd)
++{
++	struct sk_buff **skbh;
++	dma_addr_t addr;
++	struct dpa_bp *dpa_bp;
++	unsigned int pad;
++	struct net_device *net_dev = priv->net_dev;
++	int err;
+ 
+ 	/*
+ 	 * We are guaranteed that we have at least DPA_BP_HEAD of headroom.
+@@ -1291,7 +1385,7 @@ static int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+ 	 * from elsewhere in the kernel.
+ 	 */
+ 	skbh = (struct sk_buff **)(skb->data - DPA_BP_HEAD);
+-	pad = headroom - DPA_BP_HEAD;
++	pad = skb_headroom(skb) - DPA_BP_HEAD;
+ 
+ 	*skbh = skb;
+ 
+@@ -1301,23 +1395,17 @@ static int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+ 	 *
+ 	 * We must do this before dma_map_single(DMA_TO_DEVICE), because we may
+ 	 * need to write into the skb. */
+-	err = dpa_enable_tx_csum(priv, skb, &fd,
+-			((char *)skbh) + DPA_PRIV_DATA_SIZE);
+-
++	err = dpa_enable_tx_csum(priv, skb, fd,
++				 ((char *)skbh) + DPA_PRIV_DATA_SIZE);
+ 	if (unlikely(err < 0)) {
+ 		if (netif_msg_tx_err(priv) && net_ratelimit())
+ 			cpu_netdev_err(net_dev, "HW csum error: %d\n", err);
+-		percpu_priv->stats.tx_errors++;
+-		goto l3_l4_csum_failed;
++		return err;
+ 	}
+ 
+-#ifdef CONFIG_FSL_DPA_1588
+-	if (priv->tsu && priv->tsu->valid && priv->tsu->hwts_tx_en_ioctl)
+-		fd.cmd |= FM_FD_CMD_UPD;
+-#endif
+-
+-	fd.length20 = skb->len;
+-	fd.offset = DPA_BP_HEAD; /* This is now guaranteed */
++	fd->format = qm_fd_contig;
++	fd->length20 = skb->len;
++	fd->offset = DPA_BP_HEAD; /* This is now guaranteed */
+ 
+ 	/*
+ 	 * Check if skb can be recycled / buffer can be readded to the bman pool
+@@ -1330,24 +1418,97 @@ static int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+ 	if (likely(skb_is_recycleable(skb, dpa_bp->size + pad)
+ 			&& (*percpu_priv->dpa_bp_count + 1 <= dpa_bp->count)
+ 			&& (IS_ALIGNED((unsigned long)skbh, 16)))) {
+-		fd.cmd |= FM_FD_CMD_FCO;
+-		fd.bpid = dpa_bp->bpid;
+-		skb_recycle(skb);
+-		skb = NULL;
+-		(*percpu_priv->dpa_bp_count)++;
+-		percpu_priv->tx_returned++;
++		fd->cmd |= FM_FD_CMD_FCO;
++		fd->bpid = dpa_bp->bpid;
+ 	}
+ 
+ 	addr = dma_map_single(dpa_bp->dev, skbh, dpa_bp->size, DMA_TO_DEVICE);
+ 	if (unlikely(dma_mapping_error(dpa_bp->dev, addr))) {
+ 		if (netif_msg_tx_err(priv)  && net_ratelimit())
+ 			cpu_netdev_err(net_dev, "dma_map_single() failed\n");
+-		goto dma_map_failed;
++		return -EINVAL;
++	}
++
++	fd->addr_hi = upper_32_bits(addr);
++	fd->addr_lo = lower_32_bits(addr);
++
++	return 0;
++}
++
++static int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
++{
++	struct dpa_priv_s	*priv;
++	struct qm_fd		 fd;
++	struct dpa_percpu_priv_s *percpu_priv;
++	int queue_mapping;
++	int err;
++
++	priv = netdev_priv(net_dev);
++	percpu_priv = per_cpu_ptr(priv->percpu_priv, smp_processor_id());
++
++	clear_fd(&fd);
++	queue_mapping = skb_get_queue_mapping(skb);
++
++	if (skb_headroom(skb) < DPA_BP_HEAD) {
++		struct sk_buff *skb_new;
++
++		skb_new = skb_realloc_headroom(skb, DPA_BP_HEAD);
++		if (unlikely(!skb_new)) {
++			percpu_priv->stats.tx_errors++;
++			kfree_skb(skb);
++			return NETDEV_TX_OK;
++		}
++		kfree_skb(skb);
++		skb = skb_new;
+ 	}
+ 
+-	fd.addr_hi = upper_32_bits(addr);
+-	fd.addr_lo = lower_32_bits(addr);
++#ifdef CONFIG_FSL_DPA_1588
++	if (priv->tsu && priv->tsu->valid && priv->tsu->hwts_tx_en_ioctl)
++		fd.cmd |= FM_FD_CMD_UPD;
++#endif
+ 
++	/*
++	 * We have two paths here:
++	 *
++	 * 1.If the skb is cloned, create a S/G frame to avoid unsharing it.
++	 * The S/G table will contain only one entry, pointing to our skb
++	 * data buffer.
++	 * The private data area containing the skb backpointer will reside
++	 * inside the first buffer, such that it won't risk being overwritten
++	 * in case a second skb pointing to the same data buffer is being
++	 * processed concurently.
++	 * No recycling is possible in this case, as the data buffer is shared.
++	 *
++	 * 2.If skb is not cloned, then the private area inside it can be
++	 * safely used to store the skb backpointer. Simply create a contiguous
++	 * fd in this case.
++	 * Recycling can happen if the right conditions are met.
++	 */
++	if (skb_cloned(skb) && (skb->len > DPA_SKB_COPY_MAX_SIZE))
++		err = skb_to_sg_fd(priv, skb, &fd);
++	else {
++		/* If cloned skb, but length is below DPA_SKB_COPY_MAX_SIZE,
++		 * it's more efficient to unshare it and then use the new skb */
++		skb = skb_unshare(skb, GFP_ATOMIC);
++		if (unlikely(!skb)) {
++			percpu_priv->stats.tx_errors++;
++			return NETDEV_TX_OK;
++		}
++		err = skb_to_contig_fd(priv, percpu_priv, skb, &fd);
++	}
++	if (unlikely(err < 0)) {
++		percpu_priv->stats.tx_errors++;
++		goto fd_create_failed;
++	}
++
++	if (fd.cmd & FM_FD_CMD_FCO) {
++		/* This skb is recycleable, and the fd generated from it
++		 * has been filled in accordingly */
++		skb_recycle(skb);
++		skb = NULL;
++		(*percpu_priv->dpa_bp_count)++;
++		percpu_priv->tx_returned++;
++	}
+ 	if (unlikely(dpa_xmit(priv, percpu_priv, queue_mapping, &fd) < 0))
+ 		goto xmit_failed;
+ 
+@@ -1356,15 +1517,12 @@ static int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+ 	return NETDEV_TX_OK;
+ 
+ xmit_failed:
+-	dma_unmap_single(dev, addr, dpa_bp->size, DMA_TO_DEVICE);
+-
+-dma_map_failed:
+ 	if (fd.cmd & FM_FD_CMD_FCO) {
+ 		(*percpu_priv->dpa_bp_count)--;
+ 		percpu_priv->tx_returned--;
+ 	}
+-
+-l3_l4_csum_failed:
++fd_create_failed:
++	_dpa_cleanup_tx_fd(priv, &fd);
+ 	dev_kfree_skb(skb);
+ 
+ 	return NETDEV_TX_OK;
+@@ -1583,12 +1741,9 @@ static void egress_ern(struct qman_portal	*portal,
+ 	struct sk_buff **skbh;
+ 	struct dpa_percpu_priv_s	*percpu_priv;
+ 	struct qm_fd fd = msg->ern.fd;
+-	dma_addr_t addr = qm_fd_addr(&fd);
+-	struct dpa_bp *bp;
+ 
+ 	net_dev = ((struct dpa_fq *)fq)->net_dev;
+ 	priv = netdev_priv(net_dev);
+-	bp = priv->dpa_bp;
+ 	percpu_priv = per_cpu_ptr(priv->percpu_priv, smp_processor_id());
+ 
+ 	percpu_priv->stats.tx_dropped++;
+@@ -1604,9 +1759,8 @@ static void egress_ern(struct qman_portal	*portal,
+ 		return;
+ 	}
+ 
+-	skbh = (struct sk_buff **)phys_to_virt(addr);
+-
+-	dma_unmap_single(bp->dev, addr, bp->size, DMA_TO_DEVICE);
++	skbh = (struct sk_buff **)phys_to_virt(qm_fd_addr(&fd));
++	_dpa_cleanup_tx_fd(priv, &fd);
+ 
+ 	skb = *skbh;
+ 	dev_kfree_skb_any(skb);
+-- 
+1.7.9.7
+

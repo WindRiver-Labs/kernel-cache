@@ -1,0 +1,160 @@
+From dd279f37b477accc367b452d6efc8aad840e29c6 Mon Sep 17 00:00:00 2001
+From: Ioana Radulescu <ruxandra.radulescu@freescale.com>
+Date: Fri, 27 Apr 2012 22:40:23 +0000
+Subject: [PATCH 115/128] dpaa_eth: Improve recycling rates on termination
+
+The ethernet driver can perform skb recycling on Tx, if certain
+conditions are met. The recycling conditions were however too
+restrictive, such that only forwarded skbs had a real chance of
+being recycled.
+
+Modify recycling code such that skb headroom is taken into account
+when computing the necessary buffer size and allow for a variable
+Tx fd offset.
+
+This change enables recycling of MTU-sized skbs originating from
+the stack, which improves throughput rates for non-TCP termination
+traffic (netperf showed ~6% improvement for 9.6K UDP jumbo frames).
+
+Signed-off-by: Ioana Radulescu <ruxandra.radulescu@freescale.com>
+[Kevin: Original patch taken from FSL
+QorIQ-SDK-V1.2-SOURCE-20120614-yocto.iso image]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/net/ethernet/freescale/dpa/dpaa_eth.c |   93 ++++++++++++++++++-------
+ 1 file changed, 66 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/dpa/dpaa_eth.c b/drivers/net/ethernet/freescale/dpa/dpaa_eth.c
+index bed6627..daad6d7 100644
+--- a/drivers/net/ethernet/freescale/dpa/dpaa_eth.c
++++ b/drivers/net/ethernet/freescale/dpa/dpaa_eth.c
+@@ -84,6 +84,9 @@
+ /* Valid checksum indication */
+ #define DPA_CSUM_VALID		0xFFFF
+ 
++/* Maximum offset value for a contig or sg FD (represented on 9bits) */
++#define DPA_MAX_FD_OFFSET	((1 << 9) - 1)
++
+ #define DPA_DESCRIPTION "FSL DPAA Ethernet driver"
+ 
+ MODULE_LICENSE("Dual BSD/GPL");
+@@ -1423,10 +1426,11 @@ static int skb_to_contig_fd(struct dpa_priv_s *priv,
+ {
+ 	struct sk_buff **skbh;
+ 	dma_addr_t addr;
+-	struct dpa_bp *dpa_bp;
+-	unsigned int pad;
++	struct dpa_bp *dpa_bp = priv->dpa_bp;
+ 	struct net_device *net_dev = priv->net_dev;
+ 	enum dma_data_direction dma_dir = DMA_TO_DEVICE;
++	bool can_recycle = false;
++	int offset, extra_offset;
+ 	int err;
+ 
+ 	/*
+@@ -1434,15 +1438,69 @@ static int skb_to_contig_fd(struct dpa_priv_s *priv,
+ 	 * Buffers we allocated are padded to improve cache usage. In order
+ 	 * to increase buffer re-use, we aim to keep any such buffers the
+ 	 * same. This means the address passed to the FM should be DPA_BP_HEAD
+-	 * before the data, and we might as well do the same for buffers
+-	 * from elsewhere in the kernel.
++	 * before the data for forwarded frames.
++	 *
++	 * However, offer some flexibility in fd layout, to allow originating
++	 * (termination) buffers to be also recycled when possible.
++	 *
++	 * First, see if the conditions needed to recycle the skb are met:
++	 * - skb not cloned, not shared
++	 * - buffer size is large enough to accomodate a maximum size Rx frame
++	 * - buffer address is 16 byte aligned, as per DPAARM
++	 * - there's enough room in the buffer pool
+ 	 */
+-	skbh = (struct sk_buff **)(skb->data - DPA_BP_HEAD);
+-	pad = skb_headroom(skb) - DPA_BP_HEAD;
++	if (likely(skb_is_recycleable(skb, dpa_bp->size) &&
++		   (*percpu_priv->dpa_bp_count < dpa_bp->target_count))) {
++		/* Compute the minimum necessary fd offset */
++		offset = dpa_bp->size - skb->len - skb_tailroom(skb);
++
++		/*
++		 * And make sure the offset is no lower than DPA_BP_HEAD,
++		 * as required by FMan
++		 */
++		offset = max(offset, (int)DPA_BP_HEAD);
+ 
++		/*
++		 * We also need to align the buffer address to 16, such that
++		 * Fman will be able to reuse it on Rx.
++		 * Since the buffer going to FMan starts at (skb->data - offset)
++		 * this is what we'll try to align. We already know that
++		 * headroom is at least DPA_BP_HEAD bytes long, but with
++		 * the extra offset needed for alignment we may go beyond
++		 * the beginning of the buffer.
++		 *
++		 * Also need to check that we don't go beyond the maximum
++		 * offset that can be set for a contiguous FD.
++		 */
++		extra_offset = (unsigned long)(skb->data - offset) & 0xF;
++		if (likely((offset + extra_offset) <= skb_headroom(skb) &&
++			   (offset + extra_offset) <= DPA_MAX_FD_OFFSET)) {
++			/* We're good to go for recycling*/
++			offset += extra_offset;
++			can_recycle = true;
++		}
++	}
++
++	if (likely(can_recycle)) {
++		/* Buffer will get recycled, setup fd accordingly */
++		fd->cmd |= FM_FD_CMD_FCO;
++		fd->bpid = dpa_bp->bpid;
++		/*
++		 * Since the buffer will get back to the Bman pool
++		 * and be re-used on Rx, map it for both read and write
++		 */
++		dma_dir = DMA_BIDIRECTIONAL;
++	} else {
++		/*
++		 * No recycling here, so we don't care about address alignment.
++		 * Just use the smallest offset required by FMan
++		 */
++		offset = DPA_BP_HEAD;
++	}
++
++	skbh = (struct sk_buff **)(skb->data - offset);
+ 	*skbh = skb;
+ 
+-	dpa_bp = priv->dpa_bp;
+ 
+ 	/* Enable L3/L4 hardware checksum computation.
+ 	 *
+@@ -1458,26 +1516,7 @@ static int skb_to_contig_fd(struct dpa_priv_s *priv,
+ 
+ 	fd->format = qm_fd_contig;
+ 	fd->length20 = skb->len;
+-	fd->offset = DPA_BP_HEAD; /* This is now guaranteed */
+-
+-	/*
+-	 * Check if skb can be recycled / buffer can be readded to the bman pool
+-	 * The following conditions must be met:
+-	 * - skb not cloned, not shared
+-	 * - buffer size is large enough to accomodate a MTU-sized frame
+-	 * - there's enough room in the buffer pool
+-	 * - address of the recycled buffer is 16 byte aligned (as per DPAA RM)
+-	 */
+-	if (likely(skb_is_recycleable(skb, dpa_bp->size + pad)
+-			&& (*percpu_priv->dpa_bp_count + 1 <=
+-					dpa_bp->target_count)
+-			&& (IS_ALIGNED((unsigned long)skbh, 16)))) {
+-		fd->cmd |= FM_FD_CMD_FCO;
+-		fd->bpid = dpa_bp->bpid;
+-		/* Since the buffer will get back to the Bman pool
+-		 * and be re-used on Rx, map it for both read and write */
+-		dma_dir = DMA_BIDIRECTIONAL;
+-	}
++	fd->offset = offset;
+ 
+ 	addr = dma_map_single(dpa_bp->dev, skbh, dpa_bp->size, dma_dir);
+ 	if (unlikely(dma_mapping_error(dpa_bp->dev, addr))) {
+-- 
+1.7.9.7
+

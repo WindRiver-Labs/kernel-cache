@@ -1,0 +1,234 @@
+From 7859d47018ef8a5e9b0337f292d2402a34ef4808 Mon Sep 17 00:00:00 2001
+From: Geoff Thorpe <Geoff.Thorpe@freescale.com>
+Date: Thu, 3 Nov 2011 13:53:01 -0500
+Subject: [PATCH 068/128] qman: handle DCP ERNs per-portal/globally, not
+ per-FQ.
+
+Lookups for DCP ERNs were based on FQ, which is completely broken, as
+it turns out. This patch instead allows per-portal and/or global DCP
+ERN handlers to be registered, with the per-portal handler taking
+precedence if it is set. This change removes the unusable callback
+from "struct qman_fq", which may help in certain scenarios where
+higher-layer extensions to stashable FQ context were struggling to fit
+within a cacheline boundary.
+
+Signed-off-by: Geoff Thorpe <Geoff.Thorpe@freescale.com>
+Signed-off-by: Kumar Gala <galak@kernel.crashing.org>
+[Kevin: Original patch taken from FSL
+QorIQ-SDK-V1.2-SOURCE-20120614-yocto.iso image]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/staging/fsl_qbman/qman_high.c |  101 ++++++++++++++++++++++++---------
+ include/linux/fsl_qman.h              |   22 ++++++-
+ 2 files changed, 95 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/staging/fsl_qbman/qman_high.c b/drivers/staging/fsl_qbman/qman_high.c
+index e1a529f..6628361 100644
+--- a/drivers/staging/fsl_qbman/qman_high.c
++++ b/drivers/staging/fsl_qbman/qman_high.c
+@@ -90,6 +90,9 @@ struct qman_portal {
+ #endif
+ 	u32 sdqcr;
+ 	int dqrr_disable_ref;
++	/* A portal-specific handler for DCP ERNs. If this is NULL, the global
++	 * handler is called instead. */
++	qman_cb_dc_ern cb_dc_ern;
+ 	/* When the cpu-affine portal is activated, this is non-NULL */
+ 	const struct qm_portal_config *config;
+ 	/* This is needed for providing a non-NULL device to dma_map_***() */
+@@ -124,6 +127,10 @@ struct qman_portal {
+ #define PORTAL_IRQ_UNLOCK(p, irqflags) local_irq_restore(irqflags)
+ #endif
+ 
++/* Global handler for DCP ERNs. Used when the portal receiving the message does
++ * not have a portal-specific handler. */
++static qman_cb_dc_ern cb_dc_ern;
++
+ static cpumask_t affine_mask;
+ static DEFINE_SPINLOCK(affine_mask_lock);
+ static DEFINE_PER_CPU(struct qman_portal, qman_affine_portal);
+@@ -247,7 +254,7 @@ static void clear_fq_table_entry(u32 entry)
+ static inline struct qman_fq *get_fq_table_entry(u32 entry)
+ {
+ 	BUG_ON(entry >= qman_fq_lookup_table_size);
+-	return  qman_fq_lookup_table[entry];
++	return qman_fq_lookup_table[entry];
+ }
+ #endif
+ 
+@@ -464,6 +471,7 @@ drain_loop:
+ 			QM_SDQCR_DEDICATED_PRECEDENCE | QM_SDQCR_TYPE_PRIO_QOS |
+ 			QM_SDQCR_TOKEN_SET(0xab) | QM_SDQCR_CHANNELS_DEDICATED;
+ 	portal->dqrr_disable_ref = 0;
++	portal->cb_dc_ern = NULL;
+ 	sprintf(buf, "qportal-%d", config->public_cfg.channel);
+ 	portal->pdev = platform_device_alloc(buf, -1);
+ 	if (!portal->pdev)
+@@ -712,45 +720,70 @@ static u32 __poll_portal_slow(struct qman_portal *p, u32 is)
+ 	}
+ 
+ 	if (is & QM_PIRQ_MRI) {
+-		u8 num = 0;
++		struct qman_fq *fq;
++		u8 verb, num = 0;
+ mr_loop:
+ 		qm_mr_pvb_update(&p->p);
+ 		msg = qm_mr_current(&p->p);
+-		if (msg) {
+-			u8 verb = msg->verb & QM_MR_VERB_TYPE_MASK;
++		if (!msg)
++			goto mr_done;
++		verb = msg->verb & QM_MR_VERB_TYPE_MASK;
++		/* The message is a software ERN iff the 0x20 bit is set */
++		if (verb & 0x20) {
++			switch (verb) {
++			case QM_MR_VERB_FQRNI:
++				/* nada, we drop FQRNIs on the floor */
++				break;
++			case QM_MR_VERB_FQRN:
++			case QM_MR_VERB_FQRL:
++				/* Lookup in the retirement table */
++				fq = table_find_fq(p, msg->fq.fqid);
++				BUG_ON(!fq);
++				fq_state_change(p, fq, msg, verb);
++				if (fq->cb.fqs)
++					fq->cb.fqs(p, fq, msg);
++				break;
++			case QM_MR_VERB_FQPN:
++				/* Parked */
+ #ifdef CONFIG_FSL_QMAN_FQ_LOOKUP
+-			struct qman_fq *fq;
++				fq = get_fq_table_entry(msg->fq.contextB);
+ #else
+-			struct qman_fq *fq = (void *)(uintptr_t)msg->ern.tag;
++				fq = (void *)(uintptr_t)msg->fq.contextB;
+ #endif
+-			if (verb == QM_MR_VERB_FQRNI) {
+-				; /* nada, we drop FQRNIs on the floor */
+-			} else if ((verb == QM_MR_VERB_FQRN) ||
+-					(verb == QM_MR_VERB_FQRL)) {
+-				/* It's retirement related - need a lookup */
+-				fq = table_find_fq(p, msg->fq.fqid);
+-				if (!fq)
+-					panic("unexpected FQ retirement");
+ 				fq_state_change(p, fq, msg, verb);
+ 				if (fq->cb.fqs)
+ 					fq->cb.fqs(p, fq, msg);
++				break;
++			case QM_MR_VERB_DC_ERN:
++				/* DCP ERN */
++				if (p->cb_dc_ern)
++					p->cb_dc_ern(p, msg);
++				else if (cb_dc_ern)
++					cb_dc_ern(p, msg);
++				else {
++					static int warn_once;
++					if (!warn_once) {
++						pr_crit("Leaking DCP ERNs!\n");
++						warn_once = 1;
++					}
++				}
++				break;
++			default:
++				pr_crit("Invalid MR verb 0x%02x\n", verb);
++			}
++		} else {
++			/* Its a software ERN */
+ #ifdef CONFIG_FSL_QMAN_FQ_LOOKUP
+-			} else if (likely(msg->ern.tag)) {
+-				fq = get_fq_table_entry(msg->ern.tag);
++			fq = get_fq_table_entry(msg->ern.tag);
+ #else
+-			} else if (likely(fq)) {
++			fq = (void *)(uintptr_t)msg->ern.tag;
+ #endif
+-				/* As per the header note, this is the way to
+-				 * determine if it's a s/w ERN or not. */
+-				if (likely(!(verb & QM_MR_VERB_DC_ERN)))
+-					fq->cb.ern(p, fq, msg);
+-				else
+-					fq->cb.dc_ern(p, fq, msg);
+-			}
+-			num++;
+-			qm_mr_next(&p->p);
+-			goto mr_loop;
++			fq->cb.ern(p, fq, msg);
+ 		}
++		num++;
++		qm_mr_next(&p->p);
++		goto mr_loop;
++mr_done:
+ 		qm_mr_cci_consume(&p->p, num);
+ 	}
+ 
+@@ -1942,6 +1975,20 @@ int qman_eqcr_is_empty(void)
+ }
+ EXPORT_SYMBOL(qman_eqcr_is_empty);
+ 
++void qman_set_dc_ern(qman_cb_dc_ern handler, int affine)
++{
++	if (affine) {
++		unsigned long irqflags __maybe_unused;
++		struct qman_portal *p = get_affine_portal();
++		PORTAL_IRQ_LOCK(p, irqflags);
++		p->cb_dc_ern = handler;
++		PORTAL_IRQ_UNLOCK(p, irqflags);
++		put_affine_portal();
++	} else
++		cb_dc_ern = handler;
++}
++EXPORT_SYMBOL(qman_set_dc_ern);
++
+ static inline struct qm_eqcr_entry *try_eq_start(struct qman_portal **p,
+ 					unsigned long *irqflags __maybe_unused,
+ 					struct qman_fq *fq,
+diff --git a/include/linux/fsl_qman.h b/include/linux/fsl_qman.h
+index 78e1494..fab8d3b 100644
+--- a/include/linux/fsl_qman.h
++++ b/include/linux/fsl_qman.h
+@@ -1037,6 +1037,10 @@ typedef enum qman_cb_dqrr_result (*qman_cb_dqrr)(struct qman_portal *qm,
+ typedef void (*qman_cb_mr)(struct qman_portal *qm, struct qman_fq *fq,
+ 				const struct qm_mr_entry *msg);
+ 
++/* This callback type is used when handling DCP ERNs */
++typedef void (*qman_cb_dc_ern)(struct qman_portal *qm,
++				const struct qm_mr_entry *msg);
++
+ /* s/w-visible states. Ie. tentatively scheduled + truly scheduled + active +
+  * held-active + held-suspended are just "sched". Things like "retired" will not
+  * be assumed until it is complete (ie. QMAN_FQ_STATE_CHANGING is set until
+@@ -1083,7 +1087,6 @@ enum qman_fq_state {
+ struct qman_fq_cb {
+ 	qman_cb_dqrr dqrr;      /* for dequeued frames */
+ 	qman_cb_mr ern;         /* for s/w ERNs */
+-	qman_cb_mr dc_ern;      /* for diverted h/w ERNs */
+ 	qman_cb_mr fqs;         /* frame-queue state changes*/
+ };
+ 
+@@ -1355,6 +1358,23 @@ void qman_dca(struct qm_dqrr_entry *dq, int park_request);
+  */
+ int qman_eqcr_is_empty(void);
+ 
++/**
++ * qman_set_dc_ern - Set the handler for DCP enqueue rejection notifications
++ * @handler: callback for processing DCP ERNs
++ * @affine: whether this handler is specific to the locally affine portal
++ *
++ * If a hardware block's interface to Qman (ie. its direct-connect portal, or
++ * DCP) is configured not to receive enqueue rejections, then any enqueues
++ * through that DCP that are rejected will be sent to a given software portal.
++ * If @affine is non-zero, then this handler will only be used for DCP ERNs
++ * received on the portal affine to the current CPU. If multiple CPUs share a
++ * portal and they all call this function, they will be setting the handler for
++ * the same portal! If @affine is zero, then this handler will be global to all
++ * portals handled by this instance of the driver. Only those portals that do
++ * not have their own affine handler will use the global handler.
++ */
++void qman_set_dc_ern(qman_cb_dc_ern handler, int affine);
++
+ 	/* FQ management */
+ 	/* ------------- */
+ /**
+-- 
+1.7.9.7
+
