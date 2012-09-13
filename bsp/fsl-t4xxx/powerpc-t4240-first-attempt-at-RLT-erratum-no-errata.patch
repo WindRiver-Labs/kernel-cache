@@ -1,0 +1,320 @@
+From 1f186f753c8bdfcb3fb4453667e507dd4b806372 Mon Sep 17 00:00:00 2001
+From: Matthew McClintock <msm@freescale.com>
+Date: Tue, 19 Jun 2012 01:00:25 +0000
+Subject: [PATCH 32/57] powerpc/t4240: first attempt at RLT erratum (no errata
+ number yet)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit b0aae0689a0564f5db2b11be0bb9c5921ead8ff7 from
+https://git.freescale.com/git-private/cgit.cgi/ppc/t4240/linux.git
+
+Erratum instructions:
+
+Normal operation has the possibility to create zombie enties in the RLT which
+will decrease performace. We need to periodically reset the RLT entries.
+If the L2HDBCR register field that configures the RLT entries is written, the
+zombie entries will disappear. This register is accessible through the skyblue
+port. The cluster needs to be quiesced to ensure there are no active RLT entries
+Need a core from cluster A to perform the following sequence of operations to
+clean the RLT entries for another cluster B at periodic intervals:
+
+1. Read the TPMIMR0, TPMCIMR0, TPMMCMR0, TPMNMIMR0 mask values of all threads
+   in cluster B from RCPM to restore later in step 13
+2. Write to TPMIMR0, TPMCIMR0, TPMMCMR0, TPMNMIMR0 bits to mask the wakeup of
+   all the threads in cluster B from PH10 in response to an interrupt, CI, MC
+   and NMI
+2.1 Write the CDHLTCR0 register to put all cores in cluster B in PH10 (debug
+    halt)
+2.2 Poll the CDSR# registers, bit 25, until all cores in cluster B have entered
+    PH10
+2.3 IJAM to L1CSR2[STASHID] register of all threads on Cluster B a value of 0
+    to disable stashing in L1 cache
+3. - Deleted -
+4. - Deleted -
+5. Read the L2CSR1[L2STASHID] register of Cluster B to restore its value later
+   in step 10
+6. Write to L2CSR1[L2STASHID] register of Cluster B a value of 0 to disable
+   stashing in Cluster B’s L2 cache
+7. Wait for a configurable number of cycles (of the order of thousands of
+   cycles) to ensure that all RLTs from Cluster B are drained
+8. Write to L2HDBCR1[rlt_depth] register of Cluster B a value of 1
+9. Write to L2HDBCR1[rlt_depth] register of Cluster B a value of 0
+10. Write to L2CSR1[L2STASHID] register of Cluster B to restore the original
+    value
+11. - Deleted -
+12. - Deleted -
+12.1. Write the CDHLTSR0 register to bring all cores in cluster B out of PH10
+12.2. Poll the CDSR# registers, bit 25, until all cores in cluster B have
+      exited PH10
+12.3. IJAM to L1CSR2[STASHID] register of all threads on Cluster B to restore
+      the original value
+13. Write to TPMIMR0, TPMCIMR0, TPMMCMR0, TPMNMIMR0 bits to restore the masks
+    of all the threads in cluster B
+
+Signed-off-by: Matthew McClintock <msm@freescale.com>
+---
+ arch/powerpc/platforms/85xx/Kconfig     |    7 +
+ arch/powerpc/platforms/85xx/t4240_qds.c |  223 +++++++++++++++++++++++++++++++
+ 2 files changed, 230 insertions(+)
+
+diff --git a/arch/powerpc/platforms/85xx/Kconfig b/arch/powerpc/platforms/85xx/Kconfig
+index 934a8c3..ad868c9 100644
+--- a/arch/powerpc/platforms/85xx/Kconfig
++++ b/arch/powerpc/platforms/85xx/Kconfig
+@@ -312,6 +312,13 @@ config T4240_QDS
+ 	help
+ 	  This option enables support for the T4240 QDS board
+ 
++config T4240_RLT_ERRATUM
++	bool "Enable workaround for RLT erratum"
++	default n
++	help
++	   This will enable a workaround for restoring zombie
++	   RLT entries. Only enable on rev1 E6500 parts
++
+ endif # FSL_SOC_BOOKE
+ 
+ config FSL_P4080_DS_MDIO
+diff --git a/arch/powerpc/platforms/85xx/t4240_qds.c b/arch/powerpc/platforms/85xx/t4240_qds.c
+index 8fef1f5..34f6b58 100644
+--- a/arch/powerpc/platforms/85xx/t4240_qds.c
++++ b/arch/powerpc/platforms/85xx/t4240_qds.c
+@@ -31,6 +31,9 @@
+ #include <sysdev/fsl_pci.h>
+ #include <asm/ehv_pic.h>
+ 
++#include <linux/hrtimer.h>
++#include <linux/ktime.h>
++
+ #include "corenet_ds.h"
+ 
+ /*
+@@ -72,3 +75,223 @@ machine_device_initcall(t4240_qds, declare_of_platform_devices);
+ #ifdef CONFIG_SWIOTLB
+ machine_arch_initcall(t4240_qds, swiotlb_setup_bus_notifier);
+ #endif
++
++#ifdef CONFIG_T4240_RLT_ERRATUM
++
++#define E6500_THREADS_PER_CORE	2
++#define E6500_CORES_PER_CLUSTER 4
++#define E6500_CLUSTER_SIZE	(E6500_CORES_PER_CLUSTER * E6500_THREADS_PER_CORE)
++#define E6500_ERRATUM_INTERVAL	1000000000  /* 1 sec in nanoseconds */
++#define E6500_WAIT_TICKS	5000
++
++static __iomem u32 *ccsr_e2000;
++static __iomem u32 *ccsr_mmr_l2;
++static __iomem u32 *dcsr_rcpm;
++
++static struct errata_info_t {
++	struct hrtimer timer;
++	struct cpumask cluster_cpus;
++	u32 thread_mask;
++	u32 core_mask;
++	u32 mmr_l2_offset;
++	u32 *dcsr_copdbg[4];
++} errata_info[NR_CPUS/E6500_CLUSTER_SIZE];
++
++static DEFINE_SPINLOCK(errata_lock);
++
++enum hrtimer_restart t4240_qds_erratum_cb(struct hrtimer *timer)
++{
++	u32 saved[5];
++	int cpu = smp_processor_id();
++	struct errata_info_t *ei = &errata_info[cpu / E6500_CLUSTER_SIZE];
++#ifndef CONFIG_T4_SIMULATOR_WORKAROUND
++	u32 tbl;
++	int i;
++	u32 saved2[E6500_CORES_PER_CLUSTER][3];
++#endif
++
++	/* we don't want to put two clusters to sleep at once */
++	spin_lock(&errata_lock);
++
++	/* step 1 */
++	saved[0] = in_be32(&ccsr_e2000[0x15c]);
++	saved[1] = in_be32(&ccsr_e2000[0x16c]);
++	saved[2] = in_be32(&ccsr_e2000[0x17c]);
++	saved[3] = in_be32(&ccsr_e2000[0x18c]);
++
++	/* step 2 */
++	setbits32(&ccsr_e2000[0x15c], ei->thread_mask);
++	setbits32(&ccsr_e2000[0x16c], ei->thread_mask);
++	setbits32(&ccsr_e2000[0x17c], ei->thread_mask);
++	setbits32(&ccsr_e2000[0x18c], ei->thread_mask);
++
++	/* step 2.1 */
++	setbits32(&ccsr_e2000[0x02c], ei->thread_mask);
++
++	/* step 2.2 */
++#ifndef CONFIG_T4_SIMULATOR_WORKAROUND
++	for_each_cpu(i, &ei->cluster_cpus) {
++		u32 offset;
++		int core = i / E6500_THREADS_PER_CORE;
++
++		offset = 0x100 + (0x4 * i);
++		spin_event_timeout((in_be32(&dcsr_rcpm[offset]) & (1 << 25) ) == 0, 5000);
++
++		/* every other thread to hit one time per core */
++		if (i % E6500_THREADS_PER_CORE)
++			continue;
++
++		/* step 2.3 */
++		out_be32(&ei->dcsr_copdbg[core][0x608], 0x00200001);
++		out_be32(&ei->dcsr_copdbg[core][0x60c], 0xf8000000);
++		spin_event_timeout(in_be32(&ei->dcsr_copdbg[core][0x10]) != 0x08000000, 5000);
++		saved2[core][0] = in_be32(&ei->dcsr_copdbg[core][0x600]);
++		saved2[core][1] = in_be32(&ei->dcsr_copdbg[core][0x604]);
++		out_be32(&ei->dcsr_copdbg[core][0x608], 0x0);
++		out_be32(&ei->dcsr_copdbg[core][0x60c], 0x7c1e92a6);
++		spin_event_timeout(in_be32(&ei->dcsr_copdbg[core][0x10]) != 0x08000000, 5000);
++		out_be32(&ei->dcsr_copdbg[core][0x608], 0x00100001);
++		out_be32(&ei->dcsr_copdbg[core][0x60c], 0x90000000);
++		spin_event_timeout(in_be32(&ei->dcsr_copdbg[core][0x10]) != 0x08000000, 5000);
++		saved2[core][2] = in_be32(&ei->dcsr_copdbg[core][0x604]);
++		out_be32(&ei->dcsr_copdbg[core][0x604], 0x00000000);
++		out_be32(&ei->dcsr_copdbg[core][0x608], 0x00100001);
++		out_be32(&ei->dcsr_copdbg[core][0x60c], 0x80000000);
++		spin_event_timeout(in_be32(&ei->dcsr_copdbg[core][0x10]) != 0x08000000, 5000);
++		out_be32(&ei->dcsr_copdbg[core][0x608], 0x00000000);
++		out_be32(&ei->dcsr_copdbg[core][0x60c], 0x7c0004ac);
++		spin_event_timeout(in_be32(&ei->dcsr_copdbg[core][0x10]) != 0x08000000, 5000);
++		out_be32(&ei->dcsr_copdbg[core][0x608], 0x00000000);
++		out_be32(&ei->dcsr_copdbg[core][0x60c], 0x7c1e93a6);
++		spin_event_timeout(in_be32(&ei->dcsr_copdbg[core][0x10]) != 0x08000000, 5000);
++	}
++
++	/* step 5 */
++	saved[4] = in_be32(&ccsr_mmr_l2[ei->mmr_l2_offset+ 0x004]);
++	/* step 6 */
++	clrbits32(&ccsr_mmr_l2[ei->mmr_l2_offset + 0x004], 0xff);
++
++	/* step 7 */
++	tbl = mfspr(SPRN_ATBL);
++	while(tbl + E6500_WAIT_TICKS > mfspr(SPRN_ATBL));
++
++	/* step 8 */
++	setbits32(&ccsr_mmr_l2[ei->mmr_l2_offset + 0xf04], 0x30000000);
++	/* step 9 */
++	clrbits32(&ccsr_mmr_l2[ei->mmr_l2_offset + 0xf04], 0x30000000);
++
++	/* step 10 */
++	clrsetbits_be32(&ccsr_mmr_l2[ei->mmr_l2_offset + 0x004], 0xff, saved[4] & 0xff);
++#endif
++
++	/* step 12.1 */
++	setbits32(&ccsr_e2000[0x01c], ei->thread_mask);
++
++	/* step 12.2 */
++#ifndef CONFIG_T4_SIMULATOR_WORKAROUND
++	for_each_cpu(i, &ei->cluster_cpus) {
++		u32 offset;
++		int core = i / E6500_THREADS_PER_CORE;
++
++		offset = 0x100 + (0x4 * i);
++		while((in_be32(&dcsr_rcpm[offset]) & (1 << 25) ) != 0);
++
++		/* every other thread to hit one time per core */
++		if (i % E6500_THREADS_PER_CORE) continue;
++
++		/* step 12.3 */
++		out_be32(&ei->dcsr_copdbg[core][0x604], saved2[core][2]);
++		out_be32(&ei->dcsr_copdbg[core][0x608], 0x00100001);
++		out_be32(&ei->dcsr_copdbg[core][0x60c], 0x80000000);
++		spin_event_timeout(in_be32(&ei->dcsr_copdbg[core][0x10]) != 0x08000000, 5000);
++		out_be32(&ei->dcsr_copdbg[core][0x608], 0x00000000);
++		out_be32(&ei->dcsr_copdbg[core][0x60c], 0x7c0004ac);
++		spin_event_timeout(in_be32(&ei->dcsr_copdbg[core][0x10]) != 0x08000000, 5000);
++		out_be32(&ei->dcsr_copdbg[core][0x608], 0x00000000);
++		out_be32(&ei->dcsr_copdbg[core][0x60c], 0x7c1e93a6);
++		spin_event_timeout(in_be32(&ei->dcsr_copdbg[core][0x10]) != 0x08000000, 5000);
++		out_be32(&ei->dcsr_copdbg[core][0x600], saved2[core][0]);
++		out_be32(&ei->dcsr_copdbg[core][0x604], saved2[core][1]);
++		out_be32(&ei->dcsr_copdbg[core][0x608], 0x00200001);
++		out_be32(&ei->dcsr_copdbg[core][0x60c], 0xe8000000);
++		spin_event_timeout(in_be32(&ei->dcsr_copdbg[core][0x10]) != 0x08000000, 5000);
++	}
++#endif
++
++	/* step 13 */
++	out_be32(&ccsr_e2000[0x15c], saved[0]);
++	out_be32(&ccsr_e2000[0x16c], saved[1]);
++	out_be32(&ccsr_e2000[0x17c], saved[2]);
++	out_be32(&ccsr_e2000[0x18c], saved[3]);
++
++	spin_unlock(&errata_lock);
++
++	hrtimer_forward(timer, timer->base->get_time(),
++			ns_to_ktime(E6500_ERRATUM_INTERVAL));
++	return HRTIMER_RESTART;
++}
++
++static void __init t4240_qds_install_hrtimer(void *arg)
++{
++	int cpu = smp_processor_id();
++	struct errata_info_t *ei = &errata_info[cpu / E6500_CLUSTER_SIZE];
++
++	hrtimer_init(&ei->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
++	ei->timer.function = &t4240_qds_erratum_cb;
++	/* delay the first run by 1 sec */
++	hrtimer_start(&ei->timer,
++			ktime_add_us(ns_to_ktime(E6500_ERRATUM_INTERVAL), 1e6),
++			HRTIMER_MODE_REL);
++}
++
++static int __init t4240_qds_erratum_workaround(void)
++{
++	phys_addr_t res2_size = (num_present_cpus() / E6500_CLUSTER_SIZE) *
++					0x40000;
++	int i, j;
++
++	/* TODO: verify we have at least two clusters otherwise this workaround
++	 * won't help */
++	ccsr_e2000 = ioremap(get_immrbase() + 0xE2000, 0x2fff);
++	if (!ccsr_e2000)
++		pr_crit("__func__: Unable to ioremap first block!\n");
++		return -ENOMEM;
++
++	ccsr_mmr_l2 = ioremap(get_immrbase() + 0xC20000, res2_size);
++	if (!ccsr_mmr_l2)
++		pr_crit("__func__: Unable to ioremap second block!\n");
++
++	dcsr_rcpm = ioremap(get_dcsrbar() + 0x22000, 0x2fff);
++	if (!dcsr_rcpm)
++		pr_crit("__func__: Unable to ioremap third block!\n");
++
++	for (i = 0; i < num_present_cpus() / E6500_CLUSTER_SIZE; i++) {
++		/* create proper mask for the adjacent cluster */
++		int tgt_cpu = i * E6500_CLUSTER_SIZE + E6500_CLUSTER_SIZE;
++		struct errata_info_t *ei = &errata_info[i];
++
++		cpumask_clear(&ei->cluster_cpus);
++		for (j = tgt_cpu;
++		     j < tgt_cpu + E6500_CLUSTER_SIZE;
++		     j++) {
++			int cpu_thread = j % num_present_cpus();
++			int core = cpu_thread / E6500_THREADS_PER_CORE;
++			if (cpu_thread % E6500_THREADS_PER_CORE == 0)
++				ei->core_mask |= (1 << (cpu_thread / E6500_THREADS_PER_CORE));
++			ei->thread_mask |= (1 << cpu_thread);
++			cpumask_set_cpu(cpu_thread, &ei->cluster_cpus);
++			ei->dcsr_copdbg[core] = ioremap(get_dcsrbar() + 0x100000 + (core * 0x8000), 0xfff);
++			if(!ei->dcsr_copdbg[core]) {
++				pr_crit("__func__: Unable to ioremap fourth block for cpu %d\n", i);
++			}
++		}
++		ei->mmr_l2_offset = 0x40000 * i;
++
++		smp_call_function_single(i * E6500_CLUSTER_SIZE,
++				t4240_qds_install_hrtimer, NULL, 0);
++	}
++
++	return 0;
++}
++__initcall(t4240_qds_erratum_workaround);
++#endif
+-- 
+1.7.9.7
+

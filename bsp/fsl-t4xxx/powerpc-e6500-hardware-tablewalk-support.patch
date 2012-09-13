@@ -1,0 +1,613 @@
+From 986422e6df4fe1854a7a26cfd5589f80817e650b Mon Sep 17 00:00:00 2001
+From: Scott Wood <scottwood@freescale.com>
+Date: Tue, 22 May 2012 04:43:41 +0000
+Subject: [PATCH 17/57] powerpc/e6500: hardware tablewalk support
+
+commit 4844067cdb52da909b08ad717b32e9f448157138 from
+https://git.freescale.com/git-private/cgit.cgi/ppc/t4240/linux.git
+
+Preliminary support for e6500 hardware tablewalk.  This is for simulator
+(and rev2) only.  On rev1 hardware, be sure to set
+CONFIG_PPC_E6500_REV1_BUGS.
+
+Locking is introduced to make TLB misses threadsafe.  TODO: add locking to
+the non-tablewalk miss handlers, which was the main reason for making the
+locking conditional.
+
+Signed-off-by: Scott Wood <scott@tyr.buserror.net>
+Signed-off-by: Andy Fleming <afleming@freescale.net>
+[Kevin: Adjust the arguments of macro tlb_prolog_bolted, also fix the
+kernel option typo in the commit log.]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ arch/powerpc/include/asm/mmu.h    |   21 ++---
+ arch/powerpc/include/asm/paca.h   |   19 ++++
+ arch/powerpc/kernel/asm-offsets.c |    5 ++
+ arch/powerpc/kernel/paca.c        |    6 +-
+ arch/powerpc/kernel/setup_64.c    |   26 ++++++
+ arch/powerpc/mm/fsl_booke_mmu.c   |    8 ++
+ arch/powerpc/mm/tlb_low_64e.S     |  177 +++++++++++++++++++++++++++++++++++++
+ arch/powerpc/mm/tlb_nohash.c      |  109 ++++++++++++++++++-----
+ 8 files changed, 339 insertions(+), 32 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/mmu.h b/arch/powerpc/include/asm/mmu.h
+index f014552..9c956e8 100644
+--- a/arch/powerpc/include/asm/mmu.h
++++ b/arch/powerpc/include/asm/mmu.h
+@@ -175,16 +175,17 @@ extern u64 ppc64_rma_size;
+ #define MMU_PAGE_64K_AP	3	/* "Admixed pages" (hash64 only) */
+ #define MMU_PAGE_256K	4
+ #define MMU_PAGE_1M	5
+-#define MMU_PAGE_4M	6
+-#define MMU_PAGE_8M	7
+-#define MMU_PAGE_16M	8
+-#define MMU_PAGE_64M	9
+-#define MMU_PAGE_256M	10
+-#define MMU_PAGE_1G	11
+-#define MMU_PAGE_16G	12
+-#define MMU_PAGE_64G	13
+-
+-#define MMU_PAGE_COUNT	14
++#define MMU_PAGE_2M	6
++#define MMU_PAGE_4M	7
++#define MMU_PAGE_8M	8
++#define MMU_PAGE_16M	9
++#define MMU_PAGE_64M	10
++#define MMU_PAGE_256M	11
++#define MMU_PAGE_1G	12
++#define MMU_PAGE_16G	13
++#define MMU_PAGE_64G	14
++
++#define MMU_PAGE_COUNT	15
+ 
+ #if defined(CONFIG_PPC_STD_MMU_64)
+ /* 64-bit classic hash table MMU */
+diff --git a/arch/powerpc/include/asm/paca.h b/arch/powerpc/include/asm/paca.h
+index daf813f..f2c4a4d 100644
+--- a/arch/powerpc/include/asm/paca.h
++++ b/arch/powerpc/include/asm/paca.h
+@@ -108,6 +108,25 @@ struct paca_struct {
+ 	/* Keep pgd in the same cacheline as the start of extlb */
+ 	pgd_t *pgd __attribute__((aligned(0x80))); /* Current PGD */
+ 	pgd_t *kernel_pgd;		/* Kernel PGD */
++
++	/* If you adjust the contents of this struct, update the TLB miss asm */
++	struct tlb_per_core {
++		/* For software way selection, as on Freescale TLB1 */
++		u8 esel_next, esel_max, esel_first;
++
++		/* Per-core spinlock for e6500 TLB handlers (no tlbsrx.) */
++		u8 lock;
++	} tlb_per_core __attribute__((aligned(4)));
++
++	/*
++	 * Points to the tlb_per_core of the first thread on this core.
++	 * The low bit is set if there is more than one thread per core
++	 * (a bit gross, but avoids an extra load in the TLB miss handler,
++	 * or atomic instructions where none are needed).
++	 */
++#define TLB_PER_CORE_HAS_LOCK 1
++	uintptr_t tlb_per_core_ptr;
++
+ 	/* We can have up to 3 levels of reentrancy in the TLB miss handler */
+ 	u64 extlb[3][EX_TLB_SIZE / sizeof(u64)];
+ 	u64 exmc[8];		/* used for machine checks */
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 502e038..f195036 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -168,6 +168,11 @@ int main(void)
+ 	DEFINE(PACA_MC_STACK, offsetof(struct paca_struct, mc_kstack));
+ 	DEFINE(PACA_CRIT_STACK, offsetof(struct paca_struct, crit_kstack));
+ 	DEFINE(PACA_DBG_STACK, offsetof(struct paca_struct, dbg_kstack));
++	DEFINE(PACA_TLB_ESEL_NEXT, offsetof(struct tlb_per_core, esel_next));
++	DEFINE(PACA_TLB_ESEL_MAX, offsetof(struct tlb_per_core, esel_max));
++	DEFINE(PACA_TLB_ESEL_FIRST, offsetof(struct tlb_per_core, esel_first));
++	DEFINE(PACA_TLB_LOCK, offsetof(struct tlb_per_core, lock));
++	DEFINE(PACA_TLB_PER_CORE_PTR, offsetof(struct paca_struct, tlb_per_core_ptr));
+ #endif /* CONFIG_PPC_BOOK3E */
+ 
+ #ifdef CONFIG_PPC_STD_MMU_64
+diff --git a/arch/powerpc/kernel/paca.c b/arch/powerpc/kernel/paca.c
+index 0bb1f98..aca800b 100644
+--- a/arch/powerpc/kernel/paca.c
++++ b/arch/powerpc/kernel/paca.c
+@@ -148,6 +148,11 @@ void __init initialise_paca(struct paca_struct *new_paca, int cpu)
+ #ifdef CONFIG_PPC_STD_MMU_64
+ 	new_paca->slb_shadow_ptr = &slb_shadow[cpu];
+ #endif /* CONFIG_PPC_STD_MMU_64 */
++
++#ifdef CONFIG_PPC_BOOK3E
++	/* For now -- if we have threads this will be adjusted later */
++	new_paca->tlb_per_core_ptr = (uintptr_t)&new_paca->tlb_per_core;
++#endif
+ }
+ 
+ /* Put the paca pointer into r13 and SPRG_PACA */
+@@ -168,7 +173,6 @@ void setup_paca(struct paca_struct *new_paca)
+ 		mtspr(SPRN_SPRG_HPACA, local_paca);
+ #endif
+ 	mtspr(SPRN_SPRG_PACA, local_paca);
+-
+ }
+ 
+ static int __initdata paca_size;
+diff --git a/arch/powerpc/kernel/setup_64.c b/arch/powerpc/kernel/setup_64.c
+index e45f21c..b8d2bbb 100644
+--- a/arch/powerpc/kernel/setup_64.c
++++ b/arch/powerpc/kernel/setup_64.c
+@@ -102,6 +102,30 @@ int ucache_bsize;
+ 
+ static char *smt_enabled_cmdline;
+ 
++#ifdef CONFIG_PPC_BOOK3E
++static void setup_tlb_per_core(void)
++{
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		int first = cpu_first_thread_sibling(cpu);
++
++		paca[cpu].tlb_per_core_ptr =
++			(uintptr_t)&paca[first].tlb_per_core;
++
++		/* If we have threads but no tlbsrx., use a per-core lock */
++		if (smt_enabled_at_boot >= 2 &&
++		    !mmu_has_feature(MMU_FTR_USE_TLBRSRV))
++			paca[cpu].tlb_per_core_ptr |= TLB_PER_CORE_HAS_LOCK;
++	}
++}
++#else
++static void setup_tlb_per_core(void)
++{
++}
++#endif
++
++
+ /* Look for ibm,smt-enabled OF option */
+ static void check_smt_enabled(void)
+ {
+@@ -142,6 +166,8 @@ static void check_smt_enabled(void)
+ 			of_node_put(dn);
+ 		}
+ 	}
++
++	setup_tlb_per_core();
+ }
+ 
+ /* Look for smt-enabled= cmdline option */
+diff --git a/arch/powerpc/mm/fsl_booke_mmu.c b/arch/powerpc/mm/fsl_booke_mmu.c
+index 9163b4d..95c6ede 100644
+--- a/arch/powerpc/mm/fsl_booke_mmu.c
++++ b/arch/powerpc/mm/fsl_booke_mmu.c
+@@ -52,6 +52,7 @@
+ #include <asm/smp.h>
+ #include <asm/machdep.h>
+ #include <asm/setup.h>
++#include <asm/paca.h>
+ 
+ #include "mmu_decl.h"
+ 
+@@ -192,6 +193,13 @@ unsigned long map_mem_in_cams(unsigned long ram, int max_cam_idx)
+ 	}
+ 	tlbcam_index = i;
+ 
++#ifdef CONFIG_PPC64
++	get_paca()->tlb_per_core.esel_next = i;
++	get_paca()->tlb_per_core.esel_max =
++		mfspr(SPRN_TLB1CFG) & TLBnCFG_N_ENTRY;
++	get_paca()->tlb_per_core.esel_first = i;
++#endif
++
+ 	return amount_mapped;
+ }
+ 
+diff --git a/arch/powerpc/mm/tlb_low_64e.S b/arch/powerpc/mm/tlb_low_64e.S
+index ff672bd..7bd27ca 100644
+--- a/arch/powerpc/mm/tlb_low_64e.S
++++ b/arch/powerpc/mm/tlb_low_64e.S
+@@ -231,6 +231,183 @@ itlb_miss_fault_bolted:
+ 	beq	tlb_miss_common_bolted
+ 	b	itlb_miss_kernel_bolted
+ 
++/*
++ * TLB miss handling for Freescale chips with hardware table walk
++ *
++ * Linear mapping is bolted: no virtual page table or nested TLB misses
++ * Indirect entries in TLB1, hardware loads resulting direct entries
++ *    into TLB0
++ * No HES or NV hint on TLB1, so we need to do software round-robin
++ * No tlbsrx. so we need a spinlock, and we have to deal
++ *    with MAS-damage caused by tlbsx
++ * 4K pages only
++ */
++
++	START_EXCEPTION(instruction_tlb_miss_fsl_htw)
++	tlb_prolog_bolted SPRN_SRR0
++
++	ld	r11,PACA_TLB_PER_CORE_PTR(r13)
++	srdi.	r15,r16,60		/* get region */
++	ori	r16,r16,1
++
++	TLB_MISS_STATS_SAVE_INFO_BOLTED
++	bne	tlb_miss_kernel_fsl_htw	/* user/kernel test */
++
++	b	tlb_miss_common_fsl_htw
++
++	START_EXCEPTION(data_tlb_miss_fsl_htw)
++	tlb_prolog_bolted SPRN_DEAR
++
++	ld	r11,PACA_TLB_PER_CORE_PTR(r13)
++	srdi.	r15,r16,60		/* get region */
++	rldicr	r16,r16,0,62
++
++	TLB_MISS_STATS_SAVE_INFO_BOLTED
++	bne	tlb_miss_kernel_fsl_htw	/* user vs kernel check */
++
++/*
++ * This is the guts of the TLB miss handler for fsl htw.
++ * We are entered with:
++ *
++ * r16 = page of faulting address (low bit 0 if data, 1 if instruction)
++ * r15 = crap (free to use)
++ * r14 = page table base
++ * r13 = PACA
++ * r11 = tlb_per_core ptr
++ * r10 = crap (free to use)
++ */
++tlb_miss_common_fsl_htw:
++	/*
++	 * Search if we already have an indirect entry for that virtual
++	 * address, and if we do, bail out.
++	 *
++	 * MAS6:IND should be already set based on MAS4
++	 */
++	mtocrf	0x01,r11
++	addi	r10,r11,PACA_TLB_LOCK-1 /* -1 to compensate for low bit set */
++	bf	31,1f		/* no lock if TLB_PER_CORE_HAS_LOCK clear */
++2:	lbarx	r15,0,r10
++	cmpdi	r15,0
++	bne	3f
++	li	r15,1
++	stbcx.	r15,0,r10
++	bne	2b
++	.subsection 1
++3:	lbz	r15,0(r10)
++	cmpdi	r15,0
++	bne	3b
++	b	2b
++	.previous
++1:
++
++	mfspr	r15,SPRN_MAS2
++
++	tlbsx	0,r16
++	mfspr	r10,SPRN_MAS1
++	andis.	r10,r10,MAS1_VALID@h
++	bne	tlb_miss_done_fsl_htw
++
++	/* Undo MAS-damage from the tlbsx */
++	mfspr	r10,SPRN_MAS1
++	oris	r10,r10,MAS1_VALID@h
++//	ori	r10,r10,MAS1_IND
++	mtspr	SPRN_MAS1,r10
++	mtspr	SPRN_MAS2,r15
++
++	/* Now, we need to walk the page tables. First check if we are in
++	 * range.
++	 */
++	rldicl.	r10,r16,64-PGTABLE_EADDR_SIZE,PGTABLE_EADDR_SIZE+4
++	bne-	tlb_miss_fault_fsl_htw
++
++	rldicl	r15,r16,64-PGDIR_SHIFT+3,64-PGD_INDEX_SIZE-3
++	cmpldi	cr0,r14,0
++	clrrdi	r15,r15,3
++	beq-	tlb_miss_fault_fsl_htw /* No PGDIR, bail */
++	ldx	r14,r14,r15		/* grab pgd entry */
++
++	rldicl	r15,r16,64-PUD_SHIFT+3,64-PUD_INDEX_SIZE-3
++	clrrdi	r15,r15,3
++	cmpdi	cr0,r14,0
++	bge	tlb_miss_fault_fsl_htw	/* Bad pgd entry or hugepage; bail */
++	ldx	r14,r14,r15		/* grab pud entry */
++
++	rldicl	r15,r16,64-PMD_SHIFT+3,64-PMD_INDEX_SIZE-3
++	clrrdi	r15,r15,3
++	cmpdi	cr0,r14,0
++	bge	tlb_miss_fault_fsl_htw
++	ldx	r14,r14,r15		/* Grab pmd entry */
++
++	/* Now we build the MAS for a 2M indirect page:
++	 *
++	 * MAS 0   :	ESEL needs to be filled by software round-robin
++	 * MAS 1   :	Almost fully setup
++	 *               - PID already updated by caller if necessary
++	 *               - TSIZE for now is base ind page size always
++	 * MAS 2   :	Use defaults
++	 * MAS 3+7 :	Needs to be done
++	 */
++
++
++	mfspr	r10,SPRN_MAS0
++	rldicr	r15,r11,0,62
++	lwz	r15,0(r15)
++
++	ori	r14,r14,(BOOK3E_PAGESZ_4K << MAS3_SPSIZE_SHIFT)
++	mtspr	SPRN_MAS7_MAS3,r14
++
++	/* Not MAS0_ESEL_MASK because source is smaller */
++	rlwimi	r10,r15,24,0x00ff0000	/* insert esel_next into MAS0 */
++	addis	r15,r15,0x0100		/* increment esel_next */
++	mtspr	SPRN_MAS0,r10
++	rlwinm	r14,r15,8,0xff		/* extract next */
++	rlwinm	r10,r15,16,0xff		/* extract last */
++	cmpw	r10,r14
++	rlwinm	r10,r15,24,0xff		/* extract first */
++	iseleq	r14,r10,r14		/* if next == last use first */
++	stb	r14,PACA_TLB_ESEL_NEXT-1(r11)
++
++	tlbwe
++
++tlb_miss_done_fsl_htw:
++	.macro	tlb_unlock_fsl_htw
++	mtocrf	0x01,r11
++	addi	r10,r11,PACA_TLB_LOCK-1
++	li	r15,0
++	bf	31,1f		/* no lock if TLB_PER_CORE_HAS_LOCK clear */
++	isync
++	stb	r15,0(r10)
++1:
++	.endm
++
++	tlb_unlock_fsl_htw
++	TLB_MISS_STATS_X(MMSTAT_TLB_MISS_NORM_OK)
++	tlb_epilog_bolted
++	rfi
++
++tlb_miss_kernel_fsl_htw:
++	mfspr	r10,SPRN_MAS1
++	ld	r14,PACA_KERNELPGD(r13)
++	cmpldi	cr0,r15,8		/* Check for vmalloc region */
++	rlwinm	r10,r10,0,16,1		/* Clear TID */
++	mtspr	SPRN_MAS1,r10
++	beq+	tlb_miss_common_fsl_htw
++
++tlb_miss_fault_fsl_htw:
++	tlb_unlock_fsl_htw
++	/* We need to check if it was an instruction miss */
++	andi.	r16,r16,1
++	bne	itlb_miss_fault_fsl_htw
++dtlb_miss_fault_fsl_htw:
++	TLB_MISS_STATS_D(MMSTAT_TLB_MISS_NORM_FAULT)
++	tlb_epilog_bolted
++	b	exc_data_storage_book3e
++itlb_miss_fault_fsl_htw:
++	TLB_MISS_STATS_I(MMSTAT_TLB_MISS_NORM_FAULT)
++	tlb_epilog_bolted
++	b	exc_instruction_storage_book3e
++
++
+ /**********************************************************************
+  *                                                                    *
+  * TLB miss handling for Book3E with TLB reservation and HES support  *
+diff --git a/arch/powerpc/mm/tlb_nohash.c b/arch/powerpc/mm/tlb_nohash.c
+index df32a83..065d7cc 100644
+--- a/arch/powerpc/mm/tlb_nohash.c
++++ b/arch/powerpc/mm/tlb_nohash.c
+@@ -27,6 +27,8 @@
+  *
+  */
+ 
++//#define CONFIG_PPC_FSL_BUGGY_HW_TABLEWALK
++
+ #include <linux/kernel.h>
+ #include <linux/export.h>
+ #include <linux/mm.h>
+@@ -43,6 +45,7 @@
+ #include <asm/tlb.h>
+ #include <asm/code-patching.h>
+ #include <asm/hugetlb.h>
++#include <asm/paca.h>
+ 
+ #include "mmu_decl.h"
+ 
+@@ -56,8 +59,17 @@
+ struct mmu_psize_def mmu_psize_defs[MMU_PAGE_COUNT] = {
+ 	[MMU_PAGE_4K] = {
+ 		.shift	= 12,
++		.ind	= 21,
+ 		.enc	= BOOK3E_PAGESZ_4K,
+ 	},
++	[MMU_PAGE_1M] = {
++		.shift	= 20,
++		.enc	= BOOK3E_PAGESZ_1M,
++	},
++	[MMU_PAGE_2M] = {
++		.shift	= 21,
++		.enc	= BOOK3E_PAGESZ_2M,
++	},
+ 	[MMU_PAGE_4M] = {
+ 		.shift	= 22,
+ 		.enc	= BOOK3E_PAGESZ_4M,
+@@ -133,10 +145,14 @@ static inline int mmu_get_tsize(int psize)
+  */
+ #ifdef CONFIG_PPC64
+ 
++#define PPC_HTW_NONE	0
++#define PPC_HTW_IBM	1
++#define PPC_HTW_FSL	2
++
+ int mmu_linear_psize;		/* Page size used for the linear mapping */
+ int mmu_pte_psize;		/* Page size used for PTE pages */
+ int mmu_vmemmap_psize;		/* Page size used for the virtual mem map */
+-int book3e_htw_enabled;		/* Is HW tablewalk enabled ? */
++int book3e_htw_mode;		/* HW tablewalk?  Value is PPC_HTW_* */
+ unsigned long linear_map_top;	/* Top of linear mapping */
+ 
+ #endif /* CONFIG_PPC64 */
+@@ -377,7 +393,7 @@ void tlb_flush_pgtable(struct mmu_gather *tlb, unsigned long address)
+ {
+ 	int tsize = mmu_psize_defs[mmu_pte_psize].enc;
+ 
+-	if (book3e_htw_enabled) {
++	if (book3e_htw_mode) {
+ 		unsigned long start = address & PMD_MASK;
+ 		unsigned long end = address + PMD_SIZE;
+ 		unsigned long size = 1UL << mmu_psize_defs[mmu_pte_psize].shift;
+@@ -413,10 +429,10 @@ static void setup_page_sizes(void)
+ 	int i, psize;
+ 
+ #ifdef CONFIG_PPC_FSL_BOOK3E
++	int fsl_mmu = mmu_has_feature(MMU_FTR_TYPE_FSL_E);
+ 	unsigned int mmucfg = mfspr(SPRN_MMUCFG);
+ 
+-	if (((mmucfg & MMUCFG_MAVN) == MMUCFG_MAVN_V1) &&
+-		(mmu_has_feature(MMU_FTR_TYPE_FSL_E))) {
++	if (fsl_mmu && (mmucfg & MMUCFG_MAVN) == MMUCFG_MAVN_V1) {
+ 		unsigned int tlb1cfg = mfspr(SPRN_TLB1CFG);
+ 		unsigned int min_pg, max_pg;
+ 
+@@ -442,6 +458,41 @@ static void setup_page_sizes(void)
+ 
+ 		goto no_indirect;
+ 	}
++
++	if (fsl_mmu && (mmucfg & MMUCFG_MAVN) == MMUCFG_MAVN_V2) {
++		u32 tlb1cfg, tlb1ps;
++
++		tlb0cfg = mfspr(SPRN_TLB0CFG);
++		tlb1cfg = mfspr(SPRN_TLB1CFG);
++		tlb1ps = mfspr(SPRN_TLB1PS);
++		eptcfg = mfspr(SPRN_EPTCFG);
++
++#ifndef CONFIG_PPC_FSL_BUGGY_HW_TABLEWALK
++		if ((tlb1cfg & TLBnCFG_IND) && (tlb0cfg & TLBnCFG_PT))
++			book3e_htw_mode = PPC_HTW_FSL;
++
++		/*
++		 * We expect 4K subpage size and unrestricted indirect size.
++		 * The lack of a restriction on indirect size is a Freescale
++		 * extension, indicated by PSn = 0 but SPSn != 0.
++		 */
++		if (eptcfg != 2)
++			book3e_htw_mode = PPC_HTW_NONE;
++#endif
++
++		for (psize = 0; psize < MMU_PAGE_COUNT; ++psize) {
++			struct mmu_psize_def *def = &mmu_psize_defs[psize];
++
++			if (tlb1ps & (1U << (def->shift - 10))) {
++				def->flags |= MMU_PAGE_SIZE_DIRECT;
++
++				if (book3e_htw_mode && psize == MMU_PAGE_2M)
++					def->flags |= MMU_PAGE_SIZE_INDIRECT;
++			}
++		}
++
++		goto no_indirect;
++	}
+ #endif
+ 
+ 	tlb0cfg = mfspr(SPRN_TLB0CFG);
+@@ -457,9 +508,12 @@ static void setup_page_sizes(void)
+ 	}
+ 
+ 	/* Indirect page sizes supported ? */
+-	if ((tlb0cfg & TLBnCFG_IND) == 0)
++	if ((tlb0cfg & TLBnCFG_IND) == 0 ||
++	    (tlb0cfg & TLBnCFG_PT) == 0)
+ 		goto no_indirect;
+ 
++	book3e_htw_mode = PPC_HTW_IBM;
++
+ 	/* Now, we only deal with one IND page size for each
+ 	 * direct size. Hopefully all implementations today are
+ 	 * unambiguous, but we might want to be careful in the
+@@ -525,23 +579,23 @@ static void __patch_exception(int exc, unsigned long addr)
+ 
+ static void setup_mmu_htw(void)
+ {
+-	/* Check if HW tablewalk is present, and if yes, enable it by:
+-	 *
+-	 * - patching the TLB miss handlers to branch to the
+-	 *   one dedicates to it
+-	 *
+-	 * - setting the global book3e_htw_enabled
++	/*
++	 * If we want to use HW tablewalk, enable it by patching the TLB miss
++	 * handlers to branch to the one dedicated to it.
+        	 */
+-	unsigned int tlb0cfg = mfspr(SPRN_TLB0CFG);
+ 
+-	if ((tlb0cfg & TLBnCFG_IND) &&
+-	    (tlb0cfg & TLBnCFG_PT)) {
++	switch (book3e_htw_mode) {
++	case PPC_HTW_IBM:
+ 		patch_exception(0x1c0, exc_data_tlb_miss_htw_book3e);
+ 		patch_exception(0x1e0, exc_instruction_tlb_miss_htw_book3e);
+-		book3e_htw_enabled = 1;
++		break;
++	case PPC_HTW_FSL:
++		patch_exception(0x1c0, exc_data_tlb_miss_fsl_htw_book3e);
++		patch_exception(0x1e0, exc_instruction_tlb_miss_fsl_htw_book3e);
++		break;
+ 	}
+ 	pr_info("MMU: Book3E HW tablewalk %s\n",
+-		book3e_htw_enabled ? "enabled" : "not supported");
++		book3e_htw_mode ? "enabled" : "not supported");
+ }
+ 
+ /*
+@@ -581,8 +635,16 @@ static void __early_init_mmu(int boot_cpu)
+ 	/* Set MAS4 based on page table setting */
+ 
+ 	mas4 = 0x4 << MAS4_WIMGED_SHIFT;
+-	if (book3e_htw_enabled) {
+-		mas4 |= mas4 | MAS4_INDD;
++	switch (book3e_htw_mode) {
++	case PPC_HTW_FSL:
++		mas4 |= MAS4_INDD;
++		mas4 |= BOOK3E_PAGESZ_2M << MAS4_TSIZED_SHIFT;
++		mas4 |= MAS4_TLBSELD(1);
++		mmu_pte_psize = MMU_PAGE_2M;
++		break;
++
++	case PPC_HTW_IBM:
++		mas4 |= MAS4_INDD;
+ #ifdef CONFIG_PPC_64K_PAGES
+ 		mas4 |=	BOOK3E_PAGESZ_256M << MAS4_TSIZED_SHIFT;
+ 		mmu_pte_psize = MMU_PAGE_256M;
+@@ -590,13 +652,16 @@ static void __early_init_mmu(int boot_cpu)
+ 		mas4 |=	BOOK3E_PAGESZ_1M << MAS4_TSIZED_SHIFT;
+ 		mmu_pte_psize = MMU_PAGE_1M;
+ #endif
+-	} else {
++		break;
++
++	case PPC_HTW_NONE:
+ #ifdef CONFIG_PPC_64K_PAGES
+ 		mas4 |=	BOOK3E_PAGESZ_64K << MAS4_TSIZED_SHIFT;
+ #else
+ 		mas4 |=	BOOK3E_PAGESZ_4K << MAS4_TSIZED_SHIFT;
+ #endif
+ 		mmu_pte_psize = mmu_virtual_psize;
++		break;
+ 	}
+ 	mtspr(SPRN_MAS4, mas4);
+ 
+@@ -616,8 +681,10 @@ static void __early_init_mmu(int boot_cpu)
+ 		/* limit memory so we dont have linear faults */
+ 		memblock_enforce_memory_limit(linear_map_top);
+ 
+-		patch_exception(0x1c0, exc_data_tlb_miss_bolted_book3e);
+-		patch_exception(0x1e0, exc_instruction_tlb_miss_bolted_book3e);
++		if (book3e_htw_mode == PPC_HTW_NONE) {
++			patch_exception(0x1c0, exc_data_tlb_miss_bolted_book3e);
++			patch_exception(0x1e0, exc_instruction_tlb_miss_bolted_book3e);
++		}
+ 	}
+ #endif
+ 
+-- 
+1.7.9.7
+
