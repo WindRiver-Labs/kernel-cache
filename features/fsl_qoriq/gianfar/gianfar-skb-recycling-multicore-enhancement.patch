@@ -1,0 +1,444 @@
+From 32a854fa3dff01bcea0c2e5a27f44867c745537a Mon Sep 17 00:00:00 2001
+From: Claudiu Manoil <claudiu.manoil@freescale.com>
+Date: Fri, 10 Feb 2012 11:51:46 +0200
+Subject: [PATCH 01/27] gianfar: skb recycling multicore enhancement
+
+Currently, the skb recycle queue is per device.
+On a multicore system, if tx and rx ring cleaning is
+happening on separate CPUs then the skb recycle queue's
+spin lock becomes a bottle neck, as time is wasted on
+CPUs for acquiring the recycle queue lock.
+
+Additionally, with the current per device recycle queue
+approach, the performance gain of skb recycling is not seen
+for unidirectional flows (forwarding between eth1 -> eth2
+for example). A global recycling approach should be taken
+instead, which also has the benefit of reducing the number
+of skbs that are held in the system for recycling purpose.
+
+To overcome these issues, this patch introduces now two levels
+of recycle queues, defined as follows:
+
+1. A global recycle queue, shared among devices
+2. Per CPU recycle queues, to speed-up processing on multicore
+systems
+
+Tx and Rx side recycling code now works like this:
+
+1. Tx ring cleaning: While cleaning the Tx ring, skb's are
+   added to the local per cpu recycle queue, and if the local
+   recycle queue becomes full then it will be swapped with
+   the global recycle queue. If the global recycle queue happens
+   to be also full then the skb is freed. After the swap operation
+   the Tx cleaning function starts filling again the new local
+   recycle queue.
+   Filling of local queue does not require any lock, only the
+   swapping operation requires locking.
+
+2. Rx ring fill up: While filling up the Rx ring, skbs are
+   picked from the local recycle queue. If it becomes empty
+   then the local recycle queue is swapped with global queue.
+   If the global queue is also empty then a new skb is
+   allocated from kernel.
+   Here also locking is only required while swapping but not
+   for picking skbs from the local recycle queue.
+
+At maximum a number of recycle_max skb's can be locally
+(per cpu) recycled. Above mentioned approach reduces thus
+the lock contention by 1/recycle_max times.
+
+Signed-off-by: Pankaj Chauhan <pankaj.chauhan@freescale.com>
+Signed-off-by: Jiajun Wu <b06378@freescale.com>
+Signed-off-by: Claudiu Manoil <claudiu.manoil@freescale.com>
+[Kevin: Original patch taken from FSL
+QorIQ-SDK-V1.2-SOURCE-20120614-yocto.iso image]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+[Use module_init()/module_exit() to replace module_platform_driver()
+to make sure SDK can hook as original when init and exit separately.]
+Integrated-by: Tiejun Chen <tiejun.chen@windriver.com>
+---
+ drivers/net/ethernet/freescale/gianfar.c       |  191 +++++++++++++++++++++---
+ drivers/net/ethernet/freescale/gianfar.h       |   42 +++++-
+ drivers/net/ethernet/freescale/gianfar_sysfs.c |   31 ++++
+ 3 files changed, 244 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/gianfar.c b/drivers/net/ethernet/freescale/gianfar.c
+index 44ae493..f04e1d7 100644
+--- a/drivers/net/ethernet/freescale/gianfar.c
++++ b/drivers/net/ethernet/freescale/gianfar.c
+@@ -109,6 +109,7 @@
+ #define TX_TIMEOUT      (1*HZ)
+ 
+ const char gfar_driver_version[] = "1.3";
++static struct gfar_recycle_cntxt *gfar_global_recycle_cntxt;
+ 
+ static int gfar_enet_open(struct net_device *dev);
+ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev);
+@@ -116,6 +117,7 @@ static void gfar_reset_task(struct work_struct *work);
+ static void gfar_timeout(struct net_device *dev);
+ static int gfar_close(struct net_device *dev);
+ struct sk_buff *gfar_new_skb(struct net_device *dev);
++static void gfar_free_skb(struct sk_buff *skb);
+ static void gfar_new_rxbdp(struct gfar_priv_rx_q *rx_queue, struct rxbd8 *bdp,
+ 		struct sk_buff *skb);
+ static int gfar_set_mac_address(struct net_device *dev);
+@@ -1774,7 +1776,6 @@ static void free_skb_resources(struct gfar_private *priv)
+ 			free_skb_rx_queue(rx_queue);
+ 	}
+ 	gfar_free_bds(priv);
+-	skb_queue_purge(&priv->rx_recycle);
+ }
+ 
+ void gfar_start(struct net_device *dev)
+@@ -1942,6 +1943,67 @@ irq_fail:
+ 	return err;
+ }
+ 
++void __exit gfar_free_recycle_cntxt(struct gfar_recycle_cntxt *recycle_cntxt)
++{
++	struct gfar_recycle_cntxt_percpu *local;
++	int cpu;
++
++	if (!recycle_cntxt)
++		return;
++	if (!recycle_cntxt->global_recycle_q)
++		return;
++	skb_queue_purge(recycle_cntxt->global_recycle_q);
++	kfree(recycle_cntxt->global_recycle_q);
++	if (!recycle_cntxt->local)
++		return;
++	for_each_possible_cpu(cpu) {
++		local = per_cpu_ptr(recycle_cntxt->local, cpu);
++		if (!local->recycle_q)
++			continue;
++		skb_queue_purge(local->recycle_q);
++		kfree(local->recycle_q);
++	}
++	free_percpu(recycle_cntxt->local);
++	kfree(recycle_cntxt);
++}
++
++struct gfar_recycle_cntxt *__init gfar_init_recycle_cntxt(void)
++{
++	struct gfar_recycle_cntxt *recycle_cntxt;
++	struct gfar_recycle_cntxt_percpu *local;
++	int cpu;
++
++	recycle_cntxt = kzalloc(sizeof(struct gfar_recycle_cntxt),
++							GFP_KERNEL);
++	if (!recycle_cntxt)
++		goto err;
++
++	recycle_cntxt->recycle_max = GFAR_RX_RECYCLE_MAX;
++	spin_lock_init(&recycle_cntxt->recycle_lock);
++	recycle_cntxt->global_recycle_q = kmalloc(sizeof(struct sk_buff_head),
++							GFP_KERNEL);
++	if (!recycle_cntxt->global_recycle_q)
++		goto err;
++	skb_queue_head_init(recycle_cntxt->global_recycle_q);
++
++	recycle_cntxt->local = alloc_percpu(struct gfar_recycle_cntxt_percpu);
++	if (!recycle_cntxt->local)
++		goto err;
++	for_each_possible_cpu(cpu) {
++		local = per_cpu_ptr(recycle_cntxt->local, cpu);
++		local->recycle_q = kmalloc(sizeof(struct sk_buff_head),
++							GFP_KERNEL);
++		if (!local->recycle_q)
++			goto err;
++		skb_queue_head_init(local->recycle_q);
++	}
++
++	return recycle_cntxt;
++err:
++	gfar_free_recycle_cntxt(recycle_cntxt);
++	return NULL;
++}
++
+ /* Called when something needs to use the ethernet device */
+ /* Returns 0 for success. */
+ static int gfar_enet_open(struct net_device *dev)
+@@ -1951,7 +2013,7 @@ static int gfar_enet_open(struct net_device *dev)
+ 
+ 	enable_napi(priv);
+ 
+-	skb_queue_head_init(&priv->rx_recycle);
++	priv->recycle = gfar_global_recycle_cntxt;
+ 
+ 	/* Initialize a bunch of registers */
+ 	init_registers(dev);
+@@ -2543,18 +2605,7 @@ static int gfar_clean_tx_ring(struct gfar_priv_tx_q *tx_queue)
+ 
+ 		bytes_sent += skb->len;
+ 
+-		/*
+-		 * If there's room in the queue (limit it to rx_buffer_size)
+-		 * we add this skb back into the pool, if it's the right size
+-		 */
+-		if (skb_queue_len(&priv->rx_recycle) < rx_queue->rx_ring_size &&
+-				skb_recycle_check(skb, priv->rx_buffer_size +
+-					RXBUF_ALIGNMENT)) {
+-			gfar_align_skb(skb);
+-			skb_queue_head(&priv->rx_recycle, skb);
+-		} else
+-			dev_kfree_skb_any(skb);
+-
++		gfar_free_skb(skb);
+ 		tx_queue->tx_skbuff[skb_dirtytx] = NULL;
+ 
+ 		skb_dirtytx = (skb_dirtytx + 1) &
+@@ -2631,14 +2682,99 @@ static struct sk_buff * gfar_alloc_skb(struct net_device *dev)
+ 	return skb;
+ }
+ 
++static void gfar_free_skb(struct sk_buff *skb)
++{
++	struct net_device *dev = skb->dev;
++	struct gfar_private *priv = netdev_priv(dev);
++	struct sk_buff_head *recycle_q, *temp_recycle_q;
++	struct gfar_recycle_cntxt *recycle_cntxt;
++	struct gfar_recycle_cntxt_percpu *local;
++	unsigned long flags;
++	int cpu;
++
++	recycle_cntxt = priv->recycle;
++
++	if (!skb_recycle_check(skb, priv->rx_buffer_size + RXBUF_ALIGNMENT)) {
++		dev_kfree_skb_any(skb);
++		return;
++	}
++
++	cpu = get_cpu();
++	local = per_cpu_ptr(recycle_cntxt->local, cpu);
++	recycle_q = local->recycle_q;
++
++	if (skb_queue_len(recycle_q) < recycle_cntxt->recycle_max) {
++		local->free_count++;
++		__skb_queue_head(recycle_q, skb);
++		put_cpu();
++		return;
++	}
++
++	/* Local per CPU queue is full. Now swap this full recycle queue
++	 * with global device recycle queue if it is empty otherwise
++	 * kfree the skb
++	 */
++	spin_lock_irqsave(&recycle_cntxt->recycle_lock, flags);
++	if (recycle_cntxt->global_recycle_q &&
++		!skb_queue_len(recycle_cntxt->global_recycle_q)) {
++
++		temp_recycle_q  = recycle_cntxt->global_recycle_q;
++		recycle_cntxt->global_recycle_q = recycle_q;
++		recycle_cntxt->free_swap_count++;
++		spin_unlock_irqrestore(&recycle_cntxt->recycle_lock, flags);
++		local->recycle_q = temp_recycle_q;
++		local->free_count++;
++		__skb_queue_head(temp_recycle_q, skb);
++		put_cpu();
++	} else {
++		spin_unlock_irqrestore(&recycle_cntxt->recycle_lock, flags);
++		put_cpu();
++		dev_kfree_skb_any(skb);
++	}
++}
++
+ struct sk_buff * gfar_new_skb(struct net_device *dev)
+ {
+ 	struct gfar_private *priv = netdev_priv(dev);
+ 	struct sk_buff *skb = NULL;
++	struct sk_buff_head *recycle_q, *temp_recycle_q;
++	struct gfar_recycle_cntxt *recycle_cntxt;
++	struct gfar_recycle_cntxt_percpu *local;
++	unsigned long flags;
++	int cpu;
+ 
+-	skb = skb_dequeue(&priv->rx_recycle);
+-	if (!skb)
++	recycle_cntxt = priv->recycle;
++
++	cpu = get_cpu();
++	local = per_cpu_ptr(recycle_cntxt->local, cpu);
++	recycle_q = local->recycle_q;
++	skb = __skb_dequeue(recycle_q);
++	if (skb) {
++		local->alloc_count++;
++		put_cpu();
++		return skb;
++	}
++
++	/* Local per cpu queue is empty. Now swap global recycle
++	 * queue (if it is full) with this empty local queue.
++	 */
++	spin_lock_irqsave(&recycle_cntxt->recycle_lock, flags);
++	if (recycle_cntxt->global_recycle_q &&
++		skb_queue_len(recycle_cntxt->global_recycle_q)) {
++
++		temp_recycle_q = recycle_cntxt->global_recycle_q;
++		recycle_cntxt->global_recycle_q = recycle_q;
++		recycle_cntxt->alloc_swap_count++;
++		spin_unlock_irqrestore(&recycle_cntxt->recycle_lock, flags);
++		local->recycle_q = temp_recycle_q;
++		local->alloc_count++;
++		skb = __skb_dequeue(temp_recycle_q);
++		put_cpu();
++	} else {
++		spin_unlock_irqrestore(&recycle_cntxt->recycle_lock, flags);
++		put_cpu();
+ 		skb = gfar_alloc_skb(dev);
++	}
+ 
+ 	return skb;
+ }
+@@ -2797,8 +2933,10 @@ int gfar_clean_rx_ring(struct gfar_priv_rx_q *rx_queue, int rx_work_limit)
+ 
+ 			if (unlikely(!newskb))
+ 				newskb = skb;
+-			else if (skb)
+-				skb_queue_head(&priv->rx_recycle, skb);
++			else if (skb) {
++				skb->dev = dev;
++				gfar_free_skb(skb);
++			}
+ 		} else {
+ 			/* Increment the number of packets */
+ 			rx_queue->stats.rx_packets++;
+@@ -3307,4 +3445,19 @@ static struct platform_driver gfar_driver = {
+ 	.remove = gfar_remove,
+ };
+ 
+-module_platform_driver(gfar_driver);
++static int __init gfar_init(void)
++{
++	gfar_global_recycle_cntxt = gfar_init_recycle_cntxt();
++	if (!gfar_global_recycle_cntxt)
++		return -ENOMEM;
++	return platform_driver_register(&gfar_driver);
++}
++
++static void __exit gfar_exit(void)
++{
++	gfar_free_recycle_cntxt(gfar_global_recycle_cntxt);
++	platform_driver_unregister(&gfar_driver);
++}
++
++module_init(gfar_init);
++module_exit(gfar_exit);
+diff --git a/drivers/net/ethernet/freescale/gianfar.h b/drivers/net/ethernet/freescale/gianfar.h
+index 65c0e00..53b8ef4 100644
+--- a/drivers/net/ethernet/freescale/gianfar.h
++++ b/drivers/net/ethernet/freescale/gianfar.h
+@@ -96,6 +96,12 @@ extern const char gfar_driver_version[];
+ #define GFAR_RX_MAX_RING_SIZE   256
+ #define GFAR_TX_MAX_RING_SIZE   256
+ 
++/* RECYCLE_MAX should be more than the size of the Tx ring,
++ * otherwise there will be unnecessary swapping of local
++ * and global recycle queues.
++ */
++#define GFAR_RX_RECYCLE_MAX	(2 * DEFAULT_TX_RING_SIZE)
++
+ #define GFAR_MAX_FIFO_THRESHOLD 511
+ #define GFAR_MAX_FIFO_STARVE	511
+ #define GFAR_MAX_FIFO_STARVE_OFF 511
+@@ -1035,6 +1041,40 @@ enum gfar_errata {
+ 	GFAR_ERRATA_12		= 0x08, /* a.k.a errata eTSEC49 */
+ };
+ 
++/**
++ *	struct gfar_recycle_cntxt - Global recycle "context"
++ *		shared among gfar devices
++ *	@global_recycle_q: points to the recycle queue held in the global
++ *		context (may be swapped with queues from local contexts)
++ *	@recycle_max: max size of a recycle queue
++ *	@alloc_swap_count: #of queue swaps b/w local and global contexts
++ *		while skb's were being allocated form a recycle queue
++ *	@free_swap_count: #of queue swaps b/w local and global contexts
++ *		while skb's were being returned to a recycle queue
++ */
++struct gfar_recycle_cntxt {
++	spinlock_t recycle_lock;
++	struct sk_buff_head *global_recycle_q;
++	unsigned int recycle_max;
++	unsigned int alloc_swap_count;
++	unsigned int free_swap_count;
++	struct gfar_recycle_cntxt_percpu __percpu *local;
++};
++
++/**
++ *	struct gfar_recycle_cntxt_percpu - Local (percpu) recycle "context"
++ *		shared among gfar devices
++ *	@recycle_q: points to the recycle queue held in this local context
++ *		(may be swapped w/ the queue held in the global context)
++ *	@alloc_count: total #of skbs alloc'd from this local context
++ *	@free_count: total #of skbs freed to this local context
++ */
++struct gfar_recycle_cntxt_percpu {
++	struct sk_buff_head *recycle_q;
++	unsigned int alloc_count;
++	unsigned int free_count;
++};
++
+ /* Struct stolen almost completely (and shamelessly) from the FCC enet source
+  * (Ok, that's not so true anymore, but there is a family resemblance)
+  * The GFAR buffer descriptors track the ring buffers.  The rx_bd_base
+@@ -1072,7 +1112,7 @@ struct gfar_private {
+ 
+ 	u32 cur_filer_idx;
+ 
+-	struct sk_buff_head rx_recycle;
++	struct gfar_recycle_cntxt *recycle;
+ 
+ 	/* RX queue filer rule set*/
+ 	struct ethtool_rx_list rx_list;
+diff --git a/drivers/net/ethernet/freescale/gianfar_sysfs.c b/drivers/net/ethernet/freescale/gianfar_sysfs.c
+index cd14a4d..bc6d336 100644
+--- a/drivers/net/ethernet/freescale/gianfar_sysfs.c
++++ b/drivers/net/ethernet/freescale/gianfar_sysfs.c
+@@ -319,6 +319,36 @@ static ssize_t gfar_set_fifo_starve_off(struct device *dev,
+ static DEVICE_ATTR(fifo_starve_off, 0644, gfar_show_fifo_starve_off,
+ 		   gfar_set_fifo_starve_off);
+ 
++static ssize_t gfar_show_recycle_cntxt(struct device *dev,
++					 struct device_attribute *attr,
++					 char *buf)
++{
++	struct gfar_private *priv = netdev_priv(to_net_dev(dev));
++	struct gfar_recycle_cntxt *recycle_cntxt;
++	struct gfar_recycle_cntxt_percpu *local;
++	unsigned int recycled_free_count, recycled_alloc_count;
++	int cpu;
++
++	recycle_cntxt = priv->recycle;
++	recycled_alloc_count = recycled_free_count = 0;
++
++	printk(KERN_NOTICE "recycle max %d\n", recycle_cntxt->recycle_max);
++	printk(KERN_NOTICE "queue swap during: free - %d, alloc - %d\n",
++		recycle_cntxt->free_swap_count,
++		recycle_cntxt->alloc_swap_count);
++	for_each_possible_cpu(cpu) {
++		local = per_cpu_ptr(recycle_cntxt->local, cpu);
++		recycled_alloc_count += local->alloc_count;
++		recycled_free_count += local->free_count;
++	}
++	printk(KERN_NOTICE \
++		"total recycle free count: %d, and recycle alloc count: %d\n",
++		recycled_free_count, recycled_alloc_count);
++	return sprintf(buf, "%d\n", recycle_cntxt->recycle_max);
++}
++
++static DEVICE_ATTR(recycle_cntxt, 0444, gfar_show_recycle_cntxt, NULL);
++
+ void gfar_init_sysfs(struct net_device *dev)
+ {
+ 	struct gfar_private *priv = netdev_priv(dev);
+@@ -336,6 +366,7 @@ void gfar_init_sysfs(struct net_device *dev)
+ 	rc |= device_create_file(&dev->dev, &dev_attr_fifo_threshold);
+ 	rc |= device_create_file(&dev->dev, &dev_attr_fifo_starve);
+ 	rc |= device_create_file(&dev->dev, &dev_attr_fifo_starve_off);
++	rc |= device_create_file(&dev->dev, &dev_attr_recycle_cntxt);
+ 	if (rc)
+ 		dev_err(&dev->dev, "Error creating gianfar sysfs files.\n");
+ }
+-- 
+1.7.9.7
+
