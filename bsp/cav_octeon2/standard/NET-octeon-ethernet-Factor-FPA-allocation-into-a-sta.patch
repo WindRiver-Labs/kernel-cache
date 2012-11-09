@@ -1,0 +1,660 @@
+From e657dccf4458070282e501a708e66a83f78de45e Mon Sep 17 00:00:00 2001
+From: David Daney <david.daney@cavium.com>
+Date: Tue, 10 Apr 2012 18:21:13 +0800
+Subject: [PATCH 209/236] NET: octeon-ethernet: Factor FPA allocation into a standalone system.
+
+Source: Cavium SDK 2.3-427
+
+This should make it easier for other users of the FPA to coordinate
+memory allocations.
+
+Signed-off-by: David Daney <david.daney@cavium.com>
+Integrated-by: Jiang Bin <bin.jiang@windriver.com>
+---
+ arch/mips/cavium-octeon/octeon-rapidio.c   |   10 +-
+ arch/mips/include/asm/octeon/cvmx-config.h |    6 +-
+ drivers/net/octeon/ethernet-mem.c          |  305 +++++++++++++++++----------
+ drivers/net/octeon/ethernet-mem.h          |    7 +-
+ drivers/net/octeon/ethernet-napi.c         |    2 +-
+ drivers/net/octeon/ethernet-rx.h           |    1 -
+ drivers/net/octeon/ethernet-xmit.c         |    6 +-
+ drivers/net/octeon/ethernet.c              |   50 ++++-
+ drivers/net/octeon/octeon-ethernet.h       |    1 +
+ 9 files changed, 247 insertions(+), 141 deletions(-)
+
+diff --git a/arch/mips/cavium-octeon/octeon-rapidio.c b/arch/mips/cavium-octeon/octeon-rapidio.c
+index d6653c2..1d9ae03 100644
+--- a/arch/mips/cavium-octeon/octeon-rapidio.c
++++ b/arch/mips/cavium-octeon/octeon-rapidio.c
+@@ -692,7 +692,8 @@ static irqreturn_t octeon_rio_irq(int irq, void *irq_arg)
+ 	return IRQ_HANDLED;
+ }
+ 
+-extern int cvm_oct_mem_fill_fpa(int pool, int size, int elements);
++extern int cvm_oct_mem_fill_fpa(int pool, int elements);
++extern int cvm_oct_alloc_fpa_pool(int pool, int size);
+ 
+ /**
+  * Initialize the RapidIO system
+@@ -788,9 +789,12 @@ static int __init octeon_rio_init(void)
+ 		}
+ 	}
+ 	if (count) {
++		int r;
+ 		cvmx_fpa_enable();
+-		cvm_oct_mem_fill_fpa(CVMX_FPA_OUTPUT_BUFFER_POOL,
+-				     CVMX_FPA_OUTPUT_BUFFER_POOL_SIZE, 128);
++		r = cvm_oct_alloc_fpa_pool(CVMX_FPA_OUTPUT_BUFFER_POOL, CVMX_FPA_OUTPUT_BUFFER_POOL_SIZE);
++		if (r < 0)
++			panic("cvm_oct_alloc_fpa_pool() failed.");
++		cvm_oct_mem_fill_fpa(CVMX_FPA_OUTPUT_BUFFER_POOL, 128);
+ 		cvmx_dma_engine_initialize();
+ 	}
+ 
+diff --git a/arch/mips/include/asm/octeon/cvmx-config.h b/arch/mips/include/asm/octeon/cvmx-config.h
+index 8efb0bc..203aea1 100644
+--- a/arch/mips/include/asm/octeon/cvmx-config.h
++++ b/arch/mips/include/asm/octeon/cvmx-config.h
+@@ -72,7 +72,7 @@ static inline int octeon_pko_lockless(void)
+ #define CVMX_FPA_POOL_0_SIZE (16 * CVMX_CACHE_LINE_SIZE)
+ #define CVMX_FPA_POOL_1_SIZE (1 * CVMX_CACHE_LINE_SIZE)
+ #define CVMX_FPA_POOL_2_SIZE (8 * CVMX_CACHE_LINE_SIZE)
+-#define CVMX_FPA_POOL_3_SIZE (1 * CVMX_CACHE_LINE_SIZE)
++#define CVMX_FPA_POOL_3_SIZE (0 * CVMX_CACHE_LINE_SIZE)
+ #define CVMX_FPA_POOL_4_SIZE (0 * CVMX_CACHE_LINE_SIZE)
+ #define CVMX_FPA_POOL_5_SIZE (0 * CVMX_CACHE_LINE_SIZE)
+ #define CVMX_FPA_POOL_6_SIZE (0 * CVMX_CACHE_LINE_SIZE)
+@@ -88,10 +88,6 @@ static inline int octeon_pko_lockless(void)
+ /* PKO queue command buffers */
+ #define CVMX_FPA_OUTPUT_BUFFER_POOL         (2)
+ #define CVMX_FPA_OUTPUT_BUFFER_POOL_SIZE    CVMX_FPA_POOL_2_SIZE
+-/* Work queue entrys for TX side */
+-#define CVMX_FPA_TX_WQE_POOL			(3)
+-#define CVMX_FPA_TX_WQE_POOL_SIZE		CVMX_FPA_POOL_3_SIZE
+-
+ 
+ /*************************  FAU allocation ********************************/
+ /* The fetch and add registers are allocated here.  They are arranged
+diff --git a/drivers/net/octeon/ethernet-mem.c b/drivers/net/octeon/ethernet-mem.c
+index 31cdabe..66cdefc 100644
+--- a/drivers/net/octeon/ethernet-mem.c
++++ b/drivers/net/octeon/ethernet-mem.c
+@@ -38,9 +38,21 @@
+ #include <asm/octeon/cvmx-bootmem.h>
+ #endif
+ 
+-static struct kmem_cache *cvm_oct_kmem_128;
+-static struct kmem_cache *cvm_oct_kmem_1024;
++struct fpa_pool {
++	int pool;
++	int users;
++	int size;
++	char kmem_name[20];
++	struct kmem_cache *kmem;
++	int (*fill)(struct fpa_pool *p, int num);
++	int (*empty)(struct fpa_pool *p, int num);
++};
+ 
++static DEFINE_SPINLOCK(cvm_oct_pools_lock);
++/* Eight pools. */
++static struct fpa_pool cvm_oct_pools[] = {
++	{-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}
++};
+ 
+ /**
+  * cvm_oct_fill_hw_skbuff - fill the supplied hardware pool with skbuffs
+@@ -50,23 +62,25 @@ static struct kmem_cache *cvm_oct_kmem_1024;
+  *
+  * Returns the actual number of buffers allocated.
+  */
+-static int cvm_oct_fill_hw_skbuff(int pool, int size, int elements)
++static int cvm_oct_fill_hw_skbuff(struct fpa_pool *pool, int elements)
+ {
+ 	int freed = elements;
+ 	int padding = 128 + sizeof(void *) + NET_SKB_PAD - 1;
++	int size = pool->size;
++	int pool_num = pool->pool;
+ 	while (freed) {
+ 		int extra_reserve;
+ 		unsigned char *desired_data;
+ 		struct sk_buff *skb = alloc_skb(size + padding, GFP_ATOMIC);
+ 		if (unlikely(skb == NULL)) {
+-			pr_warning("Failed to allocate skb for hardware pool %d\n", pool);
++			pr_warning("Failed to allocate skb for hardware pool %d\n", pool_num);
+ 			break;
+ 		}
+ 		desired_data = (unsigned char *)((unsigned long)(skb->data + padding) & ~0x7fUl);
+ 		extra_reserve = desired_data - skb->data;
+ 		skb_reserve(skb, extra_reserve);
+ 		*(struct sk_buff **)(skb->data - NET_SKB_PAD - sizeof(void *)) = skb;
+-		cvmx_fpa_free(skb->data, pool, DONT_WRITEBACK(size / 128));
++		cvmx_fpa_free(skb->data, pool_num, DONT_WRITEBACK(size / 128));
+ 		freed--;
+ 	}
+ 	return elements - freed;
+@@ -78,12 +92,13 @@ static int cvm_oct_fill_hw_skbuff(int pool, int size, int elements)
+  * @size:     Size of the buffer needed for the pool
+  * @elements: Number of buffers to allocate
+  */
+-static void cvm_oct_free_hw_skbuff(int pool, int size, int elements)
++static int cvm_oct_free_hw_skbuff(struct fpa_pool *pool, int elements)
+ {
+ 	char *memory;
++	int pool_num = pool->pool;
+ 
+ 	do {
+-		memory = cvmx_fpa_alloc(pool);
++		memory = cvmx_fpa_alloc(pool_num);
+ 		if (memory) {
+ 			struct sk_buff *skb = *cvm_oct_packet_to_skb(memory);
+ 			elements--;
+@@ -92,9 +107,34 @@ static void cvm_oct_free_hw_skbuff(int pool, int size, int elements)
+ 	} while (memory);
+ 
+ 	if (elements < 0)
+-		pr_warning("Freeing of pool %u had too many skbuffs (%d)\n", pool, elements);
++		pr_warning("Freeing of pool %u had too many skbuffs (%d)\n", pool_num, elements);
+ 	else if (elements > 0)
+-		pr_warning("Freeing of pool %u is missing %d skbuffs\n", pool, elements);
++		pr_warning("Freeing of pool %u is missing %d skbuffs\n", pool_num, elements);
++
++	return 0;
++}
++
++static int cvm_oct_bootmem_fill(struct fpa_pool *pool, int elements)
++{
++	extern u64 octeon_reserve32_memory;
++	char *memory;
++	int freed = elements;
++
++	memory = cvmx_bootmem_alloc_range(elements * pool->size, 128, octeon_reserve32_memory,
++					octeon_reserve32_memory + (CONFIG_CAVIUM_RESERVE32 << 20) - 1);
++
++	if (memory == NULL)
++		panic("Unable to allocate %u bytes for FPA pool %d\n", elements * pool->size, pool->pool);
++
++	printk("Memory range %p - %p reserved for hardware\n",
++		memory, memory + elements * pool->size - 1);
++
++	while (freed) {
++		cvmx_fpa_free(memory, pool->pool, 0);
++		memory += pool->size;
++		freed--;
++	}
++	return elements - freed;
+ }
+ 
+ /**
+@@ -105,49 +145,19 @@ static void cvm_oct_free_hw_skbuff(int pool, int size, int elements)
+  *
+  * Returns the actual number of buffers allocated.
+  */
+-static int cvm_oct_fill_hw_memory(int pool, int size, int elements)
++static int cvm_oct_fill_hw_kmem(struct fpa_pool *pool, int elements)
+ {
+ 	char *memory;
+ 	int freed = elements;
+ 
+-	if (USE_32BIT_SHARED) {
+-		extern u64 octeon_reserve32_memory;
+-		memory = cvmx_bootmem_alloc_range(elements*size, 128, octeon_reserve32_memory,
+-			    octeon_reserve32_memory + (CONFIG_CAVIUM_RESERVE32<<20) - 1);
+-
+-		if (memory == NULL)
+-			panic("Unable to allocate %u bytes for FPA pool %d\n", elements*size, pool);
+-
+-		printk("Memory range %p - %p reserved for hardware\n",
+-			memory, memory + elements*size - 1);
+-
+-		while (freed) {
+-			cvmx_fpa_free(memory, pool, 0);
+-			memory += size;
+-			freed--;
+-		}
+-		return elements - freed;
+-	}
+-
+ 	while (freed) {
+-		if (size == 128) {
+-			memory = kmem_cache_alloc(cvm_oct_kmem_128, GFP_KERNEL);
+-			if (unlikely(memory == NULL)) {
+-				pr_warning("Unable to allocate %u bytes for FPA pool %d\n",
+-					elements * size, pool);
+-				break;
+-			}
+-		} else if (size == 1024) {
+-			memory = kmem_cache_alloc(cvm_oct_kmem_1024, GFP_KERNEL);
+-			if (unlikely(memory == NULL)) {
+-				pr_warning("Unable to allocate %u bytes for FPA pool %d\n",
+-					elements * size, pool);
+-				break;
+-			}
+-		} else {
+-			BUG();
++		memory = kmem_cache_alloc(pool->kmem, GFP_KERNEL);
++		if (unlikely(memory == NULL)) {
++			pr_warning("Unable to allocate %u bytes for FPA pool %d\n",
++				elements * pool->size, pool->pool);
++			break;
+ 		}
+-		cvmx_fpa_free(memory, pool, 0);
++		cvmx_fpa_free(memory, pool->pool, 0);
+ 		freed--;
+ 	}
+ 	return elements - freed;
+@@ -159,106 +169,175 @@ static int cvm_oct_fill_hw_memory(int pool, int size, int elements)
+  * @size:     Size of each buffer in the pool
+  * @elements: Number of buffers that should be in the pool
+  */
+-static void cvm_oct_free_hw_memory(int pool, int size, int elements)
++static int cvm_oct_free_hw_kmem(struct fpa_pool *pool, int elements)
+ {
+ 	char *fpa;
+-	if (USE_32BIT_SHARED) {
+-		printk("Warning: 32 shared memory is not freeable\n");
+-		return;
++	while (elements) {
++		fpa = cvmx_fpa_alloc(pool->pool);
++		if (!fpa)
++			break;
++		elements--;
++		kmem_cache_free(pool->kmem, fpa);
+ 	}
+-	do {
+-		fpa = cvmx_fpa_alloc(pool);
+-		if (fpa) {
+-			elements--;
+-			if (size == 128)
+-				kmem_cache_free(cvm_oct_kmem_128, fpa);
+-			else if (size == 1024)
+-				kmem_cache_free(cvm_oct_kmem_1024, fpa);
+-			else
+-				BUG();
+-		}
+-	} while (fpa);
+ 
+ 	if (elements < 0)
+ 		pr_warning("Freeing of pool %u had too many buffers (%d)\n",
+-			pool, elements);
++			pool->pool, elements);
+ 	else if (elements > 0)
+ 		pr_warning("Warning: Freeing of pool %u is missing %d buffers\n",
+-			pool, elements);
++			pool->pool, elements);
++	return elements;
+ }
+ 
+-int cvm_oct_mem_fill_fpa(int pool, int size, int elements)
++int cvm_oct_mem_fill_fpa(int pool, int elements)
+ {
+-	int freed;
++	struct fpa_pool *p;
++
++	if (pool < 0 || pool >= ARRAY_SIZE(cvm_oct_pools))
++		return -EINVAL;
++
++	p = cvm_oct_pools + pool;
+ 
+-	if (USE_SKBUFFS_IN_HW && pool == CVMX_FPA_PACKET_POOL)
+-		freed = cvm_oct_fill_hw_skbuff(pool, size, elements);
+-	else
+-		freed = cvm_oct_fill_hw_memory(pool, size, elements);
+-	return freed;
++	return p->fill(p, elements);
+ }
+ EXPORT_SYMBOL(cvm_oct_mem_fill_fpa);
+ 
+-void cvm_oct_mem_empty_fpa(int pool, int size, int elements)
++int cvm_oct_mem_empty_fpa(int pool, int elements)
+ {
+-	if (USE_SKBUFFS_IN_HW && pool == CVMX_FPA_PACKET_POOL)
+-		cvm_oct_free_hw_skbuff(pool, size, elements);
+-	else
+-		cvm_oct_free_hw_memory(pool, size, elements);
+-}
+-EXPORT_SYMBOL(cvm_oct_mem_empty_fpa);
++	struct fpa_pool *p;
+ 
+-void cvm_oct_mem_uninit(void)
+-{
+-	if (USE_32BIT_SHARED)
+-		return;
++	if (pool < 0 || pool >= ARRAY_SIZE(cvm_oct_pools))
++		return -EINVAL;
+ 
+-	if (cvm_oct_kmem_128)
+-		kmem_cache_destroy(cvm_oct_kmem_128);
+-	if (cvm_oct_kmem_1024)
+-		kmem_cache_destroy(cvm_oct_kmem_1024);
++	p = cvm_oct_pools + pool;
++	if (p->empty)
++		return p->empty(p, elements);
+ 
+-	cvm_oct_kmem_128 = NULL;
+-	cvm_oct_kmem_1024 = NULL;
++	return 0;
+ }
+-EXPORT_SYMBOL(cvm_oct_mem_uninit);
++EXPORT_SYMBOL(cvm_oct_mem_empty_fpa);
+ 
+ void cvm_oct_mem_cleanup(void)
+ {
+-	if (USE_32BIT_SHARED)
+-		return;
++	int i;
+ 
+-	if (cvm_oct_kmem_128)
+-		kmem_cache_shrink(cvm_oct_kmem_128);
+-	if (cvm_oct_kmem_1024)
+-		kmem_cache_shrink(cvm_oct_kmem_1024);
++	spin_lock(&cvm_oct_pools_lock);
++
++	for (i = 0; i < ARRAY_SIZE(cvm_oct_pools); i++)
++		if (cvm_oct_pools[i].kmem)
++			kmem_cache_shrink(cvm_oct_pools[i].kmem);
++	spin_unlock(&cvm_oct_pools_lock);
+ }
+ EXPORT_SYMBOL(cvm_oct_mem_cleanup);
+ 
+-static int __init cvm_oct_mem_init(void)
++/**
++ * cvm_oct_alloc_fpa_pool() - Allocate an FPA pool of the given size
++ * @pool:  Requested pool number (-1 for don't care).
++ * @size:  The size of the pool elements.
++ *
++ * Returns the pool number or a negative number on error.
++ */
++int cvm_oct_alloc_fpa_pool(int pool, int size)
+ {
+-	int r = 0;
++	int i;
++	int ret = 0;
+ 
+-	if (USE_32BIT_SHARED)
+-		goto out;
++	if (pool >= (int)ARRAY_SIZE(cvm_oct_pools) || size < 128)
++		return -EINVAL;
+ 
+-	cvm_oct_kmem_128 = kmem_cache_create("octeon_ethernet-128", 128, 128, 0, NULL);
+-	if (!cvm_oct_kmem_128) {
+-		r = -ENOMEM;
+-		goto out;
++	spin_lock(&cvm_oct_pools_lock);
++
++	if (pool >= 0) {
++		if (cvm_oct_pools[pool].pool != -1) {
++			if (cvm_oct_pools[pool].size == size) {
++				/* Already allocated */
++				cvm_oct_pools[pool].users++;
++				ret = pool;
++				goto out;
++			} else {
++				/* conflict */
++				ret = -EINVAL;
++				goto out;
++			}
++		}
++	} else {
++		/* Find an established pool */
++		for (i = 0; i < ARRAY_SIZE(cvm_oct_pools); i++)
++			if (cvm_oct_pools[i].pool >= 0 &&
++			    cvm_oct_pools[i].size == size) {
++				cvm_oct_pools[i].users++;
++				ret = i;
++				goto out;
++			}
++
++		/* Find an empty pool */
++		for (i = 0; i < ARRAY_SIZE(cvm_oct_pools); i++)
++			if (cvm_oct_pools[i].pool == -1) {
++				pool = i;
++				break;
++			}
++		if (pool < 0) {
++			/* No empties. */
++			ret = -EINVAL;
++			goto out;
++		}
+ 	}
+ 
+-	cvm_oct_kmem_1024 = kmem_cache_create("octeon_ethernet-1024", 1024, 128, 0, NULL);
+-	if (!cvm_oct_kmem_1024) {
+-		r = -ENOMEM;
+-		goto err;
++	/* Setup the pool */
++	cvm_oct_pools[pool].pool = pool;
++	cvm_oct_pools[pool].users++;
++	cvm_oct_pools[pool].size = size;
++	if (USE_SKBUFFS_IN_HW && pool == 0) {
++		/* Special packet pool */
++		cvm_oct_pools[pool].fill = cvm_oct_fill_hw_skbuff;
++		cvm_oct_pools[pool].empty = cvm_oct_free_hw_skbuff;
++	} else if (USE_32BIT_SHARED) {
++		cvm_oct_pools[pool].fill = cvm_oct_bootmem_fill;
++	} else {
++		snprintf(cvm_oct_pools[pool].kmem_name,
++			 sizeof(cvm_oct_pools[pool].kmem_name), "oct-fpa-%d", size);
++		cvm_oct_pools[pool].fill = cvm_oct_fill_hw_kmem;
++		cvm_oct_pools[pool].empty = cvm_oct_free_hw_kmem;
++		cvm_oct_pools[pool].kmem =
++			kmem_cache_create(cvm_oct_pools[pool].kmem_name, size, 128, 0, NULL);
++		if (!cvm_oct_pools[pool].kmem) {
++			ret = -ENOMEM;
++			cvm_oct_pools[pool].pool = -1;
++			goto out;
++		}
+ 	}
+-	goto out;
++	ret = pool;
++out:
++	spin_unlock(&cvm_oct_pools_lock);
++	return ret;
++}
++EXPORT_SYMBOL(cvm_oct_alloc_fpa_pool);
+ 
+-err:
+-	kmem_cache_destroy(cvm_oct_kmem_128);
+-	cvm_oct_kmem_128 = NULL;
++/**
++ * cvm_oct_release_fpa_pool() - Releases an FPA pool
++ * @pool:  Pool number.
++ *
++ * This undoes the action of cvm_oct_alloc_fpa_pool().
++ *
++ * Returns zero on success.
++ */
++int cvm_oct_release_fpa_pool(int pool)
++{
++	int ret = -EINVAL;
++
++	if (pool < 0 || pool >= (int)ARRAY_SIZE(cvm_oct_pools))
++		return ret;
++
++	spin_lock(&cvm_oct_pools_lock);
++
++	if (cvm_oct_pools[pool].users <= 0) {
++		pr_err("Error: Unbalanced FPA pool allocation\n");
++		goto out;
++	}
++	cvm_oct_pools[pool].users--;
++	ret = 0;
+ out:
+-	return r;
++	spin_unlock(&cvm_oct_pools_lock);
++	return ret;
+ }
+-arch_initcall(cvm_oct_mem_init);
++EXPORT_SYMBOL(cvm_oct_release_fpa_pool);
+diff --git a/drivers/net/octeon/ethernet-mem.h b/drivers/net/octeon/ethernet-mem.h
+index 89cdda4..ec8c7fc 100644
+--- a/drivers/net/octeon/ethernet-mem.h
++++ b/drivers/net/octeon/ethernet-mem.h
+@@ -25,7 +25,8 @@
+  * Contact Cavium Networks for more information
+ ********************************************************************/
+ 
+-int cvm_oct_mem_fill_fpa(int pool, int size, int elements);
+-void cvm_oct_mem_empty_fpa(int pool, int size, int elements);
++int cvm_oct_mem_fill_fpa(int pool, int elements);
++int cvm_oct_mem_empty_fpa(int pool, int elements);
++int cvm_oct_alloc_fpa_pool(int pool, int size);
++int cvm_oct_release_fpa_pool(int pool);
+ void cvm_oct_mem_cleanup(void);
+-void cvm_oct_mem_uninit(void);
+diff --git a/drivers/net/octeon/ethernet-napi.c b/drivers/net/octeon/ethernet-napi.c
+index be131b3..7309948 100644
+--- a/drivers/net/octeon/ethernet-napi.c
++++ b/drivers/net/octeon/ethernet-napi.c
+@@ -169,7 +169,7 @@ static int CVM_OCT_NAPI_POLL(struct napi_struct *napi, int budget)
+ 
+ 			dev_kfree_skb_any(skb);
+ 
+-			cvmx_fpa_free(work, CVMX_FPA_TX_WQE_POOL, DONT_WRITEBACK(1));
++			cvmx_fpa_free(work, cvm_oct_tx_wqe_pool, DONT_WRITEBACK(1));
+ 
+ 			/*
+ 			 * We are done with this one, adjust the queue
+diff --git a/drivers/net/octeon/ethernet-rx.h b/drivers/net/octeon/ethernet-rx.h
+index 2c5d093..2a66b0f 100644
+--- a/drivers/net/octeon/ethernet-rx.h
++++ b/drivers/net/octeon/ethernet-rx.h
+@@ -43,7 +43,6 @@ static inline void cvm_oct_rx_refill_pool(int fill_threshold)
+ 		cvmx_fau_atomic_add32(FAU_NUM_PACKET_BUFFERS_TO_FREE,
+ 				      -number_to_free);
+ 		num_freed = cvm_oct_mem_fill_fpa(CVMX_FPA_PACKET_POOL,
+-						 CVMX_FPA_PACKET_POOL_SIZE,
+ 						 number_to_free);
+ 		if (num_freed != number_to_free) {
+ 			cvmx_fau_atomic_add32(FAU_NUM_PACKET_BUFFERS_TO_FREE,
+diff --git a/drivers/net/octeon/ethernet-xmit.c b/drivers/net/octeon/ethernet-xmit.c
+index 2edd476..d31d26d 100644
+--- a/drivers/net/octeon/ethernet-xmit.c
++++ b/drivers/net/octeon/ethernet-xmit.c
+@@ -175,7 +175,7 @@ CVM_OCT_XMIT
+ 		hw_buffer.s.size = skb->len;
+ 	} else {
+ 		u64 *hw_buffer_list;
+-		work = cvmx_fpa_alloc(CVMX_FPA_TX_WQE_POOL);
++		work = cvmx_fpa_alloc(cvm_oct_tx_wqe_pool);
+ 		if (unlikely(!work)) {
+ 			DEBUGPRINT("%s: Failed WQE allocate\n", dev->name);
+ 			queue_type = QUEUE_DROP;
+@@ -349,7 +349,7 @@ dont_put_skbuff_in_hw:
+ 
+ 	if (queue_type == QUEUE_WQE) {
+ 		if (!work) {
+-			work = cvmx_fpa_alloc(CVMX_FPA_TX_WQE_POOL);
++			work = cvmx_fpa_alloc(cvm_oct_tx_wqe_pool);
+ 			if (unlikely(!work)) {
+ 				DEBUGPRINT("%s: Failed WQE allocate\n", dev->name);
+ 				queue_type = QUEUE_DROP;
+@@ -398,7 +398,7 @@ dont_put_skbuff_in_hw:
+ 							  priv->tx_queue[qos].queue, pko_command, hw_buffer,
+ 							  word2, CVM_OCT_PKO_LOCK_TYPE))) {
+ 				queue_type = QUEUE_DROP;
+-				cvmx_fpa_free(work, CVMX_FPA_TX_WQE_POOL, 0);
++				cvmx_fpa_free(work, cvm_oct_tx_wqe_pool, 0);
+ 				DEBUGPRINT("%s: Failed to send the packet with wqe\n", dev->name);
+ 		}
+ 	} else {
+diff --git a/drivers/net/octeon/ethernet.c b/drivers/net/octeon/ethernet.c
+index 531bbe0..3f80437 100644
+--- a/drivers/net/octeon/ethernet.c
++++ b/drivers/net/octeon/ethernet.c
+@@ -92,6 +92,9 @@ int rx_napi_weight = 32;
+ module_param(rx_napi_weight, int, 0444);
+ MODULE_PARM_DESC(rx_napi_weight, "The NAPI WEIGHT parameter.");
+ 
++
++int cvm_oct_tx_wqe_pool = -1;
++
+ /**
+  * cvm_oct_poll_queue - Workqueue for polling operations.
+  */
+@@ -163,16 +166,32 @@ static __init void cvm_oct_configure_common_hw(void)
+ {
+ 	/* Setup the FPA */
+ 	cvmx_fpa_enable();
+-	cvm_oct_mem_fill_fpa(CVMX_FPA_PACKET_POOL, CVMX_FPA_PACKET_POOL_SIZE,
+-			     num_packet_buffers);
+-	cvm_oct_mem_fill_fpa(CVMX_FPA_WQE_POOL, CVMX_FPA_WQE_POOL_SIZE,
+-			     num_packet_buffers);
++
++	if (cvm_oct_alloc_fpa_pool(CVMX_FPA_PACKET_POOL, CVMX_FPA_PACKET_POOL_SIZE) < 0) {
++		pr_err("cvm_oct_alloc_fpa_pool(CVMX_FPA_PACKET_POOL, CVMX_FPA_PACKET_POOL_SIZE) failed.\n");
++		return;
++	}
++	cvm_oct_mem_fill_fpa(CVMX_FPA_PACKET_POOL, num_packet_buffers);
++
++	if (cvm_oct_alloc_fpa_pool(CVMX_FPA_WQE_POOL, CVMX_FPA_WQE_POOL_SIZE) < 0) {
++		pr_err("cvm_oct_alloc_fpa_pool(CVMX_FPA_WQE_POOL, CVMX_FPA_WQE_POOL_SIZE) failed.\n");
++		return;
++	}
++	cvm_oct_mem_fill_fpa(CVMX_FPA_WQE_POOL, num_packet_buffers);
++
+ 	if (CVMX_FPA_OUTPUT_BUFFER_POOL != CVMX_FPA_PACKET_POOL) {
+ 		cvm_oct_num_output_buffers = 4 * octeon_pko_get_total_queues();
+-		cvm_oct_mem_fill_fpa(CVMX_FPA_OUTPUT_BUFFER_POOL,
+-				     CVMX_FPA_OUTPUT_BUFFER_POOL_SIZE, cvm_oct_num_output_buffers);
++		if (cvm_oct_alloc_fpa_pool(CVMX_FPA_OUTPUT_BUFFER_POOL, CVMX_FPA_OUTPUT_BUFFER_POOL_SIZE) < 0) {
++			pr_err("cvm_oct_alloc_fpa_pool(CVMX_FPA_OUTPUT_BUFFER_POOL, CVMX_FPA_OUTPUT_BUFFER_POOL_SIZE) failed.\n");
++			return;
++		}
++		cvm_oct_mem_fill_fpa(CVMX_FPA_OUTPUT_BUFFER_POOL, cvm_oct_num_output_buffers);
+ 	}
+ 
++	cvm_oct_tx_wqe_pool = cvm_oct_alloc_fpa_pool(-1, CVMX_FPA_WQE_POOL_SIZE);
++
++	if (cvm_oct_tx_wqe_pool < 0)
++		pr_err("cvm_oct_alloc_fpa_pool(-1, CVMX_FPA_WQE_POOL_SIZE)) failed.\n");
+ }
+ 
+ /**
+@@ -984,7 +1003,7 @@ static int __init cvm_oct_init_module(void)
+ 				 * own MAX_OUT_QUEUE_DEPTH worth of
+ 				 * WQE to track the transmit skbs.
+ 				 */
+-				cvm_oct_mem_fill_fpa(CVMX_FPA_TX_WQE_POOL, CVMX_FPA_TX_WQE_POOL_SIZE, PER_DEVICE_EXTRA_WQE);
++				cvm_oct_mem_fill_fpa(cvm_oct_tx_wqe_pool, PER_DEVICE_EXTRA_WQE);
+ 				num_devices_extra_wqe++;
+ 
+ 				queue_delayed_work(cvm_oct_poll_queue, &priv->port_periodic_work, HZ);
+@@ -1065,12 +1084,19 @@ static void __exit cvm_oct_cleanup_module(void)
+ 	cvm_oct_proc_shutdown();
+ 
+ 	/* Free the HW pools */
+-	cvm_oct_mem_empty_fpa(CVMX_FPA_PACKET_POOL, CVMX_FPA_PACKET_POOL_SIZE, num_packet_buffers);
+-	cvm_oct_mem_empty_fpa(CVMX_FPA_WQE_POOL, CVMX_FPA_WQE_POOL_SIZE, num_packet_buffers);
+-	cvm_oct_mem_empty_fpa(CVMX_FPA_TX_WQE_POOL, CVMX_FPA_TX_WQE_POOL_SIZE, num_devices_extra_wqe * PER_DEVICE_EXTRA_WQE);
++	cvm_oct_mem_empty_fpa(CVMX_FPA_PACKET_POOL, num_packet_buffers);
++	cvm_oct_release_fpa_pool(CVMX_FPA_PACKET_POOL);
++
++	cvm_oct_mem_empty_fpa(CVMX_FPA_WQE_POOL, num_packet_buffers);
++	cvm_oct_release_fpa_pool(CVMX_FPA_WQE_POOL);
+ 
+-	if (CVMX_FPA_OUTPUT_BUFFER_POOL != CVMX_FPA_PACKET_POOL)
+-		cvm_oct_mem_empty_fpa(CVMX_FPA_OUTPUT_BUFFER_POOL, CVMX_FPA_OUTPUT_BUFFER_POOL_SIZE, cvm_oct_num_output_buffers);
++	cvm_oct_mem_empty_fpa(cvm_oct_tx_wqe_pool, num_devices_extra_wqe * PER_DEVICE_EXTRA_WQE);
++	cvm_oct_release_fpa_pool(cvm_oct_tx_wqe_pool);
++
++	if (CVMX_FPA_OUTPUT_BUFFER_POOL != CVMX_FPA_PACKET_POOL) {
++		cvm_oct_mem_empty_fpa(CVMX_FPA_OUTPUT_BUFFER_POOL, cvm_oct_num_output_buffers);
++		cvm_oct_release_fpa_pool(CVMX_FPA_OUTPUT_BUFFER_POOL);
++	}
+ 
+ 	/*
+ 	 * Disable FPA, all buffers are free, not done by helper
+diff --git a/drivers/net/octeon/octeon-ethernet.h b/drivers/net/octeon/octeon-ethernet.h
+index 5d0671d..35d9ee4 100644
+--- a/drivers/net/octeon/octeon-ethernet.h
++++ b/drivers/net/octeon/octeon-ethernet.h
+@@ -145,5 +145,6 @@ extern atomic_t cvm_oct_poll_queue_stopping;
+ 
+ extern int max_rx_cpus;
+ extern int rx_napi_weight;
++extern int cvm_oct_tx_wqe_pool;
+ 
+ #endif
+-- 
+1.7.0
+

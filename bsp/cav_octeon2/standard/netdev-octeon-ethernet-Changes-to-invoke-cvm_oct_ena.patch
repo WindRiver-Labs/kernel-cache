@@ -1,0 +1,221 @@
+From a8ad5c351beb49e2c52bfa34ac3e91e5af019a7b Mon Sep 17 00:00:00 2001
+From: Venkat Subbiah <vsubbiah@caviumnetworks.com>
+Date: Wed, 10 Aug 2011 10:54:26 -0700
+Subject: [PATCH 104/236] netdev: octeon-ethernet: Changes to invoke cvm_oct_enable_one_cpu() from worker thread.
+
+Source: Cavium SDK 2.2-414
+
+cvm_oct_enable_one_cpu() uses smp_call_function_single() and this cannot
+be invoked from softirq. Invoking it from softirq could cause deadlocks.
+The deadlock was seen it tests with tasklist_lock but could have been any
+other rw lock.
+
+       CPU X                                   CPU Y
+
+1. Acquires read_lock(&tasklist_lock)
+2. Gets interrupted and                  2. spins trying to do
+   calls smp_call_function_single           write_lock_irq(&tasklist_lock)
+   on CPU Y
+3. Calls smp_call_function_single on CPU Z
+
+smp_call_function_single use a per CPU data structure, the second
+smp_call_function_single will wait until the remote call from the
+first smp_call_function_single is completed. In the deadlock scenario
+above the first remote call will never get a chance to execute as CPU Y has
+interrupts disabled and waiting for CPU X to release the read lock.
+CPU X is spinning waiting for the first remote call from
+smp_call_function_single to complete.
+
+Signed-off-by: Venkat Subbiah <vsubbiah@caviumnetworks.com>
+Integrated-by: Yang Shi <yang.shi@windriver.com>
+---
+ drivers/net/octeon/ethernet-napi.c   |    5 +--
+ drivers/net/octeon/ethernet-rx.c     |   45 ++++++++++++++++++++++++++++-----
+ drivers/net/octeon/ethernet.c        |   19 ++++++++++++--
+ drivers/net/octeon/octeon-ethernet.h |    1 +
+ 4 files changed, 57 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/octeon/ethernet-napi.c b/drivers/net/octeon/ethernet-napi.c
+index 2564d13..e475fa4 100644
+--- a/drivers/net/octeon/ethernet-napi.c
++++ b/drivers/net/octeon/ethernet-napi.c
+@@ -127,10 +127,9 @@ static int CVM_OCT_NAPI_POLL(struct napi_struct *napi, int budget)
+ 				counts.u64 = cvmx_read_csr(CVMX_POW_WQ_INT_CNTX(pow_receive_group));
+ 				backlog = counts.s.iq_cnt + counts.s.ds_cnt;
+ 			}
+-			if (backlog > budget * cores_in_use &&
+-			    napi != NULL &&
++			if (backlog > budget * cores_in_use && napi != NULL &&
+ 			    cores_in_use < core_state.baseline_cores)
+-				cvm_oct_enable_one_cpu();
++				queue_work(cvm_oct_enable_cpu_queue, &cvm_oct_enable_one_cpu_work);
+ 		}
+ 
+ 		/*
+diff --git a/drivers/net/octeon/ethernet-rx.c b/drivers/net/octeon/ethernet-rx.c
+index 794178d..8f08edf 100644
+--- a/drivers/net/octeon/ethernet-rx.c
++++ b/drivers/net/octeon/ethernet-rx.c
+@@ -84,6 +84,14 @@ struct cvm_oct_core_state {
+ 	 * consistent with this lock.
+ 	 */
+ 	spinlock_t lock;
++	/*
++	 * When a decision is made to re-enable interrupts there could
++	 * be an entry in the work queue which could cause a CPU to be
++	 * enabled. No CPUs should be enabled till the first 
++         * interrupt happens again. This is used to keep track of this window  
++	 * and skip acting on any work queue entries during this period.
++	 */
++	int skip_enable_cpu_wqe;
+ } ____cacheline_aligned_in_smp;
+ 
+ static struct cvm_oct_core_state core_state __cacheline_aligned_in_smp;
+@@ -102,6 +110,11 @@ static void cvm_oct_enable_one_cpu(void)
+ 
+ 	spin_lock_irqsave(&core_state.lock, flags);
+ 	/* ... if a CPU is available, Turn on NAPI polling for that CPU.  */
++	if (core_state.skip_enable_cpu_wqe) {
++		spin_unlock_irqrestore(&core_state.lock, flags);
++		goto out;
++	}
++
+ 	for_each_online_cpu(cpu) {
+ 		if (cvm_oct_napi[cpu].available > 0) {
+ 			cvm_oct_napi[cpu].available--;
+@@ -119,6 +132,16 @@ out:
+ 	return;
+ }
+ 
++
++
++static void cvm_oct_enable_one_cpu_worker(struct work_struct *work)
++{
++	cvm_oct_enable_one_cpu();
++}
++
++static DECLARE_WORK(cvm_oct_enable_one_cpu_work,
++		    &cvm_oct_enable_one_cpu_worker);
++
+ static void cvm_oct_no_more_work(struct napi_struct *napi)
+ {
+ 	struct cvm_napi_wrapper *nr = container_of(napi, struct cvm_napi_wrapper, napi);
+@@ -133,15 +156,13 @@ static void cvm_oct_no_more_work(struct napi_struct *napi)
+ 	nr->available++;
+ 	BUG_ON(nr->available != 1);
+ 
+-	spin_unlock_irqrestore(&core_state.lock, flags);
+-
+ 	if (current_active == 0) {
+ 		/*
+ 		 * No more CPUs doing processing, enable interrupts so
+ 		 * we can start processing again when there is
+ 		 * something to do.
+ 		 */
+-
++		core_state.skip_enable_cpu_wqe = 1;
+ 		if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
+ 			union cvmx_sso_wq_int_thrx int_thr;
+ 			int_thr.u64 = 0;
+@@ -166,6 +187,7 @@ static void cvm_oct_no_more_work(struct napi_struct *napi)
+ 				       int_thr.u64);
+ 		}
+ 	}
++	spin_unlock_irqrestore(&core_state.lock, flags);
+ }
+ 
+ /**
+@@ -198,13 +220,21 @@ static irqreturn_t cvm_oct_do_interrupt(int cpl, void *dev_id)
+ 	spin_lock_irqsave(&core_state.lock, flags);
+ 
+ 	/* ... and NAPI better not be running on this CPU.  */
+-	BUG_ON(cvm_oct_napi[cpu].available != 1);
+-	cvm_oct_napi[cpu].available--;
++	if (cvm_oct_napi[cpu].available != 1) {
++		pr_err("BUG : CPU=%d available=%d \n", cpu,
++		       cvm_oct_napi[cpu].available);
++		BUG_ON(1);
++	}
+ 
++	cvm_oct_napi[cpu].available--;
+ 	/* There better be cores available...  */
+ 	core_state.active_cores++;
+-	BUG_ON(core_state.active_cores > core_state.baseline_cores);
+-
++	if (core_state.active_cores > core_state.baseline_cores) {
++		pr_err("BUG : CPU=%d active_cores=%d baseline_cores =%d \n",
++		       cpu, core_state.active_cores, core_state.baseline_cores);
++		BUG_ON(1);
++	}
++	core_state.skip_enable_cpu_wqe = 0;
+ 	spin_unlock_irqrestore(&core_state.lock, flags);
+ 
+ 	cvm_oct_enable_napi(&cvm_oct_napi[cpu].napi);
+@@ -367,6 +397,7 @@ void cvm_oct_rx_initialize(int num_wqe)
+ 	else
+ 		core_state.baseline_cores = num_online_cpus();
+ 
++	core_state.skip_enable_cpu_wqe = 0;
+ 	for_each_possible_cpu(i) {
+ 		cvm_oct_napi[i].available = 1;
+ 		netif_napi_add(dev_for_napi, &cvm_oct_napi[i].napi,
+diff --git a/drivers/net/octeon/ethernet.c b/drivers/net/octeon/ethernet.c
+index 504fdac..eb90e61 100644
+--- a/drivers/net/octeon/ethernet.c
++++ b/drivers/net/octeon/ethernet.c
+@@ -106,6 +106,11 @@ static unsigned int cvm_oct_mac_addr_offset;
+ struct workqueue_struct *cvm_oct_poll_queue;
+ 
+ /**
++ * cvm_oct_enable_cpu - Workqueue for enable cpu operations
++ */
++struct workqueue_struct *cvm_oct_enable_cpu_queue;
++
++/**
+  * cvm_oct_poll_queue_stopping - flag to indicate polling should stop.
+  *
+  * Set to one right before cvm_oct_poll_queue is destroyed.
+@@ -758,9 +763,16 @@ static int __init cvm_oct_init_module(void)
+ 	else
+ 		cvm_oct_mac_addr_offset = 0;
+ 
+-	cvm_oct_poll_queue = create_singlethread_workqueue("octeon-ethernet");
++	cvm_oct_poll_queue = create_singlethread_workqueue("oct-eth-wq1");
+ 	if (cvm_oct_poll_queue == NULL) {
+-		pr_err("octeon-ethernet: Cannot create workqueue");
++		pr_err("oct-eth-wq1 : Cannot create workqueue");
++		rv = -ENOMEM;
++		goto err_cleanup;
++	}
++
++	cvm_oct_enable_cpu_queue = create_singlethread_workqueue("oct-eth-wq2");
++	if (cvm_oct_enable_cpu_queue == NULL) {
++		pr_err("oct-eth-wq2 : Cannot create workqueue");
+ 		rv = -ENOMEM;
+ 		goto err_cleanup;
+ 	}
+@@ -1038,7 +1050,8 @@ static void __exit cvm_oct_cleanup_module(void)
+ 	cvm_oct_rx_shutdown1();
+ 
+ 	destroy_workqueue(cvm_oct_poll_queue);
+-
++	if (cvm_oct_enable_cpu_queue != 0)
++		destroy_workqueue(cvm_oct_enable_cpu_queue);
+ 	cvm_oct_proc_shutdown();
+ 
+ 	/* Free the HW pools */
+diff --git a/drivers/net/octeon/octeon-ethernet.h b/drivers/net/octeon/octeon-ethernet.h
+index 78653a4..92c3a64 100644
+--- a/drivers/net/octeon/octeon-ethernet.h
++++ b/drivers/net/octeon/octeon-ethernet.h
+@@ -145,6 +145,7 @@ extern struct octeon_ethernet *cvm_oct_by_pkind[];
+ extern struct octeon_ethernet *cvm_oct_by_srio_mbox[4][4];
+ 
+ extern struct workqueue_struct *cvm_oct_poll_queue;
++extern struct workqueue_struct *cvm_oct_enable_cpu_queue;
+ extern atomic_t cvm_oct_poll_queue_stopping;
+ 
+ extern int max_rx_cpus;
+-- 
+1.7.0
+
