@@ -1,0 +1,261 @@
+From f5786f4dcca69e295f720ac0f7f231c8eda1d9c2 Mon Sep 17 00:00:00 2001
+From: Ajay Kumar Gupta <ajay.gupta@ti.com>
+Date: Thu, 25 Nov 2010 18:25:47 +0530
+Subject: [PATCH 360/609] musb: Add workqueue for URB giveback
+
+Original commit: cf41b6504ec187995900edf1d42a2b9317c9f08a
+
+  From git://arago-project.org/git/projects/linux-am33x.git
+  And ti-sdk-am335x-evm-05.05.00.00-Linux-x86-Install image
+
+Current musb host driver does the giveback of completed urb first and
+then start the next request. This is significantly affecting the streaming
+from an USB camera wherein we observe huge delay between the two IN tokens
+from musb host. This is due to the fact that UVC driver is doing decoding
+and further processing in giveback context.
+
+The patch tries to defer the giveback part to a workqueue and continues
+with the start of new request in completion path.
+
+the giveback workqueue has only succesfull completed URBs, it is safe to
+giveback URBs without taking musb spinlocks.
+
+Signed-off-by: Ajay Kumar Gupta <ajay.gupta@ti.com>
+Signed-off-by: Sriramakrishnan A G <srk@ti.com>
+Signed-off-by: Vaibhav Hiremath <hvaibhav@ti.com>
+---
+ drivers/usb/musb/musb_core.c |   14 ++++++++
+ drivers/usb/musb/musb_core.h |    6 +++
+ drivers/usb/musb/musb_host.c |   71 ++++++++++++++++++++++++++++++++++++------
+ include/linux/usb.h          |    1 +
+ 4 files changed, 82 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/usb/musb/musb_core.c b/drivers/usb/musb/musb_core.c
+index 935fa3c..4325d3c 100644
+--- a/drivers/usb/musb/musb_core.c
++++ b/drivers/usb/musb/musb_core.c
+@@ -1832,6 +1832,7 @@ allocate_instance(struct device *dev,
+ 	INIT_LIST_HEAD(&musb->control);
+ 	INIT_LIST_HEAD(&musb->in_bulk);
+ 	INIT_LIST_HEAD(&musb->out_bulk);
++	INIT_LIST_HEAD(&musb->gb_list);
+ 
+ 	hcd->uses_new_polling = 1;
+ 	hcd->has_tt = 1;
+@@ -1878,6 +1879,9 @@ static void musb_free(struct musb *musb)
+ 		musb->ops->dma_controller_destroy(c);
+ 	}
+ 
++	if (musb->gb_queue)
++		destroy_workqueue(musb->gb_queue);
++
+ 	kfree(musb);
+ }
+ 
+@@ -1917,6 +1921,7 @@ musb_init_controller(struct device *dev, int nIrq, void __iomem *ctrl)
+ 	pm_runtime_enable(musb->controller);
+ 
+ 	spin_lock_init(&musb->lock);
++	spin_lock_init(&musb->gb_lock);
+ 	musb->board_mode = plat->mode;
+ 	musb->board_set_power = plat->set_power;
+ 	musb->min_power = plat->min_power;
+@@ -2094,8 +2099,17 @@ musb_init_controller(struct device *dev, int nIrq, void __iomem *ctrl)
+ 	if (status == 0)
+ 		musb_debug_create("driver/musb_hdrc", musb);
+ 
++	musb->gb_queue = create_singlethread_workqueue(dev_name(dev));
++	if (musb->gb_queue == NULL)
++		goto fail6;
++	/* Init giveback workqueue */
++	INIT_WORK(&musb->gb_work, musb_gb_work);
++
+ 	return 0;
+ 
++fail6:
++	destroy_workqueue(musb->gb_queue);
++
+ fail5:
+ 	musb_exit_debugfs(musb);
+ 
+diff --git a/drivers/usb/musb/musb_core.h b/drivers/usb/musb/musb_core.h
+index 64020f3..fb56d16 100644
+--- a/drivers/usb/musb/musb_core.h
++++ b/drivers/usb/musb/musb_core.h
+@@ -350,6 +350,11 @@ struct musb {
+ 	struct list_head	in_bulk;	/* of musb_qh */
+ 	struct list_head	out_bulk;	/* of musb_qh */
+ 
++	struct workqueue_struct *gb_queue;
++	struct work_struct      gb_work;
++	spinlock_t              gb_lock;
++	struct list_head        gb_list;        /* of urbs */
++
+ 	struct notifier_block	nb;
+ 
+ 	struct dma_controller	*dma_controller;
+@@ -623,6 +628,7 @@ static inline const char *get_dma_name(struct musb *musb)
+ #endif
+ }
+ 
++extern void musb_gb_work(struct work_struct *data);
+ /*-------------------------- ProcFS definitions ---------------------*/
+ 
+ struct proc_dir_entry;
+diff --git a/drivers/usb/musb/musb_host.c b/drivers/usb/musb/musb_host.c
+index 03c9077..2bc7cac 100644
+--- a/drivers/usb/musb/musb_host.c
++++ b/drivers/usb/musb/musb_host.c
+@@ -101,6 +101,30 @@ static void musb_ep_program(struct musb *musb, u8 epnum,
+ 			struct urb *urb, int is_out,
+ 			u8 *buf, u32 offset, u32 len);
+ 
++void push_queue(struct musb *musb, struct urb *urb)
++{
++	spin_lock(&musb->gb_lock);
++	list_add_tail(&urb->giveback_list, &musb->gb_list);
++	spin_unlock(&musb->gb_lock);
++}
++
++struct urb *pop_queue(struct musb *musb)
++{
++	struct urb *urb;
++	unsigned long flags;
++
++	spin_lock_irqsave(&musb->gb_lock, flags);
++	if (list_empty(&musb->gb_list)) {
++		spin_unlock_irqrestore(&musb->gb_lock, flags);
++		return NULL;
++	}
++	urb = list_entry(musb->gb_list.next, struct urb, giveback_list);
++	list_del(&urb->giveback_list);
++	spin_unlock_irqrestore(&musb->gb_lock, flags);
++
++	return urb;
++}
++
+ /*
+  * Clear TX fifo. Needed to avoid BABBLE errors.
+  */
+@@ -299,8 +323,6 @@ start:
+ 
+ /* Context: caller owns controller lock, IRQs are blocked */
+ static void musb_giveback(struct musb *musb, struct urb *urb, int status)
+-__releases(musb->lock)
+-__acquires(musb->lock)
+ {
+ 	dev_dbg(musb->controller,
+ 			"complete %p %pF (%d), dev%d ep%d%s, %d/%d\n",
+@@ -311,10 +333,7 @@ __acquires(musb->lock)
+ 			urb->actual_length, urb->transfer_buffer_length
+ 			);
+ 
+-	usb_hcd_unlink_urb_from_ep(musb_to_hcd(musb), urb);
+-	spin_unlock(&musb->lock);
+ 	usb_hcd_giveback_urb(musb_to_hcd(musb), urb, status);
+-	spin_lock(&musb->lock);
+ }
+ 
+ /* For bulk/interrupt endpoints only */
+@@ -336,6 +355,15 @@ static inline void musb_save_toggle(struct musb_qh *qh, int is_in,
+ 
+ 	usb_settoggle(urb->dev, qh->epnum, !is_in, csr ? 1 : 0);
+ }
++/* Used to complete urb giveback */
++void musb_gb_work(struct work_struct *data)
++{
++	struct musb *musb = container_of(data, struct musb, gb_work);
++	struct urb *urb;
++
++	while ((urb = pop_queue(musb)) != 0)
++		musb_giveback(musb, urb, 0);
++}
+ 
+ /*
+  * Advance this hardware endpoint's queue, completing the specified URB and
+@@ -366,10 +394,16 @@ static void musb_advance_schedule(struct musb *musb, struct urb *urb,
+ 		break;
+ 	}
+ 
+-	qh->is_ready = 0;
+-	musb_giveback(musb, urb, status);
+-	qh->is_ready = ready;
++	usb_hcd_unlink_urb_from_ep(musb_to_hcd(musb), urb);
+ 
++	/* If URB completed with error then giveback first */
++	if (status != 0) {
++		qh->is_ready = 0;
++		spin_unlock(&musb->lock);
++		musb_giveback(musb, urb, status);
++		spin_lock(&musb->lock);
++		qh->is_ready = ready;
++	}
+ 	/* reclaim resources (and bandwidth) ASAP; deschedule it, and
+ 	 * invalidate qh as soon as list_empty(&hep->urb_list)
+ 	 */
+@@ -417,6 +451,12 @@ static void musb_advance_schedule(struct musb *musb, struct urb *urb,
+ 		    hw_ep->epnum, is_in ? 'R' : 'T', next_urb(qh));
+ 		musb_start_urb(musb, is_in, qh);
+ 	}
++
++	/* if URB is successfully completed then giveback in workqueue */
++	if (status == 0) {
++		push_queue(musb, urb);
++		queue_work(musb->gb_queue, &musb->gb_work);
++	}
+ }
+ 
+ static u16 musb_h_flush_rxfifo(struct musb_hw_ep *hw_ep, u16 csr)
+@@ -1898,6 +1938,8 @@ static int musb_urb_enqueue(
+ 	qh = ret ? NULL : hep->hcpriv;
+ 	if (qh)
+ 		urb->hcpriv = qh;
++
++	INIT_LIST_HEAD(&urb->giveback_list);
+ 	spin_unlock_irqrestore(&musb->lock, flags);
+ 
+ 	/* DMA mapping was already done, if needed, and this urb is on
+@@ -2161,8 +2203,12 @@ static int musb_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
+ 			|| musb_ep_get_qh(qh->hw_ep, is_in) != qh) {
+ 		int	ready = qh->is_ready;
+ 
++		usb_hcd_unlink_urb_from_ep(musb_to_hcd(musb), urb);
++
+ 		qh->is_ready = 0;
++		spin_unlock(&musb->lock);
+ 		musb_giveback(musb, urb, 0);
++		spin_lock(&musb->lock);
+ 		qh->is_ready = ready;
+ 
+ 		/* If nothing else (usually musb_giveback) is using it
+@@ -2223,8 +2269,13 @@ musb_h_disable(struct usb_hcd *hcd, struct usb_host_endpoint *hep)
+ 		 * other transfers, and since !qh->is_ready nothing
+ 		 * will activate any of these as it advances.
+ 		 */
+-		while (!list_empty(&hep->urb_list))
+-			musb_giveback(musb, next_urb(qh), -ESHUTDOWN);
++		while (!list_empty(&hep->urb_list)) {
++			urb = next_urb(qh);
++			usb_hcd_unlink_urb_from_ep(musb_to_hcd(musb), urb);
++			spin_unlock(&musb->lock);
++			musb_giveback(musb, urb, -ESHUTDOWN);
++			spin_lock(&musb->lock);
++		}
+ 
+ 		hep->hcpriv = NULL;
+ 		list_del(&qh->ring);
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index dd971ff..e2315ef 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1257,6 +1257,7 @@ struct urb {
+ 	struct list_head urb_list;	/* list head for use by the urb's
+ 					 * current owner */
+ 	struct list_head anchor_list;	/* the URB may be anchored */
++	struct list_head giveback_list;	/* to postpone the giveback call */
+ 	struct usb_anchor *anchor;
+ 	struct usb_device *dev;		/* (in) pointer to associated device */
+ 	struct usb_host_endpoint *ep;	/* (internal) pointer to endpoint */
+-- 
+1.7.5.4
+
