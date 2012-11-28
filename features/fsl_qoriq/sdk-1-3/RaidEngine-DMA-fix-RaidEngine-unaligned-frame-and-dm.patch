@@ -1,0 +1,1068 @@
+From 6aa81453f7d961663e8e90a325018c27f58abf60 Mon Sep 17 00:00:00 2001
+From: Xuelin Shi <b29237@freescale.com>
+Date: Wed, 12 Sep 2012 11:58:12 +0000
+Subject: [PATCH 114/162] RaidEngine/DMA: fix RaidEngine unaligned frame and
+ dma unmap issue
+
+Fix jr error irqstate: c0000000 issue.
+This issue is caused by not align the compound frame and cdb to 64 bytes which is specified in RE_blockGuide(1.07)
+
+Fix DMA: Out of SW-IOMMU space issue.
+This issue is caused by not unmap some dma memory.
+
+This patch made the following change to address above issues.
+a) using dma_pool to allocate compound frame and cdb that aligns to 64 bytes
+b) since compound frame is a variant record, max size is allocated which is
+   320 bytes (align to 64 bytes)
+c) add unmap dma dest and sources that allocated by up layer
+d) when probe a jr, program the LIODN value from u-boot to proper config register.
+e) remove fsl_soft_desc cache, since kernel already has kmem_cache to support
+   this kind of requirement, we do not need to maintain a descriptor list cache.
+
+Signed-off-by: Xuelin Shi <b29237@freescale.com>
+[Kevin: Original patch taken from FSL
+QorIQ-SDK-V1.3-SOURCE-20121114-yocto.iso tarball.]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/dma/fsl_raid.c |  577 ++++++++++++++++++++----------------------------
+ drivers/dma/fsl_raid.h |   44 ++--
+ 2 files changed, 263 insertions(+), 358 deletions(-)
+
+diff --git a/drivers/dma/fsl_raid.c b/drivers/dma/fsl_raid.c
+index 1af0a59..bbc3b6e 100644
+--- a/drivers/dma/fsl_raid.c
++++ b/drivers/dma/fsl_raid.c
+@@ -79,6 +79,9 @@
+ #define FRAME_FORMAT		0x1
+ #define MAX_DATA_LENGTH		(1024*1024)
+ 
++#define to_fsl_re_dma_desc(tx) container_of(tx, \
++		struct fsl_re_dma_async_tx_desc, async_tx)
++
+ struct re_drv_private {
+ 	struct device *dev;
+ 	u8 total_jrs;
+@@ -87,6 +90,8 @@ struct re_drv_private {
+ 	struct re_jr *re_jrs[MAX_RE_JRS];
+ };
+ 
++static struct kmem_cache *re_sw_desc_cache;
++
+ /* Add descriptors into per jr software queue - submit_q */
+ static dma_cookie_t re_jr_tx_submit(struct dma_async_tx_descriptor *tx)
+ {
+@@ -97,7 +102,7 @@ static dma_cookie_t re_jr_tx_submit(struct dma_async_tx_descriptor *tx)
+ 	desc = container_of(tx, struct fsl_re_dma_async_tx_desc, async_tx);
+ 	jr = container_of(tx->chan, struct re_jr, chan);
+ 
+-	spin_lock_irq(&jr->submit_lock);
++	spin_lock_bh(&jr->desc_lock);
+ 
+ 	jr->timer.data = (unsigned long)tx->chan;
+ 	cookie = jr->chan.cookie + 1;
+@@ -111,11 +116,85 @@ static dma_cookie_t re_jr_tx_submit(struct dma_async_tx_descriptor *tx)
+ 	if (!timer_pending(&jr->timer))
+ 		add_timer(&jr->timer);
+ 
+-	spin_unlock_irq(&jr->submit_lock);
++	spin_unlock_bh(&jr->desc_lock);
+ 
+ 	return cookie;
+ }
+ 
++static void re_jr_unmap_dest_src(struct fsl_re_dma_async_tx_desc *desc)
++{
++	int i, j;
++	struct cmpnd_frame *cf;
++	dma_addr_t dest1 = 0, dest2 = 0, src;
++	struct device *dev;
++	enum dma_ctrl_flags flags;
++	enum dma_data_direction dir;
++
++	BUG_ON(!desc);
++	cf = desc->cf_addr;
++	dest1 = cf[1].address;
++	j = 2;
++	if (desc->dest_cnt == 2) {
++		dest2 = cf[2].address;
++		j = 3;
++	}
++	dev = desc->jr->chan.device->dev;
++	flags = desc->async_tx.flags;
++	if (!(flags & DMA_COMPL_SKIP_DEST_UNMAP)) {
++		if (desc->cdb_opcode == RE_MOVE_OPCODE)
++			dir = DMA_FROM_DEVICE;
++		else
++			dir = DMA_BIDIRECTIONAL;
++
++		dma_unmap_page(dev, dest1, desc->dma_len, dir);
++
++		if (dest2)
++			dma_unmap_page(dev, dest2, desc->dma_len, dir);
++	}
++
++	if (!(flags & DMA_COMPL_SKIP_SRC_UNMAP)) {
++		dir = DMA_TO_DEVICE;
++		for (i = j; i < desc->src_cnt+j; i++) {
++			src = cf[i].address;
++			if (src == dest1 || src == dest2)
++				continue;
++			dma_unmap_page(dev, src, desc->dma_len, dir);
++		}
++	}
++}
++
++static void re_jr_desc_done(struct fsl_re_dma_async_tx_desc *desc)
++{
++	struct re_jr *dma_jr = desc->jr;
++	dma_async_tx_callback callback;
++	void *callback_param;
++
++	dma_run_dependencies(&desc->async_tx);
++
++	spin_lock_bh(&dma_jr->desc_lock);
++	if (dma_jr->completed_cookie < desc->async_tx.cookie) {
++		dma_jr->completed_cookie = desc->async_tx.cookie;
++		if (dma_jr->completed_cookie == DMA_MAX_COOKIE)
++			dma_jr->completed_cookie = DMA_MIN_COOKIE;
++	}
++	spin_unlock_bh(&dma_jr->desc_lock);
++
++	callback = desc->async_tx.callback;
++	callback_param = desc->async_tx.callback_param;
++
++	re_jr_unmap_dest_src(desc);
++
++	/* Free the cf/cdb address stored in descs
++	 * unconditionally. These pointers are only
++	 * required for RE driver's housekeeping
++	 */
++	dma_pool_free(dma_jr->desc_pool, desc->cf_addr, desc->cf_paddr);
++	dma_pool_free(dma_jr->desc_pool, desc->cdb_addr, desc->cdb_paddr);
++
++	if (callback)
++		callback(callback_param);
++}
++
+ /*
+  * Get the virtual address of software desc from virt_addr.
+  * Storing the address of software desc like this makes the
+@@ -126,82 +205,45 @@ static void re_jr_dequeue(unsigned long data)
+ 	struct device *dev = (struct device *)data;
+ 	struct re_jr *jr = dev_get_drvdata(dev);
+ 	struct fsl_re_dma_async_tx_desc *desc;
+-	dma_async_tx_callback callback;
+-	void *callback_param;
+ 	unsigned int count = 0;
+-	unsigned int i = 0;
+ 	struct fsl_re_dma_async_tx_desc *ack_desc = NULL, *_ack_desc = NULL;
+ 
+-	spin_lock_bh(&jr->desc_lock);
+-
+ 	while ((count =
+ 		RE_JR_OUB_SLOT_FULL(in_be32(&jr->jrregs->oubring_slot_full)))) {
+-		for (i = 0; i < count; i++) {
++		while (count--) {
++			spin_lock_bh(&jr->desc_lock);
++
+ 			/* Wrap around index */
+ 			jr->oub_count &= RING_SIZE-1;
+ 
+ 			desc = (struct fsl_re_dma_async_tx_desc *)
+ 				jr->virt_arry[jr->oub_count].virt_addr;
+ 
+-			if (jr->completed_cookie < desc->async_tx.cookie)
+-				jr->completed_cookie = desc->async_tx.cookie;
+-
+-			callback = desc->async_tx.callback;
+-			callback_param = desc->async_tx.callback_param;
+-
+-			smp_mb();
+-
+ 			/* Re-initialise so that it can be reused */
+ 			jr->virt_arry[jr->oub_count].virt_addr = 0;
+ 			jr->virt_arry[jr->oub_count++].phys_addr = 0;
+ 
+ 			/* One job processed */
+ 			out_be32(&jr->jrregs->oubring_job_rmvd,
+-					RE_JR_OUB_JOB_REMOVE);
+-
+-			/* Free the cf/cdb address stored in descs
+-			 * unconditionally. These pointers are only
+-			 * required for RE driver's housekeeping
+-			 */
+-			kfree(desc->cf_addr);
+-			kfree(desc->cdb_addr);
+-
+-			if (async_tx_test_ack(&desc->async_tx)) {
+-				if (jr->soft_desc->desc_cnt <
+-							MAX_INITIAL_DESCS) {
+-					list_add(&desc->node,
+-						&jr->soft_desc->head);
+-					jr->soft_desc->desc_cnt++;
+-				} else {
+-					kfree(desc);
+-				}
+-			}
+-			/* Add descs which has DMA_CTRL_ACK bit cleared to
+-			 * ack_q list.
+-			 */
+-			else {
+-				list_add_tail(&desc->node, &jr->ack_q);
+-			}
++						RE_JR_OUB_JOB_REMOVE);
+ 
+-			/* Call callback of upper layer */
+-			if (callback) {
+-				spin_unlock_bh(&jr->desc_lock);
+-				callback(callback_param);
+-				spin_lock_bh(&jr->desc_lock);
+-			}
+-		}
++			list_add_tail(&desc->node, &jr->ack_q);
+ 
+-		/* To save memory, parse the ack_q and free up descs */
+-		list_for_each_entry_safe(ack_desc, _ack_desc, &jr->ack_q,
+-					node) {
+-			if (async_tx_test_ack(&ack_desc->async_tx)) {
+-				list_del(&ack_desc->node);
+-				kfree(ack_desc);
+-			}
++			spin_unlock_bh(&jr->desc_lock);
++
++			re_jr_desc_done(desc);
+ 		}
+ 	}
+ 
+-	spin_unlock_bh(&jr->desc_lock);
++	/* To save memory, parse the ack_q and free up descs */
++	list_for_each_entry_safe(ack_desc, _ack_desc, &jr->ack_q, node) {
++		if (async_tx_test_ack(&ack_desc->async_tx)) {
++			spin_lock_bh(&jr->desc_lock);
++			list_del(&ack_desc->node);
++			spin_unlock_bh(&jr->desc_lock);
++			kmem_cache_free(re_sw_desc_cache, ack_desc);
++		}
++	}
+ }
+ 
+ /* Per Job Ring interrupt handler */
+@@ -234,31 +276,16 @@ static irqreturn_t re_jr_interrupt(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
+-/* Allocate per jr descriptors - 256 each in number */
+ static int re_jr_alloc_chan_resources(struct dma_chan *chan)
+ {
+ 	struct re_jr *jr = container_of(chan, struct re_jr, chan);
+-	struct fsl_re_dma_async_tx_desc *desc;
+-	unsigned int i;
+-
+-	jr->soft_desc = kzalloc(sizeof(struct fsl_dma_pool), GFP_KERNEL);
+-	if (!jr->soft_desc) {
+-		pr_err("%s: Not enough mem\n", __func__);
+-		return -ENOMEM;
+-	}
+ 
+-	INIT_LIST_HEAD(&jr->soft_desc->head);
+-	for (i = 0; i < MAX_INITIAL_DESCS; i++) {
+-		desc = kzalloc(sizeof(struct fsl_re_dma_async_tx_desc),
+-				GFP_KERNEL);
+-		if (!desc) {
+-			pr_err("%s:Not enough memory for desc\n", __func__);
+-			break;
+-		}
++	jr->desc_pool = dma_pool_create("re_jr_desc_pool", jr->dev,
++					RE_CF_CDB_SIZE, RE_CF_CDB_ALIGN, 0);
+ 
+-		desc->async_tx.tx_submit = re_jr_tx_submit;
+-		jr->soft_desc->desc_cnt++;
+-		list_add_tail(&desc->node, &jr->soft_desc->head);
++	if (!jr->desc_pool) {
++		pr_err("%s:No memory for re_jr_desc_pool\n", __func__);
++		return -ENOMEM;
+ 	}
+ 
+ 	return 0;
+@@ -267,6 +294,8 @@ static int re_jr_alloc_chan_resources(struct dma_chan *chan)
+ /* This function is just to please the ASYNC layer */
+ static void re_jr_free_chan_resources(struct dma_chan *chan)
+ {
++	struct re_jr *jr = container_of(chan, struct re_jr, chan);
++	dma_pool_destroy(jr->desc_pool);
+ 	return;
+ }
+ 
+@@ -298,20 +327,20 @@ void re_jr_issue_pending(struct dma_chan *chan)
+ 	if (timer_pending(&jr->timer))
+ 		del_timer_sync(&jr->timer);
+ 
+-	spin_lock_irq(&jr->submit_lock);
++	spin_lock_bh(&jr->desc_lock);
+ 
+ 	list_for_each_entry_safe(desc, _desc, &jr->submit_q, node) {
+ 
+-		if (!in_be32(&jr->jrregs->inbring_slot_avail)) {
++		if (!in_be32(&jr->jrregs->inbring_slot_avail))
+ 			goto out_unlock;
+-		}
++
+ 
+ 		/* Wrap around ring index */
+ 		jr->inb_count &= RING_SIZE-1;
+ 
+-		if (jr->virt_arry[jr->inb_count].phys_addr != 0) {
++		if (jr->virt_arry[jr->inb_count].phys_addr != 0)
+ 			goto out_unlock;
+-		}
++
+ 
+ 		jr->virt_arry[jr->inb_count].phys_addr =
+ 			(phys_addr_t)desc->hwdesc.address;
+@@ -335,7 +364,7 @@ void re_jr_issue_pending(struct dma_chan *chan)
+ 		out_be32(&jr->jrregs->inbring_add_job, RE_JR_INB_JOB_ADD);
+ 	}
+ out_unlock:
+-	spin_unlock_irq(&jr->submit_lock);
++	spin_unlock_bh(&jr->desc_lock);
+ }
+ 
+ /* Per Job Ring timer handler */
+@@ -349,7 +378,7 @@ static void raide_timer_handler(unsigned long data)
+ 	return;
+ }
+ 
+-static void fill_cfd_frame(struct cmpnd_frame *cf, u8 index,
++inline void fill_cfd_frame(struct cmpnd_frame *cf, u8 index,
+ 		size_t length, dma_addr_t addr, bool final)
+ {
+ 	cf[index].extension = 0;
+@@ -364,25 +393,54 @@ static void fill_cfd_frame(struct cmpnd_frame *cf, u8 index,
+ 
+ }
+ 
+-static int fill_cfd_frame_with_cdb(struct cmpnd_frame *cf, struct re_jr *jr,
+-		void *addr, size_t size)
++static struct fsl_re_dma_async_tx_desc *re_jr_alloc_desc(struct re_jr *jr,
++					int cf_num, unsigned long flags)
+ {
++	struct fsl_re_dma_async_tx_desc *desc = NULL;
++	struct jr_hw_desc *hw_desc = NULL;
++	struct cmpnd_frame *cf = NULL;
++	void *cdb = NULL;
++	dma_addr_t paddr;
++
++	desc = kmem_cache_alloc(re_sw_desc_cache, GFP_KERNEL);
++	if (!desc)
++		return ERR_PTR(-ENOMEM);
+ 
+-	cf[0].extension = 0;
+-	cf[0].final = 0;
+-	cf[0].rsvd1 = 0;
+-	cf[0].rsvd3 = 0;
+-	cf[0].rsvd4 = 0;
+-	cf[0].rsvd5 = 0;
+-	cf[0].length = size;
+-	cf[0].offset = 0;
+-	cf[0].address = dma_map_single(jr->dev, addr, size, DMA_TO_DEVICE);
+-	if (dma_mapping_error(jr->dev, cf[0].address)) {
+-		pr_err("%s: Can't map cdb\n", __func__);
+-		return -EIO;
++	memset(desc, 0, sizeof(*desc));
++	desc->async_tx.tx_submit = re_jr_tx_submit;
++	dma_async_tx_descriptor_init(&desc->async_tx, &jr->chan);
++	INIT_LIST_HEAD(&desc->node);
++	hw_desc = &desc->hwdesc;
++	hw_desc->format = FRAME_FORMAT;
++
++	cf = dma_pool_alloc(jr->desc_pool, GFP_ATOMIC, &paddr);
++	if (!cf) {
++		kmem_cache_free(re_sw_desc_cache, desc);
++		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+-	return 0;
++	hw_desc->address = paddr;
++	desc->cf_addr = cf;
++	desc->cf_paddr = paddr;
++	desc->cf_len = sizeof(struct cmpnd_frame)*cf_num;
++	memset(cf, 0, desc->cf_len);
++
++	cdb = dma_pool_alloc(jr->desc_pool, GFP_ATOMIC, &paddr);
++	if (!cdb) {
++		dma_pool_free(jr->desc_pool, desc->cf_addr, desc->cf_paddr);
++		kmem_cache_free(re_sw_desc_cache, desc);
++		return ERR_PTR(-ENOMEM);
++	}
++	memset(cdb, 0, RE_CF_CDB_SIZE);
++
++	desc->cdb_addr = cdb;
++	desc->cdb_paddr = paddr;
++
++	desc->jr = jr;
++	desc->async_tx.cookie = -EBUSY;
++	desc->async_tx.flags = flags;
++
++	return desc;
+ }
+ 
+ static struct dma_async_tx_descriptor *re_jr_prep_genq(
+@@ -392,62 +450,31 @@ static struct dma_async_tx_descriptor *re_jr_prep_genq(
+ {
+ 	struct re_jr *jr = NULL;
+ 	struct fsl_re_dma_async_tx_desc *desc = NULL;
+-	struct jr_hw_desc *hw_desc = NULL;
+ 	struct xor_cdb *xor = NULL;
+ 	unsigned int cfs_reqd = src_cnt + 2; /* CDB+dest+src_cnt */
+ 	struct cmpnd_frame *cf;
+ 	unsigned int i = 0;
+ 	unsigned int j = 0;
+-	int ret = 0;
+ 
+ 	if (len > MAX_DATA_LENGTH) {
+ 		pr_err("%s: Length greater than %d not supported\n",
+ 				__func__, MAX_DATA_LENGTH);
+ 		return NULL;
+ 	}
+-
+ 	jr = container_of(chan, struct re_jr, chan);
++	desc = re_jr_alloc_desc(jr, cfs_reqd, flags);
++	if (!desc || desc < 0)
++		return NULL;
+ 
+-	spin_lock_bh(&jr->desc_lock);
+-	if (jr->soft_desc->desc_cnt) {
+-		desc = container_of(jr->soft_desc->head.next,
+-				struct fsl_re_dma_async_tx_desc, node);
+-		jr->soft_desc->desc_cnt--;
+-		list_del_init(&desc->node);
+-	}
+-	spin_unlock_bh(&jr->desc_lock);
+-
+-	if (!desc) {
+-		desc = kzalloc(sizeof(struct fsl_re_dma_async_tx_desc),
+-				GFP_KERNEL);
+-		if (!desc)
+-			return ERR_PTR(-ENOMEM);
+-
+-		desc->async_tx.tx_submit = re_jr_tx_submit;
+-	}
+-
+-	dma_async_tx_descriptor_init(&desc->async_tx, &jr->chan);
+-	INIT_LIST_HEAD(&desc->node);
+-	hw_desc = &desc->hwdesc;
+-
+-	cf = kzalloc(sizeof(struct cmpnd_frame)*cfs_reqd, GFP_KERNEL);
+-	if (!cf) {
+-		ret = -ENOMEM;
+-		goto err_free;
+-	}
+-
+-	/* Allocate memory for GenQ CDB */
+-	xor = kzalloc(sizeof(struct xor_cdb), GFP_KERNEL);
+-	if (!xor) {
+-		ret = -ENOMEM;
+-		goto err_free_2;
+-
+-	}
++	desc->dma_len = len;
++	desc->dest_cnt = 1;
++	desc->src_cnt = src_cnt;
+ 
+-	desc->cf_addr = cf;
+-	desc->cdb_addr = xor;
++	desc->cdb_opcode = RE_XOR_OPCODE;
++	desc->cdb_len = sizeof(struct xor_cdb);
+ 
+ 	/* Filling xor CDB */
++	xor = desc->cdb_addr;
+ 	xor->opcode = RE_XOR_OPCODE;
+ 	xor->nrcs = (src_cnt - 1);
+ 	xor->blk_size = RE_BLOCK_SIZE;
+@@ -468,12 +495,8 @@ static struct dma_async_tx_descriptor *re_jr_prep_genq(
+ 	}
+ 
+ 	/* Filling frame 0 of compound frame descriptor with CDB */
+-	ret = fill_cfd_frame_with_cdb(cf, jr, xor, sizeof(struct xor_cdb));
+-	if (ret < 0) {
+-		pr_err("%s: Can't map xor_cdb\n", __func__);
+-		ret = -EIO;
+-		goto err_free_3;
+-	}
++	cf = desc->cf_addr;
++	fill_cfd_frame(cf, 0, desc->cdb_len, desc->cdb_paddr, 0);
+ 
+ 	/* Fill CFD's 1st frame with dest buffer */
+ 	fill_cfd_frame(cf, 1, len, dest, 0);
+@@ -485,37 +508,7 @@ static struct dma_async_tx_descriptor *re_jr_prep_genq(
+ 	/* Setting the final bit in the last source buffer frame in CFD */
+ 	cf[i - 1].final = 1;
+ 
+-	/* Filling the frame descriptor */
+-	hw_desc->address = dma_map_single(jr->dev, cf,
+-		sizeof(struct cmpnd_frame) * cfs_reqd, DMA_BIDIRECTIONAL);
+-	if (dma_mapping_error(jr->dev, hw_desc->address)) {
+-		pr_err("%s: Can't map cf\n", __func__);
+-		ret = -EIO;
+-		goto err_free_3;
+-	}
+-
+-	hw_desc->debug = 0;
+-	hw_desc->liodn_off = 0;
+-	hw_desc->eliodn_off = 0;
+-	hw_desc->rsvd1 = 0;
+-	hw_desc->format = FRAME_FORMAT;
+-
+-	desc->async_tx.parent = NULL;
+-	desc->async_tx.next = NULL;
+-	desc->async_tx.cookie = 0;
+-
+-	desc->async_tx.flags = flags;
+-	desc->async_tx.cookie = -EBUSY;
+-
+ 	return &desc->async_tx;
+-
+-err_free_3:
+-	kfree(xor);
+-err_free_2:
+-	kfree(cf);
+-err_free:
+-	kfree(desc);
+-	return ERR_PTR(ret);
+ }
+ 
+ /*
+@@ -526,7 +519,7 @@ static struct dma_async_tx_descriptor *re_jr_prep_dma_xor(
+ 		struct dma_chan *chan, dma_addr_t dest, dma_addr_t *src,
+ 		unsigned int src_cnt, size_t len, unsigned long flags)
+ {
+-	/* NULL let genq init all coef as 1 */
++	/* NULL let genq take all coef as 1 */
+ 	return re_jr_prep_genq(chan, dest, src, src_cnt, NULL, len, flags);
+ }
+ 
+@@ -541,12 +534,11 @@ static struct dma_async_tx_descriptor *re_jr_prep_pq(
+ {
+ 	struct re_jr *jr = NULL;
+ 	struct fsl_re_dma_async_tx_desc *desc = NULL;
+-	struct jr_hw_desc *hw_desc = NULL;
+ 	struct pq_cdb *pq = NULL;
+ 	u8 cfs_reqd = src_cnt + 3; /* CDB+P+Q+src_cnt */
+ 	struct cmpnd_frame *cf;
+ 	u8 *p;
+-	int ret = 0, gfmq_len, i, j;
++	int gfmq_len, i, j;
+ 
+ 	if (len > MAX_DATA_LENGTH) {
+ 		pr_err("%s: Length greater than %d not supported\n",
+@@ -555,21 +547,25 @@ static struct dma_async_tx_descriptor *re_jr_prep_pq(
+ 	}
+ 
+ 	/*
+-	 * RE requires at least 2 sources, here we give RE another source
+-	 * if only given one source. The other source is same as the only
+-	 * source.
+-	 * With only one source, P should equal source. Expect no need to
+-	 * generate P with only one source.
++	 * RE requires at least 2 sources, if given only one source, we pass the
++	 * second source same as the first one.
++	 * With only one source, generate P is meaningless, only care Q.
+ 	 */
+ 	if (src_cnt == 1) {
++		struct dma_async_tx_descriptor *tx = NULL;
+ 		dma_addr_t dma_src[2];
+ 		unsigned char coef[2];
+ 		dma_src[0] = *src;
+ 		coef[0] = *scf;
+ 		dma_src[1] = *src;
+ 		coef[1] = 0;
+-		return re_jr_prep_genq(chan, dest[1], dma_src, 2, coef, len,
++		tx = re_jr_prep_genq(chan, dest[1], dma_src, 2, coef, len,
+ 				flags);
++		if (tx) {
++			desc = to_fsl_re_dma_desc(tx);
++			desc->src_cnt = 1;
++		}
++		return tx;
+ 	}
+ 
+ 	/*
+@@ -585,45 +581,19 @@ static struct dma_async_tx_descriptor *re_jr_prep_pq(
+ 				scf, len, flags);
+ 
+ 	jr = container_of(chan, struct re_jr, chan);
+-	spin_lock_bh(&jr->desc_lock);
+-	if (jr->soft_desc->desc_cnt) {
+-		desc = container_of(jr->soft_desc->head.next,
+-				struct fsl_re_dma_async_tx_desc, node);
+-		jr->soft_desc->desc_cnt--;
+-		list_del_init(&desc->node);
+-	}
+-	spin_unlock_bh(&jr->desc_lock);
+-
+-	if (!desc) {
+-		desc = kzalloc(sizeof(struct fsl_re_dma_async_tx_desc),
+-				GFP_KERNEL);
+-		if (!desc)
+-			return ERR_PTR(-ENOMEM);
+-
+-		desc->async_tx.tx_submit = re_jr_tx_submit;
+-	}
+-
+-	dma_async_tx_descriptor_init(&desc->async_tx, &jr->chan);
+-	INIT_LIST_HEAD(&desc->node);
+-	hw_desc = &desc->hwdesc;
+-
+-	cf = kzalloc(sizeof(struct cmpnd_frame)*cfs_reqd, GFP_KERNEL);
+-	if (!cf) {
+-		ret = -ENOMEM;
+-		goto err_free;
+-	}
++	desc = re_jr_alloc_desc(jr, cfs_reqd, flags);
++	if (!desc || desc < 0)
++		return NULL;
+ 
+-	/* Filling frame 0 of compound frame descriptor with CDB */
+-	pq = kzalloc(sizeof(struct pq_cdb), GFP_KERNEL);
+-	if (!pq) {
+-		ret = -ENOMEM;
+-		goto err_free_2;
+-	}
++	desc->dma_len = len;
++	desc->dest_cnt = 2;
++	desc->src_cnt = src_cnt;
+ 
+-	desc->cf_addr = cf;
+-	desc->cdb_addr = pq;
++	desc->cdb_opcode = RE_PQ_OPCODE;
++	desc->cdb_len = sizeof(struct pq_cdb);
+ 
+ 	/* Filling GenQQ CDB */
++	pq = desc->cdb_addr;
+ 	pq->opcode = RE_PQ_OPCODE;
+ 	pq->excl_enable = 0x0; /* Don't exclude for Q1/Q2 parity */
+ 	pq->excl_q1 = 0x0;
+@@ -650,13 +620,8 @@ static struct dma_async_tx_descriptor *re_jr_prep_pq(
+ 		p[i] = scf[i];
+ 
+ 	/* Filling frame 0 of compound frame descriptor with CDB */
+-	ret = fill_cfd_frame_with_cdb(cf, jr, pq,
+-			sizeof(struct pq_cdb)-32+2*gfmq_len);
+-	if (ret < 0) {
+-		pr_err("%s: Can't map pq_cdb\n", __func__);
+-		ret = -EIO;
+-		goto err_free_3;
+-	}
++	cf = desc->cf_addr;
++	fill_cfd_frame(cf, 0, desc->cdb_len, desc->cdb_paddr, 0);
+ 
+ 	/* Fill CFD's 1st & 2nd frame with dest buffers */
+ 	for (i = 1, j = 0; i < 3; i++, j++)
+@@ -669,37 +634,7 @@ static struct dma_async_tx_descriptor *re_jr_prep_pq(
+ 	/* Setting the final bit in the last source buffer frame in CFD */
+ 	cf[i - 1].final = 1;
+ 
+-	/* Filling the frame descriptor */
+-	hw_desc->address = dma_map_single(jr->dev, cf,
+-		sizeof(struct cmpnd_frame) * cfs_reqd, DMA_BIDIRECTIONAL);
+-	if (dma_mapping_error(jr->dev, hw_desc->address)) {
+-		pr_err("%s: Can't map cf\n", __func__);
+-		ret = -EIO;
+-		goto err_free_3;
+-	}
+-
+-	hw_desc->debug = 0;
+-	hw_desc->liodn_off = 0;
+-	hw_desc->eliodn_off = 0;
+-	hw_desc->rsvd1 = 0;
+-	hw_desc->format = FRAME_FORMAT;
+-
+-	desc->async_tx.parent = NULL;
+-	desc->async_tx.next = NULL;
+-	desc->async_tx.cookie = 0;
+-
+-	desc->async_tx.flags = flags;
+-	desc->async_tx.cookie = -EBUSY;
+-
+ 	return &desc->async_tx;
+-
+-err_free_3:
+-	kfree(pq);
+-err_free_2:
+-	kfree(cf);
+-err_free:
+-	kfree(desc);
+-	return ERR_PTR(ret);
+ }
+ 
+ /*
+@@ -713,12 +648,10 @@ static struct dma_async_tx_descriptor *re_jr_prep_memcpy(
+ {
+ 	struct re_jr *jr = NULL;
+ 	struct fsl_re_dma_async_tx_desc *desc = NULL;
+-	struct jr_hw_desc *hw_desc = NULL;
+ 	size_t length = 0;
+ 	unsigned int cfs_reqd = 3; /* CDB+dest+src */
+ 	struct cmpnd_frame *cf = NULL;
+ 	struct move_cdb *move = NULL;
+-	int ret = 0;
+ 
+ 	jr = container_of(chan, struct re_jr, chan);
+ 
+@@ -728,45 +661,19 @@ static struct dma_async_tx_descriptor *re_jr_prep_memcpy(
+ 		return NULL;
+ 	}
+ 
+-	spin_lock_bh(&jr->desc_lock);
+-	if (jr->soft_desc->desc_cnt) {
+-		desc = container_of(jr->soft_desc->head.next,
+-				struct fsl_re_dma_async_tx_desc, node);
+-		jr->soft_desc->desc_cnt--;
+-		list_del_init(&desc->node);
+-	}
+-	spin_unlock_bh(&jr->desc_lock);
+-
+-	if (!desc) {
+-		desc = kzalloc(sizeof(struct fsl_re_dma_async_tx_desc),
+-				GFP_KERNEL);
+-		if (!desc)
+-			return ERR_PTR(-ENOMEM);
+-
+-		desc->async_tx.tx_submit = re_jr_tx_submit;
+-	}
+-
+-	dma_async_tx_descriptor_init(&desc->async_tx, &jr->chan);
+-	INIT_LIST_HEAD(&desc->node);
+-	hw_desc = &desc->hwdesc;
+-
+-	cf = kzalloc(sizeof(struct cmpnd_frame)*cfs_reqd, GFP_KERNEL);
+-	if (!cf) {
+-		ret = -ENOMEM;
+-		goto err_free;
+-	}
++	desc = re_jr_alloc_desc(jr, cfs_reqd, flags);
++	if (!desc || desc < 0)
++		return NULL;
+ 
+-	/* Filling frame 0 of CFD with move CDB */
+-	move = kzalloc(sizeof(struct move_cdb), GFP_KERNEL);
+-	if (!move) {
+-		ret = -ENOMEM;
+-		goto err_free_2;
+-	}
++	desc->dma_len = len;
++	desc->src_cnt = 1;
++	desc->dest_cnt = 1;
+ 
+-	desc->cf_addr = cf;
+-	desc->cdb_addr = move;
++	desc->cdb_opcode = RE_MOVE_OPCODE;
++	desc->cdb_len = sizeof(struct move_cdb);
+ 
+ 	/* Filling move CDB */
++	move = desc->cdb_addr;
+ 	move->opcode = RE_MOVE_OPCODE; /* Unicast move */
+ 	move->blk_size = RE_BLOCK_SIZE;
+ 	move->cache_attrib = CACHEABLE_INPUT_OUTPUT;
+@@ -775,12 +682,9 @@ static struct dma_async_tx_descriptor *re_jr_prep_memcpy(
+ 	move->data_depend = DATA_DEPENDENCY;
+ 	move->dpi = ENABLE_DPI;
+ 
+-	ret = fill_cfd_frame_with_cdb(cf, jr, move, sizeof(struct move_cdb));
+-	if (ret < 0) {
+-		pr_err("%s: Can't map move_cdb\n", __func__);
+-		ret = -EIO;
+-		goto err_free_3;
+-	}
++	/* Filling frame 0 of CFD with move CDB */
++	cf = desc->cf_addr;
++	fill_cfd_frame(cf, 0, desc->cdb_len, desc->cdb_paddr, 0);
+ 
+ 	length = min_t(size_t, len, MAX_DATA_LENGTH);
+ 
+@@ -790,37 +694,7 @@ static struct dma_async_tx_descriptor *re_jr_prep_memcpy(
+ 	/* Fill CFD's 2nd frame with src buffer */
+ 	fill_cfd_frame(cf, 2, length, src, 1);
+ 
+-	/* Filling the frame descriptor */
+-	hw_desc->address = dma_map_single(jr->dev, cf,
+-		sizeof(struct cmpnd_frame) * cfs_reqd, DMA_BIDIRECTIONAL);
+-	if (dma_mapping_error(jr->dev, hw_desc->address)) {
+-		pr_err("%s: Can't map cf\n", __func__);
+-		ret = -EIO;
+-		goto err_free_3;
+-	}
+-
+-	hw_desc->debug = 0;
+-	hw_desc->liodn_off = 0;
+-	hw_desc->eliodn_off = 0;
+-	hw_desc->rsvd1 = 0;
+-	hw_desc->format = FRAME_FORMAT;
+-
+-	desc->async_tx.parent = NULL;
+-	desc->async_tx.next = NULL;
+-	desc->async_tx.cookie = 0;
+-
+-	desc->async_tx.flags = flags;
+-	desc->async_tx.cookie = -EBUSY;
+-
+ 	return &desc->async_tx;
+-
+-err_free_3:
+-	kfree(move);
+-err_free_2:
+-	kfree(cf);
+-err_free:
+-	kfree(desc);
+-	return ERR_PTR(ret);
+ }
+ 
+ /*
+@@ -896,7 +770,6 @@ int re_jr_probe(struct platform_device *ofdev,
+ 	INIT_LIST_HEAD(&jr->submit_q);
+ 	INIT_LIST_HEAD(&jr->ack_q);
+ 	spin_lock_init(&jr->desc_lock);
+-	spin_lock_init(&jr->submit_lock);
+ 
+ 	init_timer(&jr->timer);
+ 	jr->timer.expires = jiffies + 10*HZ;
+@@ -918,8 +791,8 @@ int re_jr_probe(struct platform_device *ofdev,
+ 	jr->inb_ring_virt_addr = dma_pool_alloc(jr->inb_desc_pool, GFP_ATOMIC,
+ 			&jr->inb_phys_addr);
+ 	if (!jr->inb_ring_virt_addr) {
+-		dev_err(dev, "%s:Unable to allocate dma_pool mem for"
+-			"inb_ring_virt_addr\n", __func__);
++		dev_err(dev, "%s:No dma mem for inb_ring_virt_addr\n",
++			__func__);
+ 		ret = -ENOMEM;
+ 		goto pool_destroy;
+ 	}
+@@ -937,14 +810,23 @@ int re_jr_probe(struct platform_device *ofdev,
+ 	jr->oub_ring_virt_addr = dma_pool_alloc(jr->oub_desc_pool, GFP_ATOMIC,
+ 			&jr->oub_phys_addr);
+ 	if (!jr->inb_ring_virt_addr) {
+-		dev_err(dev, "%s:Unable to allocate dma_pool mem for"
+-			"oub_ring_virt_addr\n", __func__);
++		dev_err(dev, "%s:No dma mem for oub_ring_virt_addr\n",
++			__func__);
+ 		ret = -ENOMEM;
+ 		goto pool_destroy_2;
+ 	}
+ 
++	jr->desc_pool = dma_pool_create("re_jr_desc_pool", jr->dev,
++			RE_CF_CDB_SIZE, RE_CF_CDB_ALIGN, 0);
++
++	if (!jr->desc_pool) {
++		dev_err(dev, "%s:No memory for re_jr_desc_pool\n",
++			__func__);
++		ret = -ENOMEM;
++		goto err_free_2;
++	}
++
+ 	jr->inb_ring_index = 0;
+-	jr->oub_ring_index = 0;
+ 	jr->inb_count = 0;
+ 	jr->oub_count = 0;
+ 
+@@ -969,18 +851,21 @@ int re_jr_probe(struct platform_device *ofdev,
+ 			jr->inb_phys_addr >> RE_JR_ADDRESS_BIT_SHIFT);
+ 	out_be32(&jr->jrregs->oubring_base_l,
+ 			jr->oub_phys_addr >> RE_JR_ADDRESS_BIT_SHIFT);
+-	out_be32(&jr->jrregs->inbring_size, RING_SIZE << 8);
+-	out_be32(&jr->jrregs->oubring_size, RING_SIZE << 8);
++	out_be32(&jr->jrregs->inbring_size, RING_SIZE << RING_SIZE_SHIFT);
++	out_be32(&jr->jrregs->oubring_size, RING_SIZE << RING_SIZE_SHIFT);
++
++	/* Read LIODN value from u-boot */
++	status = in_be32(&jr->jrregs->jr_config_1) & RE_JR_REG_LIODN_MASK;
+ 
+ 	/* Program the CFG reg */
+ 	out_be32(&jr->jrregs->jr_config_1,
+-			RE_JR_CFG1_CBSI | RE_JR_CFG1_CBS0);
++			RE_JR_CFG1_CBSI | RE_JR_CFG1_CBS0 | status);
+ 
+ 	/* Enable RE/JR */
+ 	out_be32(&jr->jrregs->jr_command, RE_JR_ENABLE);
+ 
+ 	/* Zero'ing the array */
+-	for (k = 0; k <= RING_SIZE; k++) {
++	for (k = 0; k < RING_SIZE; k++) {
+ 		jr->virt_arry[k].virt_addr = 0;
+ 		jr->virt_arry[k].phys_addr = 0;
+ 	}
+@@ -1042,7 +927,7 @@ static int __devinit raide_probe(struct platform_device *ofdev)
+ 
+ 	/* Program Galois Field polymomial */
+ 	out_be32(&repriv->re_regs->galois_field_config, RE_GFM_POLY);
+-	dev_info(dev, "%s:Galois Field Polymomial is %x\n", __func__,
++	dev_info(dev, "%s:Galois Field Polynomial is %x\n", __func__,
+ 			in_be32(&repriv->re_regs->galois_field_config));
+ 
+ 	dma_dev = &repriv->dma_dev;
+@@ -1083,9 +968,15 @@ static int __devinit raide_probe(struct platform_device *ofdev)
+ 				"fsl,raideng-v1.0-job-ring")) {
+ 				re_jr_probe(ofdev, child, ridx++, off);
+ 				repriv->total_jrs++;
+-			};
+-		};
+-	};
++				break;
++			}
++		}
++		break;
++	}
++
++	re_sw_desc_cache = kmem_cache_create("re_desc_cache",
++				sizeof(struct fsl_re_dma_async_tx_desc), 0,
++				SLAB_HWCACHE_ALIGN, NULL);
+ 
+ 	dma_async_device_register(dma_dev);
+ 
+@@ -1118,6 +1009,8 @@ static int raide_remove(struct platform_device *ofdev)
+ 	for (i = 0; i < repriv->total_jrs; i++)
+ 		release_jr(repriv->re_jrs[i]);
+ 
++	kmem_cache_destroy(re_sw_desc_cache);
++
+ 	/* Unregister the driver */
+ 	dma_async_device_unregister(&repriv->dma_dev);
+ 
+diff --git a/drivers/dma/fsl_raid.h b/drivers/dma/fsl_raid.h
+index 2d18eef..d3cebc3 100644
+--- a/drivers/dma/fsl_raid.h
++++ b/drivers/dma/fsl_raid.h
+@@ -58,6 +58,7 @@
+ #define DATA_DEPENDENCY		0x1
+ #define ENABLE_DPI		0x0
+ #define RING_SIZE		0x1000
++#define RING_SIZE_SHIFT		8
+ #define RE_JR_ADDRESS_BIT_SHIFT	4
+ #define RE_JR_ADDRESS_BIT_MASK	((1 << RE_JR_ADDRESS_BIT_SHIFT) - 1)
+ #define RE_JR_ERROR		0x40000000
+@@ -66,6 +67,15 @@
+ #define RE_JR_PAUSE		0x80000000
+ #define RE_JR_ENABLE		0x80000000
+ 
++#define RE_JR_REG_LIODN_MASK	0x00000fff
++#define RE_CF_CDB_ALIGN		64
++
++/*
++ *  * max size is 19*sizeof(struct cmpnd_frame), 64 bytes align to 320
++ *   * here 19 = 1(cdb)+2(dest)+16(src)
++ *    */
++#define RE_CF_CDB_SIZE		320
++
+ struct re_ctrl {
+ 	/* General Configuration Registers */
+ 	__be32 global_config;	/* Global Configuration Register */
+@@ -138,7 +148,7 @@ struct move_cdb {
+ 	u32 data_depend:1;
+ 	u32 dpi:1;
+ 	u32 rsvd3:2;
+-};
++} __packed;
+ 
+ /* Data protection/integrity related fields */
+ struct dpi_related {
+@@ -149,7 +159,7 @@ struct dpi_related {
+ 	u32 rsvd1:8;
+ 	u32 meta_tag:16;
+ 	u32 ref_tag:32;
+-};
++} __packed;
+ 
+ /*
+  * CDB for GenQ command. In RAID Engine terminology, XOR is
+@@ -170,7 +180,7 @@ struct xor_cdb {
+ 	u8 gfm[16];
+ 	struct dpi_related dpi_dest_spec;
+ 	struct dpi_related dpi_src_spec[16];
+-};
++} __packed;
+ 
+ /* CDB for no-op command */
+ struct noop_cdb {
+@@ -178,7 +188,7 @@ struct noop_cdb {
+ 	u32 rsvd1:23;
+ 	u32 dependency:1;
+ 	u32 rsvd2:3;
+-};
++} __packed;
+ 
+ /*
+  * CDB for GenQQ command. In RAID Engine terminology, P/Q is
+@@ -203,7 +213,7 @@ struct pq_cdb {
+ 	u8 gfm_q2[16];
+ 	struct dpi_related dpi_dest_spec[2];
+ 	struct dpi_related dpi_src_spec[16];
+-};
++} __packed;
+ 
+ /* Compound frame */
+ struct cmpnd_frame {
+@@ -217,7 +227,7 @@ struct cmpnd_frame {
+ 	u32 bpid:8;
+ 	u32 rsvd5:3;
+ 	u32 offset:13;
+-};
++} __packed;
+ 
+ /* Frame descriptor */
+ struct jr_hw_desc {
+@@ -230,7 +240,7 @@ struct jr_hw_desc {
+ 	u64 format:3;
+ 	u64 rsvd2:29;
+ 	u64 status:32;
+-};
++} __packed;
+ 
+ /* Array to store the virtual/physical address of descriptors */
+ struct virt_struct {
+@@ -242,7 +252,6 @@ struct virt_struct {
+ struct re_jr {
+ 	dma_cookie_t completed_cookie;
+ 	spinlock_t desc_lock;
+-	spinlock_t submit_lock;
+ 	struct list_head submit_q;
+ 	struct list_head ack_q;
+ 	struct device *dev;
+@@ -257,12 +266,12 @@ struct re_jr {
+ 	struct jr_hw_desc *inb_ring_virt_addr;
+ 	struct jr_hw_desc *oub_ring_virt_addr;
+ 	u32 inb_ring_index;
+-	u32 oub_ring_index;
+ 	u32 inb_count;
+ 	u32 oub_count;
+ 	struct virt_struct virt_arry[RING_SIZE];
+-	struct fsl_dma_pool *soft_desc;
+ 	struct timer_list timer;
++	struct dma_pool *desc_pool;
++	u64 sstart, send;
+ };
+ 
+ /* Async transaction descriptor */
+@@ -271,12 +280,15 @@ struct fsl_re_dma_async_tx_desc {
+ 	struct list_head node;
+ 	struct list_head tx_list;
+ 	struct jr_hw_desc hwdesc;
++	struct re_jr *jr;
+ 	void *cf_addr;
++	int dma_len;
++	int dest_cnt;
++	int src_cnt;
++	dma_addr_t cf_paddr;
++	int cf_len;
+ 	void *cdb_addr;
+-};
+-
+-/* Linked list of malloc'd software descriptors */
+-struct fsl_dma_pool {
+-	int desc_cnt;
+-	struct list_head head;
++	u32 cdb_opcode;
++	dma_addr_t cdb_paddr;
++	int cdb_len;
+ };
+-- 
+1.7.9.7
+
