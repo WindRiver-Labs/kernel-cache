@@ -1,0 +1,220 @@
+From aef42480fecbe8099fc1d0d38baa3a3cf3a0a520 Mon Sep 17 00:00:00 2001
+From: Xufeng Zhang <xufeng.zhang@windriver.com>
+Date: Mon, 24 Dec 2012 10:10:32 +0800
+Subject: [PATCH] sctp: Enforce retransmission limit during shutdown
+
+commit f8d9605243280f1870dd2c6c37a735b925c15f3c upstream
+
+When initiating a graceful shutdown while having data chunks
+on the retransmission queue with a peer which is in zero
+window mode the shutdown is never completed because the
+retransmission error count is reset periodically by the
+following two rules:
+
+ - Do not timeout association while doing zero window probe.
+ - Reset overall error count when a heartbeat request has
+   been acknowledged.
+
+The graceful shutdown will wait for all outstanding TSN to
+be acknowledged before sending the SHUTDOWN request. This
+never happens due to the peer's zero window not acknowledging
+the continuously retransmitted data chunks. Although the
+error counter is incremented for each failed retransmission,
+the receiving of the SACK announcing the zero window clears
+the error count again immediately. Also heartbeat requests
+continue to be sent periodically. The peer acknowledges these
+requests causing the error counter to be reset as well.
+
+This patch changes behaviour to only reset the overall error
+counter for the above rules while not in shutdown. After
+reaching the maximum number of retransmission attempts, the
+T5 shutdown guard timer is scheduled to give the receiver
+some additional time to recover. The timer is stopped as soon
+as the receiver acknowledges any data.
+
+The issue can be easily reproduced by establishing a sctp
+association over the loopback device, constantly queueing
+data at the sender while not reading any at the receiver.
+Wait for the window to reach zero, then initiate a shutdown
+by killing both processes simultaneously. The association
+will never be freed and the chunks on the retransmission
+queue will be retransmitted indefinitely.
+
+Signed-off-by: Thomas Graf <tgraf@infradead.org>
+Acked-by: Vlad Yasevich <vladislav.yasevich@hp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Xufeng Zhang <xufeng.zhang@windriver.com>
+---
+ include/net/sctp/command.h |    1 +
+ net/sctp/outqueue.c        |   20 +++++++++++++++++++-
+ net/sctp/sm_sideeffect.c   |   20 ++++++++++++++++++--
+ net/sctp/sm_statefuns.c    |   32 +++++++++++++++++++++++---------
+ net/sctp/sm_statetable.c   |    2 +-
+ 5 files changed, 62 insertions(+), 13 deletions(-)
+
+diff --git a/include/net/sctp/command.h b/include/net/sctp/command.h
+index 3b96680..cd5f0db 100644
+--- a/include/net/sctp/command.h
++++ b/include/net/sctp/command.h
+@@ -63,6 +63,7 @@ typedef enum {
+ 	SCTP_CMD_ECN_ECNE,	/* Do delayed ECNE processing. */
+ 	SCTP_CMD_ECN_CWR,	/* Do delayed CWR processing.  */
+ 	SCTP_CMD_TIMER_START,	/* Start a timer.  */
++	SCTP_CMD_TIMER_START_ONCE, /* Start a timer once */
+ 	SCTP_CMD_TIMER_RESTART,	/* Restart a timer. */
+ 	SCTP_CMD_TIMER_STOP,	/* Stop a timer. */
+ 	SCTP_CMD_INIT_CHOOSE_TRANSPORT, /* Choose transport for an INIT. */
+diff --git a/net/sctp/outqueue.c b/net/sctp/outqueue.c
+index 4785998..36a3dad 100644
+--- a/net/sctp/outqueue.c
++++ b/net/sctp/outqueue.c
+@@ -1546,6 +1546,8 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+ #endif /* SCTP_DEBUG */
+ 	if (transport) {
+ 		if (bytes_acked) {
++			struct sctp_association *asoc = transport->asoc;
++
+ 			/* 8.2. When an outstanding TSN is acknowledged,
+ 			 * the endpoint shall clear the error counter of
+ 			 * the destination transport address to which the
+@@ -1556,6 +1558,17 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+ 			transport->error_count = 0;
+ 			transport->asoc->overall_error_count = 0;
+ 
++			/*
++			 * While in SHUTDOWN PENDING, we may have started
++			 * the T5 shutdown guard timer after reaching the
++			 * retransmission limit. Stop that timer as soon
++			 * as the receiver acknowledged any data.
++			 */
++			if (asoc->state == SCTP_STATE_SHUTDOWN_PENDING &&
++			    del_timer(&asoc->timers
++				[SCTP_EVENT_TIMEOUT_T5_SHUTDOWN_GUARD]))
++					sctp_association_put(asoc);
++
+ 			/* Mark the destination transport address as
+ 			 * active if it is not so marked.
+ 			 */
+@@ -1585,10 +1598,15 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+ 			 * A sender is doing zero window probing when the
+ 			 * receiver's advertised window is zero, and there is
+ 			 * only one data chunk in flight to the receiver.
++			 *
++			 * Allow the association to timeout while in SHUTDOWN
++			 * PENDING or SHUTDOWN RECEIVED in case the receiver
++			 * stays in zero window mode forever.
+ 			 */
+ 			if (!q->asoc->peer.rwnd &&
+ 			    !list_empty(&tlist) &&
+-			    (sack_ctsn+2 == q->asoc->next_tsn)) {
++			    (sack_ctsn+2 == q->asoc->next_tsn) &&
++			    q->asoc->state < SCTP_STATE_SHUTDOWN_PENDING) {
+ 				SCTP_DEBUG_PRINTK("%s: SACK received for zero "
+ 						  "window probe: %u\n",
+ 						  __func__, sack_ctsn);
+diff --git a/net/sctp/sm_sideeffect.c b/net/sctp/sm_sideeffect.c
+index cca0322..ae39392 100644
+--- a/net/sctp/sm_sideeffect.c
++++ b/net/sctp/sm_sideeffect.c
+@@ -669,10 +669,19 @@ static void sctp_cmd_transport_on(sctp_cmd_seq_t *cmds,
+ 	/* 8.3 Upon the receipt of the HEARTBEAT ACK, the sender of the
+ 	 * HEARTBEAT should clear the error counter of the destination
+ 	 * transport address to which the HEARTBEAT was sent.
+-	 * The association's overall error count is also cleared.
+ 	 */
+ 	t->error_count = 0;
+-	t->asoc->overall_error_count = 0;
++
++	/*
++	 * Although RFC4960 specifies that the overall error count must
++	 * be cleared when a HEARTBEAT ACK is received, we make an
++	 * exception while in SHUTDOWN PENDING. If the peer keeps its
++	 * window shut forever, we may never be able to transmit our
++	 * outstanding data and rely on the retransmission limit be reached
++	 * to shutdown the association.
++	 */
++	if (t->asoc->state != SCTP_STATE_SHUTDOWN_PENDING)
++		t->asoc->overall_error_count = 0;
+ 
+ 	/* Clear the hb_sent flag to signal that we had a good
+ 	 * acknowledgement.
+@@ -1353,6 +1362,13 @@ static int sctp_cmd_interpreter(sctp_event_t event_type,
+ 			sctp_cmd_setup_t2(commands, asoc, cmd->obj.ptr);
+ 			break;
+ 
++		case SCTP_CMD_TIMER_START_ONCE:
++			timer = &asoc->timers[cmd->obj.to];
++
++			if (timer_pending(timer))
++				break;
++			/* fall through */
++
+ 		case SCTP_CMD_TIMER_START:
+ 			timer = &asoc->timers[cmd->obj.to];
+ 			timeout = asoc->timeouts[cmd->obj.to];
+diff --git a/net/sctp/sm_statefuns.c b/net/sctp/sm_statefuns.c
+index 594c3db..f150282 100644
+--- a/net/sctp/sm_statefuns.c
++++ b/net/sctp/sm_statefuns.c
+@@ -5012,7 +5012,7 @@ sctp_disposition_t sctp_sf_do_9_2_start_shutdown(
+ 	 * The sender of the SHUTDOWN MAY also start an overall guard timer
+ 	 * 'T5-shutdown-guard' to bound the overall time for shutdown sequence.
+ 	 */
+-	sctp_add_cmd_sf(commands, SCTP_CMD_TIMER_START,
++	sctp_add_cmd_sf(commands, SCTP_CMD_TIMER_RESTART,
+ 			SCTP_TO(SCTP_EVENT_TIMEOUT_T5_SHUTDOWN_GUARD));
+ 
+ 	if (asoc->autoclose)
+@@ -5157,14 +5157,28 @@ sctp_disposition_t sctp_sf_do_6_3_3_rtx(const struct sctp_endpoint *ep,
+ 	SCTP_INC_STATS(SCTP_MIB_T3_RTX_EXPIREDS);
+ 
+ 	if (asoc->overall_error_count >= asoc->max_retrans) {
+-		sctp_add_cmd_sf(commands, SCTP_CMD_SET_SK_ERR,
+-				SCTP_ERROR(ETIMEDOUT));
+-		/* CMD_ASSOC_FAILED calls CMD_DELETE_TCB. */
+-		sctp_add_cmd_sf(commands, SCTP_CMD_ASSOC_FAILED,
+-				SCTP_PERR(SCTP_ERROR_NO_ERROR));
+-		SCTP_INC_STATS(SCTP_MIB_ABORTEDS);
+-		SCTP_DEC_STATS(SCTP_MIB_CURRESTAB);
+-		return SCTP_DISPOSITION_DELETE_TCB;
++		if (asoc->state == SCTP_STATE_SHUTDOWN_PENDING) {
++			/*
++			 * We are here likely because the receiver had its rwnd
++			 * closed for a while and we have not been able to
++			 * transmit the locally queued data within the maximum
++			 * retransmission attempts limit.  Start the T5
++			 * shutdown guard timer to give the receiver one last
++			 * chance and some additional time to recover before
++			 * aborting.
++			 */
++			sctp_add_cmd_sf(commands, SCTP_CMD_TIMER_START_ONCE,
++				SCTP_TO(SCTP_EVENT_TIMEOUT_T5_SHUTDOWN_GUARD));
++		} else {
++			sctp_add_cmd_sf(commands, SCTP_CMD_SET_SK_ERR,
++					SCTP_ERROR(ETIMEDOUT));
++			/* CMD_ASSOC_FAILED calls CMD_DELETE_TCB. */
++			sctp_add_cmd_sf(commands, SCTP_CMD_ASSOC_FAILED,
++					SCTP_PERR(SCTP_ERROR_NO_ERROR));
++			SCTP_INC_STATS(SCTP_MIB_ABORTEDS);
++			SCTP_DEC_STATS(SCTP_MIB_CURRESTAB);
++			return SCTP_DISPOSITION_DELETE_TCB;
++		}
+ 	}
+ 
+ 	/* E1) For the destination address for which the timer
+diff --git a/net/sctp/sm_statetable.c b/net/sctp/sm_statetable.c
+index dd4ddc4..d991237 100644
+--- a/net/sctp/sm_statetable.c
++++ b/net/sctp/sm_statetable.c
+@@ -897,7 +897,7 @@ static const sctp_sm_table_entry_t other_event_table[SCTP_NUM_OTHER_TYPES][SCTP_
+ 	/* SCTP_STATE_ESTABLISHED */ \
+ 	TYPE_SCTP_FUNC(sctp_sf_timer_ignore), \
+ 	/* SCTP_STATE_SHUTDOWN_PENDING */ \
+-	TYPE_SCTP_FUNC(sctp_sf_timer_ignore), \
++	TYPE_SCTP_FUNC(sctp_sf_t5_timer_expire), \
+ 	/* SCTP_STATE_SHUTDOWN_SENT */ \
+ 	TYPE_SCTP_FUNC(sctp_sf_t5_timer_expire), \
+ 	/* SCTP_STATE_SHUTDOWN_RECEIVED */ \
+-- 
+1.7.0.2
+
