@@ -1,0 +1,552 @@
+From 0ef5a8c5581749c4a1de89359c86360dd22d88f3 Mon Sep 17 00:00:00 2001
+From: hwang7 <huanhuan.Wang@windriver.com>
+Date: Wed, 9 Jan 2013 11:35:47 +0800
+Subject: [PATCH] crypto: make cryptosoft SMP safe
+
+When running test scripts which includes the following command
+on fsl_p4080:
+
+$ openssl speed -evp des -engine cryptodev -elapsed
+$ openssl speed -evp des3 -engine cryptodev -elapsed
+$ openssl speed -evp aes128 -engine cryptodev -elapsed
+
+$ openssl speed -evp des -engine cryptodev -elapsed -multi 10
+$ openssl speed -evp des3 -engine cryptodev -elapsed -multi 10
+$ openssl speed -evp aes128 -engine cryptodev -elapsed -multi 10
+
+The system will give out call trace or hang.
+
+The root causes of this issue are:
+1. The session list in fcrypt is not protected properly.
+2. Though the swcr_sessions is protect by spin lock, but the three
+types of session operation "create session, use session, delete
+session" are not protected properly.
+
+So:
+1.add spin lock to protect session list in fcrypt
+2.add state/ref fields to session, use session state to prevent from
+deleting a session when it's in creating or using state, and use spin
+lock to protect the swcr_sessions and session state.
+
+Besides:
+crypto_req_lock is deleted for the code it try to protect is dealing
+with a dynamic allocated resource, and there is no SMP problems with
+these codes. Futhermore, there is bug with the use of crypto_req_lock:
+when this spin lock is held, there is kmalloc with GFP_KERNEL flag
+set.
+
+Signed-off-by: hwang7 <huanhuan.Wang@windriver.com>
+---
+ crypto/ocf/cryptodev.c  |   13 ++++-
+ crypto/ocf/cryptosoft.c |  168 +++++++++++++++++++++++++++++++++--------------
+ 2 files changed, 130 insertions(+), 51 deletions(-)
+
+diff --git a/crypto/ocf/cryptodev.c b/crypto/ocf/cryptodev.c
+index d434d88..28bd3d0 100644
+--- a/crypto/ocf/cryptodev.c
++++ b/crypto/ocf/cryptodev.c
+@@ -125,6 +125,8 @@ static	int cryptodev_find(struct crypt_find_op *);
+ static int cryptodev_cb(void *);
+ static int cryptodev_open(struct inode *inode, struct file *filp);
+ 
++static DEFINE_SPINLOCK(cselist_lock);
++
+ /*
+  * Check a crypto identifier to see if it requested
+  * a valid crid and it's capabilities match.
+@@ -544,10 +546,14 @@ csefind(struct fcrypt *fcr, u_int ses)
+ {
+ 	struct csession *cse;
+ 
++	spin_lock(&cselist_lock);
+ 	dprintk("%s()\n", __FUNCTION__);
+ 	list_for_each_entry(cse, &fcr->csessions, list)
+-		if (cse->ses == ses)
++		if (cse->ses == ses) {
++			spin_unlock(&cselist_lock);
+ 			return (cse);
++		}
++	spin_unlock(&cselist_lock);
+ 	return (NULL);
+ }
+ 
+@@ -556,22 +562,27 @@ csedelete(struct fcrypt *fcr, struct csession *cse_del)
+ {
+ 	struct csession *cse;
+ 
++	spin_lock(&cselist_lock);
+ 	dprintk("%s()\n", __FUNCTION__);
+ 	list_for_each_entry(cse, &fcr->csessions, list) {
+ 		if (cse == cse_del) {
+ 			list_del(&cse->list);
++			spin_unlock(&cselist_lock);
+ 			return (1);
+ 		}
+ 	}
++	spin_unlock(&cselist_lock);
+ 	return (0);
+ }
+ 	
+ static struct csession *
+ cseadd(struct fcrypt *fcr, struct csession *cse)
+ {
++	spin_lock(&cselist_lock);
+ 	dprintk("%s()\n", __FUNCTION__);
+ 	list_add_tail(&cse->list, &fcr->csessions);
+ 	cse->ses = fcr->sesn++;
++	spin_unlock(&cselist_lock);
+ 	return (cse);
+ }
+ 
+diff --git a/crypto/ocf/cryptosoft.c b/crypto/ocf/cryptosoft.c
+index 8ecc6af..e2d22c4 100644
+--- a/crypto/ocf/cryptosoft.c
++++ b/crypto/ocf/cryptosoft.c
+@@ -83,9 +83,16 @@ struct {
+ 
+ #define SCATTERLIST_MAX 16
+ 
++
++#define SW_SESSION_IDLE				0x0
++#define SW_SESSION_CREATION_IN_PROGRESS		0x1
++#define SW_SESSION_IN_USE			0x2
++#define SW_SESSION_DELETION_IN_PROGRESS		0x3
+ struct swcr_data {
+ 	int					sw_type;
+ 	int					sw_alg;
++	int					sw_state;
++	int					sw_ref;
+ 	struct crypto_tfm	*sw_tfm;
+ 	union {
+ 		struct {
+@@ -274,6 +281,24 @@ module_param(swcr_debug, int, 0644);
+ MODULE_PARM_DESC(swcr_debug, "Enable debug");
+ 
+ static void swcr_process_req(struct swcr_req *req);
++static DEFINE_SPINLOCK(session_lock);
++
++static inline void _swcr_set_state(struct swcr_data *swd, int state, int lock)
++{
++	if( lock )
++		spin_lock(&session_lock);
++
++	if (swd != NULL)
++		swd->sw_state = state;
++
++	if ( lock )
++		spin_unlock(&session_lock);
++}
++
++static inline void swcr_set_state(struct swcr_data *swd, int state)
++{
++	_swcr_set_state(swd, state, 0);
++}
+ 
+ /*
+  * Generate a new software session.
+@@ -282,19 +307,17 @@ static int
+ swcr_newsession(device_t dev, u_int32_t *sid, struct cryptoini *cri)
+ {
+ 	struct swcr_data **swd;
+-	u_int32_t i;
++	u_int32_t index, i;
+ 	int error;
+ 	char *algo;
+ 	int mode;
+-	static DEFINE_SPINLOCK(session_lock);
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&session_lock, flags);
++	spin_lock(&session_lock);
+ 
+ 	dprintk("%s()\n", __FUNCTION__);
+ 	if (sid == NULL || cri == NULL) {
+ 		dprintk("%s,%d - EINVAL\n", __FILE__, __LINE__);
+-		spin_unlock_irqrestore(&session_lock, flags);
++		spin_unlock(&session_lock);
+ 		return EINVAL;
+ 	}
+ 
+@@ -320,7 +343,7 @@ swcr_newsession(device_t dev, u_int32_t *sid, struct cryptoini *cri)
+ 			else
+ 				swcr_sesnum /= 2;
+ 			dprintk("%s,%d: ENOBUFS\n", __FILE__, __LINE__);
+-			spin_unlock_irqrestore(&session_lock, flags);
++			spin_unlock(&session_lock);
+ 			return ENOBUFS;
+ 		}
+ 		memset(swd, 0, swcr_sesnum * sizeof(struct swcr_data *));
+@@ -335,33 +358,39 @@ swcr_newsession(device_t dev, u_int32_t *sid, struct cryptoini *cri)
+ 		swcr_sessions = swd;
+ 	}
+ 
+-	swd = &swcr_sessions[i];
+-	*sid = i;
++	index = i;
++	swd = &swcr_sessions[index];
++	*sid = index;
+ 
+ 	while (cri) {
+ 		*swd = (struct swcr_data *) kmalloc(sizeof(struct swcr_data),
+ 				SLAB_ATOMIC);
+ 		if (*swd == NULL) {
+-			swcr_freesession(NULL, i);
++			swcr_set_state(swcr_sessions[index], SW_SESSION_DELETION_IN_PROGRESS);
++			spin_unlock(&session_lock);
++			swcr_freesession(NULL, index);
+ 			dprintk("%s,%d: ENOBUFS\n", __FILE__, __LINE__);
+-			spin_unlock_irqrestore(&session_lock, flags);
+ 			return ENOBUFS;
+ 		}
+ 		memset(*swd, 0, sizeof(struct swcr_data));
++		swcr_set_state(*swd, SW_SESSION_CREATION_IN_PROGRESS);
++		spin_unlock(&session_lock);
+ 
+ 		if (cri->cri_alg < 0 ||
+ 				cri->cri_alg>=sizeof(crypto_details)/sizeof(crypto_details[0])){
+ 			printk("cryptosoft: Unknown algorithm 0x%x\n", cri->cri_alg);
+-			swcr_freesession(NULL, i);
+-			spin_unlock_irqrestore(&session_lock, flags);
++			_swcr_set_state(swcr_sessions[index],
++				SW_SESSION_DELETION_IN_PROGRESS, 1);
++			swcr_freesession(NULL, index);
+ 			return EINVAL;
+ 		}
+ 
+ 		algo = crypto_details[cri->cri_alg].alg_name;
+ 		if (!algo || !*algo) {
+ 			printk("cryptosoft: Unsupported algorithm 0x%x\n", cri->cri_alg);
+-			swcr_freesession(NULL, i);
+-			spin_unlock_irqrestore(&session_lock, flags);
++			_swcr_set_state(swcr_sessions[index],
++				SW_SESSION_DELETION_IN_PROGRESS, 1);
++			swcr_freesession(NULL, index);
+ 			return EINVAL;
+ 		}
+ 
+@@ -379,7 +408,6 @@ swcr_newsession(device_t dev, u_int32_t *sid, struct cryptoini *cri)
+ 		}
+ 
+ 		if ((*swd)->sw_type & SW_TYPE_BLKCIPHER) {
+-			spin_unlock_irqrestore(&session_lock, flags);
+ 			dprintk("%s crypto_alloc_*blkcipher(%s, 0x%x)\n", __FUNCTION__,
+ 					algo, mode);
+ 
+@@ -394,12 +422,12 @@ swcr_newsession(device_t dev, u_int32_t *sid, struct cryptoini *cri)
+ 				(*swd)->sw_tfm = crypto_blkcipher_tfm(
+ 						crypto_alloc_blkcipher(algo, 0, CRYPTO_ALG_ASYNC));
+ 			}
+-			spin_lock_irqsave(&session_lock, flags);
+ 			if (!(*swd)->sw_tfm) {
+ 				dprintk("cryptosoft: crypto_alloc_blkcipher failed(%s, 0x%x)\n",
+ 						algo,mode);
+-				swcr_freesession(NULL, i);
+-				spin_unlock_irqrestore(&session_lock, flags);
++				_swcr_set_state(swcr_sessions[index],
++					SW_SESSION_DELETION_IN_PROGRESS, 1);
++				swcr_freesession(NULL, index);
+ 				return EINVAL;
+ 			}
+ 
+@@ -431,12 +459,12 @@ swcr_newsession(device_t dev, u_int32_t *sid, struct cryptoini *cri)
+ 			if (error) {
+ 				printk("cryptosoft: setkey failed %d (crt_flags=0x%x)\n", error,
+ 						(*swd)->sw_tfm->crt_flags);
+-				swcr_freesession(NULL, i);
+-				spin_unlock_irqrestore(&session_lock, flags);
++				_swcr_set_state(swcr_sessions[index],
++					SW_SESSION_DELETION_IN_PROGRESS, 1);
++				swcr_freesession(NULL, index);
+ 				return error;
+ 			}
+ 		} else if ((*swd)->sw_type & (SW_TYPE_HMAC | SW_TYPE_HASH)) {
+-			spin_unlock_irqrestore(&session_lock, flags);
+ 			dprintk("%s crypto_alloc_*hash(%s, 0x%x)\n", __FUNCTION__,
+ 					algo, mode);
+ 
+@@ -452,12 +480,12 @@ swcr_newsession(device_t dev, u_int32_t *sid, struct cryptoini *cri)
+ 						crypto_alloc_hash(algo, 0, CRYPTO_ALG_ASYNC));
+ 			}
+ 
+-			spin_lock_irqsave(&session_lock, flags);
+ 			if (!(*swd)->sw_tfm) {
+ 				dprintk("cryptosoft: crypto_alloc_hash failed(%s,0x%x)\n",
+ 						algo, mode);
+-				swcr_freesession(NULL, i);
+-				spin_unlock_irqrestore(&session_lock, flags);
++				_swcr_set_state(swcr_sessions[index],
++					SW_SESSION_DELETION_IN_PROGRESS, 1);
++				swcr_freesession(NULL, index);
+ 				return EINVAL;
+ 			}
+ 
+@@ -465,9 +493,10 @@ swcr_newsession(device_t dev, u_int32_t *sid, struct cryptoini *cri)
+ 			(*swd)->u.hmac.sw_key = (char *)kmalloc((*swd)->u.hmac.sw_klen,
+ 					SLAB_ATOMIC);
+ 			if ((*swd)->u.hmac.sw_key == NULL) {
+-				swcr_freesession(NULL, i);
++				_swcr_set_state(swcr_sessions[index],
++					SW_SESSION_DELETION_IN_PROGRESS, 1);
++				swcr_freesession(NULL, index);
+ 				dprintk("%s,%d: ENOBUFS\n", __FILE__, __LINE__);
+-				spin_unlock_irqrestore(&session_lock, flags);
+ 				return ENOBUFS;
+ 			}
+ 			memcpy((*swd)->u.hmac.sw_key, cri->cri_key, (*swd)->u.hmac.sw_klen);
+@@ -481,35 +510,38 @@ swcr_newsession(device_t dev, u_int32_t *sid, struct cryptoini *cri)
+ 						crypto_hash_cast((*swd)->sw_tfm));
+ 			}
+ 		} else if ((*swd)->sw_type & SW_TYPE_COMP) {
+-			spin_unlock_irqrestore(&session_lock, flags);
+ 			(*swd)->sw_tfm = crypto_comp_tfm(
+ 					crypto_alloc_comp(algo, 0, CRYPTO_ALG_ASYNC));
+-			spin_lock_irqsave(&session_lock, flags);
+ 			if (!(*swd)->sw_tfm) {
+ 				dprintk("cryptosoft: crypto_alloc_comp failed(%s,0x%x)\n",
+ 						algo, mode);
+-				swcr_freesession(NULL, i);
+-				spin_unlock_irqrestore(&session_lock, flags);
++				_swcr_set_state(swcr_sessions[index],
++					SW_SESSION_DELETION_IN_PROGRESS, 1);
++				swcr_freesession(NULL, index);
+ 				return EINVAL;
+ 			}
+ 			(*swd)->u.sw_comp_buf = kmalloc(CRYPTO_MAX_DATA_LEN, SLAB_ATOMIC);
+ 			if ((*swd)->u.sw_comp_buf == NULL) {
+-				swcr_freesession(NULL, i);
++				_swcr_set_state(swcr_sessions[index],
++					SW_SESSION_DELETION_IN_PROGRESS, 1);
++				swcr_freesession(NULL, index);
+ 				dprintk("%s,%d: ENOBUFS\n", __FILE__, __LINE__);
+-				spin_unlock_irqrestore(&session_lock, flags);
+ 				return ENOBUFS;
+ 			}
+ 		} else {
+ 			printk("cryptosoft: Unhandled sw_type %d\n", (*swd)->sw_type);
+-			swcr_freesession(NULL, i);
+-			spin_unlock_irqrestore(&session_lock, flags);
++			_swcr_set_state(swcr_sessions[index],
++				SW_SESSION_DELETION_IN_PROGRESS, 1);
++			swcr_freesession(NULL, index);
+ 			return EINVAL;
+ 		}
+ 
+ 		cri = cri->cri_next;
+ 		swd = &((*swd)->sw_next);
++		spin_lock(&session_lock);
+ 	}
+-	spin_unlock_irqrestore(&session_lock, flags);
++	swcr_set_state(swcr_sessions[index], SW_SESSION_IDLE);
++	spin_unlock(&session_lock);
+ 	return 0;
+ }
+ 
+@@ -522,19 +554,38 @@ swcr_freesession(device_t dev, u_int64_t tid)
+ 	struct swcr_data *swd;
+ 	u_int32_t sid = CRYPTO_SESID2LID(tid);
+ 
++	spin_lock(&session_lock);
+ 	dprintk("%s()\n", __FUNCTION__);
+ 	if (sid > swcr_sesnum || swcr_sessions == NULL ||
+ 			swcr_sessions[sid] == NULL) {
+ 		dprintk("%s,%d: EINVAL\n", __FILE__, __LINE__);
++		spin_unlock(&session_lock);
+ 		return(EINVAL);
+ 	}
+ 
+ 	/* Silently accept and return */
+-	if (sid == 0)
++	if (sid == 0) {
++		spin_unlock(&session_lock);
+ 		return(0);
++	}
+ 
+ 	while ((swd = swcr_sessions[sid]) != NULL) {
++		if (swd->sw_state == SW_SESSION_IN_USE
++			|| swd->sw_state == SW_SESSION_CREATION_IN_PROGRESS) {
++			spin_unlock(&session_lock);
++			return EAGAIN;
++		}
++		/*
++		 * If the session is to be deleted, it should all be deleted
++		 * so mark it as unuseable.
++		 * In fact, only the first swcr_data's state is used as the
++		 * session state now, so just change it to mark the session
++		 * as being delete
++		 */
++		swcr_set_state(swd, SW_SESSION_DELETION_IN_PROGRESS);
+ 		swcr_sessions[sid] = swd->sw_next;
++		swcr_set_state(swcr_sessions[sid], SW_SESSION_DELETION_IN_PROGRESS);
++		spin_unlock(&session_lock);
+ 		if (swd->sw_tfm) {
+ 			switch (swd->sw_type & SW_TYPE_ALG_AMASK) {
+ #ifdef HAVE_AHASH
+@@ -571,7 +622,9 @@ swcr_freesession(device_t dev, u_int64_t tid)
+ 				kfree(swd->u.hmac.sw_key);
+ 		}
+ 		kfree(swd);
++		spin_lock(&session_lock);
+ 	}
++	spin_unlock(&session_lock);
+ 	return 0;
+ }
+ 
+@@ -613,6 +666,12 @@ static void swcr_process_callback(struct crypto_async_request *creq, int err)
+ 	}
+ 
+ done:
++	spin_lock(&session_lock);
++	req->sw_head->sw_ref--;
++	if (req->sw_head->sw_ref <= 0) {
++		swcr_set_state(req->sw_head, SW_SESSION_IDLE);
++	}
++	spin_unlock(&session_lock);
+ 	dprintk("%s crypto_done %p\n", __FUNCTION__, req);
+ 	crypto_done(req->crp);
+ 	kmem_cache_free(swcr_req_cache, req);
+@@ -628,8 +687,6 @@ static void swcr_process_req(struct swcr_req *req)
+ 	struct sk_buff *skb = (struct sk_buff *) crp->crp_buf;
+ 	struct uio *uiop = (struct uio *) crp->crp_buf;
+ 	int sg_num, sg_len, skip;
+-	static DEFINE_SPINLOCK(crypto_req_lock);
+-	unsigned long flags;
+ 
+ 	dprintk("%s()\n", __FUNCTION__);
+ 
+@@ -743,14 +800,11 @@ static void swcr_process_req(struct swcr_req *req)
+ 			goto done;
+ 		}
+ 
+-		spin_lock_irqsave(&crypto_req_lock, flags);
+-
+ 		req->crypto_req =
+ 				ahash_request_alloc(__crypto_ahash_cast(sw->sw_tfm),GFP_KERNEL);
+ 		if (!req->crypto_req) {
+ 			crp->crp_etype = ENOMEM;
+ 			dprintk("%s,%d: ENOMEM ahash_request_alloc", __FILE__, __LINE__);
+-			spin_unlock_irqrestore(&crypto_req_lock, flags);
+ 			goto done;
+ 		}
+ 
+@@ -767,18 +821,14 @@ static void swcr_process_req(struct swcr_req *req)
+ 		switch (ret) {
+ 		case -EINPROGRESS:
+ 		case -EBUSY:
+-			spin_unlock_irqrestore(&crypto_req_lock, flags);
+ 			return;
+ 		default:
+ 		case 0:
+ 			dprintk("hash OP %s %d\n", ret ? "failed" : "success", ret);
+ 			crp->crp_etype = ret;
+ 			ahash_request_free(req->crypto_req);
+-			spin_unlock_irqrestore(&crypto_req_lock, flags);
+ 			goto done;
+ 		}
+-
+-		spin_unlock_irqrestore(&crypto_req_lock, flags);
+ 		} break;
+ #endif /* HAVE_AHASH */
+ 
+@@ -804,14 +854,12 @@ static void swcr_process_req(struct swcr_req *req)
+ 			goto done;
+ 		}
+ 
+-		spin_lock_irqsave(&crypto_req_lock, flags);
+ 		req->crypto_req = ablkcipher_request_alloc(
+ 				__crypto_ablkcipher_cast(sw->sw_tfm), GFP_KERNEL);
+ 		if (!req->crypto_req) {
+ 			crp->crp_etype = ENOMEM;
+ 			dprintk("%s,%d: ENOMEM ablkcipher_request_alloc",
+ 					__FILE__, __LINE__);
+-			spin_unlock_irqrestore(&crypto_req_lock, flags);
+ 			goto done;
+ 		}
+ 
+@@ -873,17 +921,14 @@ static void swcr_process_req(struct swcr_req *req)
+ 		switch (ret) {
+ 		case -EINPROGRESS:
+ 		case -EBUSY:
+-			spin_unlock_irqrestore(&crypto_req_lock, flags);
+ 			return;
+ 		default:
+ 		case 0:
+ 			dprintk("crypto OP %s %d\n", ret ? "failed" : "success", ret);
+ 			crp->crp_etype = ret;
+ 			ablkcipher_request_free(req->crypto_req);
+-			spin_unlock_irqrestore(&crypto_req_lock, flags);
+ 			goto done;
+ 		}
+-		spin_unlock_irqrestore(&crypto_req_lock, flags);
+ 		} break;
+ #endif /* HAVE_ABLKCIPHER */
+ 
+@@ -1075,6 +1120,12 @@ static void swcr_process_req(struct swcr_req *req)
+ 	}
+ 
+ done:
++	spin_lock(&session_lock);
++	req->sw_head->sw_ref--;
++	if (req->sw_head->sw_ref <= 0) {
++		swcr_set_state(req->sw_head, SW_SESSION_IDLE);
++	}
++	spin_unlock(&session_lock);
+ 	crypto_done(crp);
+ 	kmem_cache_free(swcr_req_cache, req);
+ }
+@@ -1105,10 +1156,12 @@ swcr_process(device_t dev, struct cryptop *crp, int hint)
+ 	}
+ 
+ 	lid = crp->crp_sid & 0xffffffff;
++	spin_lock(&session_lock);
+ 	if (lid >= swcr_sesnum || lid == 0 || swcr_sessions == NULL ||
+ 			swcr_sessions[lid] == NULL) {
+ 		crp->crp_etype = ENOENT;
+ 		dprintk("%s,%d: ENOENT\n", __FILE__, __LINE__);
++		spin_unlock(&session_lock);
+ 		goto done;
+ 	}
+ 
+@@ -1121,6 +1174,7 @@ swcr_process(device_t dev, struct cryptop *crp, int hint)
+ 		if (skb_shinfo(skb)->nr_frags >= SCATTERLIST_MAX) {
+ 			printk("%s,%d: %d nr_frags > SCATTERLIST_MAX", __FILE__, __LINE__,
+ 					skb_shinfo(skb)->nr_frags);
++			spin_unlock(&session_lock);
+ 			goto done;
+ 		}
+ 	} else if (crp->crp_flags & CRYPTO_F_IOV) {
+@@ -1128,6 +1182,7 @@ swcr_process(device_t dev, struct cryptop *crp, int hint)
+ 		if (uiop->uio_iovcnt > SCATTERLIST_MAX) {
+ 			printk("%s,%d: %d uio_iovcnt > SCATTERLIST_MAX", __FILE__, __LINE__,
+ 					uiop->uio_iovcnt);
++			spin_unlock(&session_lock);
+ 			goto done;
+ 		}
+ 	}
+@@ -1139,11 +1194,24 @@ swcr_process(device_t dev, struct cryptop *crp, int hint)
+ 	if (req == NULL) {
+ 		dprintk("%s,%d: ENOMEM\n", __FILE__, __LINE__);
+ 		crp->crp_etype = ENOMEM;
++		spin_unlock(&session_lock);
+ 		goto done;
+ 	}
+ 	memset(req, 0, sizeof(*req));
+ 
+ 	req->sw_head = swcr_sessions[lid];
++	if (req->sw_head->sw_state == SW_SESSION_DELETION_IN_PROGRESS) {
++		crp->crp_etype = EINVAL;
++		spin_unlock(&session_lock);
++		goto done;
++	} else if (req->sw_head->sw_state == SW_SESSION_CREATION_IN_PROGRESS) {
++		crp->crp_etype = EAGAIN;
++		spin_unlock(&session_lock);
++		goto done;
++	}
++	swcr_set_state(req->sw_head, SW_SESSION_IN_USE);
++	req->sw_head->sw_ref++;
++	spin_unlock(&session_lock);
+ 	req->crp = crp;
+ 	req->crd = crp->crp_desc;
+ 
+-- 
+1.7.0
+
