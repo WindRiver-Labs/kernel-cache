@@ -1,0 +1,1108 @@
+From 6892eacf20ef097831b76020246a8dca90112809 Mon Sep 17 00:00:00 2001
+From: David Daney <ddaney@caviumnetworks.com>
+Date: Tue, 26 Apr 2011 12:43:20 -0700
+Subject: [PATCH 60/97] netdev: octeon-pow-ethernet: Rewrite to support cn68XX and linux-filter.
+
+Source: Cavium SDK 2.1.0-407
+
+The pow0 device is now supported by this driver instead of octeon-ethernet.
+
+Making the etherent address depend on the hardware core number leads
+to random behavior.  Since broadcasting is based on the rx_groups, we
+need to fix the rx_group in a deterministic manner.
+
+We need to receive both IQ and DS work.  Some applications
+(linux-filter) will deschedule work into our group.
+
+Signed-off-by: David Daney <ddaney@caviumnetworks.com>
+Integrated-by: Phil Staub <Phil.Staub@windriver.com>
+---
+ drivers/net/octeon/Kconfig               |   14 +
+ drivers/net/octeon/Makefile              |    1 +
+ drivers/net/octeon/ethernet-tx.c         |  162 -----------
+ drivers/net/octeon/ethernet-tx.h         |    1 -
+ drivers/net/octeon/ethernet.c            |   81 +-----
+ drivers/net/octeon/octeon-pow-ethernet.c |  458 +++++++++++++++---------------
+ 6 files changed, 247 insertions(+), 470 deletions(-)
+
+diff --git a/drivers/net/octeon/Kconfig b/drivers/net/octeon/Kconfig
+index bc17953..ac989f0 100644
+--- a/drivers/net/octeon/Kconfig
++++ b/drivers/net/octeon/Kconfig
+@@ -18,6 +18,20 @@ config OCTEON_NUM_PACKET_BUFFERS
+ 	  Number of packet buffers (and work queue entries) to allocate for
+ 	  the ethernet driver. Zero is treated as 1024.
+ 
++config OCTEON_POW_ONLY_ETHERNET
++        tristate "POW based internal only ethernet driver"
++	depends on  CPU_CAVIUM_OCTEON
++	depends on  OCTEON_ETHERNET
++        help
++          This option enables a very simple ethernet driver for internal core
++          to core traffic. It relies on another driver, octeon-ethernet,
++          to perform all hardware setup. This driver's purpose is to supply
++          basic networking between different Linux images running on the same
++          chip. A single core loads the octeon-ethernet module, all other cores
++          load this driver. On load, the driver waits for some other core to
++          perform hardware setup.
++
++
+ config OCTEON_ETHERNET
+ 	tristate "Cavium Networks Octeon Ethernet support"
+ 	depends on CPU_CAVIUM_OCTEON
+diff --git a/drivers/net/octeon/Makefile b/drivers/net/octeon/Makefile
+index 8baa84d..26af82b 100644
+--- a/drivers/net/octeon/Makefile
++++ b/drivers/net/octeon/Makefile
+@@ -12,6 +12,7 @@
+ #
+ 
+ obj-$(CONFIG_OCTEON_MGMT_ETHERNET)	+= octeon_mgmt.o
++obj-$(CONFIG_OCTEON_POW_ONLY_ETHERNET)	+= octeon-pow-ethernet.o
+ 
+ obj-${CONFIG_OCTEON_ETHERNET} +=  octeon-ethernet.o
+ obj-${CONFIG_KEXEC} +=  octeon-kexec-net.o
+diff --git a/drivers/net/octeon/ethernet-tx.c b/drivers/net/octeon/ethernet-tx.c
+index 04087aa..29747ce 100644
+--- a/drivers/net/octeon/ethernet-tx.c
++++ b/drivers/net/octeon/ethernet-tx.c
+@@ -80,168 +80,6 @@
+ #include "ethernet-xmit.c"
+ 
+ /**
+- * cvm_oct_xmit_pow - transmit a packet to the POW
+- * @skb:    Packet to send
+- * @dev:    Device info structure
+-
+- * Returns Always returns zero
+- */
+-int cvm_oct_xmit_pow(struct sk_buff *skb, struct net_device *dev)
+-{
+-	struct octeon_ethernet *priv = netdev_priv(dev);
+-	void               *packet_buffer;
+-	void               *copy_location;
+-	cvmx_buf_ptr_t     *buffer_ptr;
+-	int remaining_bytes = skb->len;
+-	int offset          = 0;
+-	int length;
+-
+-	/* Get a work queue entry */
+-	cvmx_wqe_t *work = cvmx_fpa_alloc(CVMX_FPA_WQE_POOL);
+-	if (unlikely(work == NULL)) {
+-		DEBUGPRINT("%s: Failed to allocate a work queue entry\n", dev->name);
+-		dev->stats.tx_dropped++;
+-		dev_kfree_skb(skb);
+-		return 0;
+-	}
+-
+-	/* Fill in some of the work queue fields. We may need to add more
+-	   if the software at the other end needs them */
+-	work->word0.u64 = 0;
+-	work->word2.u64     = 0;    /* Default to zero. Sets of zero later are commented out */
+-#if 0
+-	work->hw_chksum = skb->csum;
+-#endif
+-	work->word1.len           = skb->len;
+-	cvmx_wqe_set_port(work, priv->ipd_port);
+-	cvmx_wqe_set_qos(work, (priv->ipd_port & 0x7));
+-	cvmx_wqe_set_grp(work, pow_send_group);
+-	work->word1.tag_type      = CVMX_HELPER_INPUT_TAG_TYPE;
+-	work->word1.tag           = pow_send_group; /* FIXME */
+-
+-	work->word2.s.bufs  = 0;
+-	work->packet_ptr.u64 = 0;
+-
+-	buffer_ptr = &work->packet_ptr;
+-
+-	/* Get a packet buffer */
+-	packet_buffer = cvmx_fpa_alloc(CVMX_FPA_PACKET_POOL);
+-	if (unlikely(packet_buffer == NULL)) {
+-		DEBUGPRINT("%s: Failed to allocate a packet buffer\n",
+-			   dev->name);
+-		cvmx_fpa_free(work, CVMX_FPA_WQE_POOL, DONT_WRITEBACK(1));
+-		dev->stats.tx_dropped++;
+-		dev_kfree_skb(skb);
+-		return 0;
+-	}
+-
+-	/* Calculate where we need to copy the data to. We need to leave 8 bytes
+-	   for a next pointer. */
+-	copy_location = packet_buffer + sizeof(cvmx_buf_ptr_t);
+-
+-	/* We also need to include any configure skip. Then we need to align
+-	   the IP packet src and dest into the same 64bit word. The below
+-	   calculation may add a little extra, but that doesn't hurt */
+-	copy_location += ((CVMX_HELPER_FIRST_MBUFF_SKIP+7)&0xfff8) + 6;
+-
+-	do {
+-		length = CVMX_FPA_PACKET_POOL_SIZE;
+-		length -= copy_location - packet_buffer;
+-
+-		/* Copy the remaining bytes in the last buffer. */
+-		if (remaining_bytes < length)
+-			length = remaining_bytes;
+-
+-		/* We have to copy the packet since whoever processes this packet
+-		   will free it to a hardware pool. We can't use the trick of
+-		   counting outstanding packets like in cvm_oct_xmit */
+-		memcpy(copy_location, skb->data + offset, length);
+-
+-		buffer_ptr->s.addr = cvmx_ptr_to_phys(copy_location);
+-		buffer_ptr->s.pool = CVMX_FPA_PACKET_POOL;
+-		buffer_ptr->s.size = length;
+-		buffer_ptr->s.back = (copy_location - packet_buffer) >> 7;
+-
+-		/* Increment the number of packet pointers used. */
+-		work->word2.s.bufs++;
+-
+-		offset += length;
+-		remaining_bytes -= length;
+-
+-		/* Create new packet buffer to fill the remaining data. */
+-		if (remaining_bytes) {
+-			packet_buffer = cvmx_fpa_alloc(CVMX_FPA_PACKET_POOL);
+-			if (unlikely(packet_buffer == NULL)) {
+-				DEBUGPRINT("%s: Failed to allocate a packet buffer\n",
+-					   dev->name);
+-				cvm_oct_free_work(work);
+-				dev->stats.tx_dropped++;
+-				dev_kfree_skb(skb);
+-				return 0;
+-			}
+-			buffer_ptr = copy_location - sizeof(cvmx_buf_ptr_t);
+-			copy_location = packet_buffer + sizeof(cvmx_buf_ptr_t);
+-		}
+-	} while (remaining_bytes);
+-
+-	if (skb->protocol == htons(ETH_P_IP)) {
+-		work->word2.s.ip_offset     = 14;
+-#if 0
+-		work->word2.s.vlan_valid  = 0; /* FIXME */
+-		work->word2.s.vlan_cfi    = 0; /* FIXME */
+-		work->word2.s.vlan_id     = 0; /* FIXME */
+-		work->word2.s.dec_ipcomp  = 0; /* FIXME */
+-#endif
+-		work->word2.s.tcp_or_udp    = (ip_hdr(skb)->protocol == IPPROTO_TCP) || (ip_hdr(skb)->protocol == IPPROTO_UDP);
+-#if 0
+-		work->word2.s.dec_ipsec   = 0; /* FIXME */
+-		work->word2.s.is_v6       = 0; /* We only support IPv4 right now */
+-		work->word2.s.software    = 0; /* Hardware would set to zero */
+-		work->word2.s.L4_error    = 0; /* No error, packet is internal */
+-#endif
+-		work->word2.s.is_frag       = !((ip_hdr(skb)->frag_off == 0) || (ip_hdr(skb)->frag_off == 1<<14));
+-#if 0
+-		work->word2.s.IP_exc      = 0;  /* Assume Linux is sending a good packet */
+-#endif
+-		work->word2.s.is_bcast      = (skb->pkt_type == PACKET_BROADCAST);
+-		work->word2.s.is_mcast      = (skb->pkt_type == PACKET_MULTICAST);
+-#if 0
+-		work->word2.s.not_IP      = 0; /* This is an IP packet */
+-		work->word2.s.rcv_error   = 0; /* No error, packet is internal */
+-		work->word2.s.err_code    = 0; /* No error, packet is internal */
+-#endif
+-
+-		/* When copying the data, include 4 bytes of the ethernet header to
+-		   align the same way hardware does */
+-		memcpy(work->packet_data, skb->data + 10, sizeof(work->packet_data));
+-	} else {
+-#if 0
+-		work->word2.snoip.vlan_valid  = 0; /* FIXME */
+-		work->word2.snoip.vlan_cfi    = 0; /* FIXME */
+-		work->word2.snoip.vlan_id     = 0; /* FIXME */
+-		work->word2.snoip.software    = 0; /* Hardware would set to zero */
+-#endif
+-		work->word2.snoip.is_rarp       = skb->protocol == htons(ETH_P_RARP);
+-		work->word2.snoip.is_arp        = skb->protocol == htons(ETH_P_ARP);
+-		work->word2.snoip.is_bcast      = (skb->pkt_type == PACKET_BROADCAST);
+-		work->word2.snoip.is_mcast      = (skb->pkt_type == PACKET_MULTICAST);
+-		work->word2.snoip.not_IP        = 1; /* IP was done up above */
+-#if 0
+-		work->word2.snoip.rcv_error   = 0; /* No error, packet is internal */
+-		work->word2.snoip.err_code    = 0; /* No error, packet is internal */
+-#endif
+-		memcpy(work->packet_data, skb->data, sizeof(work->packet_data));
+-	}
+-
+-	/* Submit the packet to the POW */
+-	/* FIXME: should tab be other than pow_send_group? */
+-	cvmx_pow_work_submit(work, pow_send_group, CVMX_HELPER_INPUT_TAG_TYPE, priv->ipd_port & 0x7, pow_send_group);
+-	dev->stats.tx_packets++;
+-	dev->stats.tx_bytes += skb->len;
+-	dev_kfree_skb(skb);
+-	return 0;
+-}
+-/**
+  * cvm_oct_transmit_qos - transmit a work queue entry out of the ethernet port.
+  *
+  * Both the work queue entry and the packet data can optionally be
+diff --git a/drivers/net/octeon/ethernet-tx.h b/drivers/net/octeon/ethernet-tx.h
+index 68dfa0b..1d7969f 100644
+--- a/drivers/net/octeon/ethernet-tx.h
++++ b/drivers/net/octeon/ethernet-tx.h
+@@ -27,5 +27,4 @@
+ 
+ int cvm_oct_xmit(struct sk_buff *skb, struct net_device *dev);
+ int cvm_oct_xmit_lockless(struct sk_buff *skb, struct net_device *dev);
+-int cvm_oct_xmit_pow(struct sk_buff *skb, struct net_device *dev);
+ 
+diff --git a/drivers/net/octeon/ethernet.c b/drivers/net/octeon/ethernet.c
+index 34b867a..64af57a 100644
+--- a/drivers/net/octeon/ethernet.c
++++ b/drivers/net/octeon/ethernet.c
+@@ -69,39 +69,10 @@ MODULE_PARM_DESC(num_packet_buffers, "\n"
+ int pow_receive_group = 15;
+ module_param(pow_receive_group, int, 0444);
+ MODULE_PARM_DESC(pow_receive_group, "\n"
+-	"\tPOW group to receive packets from. All ethernet hardware\n"
+-	"\twill be configured to send incomming packets to this POW\n"
+-	"\tgroup. Also any other software can submit packets to this\n"
+-	"\tgroup for the kernel to process.");
+-
+-int pow_send_group = -1;
+-module_param(pow_send_group, int, 0644);
+-MODULE_PARM_DESC(pow_send_group, "\n"
+-	"\tPOW group to send packets to other software on. This\n"
+-	"\tcontrols the creation of the virtual device pow0.\n"
+-	"\talways_use_pow also depends on this value.");
+-
+-int always_use_pow;
+-module_param(always_use_pow, int, 0444);
+-MODULE_PARM_DESC(always_use_pow, "\n"
+-	"\tWhen set, always send to the pow group. This will cause\n"
+-	"\tpackets sent to real ethernet devices to be sent to the\n"
+-	"\tPOW group instead of the hardware. Unless some other\n"
+-	"\tapplication changes the config, packets will still be\n"
+-	"\treceived from the low level hardware. Use this option\n"
+-	"\tto allow a CVMX app to intercept all packets from the\n"
+-	"\tlinux kernel. You must specify pow_send_group along with\n"
+-	"\tthis option.");
+-
+-char pow_send_list[128] = "";
+-module_param_string(pow_send_list, pow_send_list, sizeof(pow_send_list), 0444);
+-MODULE_PARM_DESC(pow_send_list, "\n"
+-	"\tComma separated list of ethernet devices that should use the\n"
+-	"\tPOW for transmit instead of the actual ethernet hardware. This\n"
+-	"\tis a per port version of always_use_pow. always_use_pow takes\n"
+-	"\tprecedence over this list. For example, setting this to\n"
+-	"\t\"eth2,spi3,spi7\" would cause these three devices to transmit\n"
+-	"\tusing the pow_send_group.");
++       "\tPOW group to receive packets from. All ethernet hardware\n"
++       "\twill be configured to send incomming packets to this POW\n"
++       "\tgroup. Also any other software can submit packets to this\n"
++       "\tgroup for the kernel to process.");
+ 
+ static int disable_core_queueing = 1;
+ module_param(disable_core_queueing, int, 0444);
+@@ -706,17 +677,6 @@ static const struct net_device_ops cvm_oct_srio_netdev_ops = {
+ #endif
+ };
+ #endif
+-static const struct net_device_ops cvm_oct_pow_netdev_ops = {
+-	.ndo_init		= cvm_oct_common_init,
+-	.ndo_start_xmit		= cvm_oct_xmit_pow,
+-	.ndo_set_multicast_list	= cvm_oct_common_set_multicast_list,
+-	.ndo_set_mac_address	= cvm_oct_common_set_mac_address,
+-	.ndo_do_ioctl		= cvm_oct_ioctl,
+-	.ndo_change_mtu		= cvm_oct_common_change_mtu,
+-#ifdef CONFIG_NET_POLL_CONTROLLER
+-	.ndo_poll_controller	= cvm_oct_poll_controller,
+-#endif
+-};
+ 
+ extern void octeon_mdiobus_force_mod_depencency(void);
+ 
+@@ -841,39 +801,6 @@ static int __init cvm_oct_init_module(void)
+ 	 */
+ 	cvmx_fau_atomic_write32(FAU_NUM_PACKET_BUFFERS_TO_FREE, 0);
+ 
+-	if ((pow_send_group != -1)) {
+-		struct net_device *dev;
+-		pr_info("\tConfiguring device for POW only access\n");
+-		dev = alloc_etherdev(sizeof(struct octeon_ethernet));
+-		if (dev) {
+-			/* Initialize the device private structure. */
+-			struct octeon_ethernet *priv = netdev_priv(dev);
+-
+-			priv->netdev = dev;
+-			priv->interface = -1;
+-			priv->interface_port = -1;
+-			dev->netdev_ops = &cvm_oct_pow_netdev_ops;
+-			priv->num_tx_queues = 0;
+-			priv->imode = CVMX_HELPER_INTERFACE_MODE_DISABLED;
+-			priv->ipd_port = CVMX_PIP_NUM_INPUT_PORTS;
+-			priv->pko_port = -1;
+-			priv->ipd_pkind = -1;
+-			strcpy(dev->name, "pow%d");
+-
+-			if (register_netdev(dev) < 0) {
+-				pr_err("Failed to register ethernet device for POW\n");
+-				kfree(dev);
+-			} else {
+-				list_add_tail(&priv->list, &cvm_oct_list);
+-				pr_info("%s: POW send group %d, receive group %d\n",
+-					dev->name, pow_send_group,
+-					pow_receive_group);
+-			}
+-		} else {
+-			pr_err("Failed to allocate ethernet device for POW\n");
+-		}
+-	}
+-
+ 	for (interface = 0; interface < num_interfaces; interface++) {
+ 		cvmx_helper_interface_mode_t imode = cvmx_helper_interface_get_mode(interface);
+ 		int num_ports = cvmx_helper_ports_on_interface(interface);
+diff --git a/drivers/net/octeon/octeon-pow-ethernet.c b/drivers/net/octeon/octeon-pow-ethernet.c
+index 97363ea..edf60bd 100644
+--- a/drivers/net/octeon/octeon-pow-ethernet.c
++++ b/drivers/net/octeon/octeon-pow-ethernet.c
+@@ -5,12 +5,13 @@
+  * License.  See the file "COPYING" in the main directory of this archive
+  * for more details.
+  *
+- * Copyright (C) 2005-2007 Cavium Networks
++ * Copyright (C) 2005-2011 Cavium Networks
+  */
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
++#include <linux/in.h>
+ #include <linux/ip.h>
+ #include <linux/string.h>
+ #include <linux/delay.h>
+@@ -20,55 +21,62 @@
+ #include <asm/octeon/cvmx-fpa.h>
+ #include <asm/octeon/cvmx-pow.h>
+ #include <asm/octeon/cvmx-wqe.h>
++#include <asm/octeon/cvmx-pow-defs.h>
++#include <asm/octeon/cvmx-sso-defs.h>
+ 
+-#define NUM_GROUPS      16	/* Total number of groups in Octeon */
+ #define VIRTUAL_PORT    63	/* Value to put in work->ipprt */
+-#define IP_PROTOCOL_TCP 6	/* IP header protocol for TCP */
+-#define IP_PROTOCOL_UDP 0x11	/* IP header protocol for UDP */
+ 
+ #define DEBUGPRINT(format, ...) do { if (printk_ratelimit())		\
+ 					printk(format, ##__VA_ARGS__);	\
+ 				} while (0)
+ 
+-/* These are the Octeon CSR IO addresses we are going to need */
+-#define OCTEON_POW_WQ_INT_THRX(offset)  (0x8001670000000080ull+((offset)*8))
+-#define OCTEON_POW_WQ_INT               (0x8001670000000200ull)
+-#define OCTEON_POW_PP_GRP_MSKX(offset)  (0x8001670000000000ull+((offset)*8))
+-#define OCTEON_POW_WORK_SUBMIT(wqe)     (0x8001610000000000ull | (wqe))
+-#define OCTEON_POW_WORK_REQUEST(wait)   (0x8001600000000000ull | (wait<<3))
+-#define OCTEON_FPA_ALLOC(pool)          (0x8001280000000000ull | ((uint64_t)pool<<40))
+-#define OCTEON_FPA_FREE(pool, address)  (0x8001280000000000ull | ((uint64_t)pool<<40) | (address))
+-#define OCTEON_IPD_PACKET_MBUFF_SIZE    (0x80014F0000000010ull)
+-#define OCTEON_IPD_WQE_FPA_QUEUE        (0x80014F0000000020ull)
+-#define OCTEON_IPD_CTL_STATUS           (0x80014F0000000018ull)
+-
+-int receive_group = -1;
++#define DEV_NAME "octeon-pow-ethernet"
++
++static int receive_group = -1;
+ module_param(receive_group, int, 0444);
+ MODULE_PARM_DESC(receive_group,
+ 		 " 0-16 POW group to receive packets from. This must be unique in\n"
+ 		 "\t\tthe system. If you don't specify a value, the core ID will\n"
+ 		 "\t\tbe used.");
+ 
+-int broadcast_groups;
++static int broadcast_groups;
+ module_param(broadcast_groups, int, 0644);
+ MODULE_PARM_DESC(broadcast_groups,
+ 		 " Bitmask of groups to send broadcasts to. This MUST be specified.\n"
+ 		 "\t\tWARNING: Be careful to not send broadcasts to groups that aren't\n"
+ 		 "\t\tread otherwise you may fill the POW and stop receiving packets.\n");
+ 
++
++
++static int ptp_rx_group = -1;
++module_param(ptp_rx_group, int, 0444);
++MODULE_PARM_DESC(ptp_rx_group,
++		 "For the PTP POW device, 0-64 POW group to receive packets from.\n"
++		 "\t\tIf you don't specify a value, the 'pow0' device will not be created\n.");
++
++static int ptp_tx_group = -1;
++module_param(ptp_tx_group, int, 0444);
++MODULE_PARM_DESC(ptp_tx_group,
++		 "For the PTP POW device, 0-64 POW group to transmit packets to.\n"
++		 "\t\tIf you don't specify a value, the 'pow0' device will not be created\n.");
++
++
+ /**
+  * This is the definition of the Ethernet driver's private
+  * driver state.
+  */
+-typedef struct {
+-	struct net_device_stats stats;	/* Device statistics */
+-} device_private_t;
++struct octeon_pow {
++	u64 tx_mask;
++	int rx_group;
++	bool is_ptp;
++};
+ 
+ static int fpa_wqe_pool = 1;	/* HW FPA pool to use for work queue entries */
+ static int fpa_packet_pool;	/* HW FPA pool to use for packet buffers */
+ static int fpa_packet_pool_size = 2048;	/* Size of the packet buffers */
+-static struct net_device *global_device;
+-
++static struct net_device *octeon_pow_oct_dev;
++static struct net_device *octeon_pow_ptp_dev;
++static int octeon_pow_num_groups;
+ 
+ /**
+  * Given a packet data address, return a pointer to the
+@@ -77,90 +85,12 @@ static struct net_device *global_device;
+  * @param packet_ptr Packet data hardware address
+  * @return Packet buffer pointer
+  */
+-static inline void *get_buffer_ptr(cvmx_buf_ptr_t packet_ptr)
++static void *get_buffer_ptr(cvmx_buf_ptr_t packet_ptr)
+ {
+ 	return phys_to_virt(((packet_ptr.s.addr >> 7) -
+ 			     packet_ptr.s.back) << 7);
+ }
+ 
+-
+-/**
+- * Get a new block from the FPA
+- *
+- * @param pool   Pool to get the block from
+- * @return Pointer to the block or NULL on failure
+- */
+-static inline void *fpa_alloc(uint64_t pool)
+-{
+-	uint64_t address = cvmx_read_csr(OCTEON_FPA_ALLOC(pool));
+-	if (address)
+-		return phys_to_virt(address);
+-	else
+-		return NULL;
+-}
+-
+-
+-/**
+- * Free a block allocated with a FPA pool.  Provides required memory
+- * ordering in cases where memory block was modified by core.
+- *
+- * @param ptr    Block to free
+- * @param pool   Pool to put it in
+- * @param num_cache_lines
+- *               Cache lines to invalidate
+- */
+-static inline void fpa_free(void *ptr, int pool, int num_cache_lines)
+-{
+-	wmb();
+-	cvmx_write_csr(OCTEON_FPA_FREE(pool, virt_to_phys(ptr)),
+-		       num_cache_lines);
+-}
+-
+-
+-/**
+- * Submits work to an input queue.  This function updates the work queue entry in DRAM to match
+- * the arguments given.
+- * Note that the tag provided is for the work queue entry submitted, and is unrelated to the tag that
+- * the core currently holds.
+- *
+- * @param wqp      pointer to work queue entry to submit.  This entry is updated to match the other parameters
+- * @param tag      tag value to be assigned to work queue entry
+- * @param tag_type type of tag
+- * @param qos      Input queue to add to.
+- * @param grp      group value for the work queue entry.
+- */
+-static inline void pow_work_submit(cvmx_wqe_t *wqp, uint32_t tag,
+-				   uint64_t tag_type, uint64_t qos,
+-				   uint64_t grp)
+-{
+-	uint64_t tag_req =
+-		(4ull << 44) | (qos << 39) | (grp << 35) | (tag_type << 32) |
+-		tag;
+-	wmb();
+-	cvmx_write_csr(OCTEON_POW_WORK_SUBMIT(virt_to_phys(wqp)), tag_req);
+-}
+-
+-
+-/**
+- * Synchronous work request.  Requests work from the POW.
+- * This function does NOT wait for previous tag switches to complete,
+- * so the caller must ensure that there is not a pending tag switch.
+- *
+- * @param wait   When set, call stalls until work becomes avaiable, or times out.
+- *               If not set, returns immediately.
+- *
+- * @return Returns the WQE pointer from POW. Returns NULL if no work was available.
+- */
+-static inline cvmx_wqe_t *pow_work_request_sync(int wait)
+-{
+-	int64_t result = cvmx_read_csr(OCTEON_POW_WORK_REQUEST(wait));
+-	if (result < 0)
+-		return NULL;
+-	else
+-		return (cvmx_wqe_t *) phys_to_virt(result);
+-}
+-
+-
+ /**
+  * Free a work queue entry received in a intercept callback.
+  *
+@@ -168,7 +98,7 @@ static inline cvmx_wqe_t *pow_work_request_sync(int wait)
+  *               Work queue entry to free
+  * @return Zero on success, Negative on failure.
+  */
+-static int free_work(cvmx_wqe_t *work)
++static int octeon_pow_free_work(cvmx_wqe_t *work)
+ {
+ 	int segments = work->word2.s.bufs;
+ 	cvmx_buf_ptr_t segment_ptr = work->packet_ptr;
+@@ -178,11 +108,11 @@ static int free_work(cvmx_wqe_t *work)
+ 			*(cvmx_buf_ptr_t *) phys_to_virt(segment_ptr.s.addr -
+ 							   8);
+ 		if (unlikely(!segment_ptr.s.i))
+-			fpa_free(get_buffer_ptr(segment_ptr),
++			cvmx_fpa_free(get_buffer_ptr(segment_ptr),
+ 				 segment_ptr.s.pool, 0);
+ 		segment_ptr = next_ptr;
+ 	}
+-	fpa_free(work, fpa_wqe_pool, 0);
++	cvmx_fpa_free(work, fpa_wqe_pool, 0);
+ 
+ 	return 0;
+ }
+@@ -195,36 +125,37 @@ static int free_work(cvmx_wqe_t *work)
+  * @param dev    Device info structure
+  * @return Always returns zero
+  */
+-static int packet_transmit(struct sk_buff *skb, struct net_device *dev)
++static int octeon_pow_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+-	device_private_t *priv;
++	struct octeon_pow *priv;
+ 	cvmx_wqe_t *work = NULL;
+ 	void *packet_buffer = NULL;
+ 	void *copy_location;
+-	int send_group_mask;
++	u64 send_group_mask;
+ 	int send_group;
+ 
+-	priv = (device_private_t *) netdev_priv(dev);
++	priv = netdev_priv(dev);
+ 
+ 	/* Any unknown MAC address goes to all groups in the module param
+ 	   broadcast_groups. Known MAC addresses use the low order dest mac
+ 	   byte as the group number */
+-	if ((*(uint64_t *) (skb->data) >> 16) < 0x01ff)
+-		send_group_mask = 1 << (skb->data[5] & (NUM_GROUPS - 1));
++	if (!priv->is_ptp && ((*(uint64_t *) (skb->data) >> 16) < 0x01ff))
++		send_group_mask = 1ull << (skb->data[5] & (octeon_pow_num_groups - 1));
+ 	else
+-		send_group_mask = broadcast_groups;
+-	send_group_mask &= ~(1 << receive_group);
++		send_group_mask = priv->tx_mask;
++
++	send_group_mask &= ~(1 << priv->rx_group);
+ 
+ 	/* It is ugly, but we need to send multiple times for broadcast
+ 	   packets. The hardware doesn't support submitting work to multiple
+ 	   groups */
+-	for (send_group = 0; send_group < NUM_GROUPS; send_group++) {
++	for (send_group = 0; send_group < octeon_pow_num_groups; send_group++) {
+ 		/* Don't transmit to groups not in our send_group_mask */
+ 		if (likely((send_group_mask & (1 << send_group)) == 0))
+ 			continue;
+ 
+ 		/* Get a work queue entry */
+-		work = fpa_alloc(fpa_wqe_pool);
++		work = cvmx_fpa_alloc(fpa_wqe_pool);
+ 		if (unlikely(work == NULL)) {
+ 			DEBUGPRINT
+ 				("%s: Failed to allocate a work queue entry\n",
+@@ -233,7 +164,7 @@ static int packet_transmit(struct sk_buff *skb, struct net_device *dev)
+ 		}
+ 
+ 		/* Get a packet buffer */
+-		packet_buffer = fpa_alloc(fpa_packet_pool);
++		packet_buffer = cvmx_fpa_alloc(fpa_packet_pool);
+ 		if (unlikely(packet_buffer == NULL)) {
+ 			DEBUGPRINT("%s: Failed to allocate a packet buffer\n",
+ 				   dev->name);
+@@ -270,7 +201,7 @@ static int packet_transmit(struct sk_buff *skb, struct net_device *dev)
+ 		cvmx_wqe_set_grp(work, send_group);
+ 		work->word1.tag_type = 2;
+ 		work->word1.tag = 0;
+-		
++
+ 		work->word2.s.bufs = 1;
+ 		work->packet_ptr.u64 = 0;
+ 		work->packet_ptr.s.addr = virt_to_phys(copy_location);
+@@ -287,8 +218,8 @@ static int packet_transmit(struct sk_buff *skb, struct net_device *dev)
+ 			work->word2.s.dec_ipcomp = 0;	/* FIXME */
+ 			#endif
+ 			work->word2.s.tcp_or_udp =
+-				(ip_hdr(skb)->protocol == IP_PROTOCOL_TCP) ||
+-				(ip_hdr(skb)->protocol == IP_PROTOCOL_UDP);
++				(ip_hdr(skb)->protocol == IPPROTO_TCP) ||
++				(ip_hdr(skb)->protocol == IPPROTO_UDP);
+ 			#if 0
+ 			work->word2.s.dec_ipsec = 0; /* FIXME */
+ 			work->word2.s.is_v6 = 0; /* We only support IPv4
+@@ -355,22 +286,22 @@ static int packet_transmit(struct sk_buff *skb, struct net_device *dev)
+ 		 * qos: 0
+ 		 * grp: send_group
+ 		 */
+-		pow_work_submit(work, 0, 2, 0, send_group);
++		cvmx_pow_work_submit(work, 0, 2, 0, send_group);
+ 		work = NULL;
+ 		packet_buffer = NULL;
+ 	}
+ 
+-	priv->stats.tx_packets++;
+-	priv->stats.tx_bytes += skb->len;
++	dev->stats.tx_packets++;
++	dev->stats.tx_bytes += skb->len;
+ 	dev_kfree_skb(skb);
+ 	return NETDEV_TX_OK;
+ 
+ fail:
+ 	if (work)
+-		fpa_free(work, fpa_wqe_pool, 0);
++		cvmx_fpa_free(work, fpa_wqe_pool, 0);
+ 	if (packet_buffer)
+-		fpa_free(packet_buffer, fpa_packet_pool, 0);
+-	priv->stats.tx_dropped++;
++		cvmx_fpa_free(packet_buffer, fpa_packet_pool, 0);
++	dev->stats.tx_dropped++;
+ 	dev_kfree_skb(skb);
+ 	return NETDEV_TX_OK;
+ }
+@@ -385,41 +316,45 @@ fail:
+  * @param regs
+  * @return
+  */
+-static irqreturn_t do_interrupt(int cpl, void *dev_id)
++static irqreturn_t octeon_pow_interrupt(int cpl, void *dev_id)
+ {
+ 	const uint64_t coreid = cvmx_get_core_num();
+ 	struct net_device *dev = (struct net_device *) dev_id;
+-	device_private_t *priv;
++	struct octeon_pow *priv;
+ 	uint64_t old_group_mask;
+ 	cvmx_wqe_t *work;
+ 	struct sk_buff *skb;
+ 
+-	priv = (device_private_t *) netdev_priv(dev);
++	priv = netdev_priv(dev);
+ 
+ 	/* Make sure any userspace operations are complete */
+ 	asm volatile ("synciobdma" : : : "memory");
+ 
+-	/* Acknowledge the interrupt */
+-	cvmx_write_csr(OCTEON_POW_WQ_INT, 0x10001 << receive_group);
+-
+-	/* Only allow work for our group */
+-	old_group_mask = cvmx_read_csr(OCTEON_POW_PP_GRP_MSKX(coreid));
+-	cvmx_write_csr(OCTEON_POW_PP_GRP_MSKX(coreid), 1 << receive_group);
+-
++	if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
++		cvmx_write_csr(CVMX_SSO_WQ_INT, 1ull << priv->rx_group);
++		cvmx_write_csr(CVMX_SSO_WQ_IQ_DIS, 1ull << priv->rx_group);
++
++		old_group_mask = cvmx_read_csr(CVMX_SSO_PPX_GRP_MSK(coreid));
++		cvmx_write_csr(CVMX_SSO_PPX_GRP_MSK(coreid),
++			       1ull << priv->rx_group);
++		/* Read it back so it takes effect before we request work */
++		cvmx_read_csr(CVMX_SSO_PPX_GRP_MSK(coreid));
++	} else {
++		/* Acknowledge the interrupt */
++		cvmx_write_csr(CVMX_POW_WQ_INT, 0x10001 << priv->rx_group);
++
++		/* Only allow work for our group */
++		old_group_mask = cvmx_read_csr(CVMX_POW_PP_GRP_MSKX(coreid));
++		cvmx_write_csr(CVMX_POW_PP_GRP_MSKX(coreid), 1 << priv->rx_group);
++	}
+ 	while (1) {
+-		work = pow_work_request_sync(0);
++		work = cvmx_pow_work_request_sync(0);
+ 		if (work == NULL)
+ 			break;
+ 
+-		/* Silently drop packets that have the wrong input port */
+-		if (cvmx_wqe_get_port(work) != VIRTUAL_PORT) {
+-			free_work(work);
+-			continue;
+-		}
+-
+ 		/* Silently drop packets if we aren't up */
+ 		if ((dev->flags & IFF_UP) == 0) {
+-			free_work(work);
++			octeon_pow_free_work(work);
+ 			continue;
+ 		}
+ 
+@@ -428,8 +363,8 @@ static irqreturn_t do_interrupt(int cpl, void *dev_id)
+ 			DEBUGPRINT
+ 				("%s: Receive error code %d, packet dropped\n",
+ 				 dev->name, work->word2.snoip.err_code);
+-			free_work(work);
+-			priv->stats.rx_errors++;
++			octeon_pow_free_work(work);
++			dev->stats.rx_errors++;
+ 			continue;
+ 		}
+ 
+@@ -439,8 +374,8 @@ static irqreturn_t do_interrupt(int cpl, void *dev_id)
+ 			DEBUGPRINT
+ 				("%s: Failed to allocate skbuff, packet dropped\n",
+ 				 dev->name);
+-			free_work(work);
+-			priv->stats.rx_dropped++;
++			octeon_pow_free_work(work);
++			dev->stats.rx_dropped++;
+ 			continue;
+ 		}
+ 
+@@ -484,17 +419,23 @@ static irqreturn_t do_interrupt(int cpl, void *dev_id)
+ 				segment_ptr = next_ptr;
+ 			}
+ 		}
+-		free_work(work);
++		octeon_pow_free_work(work);
+ 		skb->protocol = eth_type_trans(skb, dev);
+ 		skb->dev = dev;
+ 		skb->ip_summed = CHECKSUM_NONE;
+-		priv->stats.rx_bytes += skb->len;
+-		priv->stats.rx_packets++;
++		dev->stats.rx_bytes += skb->len;
++		dev->stats.rx_packets++;
+ 		netif_rx(skb);
+ 	}
+ 
+ 	/* Restore the original POW group mask */
+-	cvmx_write_csr(OCTEON_POW_PP_GRP_MSKX(coreid), old_group_mask);
++	if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
++		cvmx_write_csr(CVMX_SSO_PPX_GRP_MSK(coreid), old_group_mask);
++		/* Read it back so it takes effect before ?? */
++		cvmx_read_csr(CVMX_SSO_PPX_GRP_MSK(coreid));
++	} else {
++		cvmx_write_csr(CVMX_POW_PP_GRP_MSKX(coreid), old_group_mask);
++	}
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -508,9 +449,9 @@ static irqreturn_t do_interrupt(int cpl, void *dev_id)
+  *
+  * @param dev    Device to poll. Unused
+  */
+-static void device_poll_controller(struct net_device *dev)
++static void octeon_pow_poll(struct net_device *dev)
+ {
+-	do_interrupt(0, dev);
++	octeon_pow_interrupt(0, dev);
+ }
+ #endif
+ 
+@@ -522,41 +463,50 @@ static void device_poll_controller(struct net_device *dev)
+  * @param dev    Device to bring up
+  * @return Zero on success
+  */
+-static int device_open(struct net_device *dev)
++static int octeon_pow_open(struct net_device *dev)
+ {
++	int r;
++	struct octeon_pow *priv = netdev_priv(dev);
+ 	/* Clear the statistics whenever the interface is brought up */
+-	device_private_t *priv = (device_private_t *) netdev_priv(dev);
+-	memset(&priv->stats, 0, sizeof(priv->stats));
+-	return 0;
+-}
++	memset(&dev->stats, 0, sizeof(dev->stats));
+ 
++	/* Register an IRQ hander for to receive POW interrupts */
++	r = request_irq(OCTEON_IRQ_WORKQ0 + priv->rx_group, octeon_pow_interrupt, 0, dev->name, dev);
++	if (r)
++		return r;
++
++	/* Enable POW interrupt when our port has at least one packet */
++	if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
++		union cvmx_sso_wq_int_thrx thr;
++		thr.u64 = 0;
++		thr.s.iq_thr = 1;
++		thr.s.ds_thr = 1;
++		cvmx_write_csr(CVMX_SSO_WQ_INT_THRX(priv->rx_group), thr.u64);
++	} else {
++		union cvmx_pow_wq_int_thrx thr;
++		thr.u64 = 0;
++		thr.s.iq_thr = 1;
++		thr.s.ds_thr = 1;
++		cvmx_write_csr(CVMX_POW_WQ_INT_THRX(priv->rx_group), thr.u64);
++	}
+ 
+-/**
+- * Stop an ethernet device. No more packets should be
+- * received from this device.
+- *
+- * @param dev    Device to bring down
+- * @return Zero on success
+- */
+-static int device_close(struct net_device *dev)
+-{
+-	/* Nothing to do */
+ 	return 0;
+ }
+ 
+-
+-/**
+- * Get the low level ethernet statistics
+- *
+- * @param dev    Device to get the statistics from
+- * @return Pointer to the statistics
+- */
+-static struct net_device_stats *device_get_stats(struct net_device *dev)
++static int octeon_pow_stop(struct net_device *dev)
+ {
+-	device_private_t *priv = (device_private_t *) netdev_priv(dev);
+-	return &priv->stats;
+-}
++	struct octeon_pow *priv = netdev_priv(dev);
+ 
++	/* Disable POW interrupt */
++	if (OCTEON_IS_MODEL(OCTEON_CN68XX))
++		cvmx_write_csr(CVMX_SSO_WQ_INT_THRX(priv->rx_group), 0);
++	else
++		cvmx_write_csr(CVMX_POW_WQ_INT_THRX(priv->rx_group), 0);
++
++	/* Free the interrupt handler */
++	free_irq(OCTEON_IRQ_WORKQ0 + priv->rx_group, dev);
++	return 0;
++}
+ 
+ /**
+  * Per network device initialization
+@@ -564,27 +514,28 @@ static struct net_device_stats *device_get_stats(struct net_device *dev)
+  * @param dev    Device to initialize
+  * @return Zero on success
+  */
+-static int device_init(struct net_device *dev)
++static int octeon_pow_init(struct net_device *dev)
+ {
++	struct octeon_pow *priv = netdev_priv(dev);
++
+ 	dev->features |= NETIF_F_LLTX;	/* We do our own locking, Linux doesn't
+ 					   need to */
+ 	dev->dev_addr[0] = 0;
+ 	dev->dev_addr[1] = 0;
+ 	dev->dev_addr[2] = 0;
+ 	dev->dev_addr[3] = 0;
+-	dev->dev_addr[4] = 1;
+-	dev->dev_addr[5] = cvmx_get_core_num();
++	dev->dev_addr[4] = priv->is_ptp ? 3 : 1;
++	dev->dev_addr[5] = priv->rx_group;
+ 	return 0;
+ }
+ 
+ static const struct net_device_ops octeon_pow_netdev_ops = {
+-	.ndo_init = device_init,
+-	.ndo_open = device_open,
+-	.ndo_stop = device_close,
+-	.ndo_start_xmit = packet_transmit,
+-	.ndo_get_stats = device_get_stats,
++	.ndo_init = octeon_pow_init,
++	.ndo_open = octeon_pow_open,
++	.ndo_stop = octeon_pow_stop,
++	.ndo_start_xmit = octeon_pow_xmit,
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+-	.ndo_poll_controller =  device_poll_controller,
++	.ndo_poll_controller =  octeon_pow_poll,
+ #endif
+ };
+ 
+@@ -595,74 +546,123 @@ static const struct net_device_ops octeon_pow_netdev_ops = {
+  *
+  * @return Zero on success
+  */
+-static int __init ethernet_pow_init(void)
++static int __init octeon_pow_mod_init(void)
+ {
+-	device_private_t *priv;
++	struct octeon_pow *priv;
++	u64 allowed_group_mask;
++	if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
++		octeon_pow_num_groups = 64;
++		allowed_group_mask = 0xffffffffffffffffull;
++	} else {
++		octeon_pow_num_groups = 16;
++		allowed_group_mask = 0xffffull;
++	}
+ 
+-	if ((receive_group >= NUM_GROUPS)) {
+-		printk(KERN_WARNING "\n\nERROR: Invalid receive group. Must be 0-%d\n",
+-		       NUM_GROUPS - 1);
++	/* If a receive group isn't specified, default to the core id */
++	if (receive_group < 0)
++		receive_group = cvmx_get_core_num();
++
++
++	if ((receive_group > octeon_pow_num_groups)) {
++		pr_err(DEV_NAME " ERROR: Invalid receive group. Must be 0-%d\n",
++		       octeon_pow_num_groups - 1);
+ 		return -1;
+ 	}
+ 
+ 	if (!broadcast_groups) {
+-		printk(KERN_WARNING "\n\nERROR: You must specify a broadcast group mask.\n");
++		pr_err(DEV_NAME " ERROR: You must specify a broadcast group mask.\n");
+ 		return -1;
+ 	}
+ 
+-	if ((broadcast_groups & ((1 << NUM_GROUPS) - 1)) != broadcast_groups) {
+-		printk(KERN_WARNING "\n\nERROR: Invalid broadcast group mask.\n");
++	if ((broadcast_groups & allowed_group_mask) != broadcast_groups) {
++		pr_err(DEV_NAME " ERROR: Invalid broadcast group mask.\n");
+ 		return -1;
+ 	}
+ 
+-	printk(KERN_INFO "Octeon POW only ethernet driver\n");
++	if ((ptp_rx_group >= 0 && ptp_tx_group < 0) || (ptp_rx_group < 0 && ptp_tx_group >= 0)) {
++		pr_err(DEV_NAME " ERROR: Both ptp_rx_group AND ptp_tx_group must be set.\n");
++		return -1;
++	}
+ 
+-	/* If a receive group isn't specified, default to the core id */
+-	if (receive_group < 0)
+-		receive_group = cvmx_get_core_num();
++	if (ptp_rx_group >= 0 && ptp_tx_group == ptp_rx_group) {
++		pr_err(DEV_NAME " ERROR: ptp_rx_group and ptp_tx_group must differ.\n");
++		return -1;
++	}
++
++	if (ptp_rx_group >= octeon_pow_num_groups || ptp_tx_group >= octeon_pow_num_groups) {
++		pr_err(DEV_NAME " ERROR: ptp_rx_group and ptp_tx_group. Must be 0-%d\n",
++		       octeon_pow_num_groups - 1);
++		return -1;
++	}
++
++	if (receive_group == ptp_rx_group) {
++		pr_err(DEV_NAME " ERROR: ptp_rx_group(%d) and  receive_group(%d) must differ.\n",
++			ptp_rx_group, receive_group);
++		return -1;
++	}
++
++	pr_info("Octeon POW only ethernet driver\n");
+ 
+ 	/* Setup is complete, create the virtual ethernet devices */
+-	global_device = alloc_etherdev(sizeof(device_private_t));
+-	if (global_device == NULL) {
+-		printk(KERN_WARNING "\n\nERROR: Failed to allocate ethernet device\n");
++	octeon_pow_oct_dev = alloc_etherdev(sizeof(struct octeon_pow));
++	if (octeon_pow_oct_dev == NULL) {
++		pr_err(DEV_NAME "ERROR: Failed to allocate ethernet device\n");
+ 		return -1;
+ 	}
+ 
+-	global_device->netdev_ops = &octeon_pow_netdev_ops;
+-	strcpy(global_device->name, "oct%d");
++	octeon_pow_oct_dev->netdev_ops = &octeon_pow_netdev_ops;
++	strcpy(octeon_pow_oct_dev->name, "oct%d");
+ 
+ 	/* Initialize the device private structure. */
+-	priv = (device_private_t *) netdev_priv(global_device);
+-	memset(priv, 0, sizeof(device_private_t));
++	priv = netdev_priv(octeon_pow_oct_dev);
++	priv->rx_group = receive_group;
++	priv->tx_mask = broadcast_groups;
+ 
+ 	/* Spin waiting for another core to setup all the hardware */
+ 	printk(KERN_DEBUG "Waiting for another core to setup the IPD hardware...");
+-	while ((cvmx_read_csr(OCTEON_IPD_CTL_STATUS) & 1) == 0)
++	while ((cvmx_read_csr(CVMX_IPD_CTL_STATUS) & 1) == 0)
+ 		mdelay(100);
+ 
+ 	printk(KERN_INFO "Done\n");
+ 
+ 	/* Read the configured size of the FPA packet buffers. This way we
+ 	   don't need changes if someone chooses to use a different buffer size */
+-	fpa_packet_pool_size =
+-		(cvmx_read_csr(OCTEON_IPD_PACKET_MBUFF_SIZE) & 0xfff) * 8;
++	fpa_packet_pool_size = (cvmx_read_csr(CVMX_IPD_PACKET_MBUFF_SIZE) & 0xfff) * 8;
+ 
+ 	/* Read the work queue pool */
+-	fpa_wqe_pool = cvmx_read_csr(OCTEON_IPD_WQE_FPA_QUEUE) & 7;
++	fpa_wqe_pool = cvmx_read_csr(CVMX_IPD_WQE_FPA_QUEUE) & 7;
+ 
+-	if (register_netdev(global_device) < 0) {
+-		printk(KERN_WARNING "\n\nERROR: Failed to register ethernet device\n");
+-		kfree(global_device);
++	if (register_netdev(octeon_pow_oct_dev) < 0) {
++		pr_err(DEV_NAME " ERROR: Failed to register ethernet device\n");
++		free_netdev(octeon_pow_oct_dev);
+ 		return -1;
+ 	}
+ 
+-	/* Register an IRQ hander for to receive POW interrupts */
+-	if (request_irq(OCTEON_IRQ_WORKQ0 + receive_group, do_interrupt, IRQF_SHARED,
+-			"POW Ethernet", global_device)) {
++	if (ptp_rx_group < 0)
++		return 0;
++
++	/* Else create a ptp device. */
++	octeon_pow_ptp_dev = alloc_etherdev(sizeof(struct octeon_pow));
++	if (octeon_pow_ptp_dev == NULL) {
++		pr_err(DEV_NAME " ERROR: Failed to allocate ethernet device\n");
++		return -1;
++	}
++
++	octeon_pow_ptp_dev->netdev_ops = &octeon_pow_netdev_ops;
++	strcpy(octeon_pow_ptp_dev->name, "pow%d");
++
++	/* Initialize the device private structure. */
++	priv = netdev_priv(octeon_pow_ptp_dev);
++	priv->rx_group = ptp_rx_group;
++	priv->tx_mask = 1ull << ptp_tx_group;
++	priv->is_ptp = true;
++
++	if (register_netdev(octeon_pow_ptp_dev) < 0) {
++		pr_err(DEV_NAME " ERROR: Failed to register ethernet device\n");
++		free_netdev(octeon_pow_ptp_dev);
++		return -1;
+ 	}
+ 
+-	/* Enable POW interrupt when our port has at least one packet */
+-	cvmx_write_csr(OCTEON_POW_WQ_INT_THRX(receive_group), 0x1001);
+ 	return 0;
+ }
+ 
+@@ -672,21 +672,19 @@ static int __init ethernet_pow_init(void)
+  *
+  * @return Zero on success
+  */
+-static void __exit ethernet_pow_cleanup(void)
++static void __exit octeon_pow_mod_exit(void)
+ {
+-	/* Disable POW interrupt */
+-	cvmx_write_csr(OCTEON_POW_WQ_INT_THRX(receive_group), 0);
+-
+-	/* Free the interrupt handler */
+-	free_irq(OCTEON_IRQ_WORKQ0 + receive_group, global_device);
+-
+ 	/* Free the ethernet devices */
+-	unregister_netdev(global_device);
+-	kfree(global_device);
++	unregister_netdev(octeon_pow_oct_dev);
++	free_netdev(octeon_pow_oct_dev);
++	if (octeon_pow_ptp_dev) {
++		unregister_netdev(octeon_pow_ptp_dev);
++		free_netdev(octeon_pow_ptp_dev);
++	}
+ }
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Cavium Networks <support@caviumnetworks.com>");
+ MODULE_DESCRIPTION("Cavium Networks Octeon internal only POW ethernet driver.");
+-module_init(ethernet_pow_init);
+-module_exit(ethernet_pow_cleanup);
++module_init(octeon_pow_mod_init);
++module_exit(octeon_pow_mod_exit);
+-- 
+1.7.0
+
