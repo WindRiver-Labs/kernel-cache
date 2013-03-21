@@ -1,0 +1,152 @@
+From 7612b8cda10adcfe8c862e725e6b4da0292cf405 Mon Sep 17 00:00:00 2001
+From: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Date: Sun, 7 Oct 2012 08:36:12 -0700
+Subject: [PATCH] rcu: Grace-period initialization excludes only RCU notifier
+
+commit a4fbe35a124526e6759be07bd9c7ea796ba1e00d upstream.
+
+Kirill noted the following deadlock cycle on shutdown involving padata:
+
+> With commit 755609a9087fa983f567dc5452b2fa7b089b591f I've got deadlock on
+> poweroff.
+>
+> It guess it happens because of race for cpu_hotplug.lock:
+>
+>       CPU A                                   CPU B
+> disable_nonboot_cpus()
+> _cpu_down()
+> cpu_hotplug_begin()
+>  mutex_lock(&cpu_hotplug.lock);
+> __cpu_notify()
+> padata_cpu_callback()
+> __padata_remove_cpu()
+> padata_replace()
+> synchronize_rcu()
+>                                       rcu_gp_kthread()
+>                                       get_online_cpus();
+>                                       mutex_lock(&cpu_hotplug.lock);
+
+It would of course be good to eliminate grace-period delays from
+CPU-hotplug notifiers, but that is a separate issue.  Deadlock is
+not an appropriate diagnostic for excessive CPU-hotplug latency.
+
+Fortunately, grace-period initialization does not actually need to
+exclude all of the CPU-hotplug operation, but rather only RCU's own
+CPU_UP_PREPARE and CPU_DEAD CPU-hotplug notifiers.  This commit therefore
+introduces a new per-rcu_state onoff_mutex that provides the required
+concurrency control in place of the get_online_cpus() that was previously
+in rcu_gp_init().
+
+Reported-by: "Kirill A. Shutemov" <kirill@shutemov.name>
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Tested-by: Kirill A. Shutemov <kirill@shutemov.name>
+Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+Signed-off-by: Yang Shi <yang.shi@windriver.com>
+
+diff --git a/kernel/rcutree.c b/kernel/rcutree.c
+index 66be2fb..2684df7 100644
+--- a/kernel/rcutree.c
++++ b/kernel/rcutree.c
+@@ -76,6 +76,7 @@ static struct lock_class_key rcu_fqs_class[RCU_NUM_LVLS];
+ 	.orphan_nxttail = &sname##_state.orphan_nxtlist, \
+ 	.orphan_donetail = &sname##_state.orphan_donelist, \
+ 	.barrier_mutex = __MUTEX_INITIALIZER(sname##_state.barrier_mutex), \
++	.onoff_mutex = __MUTEX_INITIALIZER(sname##_state.onoff_mutex), \
+ 	.name = #sname, \
+ }
+ 
+@@ -1214,7 +1215,7 @@ static int rcu_gp_init(struct rcu_state *rsp)
+ 	raw_spin_unlock_irq(&rnp->lock);
+ 
+ 	/* Exclude any concurrent CPU-hotplug operations. */
+-	get_online_cpus();
++	mutex_lock(&rsp->onoff_mutex);
+ 
+ 	/*
+ 	 * Set the quiescent-state-needed bits in all the rcu_node
+@@ -1251,7 +1252,7 @@ static int rcu_gp_init(struct rcu_state *rsp)
+ 		cond_resched();
+ 	}
+ 
+-	put_online_cpus();
++	mutex_unlock(&rsp->onoff_mutex);
+ 	return 1;
+ }
+ 
+@@ -1717,6 +1718,7 @@ static void rcu_cleanup_dead_cpu(int cpu, struct rcu_state *rsp)
+ 	/* Remove the dead CPU from the bitmasks in the rcu_node hierarchy. */
+ 
+ 	/* Exclude any attempts to start a new grace period. */
++	mutex_lock(&rsp->onoff_mutex);
+ 	raw_spin_lock_irqsave(&rsp->onofflock, flags);
+ 
+ 	/* Orphan the dead CPU's callbacks, and adopt them if appropriate. */
+@@ -1761,6 +1763,7 @@ static void rcu_cleanup_dead_cpu(int cpu, struct rcu_state *rsp)
+ 	init_callback_list(rdp);
+ 	/* Disallow further callbacks on this CPU. */
+ 	rdp->nxttail[RCU_NEXT_TAIL] = NULL;
++	mutex_unlock(&rsp->onoff_mutex);
+ }
+ 
+ #else /* #ifdef CONFIG_HOTPLUG_CPU */
+@@ -2673,6 +2676,9 @@ rcu_init_percpu_data(int cpu, struct rcu_state *rsp, int preemptible)
+ 	struct rcu_data *rdp = per_cpu_ptr(rsp->rda, cpu);
+ 	struct rcu_node *rnp = rcu_get_root(rsp);
+ 
++	/* Exclude new grace periods. */
++	mutex_lock(&rsp->onoff_mutex);
++
+ 	/* Set up local state, ensuring consistent view of global state. */
+ 	raw_spin_lock_irqsave(&rnp->lock, flags);
+ 	rdp->beenonline = 1;	 /* We have now been online. */
+@@ -2687,14 +2693,6 @@ rcu_init_percpu_data(int cpu, struct rcu_state *rsp, int preemptible)
+ 	rcu_prepare_for_idle_init(cpu);
+ 	raw_spin_unlock(&rnp->lock);		/* irqs remain disabled. */
+ 
+-	/*
+-	 * A new grace period might start here.  If so, we won't be part
+-	 * of it, but that is OK, as we are currently in a quiescent state.
+-	 */
+-
+-	/* Exclude any attempts to start a new GP on large systems. */
+-	raw_spin_lock(&rsp->onofflock);		/* irqs already disabled. */
+-
+ 	/* Add CPU to rcu_node bitmasks. */
+ 	rnp = rdp->mynode;
+ 	mask = rdp->grpmask;
+@@ -2718,8 +2716,9 @@ rcu_init_percpu_data(int cpu, struct rcu_state *rsp, int preemptible)
+ 		raw_spin_unlock(&rnp->lock); /* irqs already disabled. */
+ 		rnp = rnp->parent;
+ 	} while (rnp != NULL && !(rnp->qsmaskinit & mask));
++	local_irq_restore(flags);
+ 
+-	raw_spin_unlock_irqrestore(&rsp->onofflock, flags);
++	mutex_unlock(&rsp->onoff_mutex);
+ }
+ 
+ static void __cpuinit rcu_prepare_cpu(int cpu)
+diff --git a/kernel/rcutree.h b/kernel/rcutree.h
+index 5faf05d..a240f03 100644
+--- a/kernel/rcutree.h
++++ b/kernel/rcutree.h
+@@ -394,11 +394,17 @@ struct rcu_state {
+ 	struct rcu_head **orphan_donetail;	/* Tail of above. */
+ 	long qlen_lazy;				/* Number of lazy callbacks. */
+ 	long qlen;				/* Total number of callbacks. */
++	/* End of fields guarded by onofflock. */
++
++	struct mutex onoff_mutex;		/* Coordinate hotplug & GPs. */
++
+ 	struct mutex barrier_mutex;		/* Guards barrier fields. */
+ 	atomic_t barrier_cpu_count;		/* # CPUs waiting on. */
+ 	struct completion barrier_completion;	/* Wake at barrier end. */
+ 	unsigned long n_barrier_done;		/* ++ at start and end of */
+ 						/*  _rcu_barrier(). */
++	/* End of fields guarded by barrier_mutex. */
++
+ 	unsigned long jiffies_force_qs;		/* Time at which to invoke */
+ 						/*  force_quiescent_state(). */
+ 	unsigned long n_force_qs;		/* Number of calls to */
+-- 
+1.7.5.4
+

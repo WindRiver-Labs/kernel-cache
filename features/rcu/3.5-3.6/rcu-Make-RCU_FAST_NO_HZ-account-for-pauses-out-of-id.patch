@@ -1,0 +1,159 @@
+From 665adea7dab2de4396823d1778aba4217754961e Mon Sep 17 00:00:00 2001
+From: "Paul E. McKenney" <paul.mckenney@linaro.org>
+Date: Tue, 28 Feb 2012 11:02:21 -0800
+Subject: [PATCH] rcu: Make RCU_FAST_NO_HZ account for pauses out of idle
+
+commit c57afe80db4e169135eb675acc2d241e26cc064e upstream
+
+Both Steven Rostedt's new idle-capable trace macros and the RCU_NONIDLE()
+macro can cause RCU to momentarily pause out of idle without the rest
+of the system being involved.  This can cause rcu_prepare_for_idle()
+to run through its state machine too quickly, which can in turn result
+in needless scheduling-clock interrupts.
+
+This commit therefore adds code to enable rcu_prepare_for_idle() to
+distinguish between an initial entry to idle on the one hand (which needs
+to advance the rcu_prepare_for_idle() state machine) and an idle reentry
+due to idle-capable trace macros and RCU_NONIDLE() on the other hand
+(which should avoid advancing the rcu_prepare_for_idle() state machine).
+Additional state is maintained to allow the timer to be correctly reposted
+when returning after a momentary pause out of idle, and even more state
+is maintained to detect when new non-lazy callbacks have been enqueued
+(which may require re-evaluation of the approach to idleness).
+
+Signed-off-by: Paul E. McKenney <paul.mckenney@linaro.org>
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Signed-off-by: Yang Shi <yang.shi@windriver.com>
+
+diff --git a/kernel/rcutree.c b/kernel/rcutree.c
+index 658b6a4..51ced84 100644
+--- a/kernel/rcutree.c
++++ b/kernel/rcutree.c
+@@ -1848,6 +1848,8 @@ __call_rcu(struct rcu_head *head, void (*func)(struct rcu_head *rcu),
+ 	rdp->qlen++;
+ 	if (lazy)
+ 		rdp->qlen_lazy++;
++	else
++		rcu_idle_count_callbacks_posted();
+ 
+ 	if (__is_kfree_rcu_offset((unsigned long)func))
+ 		trace_rcu_kfree_callback(rsp->name, head, (unsigned long)func,
+diff --git a/kernel/rcutree.h b/kernel/rcutree.h
+index a905c20..ea62f5d 100644
+--- a/kernel/rcutree.h
++++ b/kernel/rcutree.h
+@@ -467,6 +467,7 @@ static void __cpuinit rcu_prepare_kthreads(int cpu);
+ static void rcu_prepare_for_idle_init(int cpu);
+ static void rcu_cleanup_after_idle(int cpu);
+ static void rcu_prepare_for_idle(int cpu);
++static void rcu_idle_count_callbacks_posted(void);
+ static void print_cpu_stall_info_begin(void);
+ static void print_cpu_stall_info(struct rcu_state *rsp, int cpu);
+ static void print_cpu_stall_info_end(void);
+diff --git a/kernel/rcutree_plugin.h b/kernel/rcutree_plugin.h
+index 196c243..234646d 100644
+--- a/kernel/rcutree_plugin.h
++++ b/kernel/rcutree_plugin.h
+@@ -1941,6 +1941,14 @@ static void rcu_prepare_for_idle(int cpu)
+ {
+ }
+ 
++/*
++ * Don't bother keeping a running count of the number of RCU callbacks
++ * posted because CONFIG_RCU_FAST_NO_HZ=n.
++ */
++static void rcu_idle_count_callbacks_posted(void)
++{
++}
++
+ #else /* #if !defined(CONFIG_RCU_FAST_NO_HZ) */
+ 
+ /*
+@@ -1984,6 +1992,10 @@ static void rcu_prepare_for_idle(int cpu)
+ static DEFINE_PER_CPU(int, rcu_dyntick_drain);
+ static DEFINE_PER_CPU(unsigned long, rcu_dyntick_holdoff);
+ static DEFINE_PER_CPU(struct timer_list, rcu_idle_gp_timer);
++static DEFINE_PER_CPU(unsigned long, rcu_idle_gp_timer_expires);
++static DEFINE_PER_CPU(bool, rcu_idle_first_pass);
++static DEFINE_PER_CPU(unsigned long, rcu_nonlazy_posted);
++static DEFINE_PER_CPU(unsigned long, rcu_nonlazy_posted_snap);
+ 
+ #ifndef CONFIG_PREEMPT_RT_FULL
+ /*
+@@ -1997,6 +2009,8 @@ static DEFINE_PER_CPU(struct timer_list, rcu_idle_gp_timer);
+  */
+ int rcu_needs_cpu(int cpu)
+ {
++	/* Flag a new idle sojourn to the idle-entry state machine. */
++	per_cpu(rcu_idle_first_pass, cpu) = 1;
+ 	/* If no callbacks, RCU doesn't need the CPU. */
+ 	if (!rcu_cpu_has_callbacks(cpu))
+ 		return 0;
+@@ -2101,6 +2115,26 @@ static void rcu_cleanup_after_idle(int cpu)
+ static void rcu_prepare_for_idle(int cpu)
+ {
+ 	/*
++	 * If this is an idle re-entry, for example, due to use of
++	 * RCU_NONIDLE() or the new idle-loop tracing API within the idle
++	 * loop, then don't take any state-machine actions, unless the
++	 * momentary exit from idle queued additional non-lazy callbacks.
++	 * Instead, repost the rcu_idle_gp_timer if this CPU has callbacks
++	 * pending.
++	 */
++	if (!per_cpu(rcu_idle_first_pass, cpu) &&
++	    (per_cpu(rcu_nonlazy_posted, cpu) ==
++	     per_cpu(rcu_nonlazy_posted_snap, cpu))) {
++		if (rcu_cpu_has_callbacks(cpu))
++			mod_timer(&per_cpu(rcu_idle_gp_timer, cpu),
++				  per_cpu(rcu_idle_gp_timer_expires, cpu));
++		return;
++	}
++	per_cpu(rcu_idle_first_pass, cpu) = 0;
++	per_cpu(rcu_nonlazy_posted_snap, cpu) =
++		per_cpu(rcu_nonlazy_posted, cpu) - 1;
++
++	/*
+ 	 * If there are no callbacks on this CPU, enter dyntick-idle mode.
+ 	 * Also reset state to avoid prejudicing later attempts.
+ 	 */
+@@ -2132,11 +2166,15 @@ static void rcu_prepare_for_idle(int cpu)
+ 		per_cpu(rcu_dyntick_drain, cpu) = 0;
+ 		per_cpu(rcu_dyntick_holdoff, cpu) = jiffies;
+ 		if (rcu_cpu_has_nonlazy_callbacks(cpu))
+-			mod_timer(&per_cpu(rcu_idle_gp_timer, cpu),
+-					   jiffies + RCU_IDLE_GP_DELAY);
++			per_cpu(rcu_idle_gp_timer_expires, cpu) =
++					   jiffies + RCU_IDLE_GP_DELAY;
+ 		else
+-			mod_timer(&per_cpu(rcu_idle_gp_timer, cpu),
+-					   jiffies + RCU_IDLE_LAZY_GP_DELAY);
++			per_cpu(rcu_idle_gp_timer_expires, cpu) =
++					   jiffies + RCU_IDLE_LAZY_GP_DELAY;
++		mod_timer(&per_cpu(rcu_idle_gp_timer, cpu),
++			  per_cpu(rcu_idle_gp_timer_expires, cpu));
++		per_cpu(rcu_nonlazy_posted_snap, cpu) =
++			per_cpu(rcu_nonlazy_posted, cpu);
+ 		return; /* Nothing more to do immediately. */
+ 	} else if (--per_cpu(rcu_dyntick_drain, cpu) <= 0) {
+ 		/* We have hit the limit, so time to give up. */
+@@ -2176,6 +2214,17 @@ static void rcu_prepare_for_idle(int cpu)
+ 		trace_rcu_prep_idle("Callbacks drained");
+ }
+ 
++/*
++ * Keep a running count of callbacks posted so that rcu_prepare_for_idle()
++ * can detect when something out of the idle loop posts a callback.
++ * Of course, it had better do so either from a trace event designed to
++ * be called from idle or from within RCU_NONIDLE().
++ */
++static void rcu_idle_count_callbacks_posted(void)
++{
++	__this_cpu_add(rcu_nonlazy_posted, 1);
++}
++
+ #endif /* #else #if !defined(CONFIG_RCU_FAST_NO_HZ) */
+ 
+ #ifdef CONFIG_RCU_CPU_STALL_INFO
+-- 
+1.7.5.4
+
