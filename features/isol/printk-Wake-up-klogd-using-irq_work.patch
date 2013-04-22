@@ -1,0 +1,153 @@
+From 9b5d86140d4dbc775b8a24308a2ae85bf41a32fd Mon Sep 17 00:00:00 2001
+From: Frederic Weisbecker <fweisbec@gmail.com>
+Date: Fri, 12 Oct 2012 18:00:23 +0200
+Subject: [PATCH] printk: Wake up klogd using irq_work
+
+commit 74876a98a87a115254b3a66a14b27320b7f0acaa upstream.
+
+klogd is woken up asynchronously from the tick in order
+to do it safely.
+
+However if printk is called when the tick is stopped, the reader
+won't be woken up until the next interrupt, which might not fire
+for a while. As a result, the user may miss some message.
+
+To fix this, lets implement the printk tick using a lazy irq work.
+This subsystem takes care of the timer tick state and can
+fix up accordingly.
+
+Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+Acked-by: Steven Rostedt <rostedt@goodmis.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Paul Gortmaker <paul.gortmaker@windriver.com>
+[PG: fixup conflict with rt's timers-mov-printk_tick-to-soft-interrupt.patch
+ since it relocated the printk_tick call into run_timer_softirq().]
+Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+
+diff --git a/include/linux/printk.h b/include/linux/printk.h
+index d5e6eed..e6320b9 100644
+--- a/include/linux/printk.h
++++ b/include/linux/printk.h
+@@ -98,9 +98,6 @@ void early_printk(const char *s, ...) { }
+ static inline void printk_kill(void) { }
+ #endif
+ 
+-extern int printk_needs_cpu(int cpu);
+-extern void printk_tick(void);
+-
+ #ifdef CONFIG_PRINTK
+ asmlinkage __printf(1, 0)
+ int vprintk(const char *fmt, va_list args);
+diff --git a/init/Kconfig b/init/Kconfig
+index 999b6e7..36227a7 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1233,6 +1233,7 @@ config HOTPLUG
+ config PRINTK
+ 	default y
+ 	bool "Enable support for printk" if EXPERT
++	select IRQ_WORK
+ 	help
+ 	  This option enables normal printk support. Removing it
+ 	  eliminates most of the message strings from the kernel image
+diff --git a/kernel/printk.c b/kernel/printk.c
+index 1a441cc..c7b8e59 100644
+--- a/kernel/printk.c
++++ b/kernel/printk.c
+@@ -42,6 +42,7 @@
+ #include <linux/notifier.h>
+ #include <linux/rculist.h>
+ #include <trace/kernel.h>
++#include <linux/irq_work.h>
+ 
+ #include <asm/uaccess.h>
+ 
+@@ -1317,30 +1318,32 @@ int is_console_locked(void)
+ static DEFINE_PER_CPU(int, printk_pending);
+ static DEFINE_PER_CPU(char [PRINTK_BUF_SIZE], printk_sched_buf);
+ 
+-void printk_tick(void)
++static void wake_up_klogd_work_func(struct irq_work *irq_work)
+ {
+-	if (__this_cpu_read(printk_pending)) {
+-		int pending = __this_cpu_xchg(printk_pending, 0);
+-		if (pending & PRINTK_PENDING_SCHED) {
+-			char *buf = __get_cpu_var(printk_sched_buf);
+-			printk(KERN_WARNING "[sched_delayed] %s", buf);
+-		}
+-		if (pending & PRINTK_PENDING_WAKEUP)
+-			wake_up_interruptible(&log_wait);
++	int pending = __this_cpu_xchg(printk_pending, 0);
++
++	if (pending & PRINTK_PENDING_SCHED) {
++		char *buf = __get_cpu_var(printk_sched_buf);
++		printk(KERN_WARNING "[sched_delayed] %s", buf);
+ 	}
+-}
+ 
+-int printk_needs_cpu(int cpu)
+-{
+-	if (unlikely(cpu_is_offline(cpu)))
+-		__this_cpu_write(printk_pending, 0);
+-	return __this_cpu_read(printk_pending);
++	if (pending & PRINTK_PENDING_WAKEUP)
++		wake_up_interruptible(&log_wait);
+ }
+ 
++static DEFINE_PER_CPU(struct irq_work, wake_up_klogd_work) = {
++	.func = wake_up_klogd_work_func,
++	.flags = IRQ_WORK_LAZY,
++};
++
+ void wake_up_klogd(void)
+ {
+-	if (waitqueue_active(&log_wait))
++	preempt_disable();
++	if (waitqueue_active(&log_wait)) {
+ 		this_cpu_or(printk_pending, PRINTK_PENDING_WAKEUP);
++		irq_work_queue(&__get_cpu_var(wake_up_klogd_work));
++	}
++	preempt_enable();
+ }
+ 
+ /**
+@@ -1753,6 +1756,7 @@ int printk_sched(const char *fmt, ...)
+ 	va_end(args);
+ 
+ 	__this_cpu_or(printk_pending, PRINTK_PENDING_SCHED);
++	irq_work_queue(&__get_cpu_var(wake_up_klogd_work));
+ 	local_irq_restore(flags);
+ 
+ 	return r;
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index 2e7de57..29e55b2 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -337,7 +337,7 @@ static ktime_t tick_nohz_stop_sched_tick(struct tick_sched *ts,
+ 		time_delta = timekeeping_max_deferment();
+ 	} while (read_seqcount_retry(&xtime_seq, seq));
+ 
+-	if (rcu_needs_cpu(cpu, &rcu_delta_jiffies) || printk_needs_cpu(cpu) ||
++	if (rcu_needs_cpu(cpu, &rcu_delta_jiffies) ||
+ 	    arch_needs_cpu(cpu) || irq_work_needs_cpu()) {
+ 		next_jiffies = last_jiffies + 1;
+ 		delta_jiffies = 1;
+diff --git a/kernel/timer.c b/kernel/timer.c
+index bfb583a..634d947 100644
+--- a/kernel/timer.c
++++ b/kernel/timer.c
+@@ -1437,8 +1437,6 @@ static void run_timer_softirq(struct softirq_action *h)
+ #if defined(CONFIG_IRQ_WORK) && defined(CONFIG_PREEMPT_RT_FULL)
+ 	irq_work_run();
+ #endif
+-
+-	printk_tick();
+ 	hrtimer_run_pending();
+ 
+ 	if (time_after_eq(jiffies, base->timer_jiffies))
+-- 
+1.8.1.2
+

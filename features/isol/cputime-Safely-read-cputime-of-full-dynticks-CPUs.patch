@@ -1,0 +1,679 @@
+From 6967a16164ea28b24146276e00d04845b3d1e924 Mon Sep 17 00:00:00 2001
+From: Frederic Weisbecker <fweisbec@gmail.com>
+Date: Sun, 16 Dec 2012 20:00:34 +0100
+Subject: [PATCH] cputime: Safely read cputime of full dynticks CPUs
+
+commit 6a61671bb2f3a1bd12cd17b8fca811a624782632 upstream.
+
+While remotely reading the cputime of a task running in a
+full dynticks CPU, the values stored in utime/stime fields
+of struct task_struct may be stale. Its values may be those
+of the last kernel <-> user transition time snapshot and
+we need to add the tickless time spent since this snapshot.
+
+To fix this, flush the cputime of the dynticks CPUs on
+kernel <-> user transition and record the time / context
+where we did this. Then on top of this snapshot and the current
+time, perform the fixup on the reader side from task_times()
+accessors.
+
+Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Li Zhong <zhong@linux.vnet.ibm.com>
+Cc: Namhyung Kim <namhyung.kim@lge.com>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Paul Gortmaker <paul.gortmaker@windriver.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+[fixed kvm module related build errors]
+Signed-off-by: Sedat Dilek <sedat.dilek@gmail.com>
+[PG: 3.4-rt "softirq: Split softirq locks" adds 2 vtime account
+ calls to kernel/softirq.c - so rename accordingly. See also
+ our cherry pick of mainline bf9fae9f which did an earlier rename.]
+Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+
+diff --git a/arch/s390/kernel/vtime.c b/arch/s390/kernel/vtime.c
+index a5fd771..984b938 100644
+--- a/arch/s390/kernel/vtime.c
++++ b/arch/s390/kernel/vtime.c
+@@ -113,7 +113,7 @@ void vtime_account_user(struct task_struct *tsk)
+  * Update process times based on virtual cpu times stored by entry.S
+  * to the lowcore fields user_timer, system_timer & steal_clock.
+  */
+-void vtime_account(struct task_struct *tsk)
++void vtime_account_irq_enter(struct task_struct *tsk)
+ {
+ 	struct thread_info *ti = task_thread_info(tsk);
+ 	__u64 timer, system;
+@@ -129,10 +129,10 @@ void vtime_account(struct task_struct *tsk)
+ 	ti->system_timer = S390_lowcore.system_timer;
+ 	account_system_time(tsk, 0, system, system);
+ }
+-EXPORT_SYMBOL_GPL(vtime_account);
++EXPORT_SYMBOL_GPL(vtime_account_irq_enter);
+ 
+ void vtime_account_system(struct task_struct *tsk)
+-__attribute__((alias("vtime_account")));
++__attribute__((alias("vtime_account_irq_enter")));
+ EXPORT_SYMBOL_GPL(vtime_account_system);
+ 
+ void __kprobes vtime_stop_cpu(void)
+diff --git a/include/linux/hardirq.h b/include/linux/hardirq.h
+index 6b18a62..7629ba0 100644
+--- a/include/linux/hardirq.h
++++ b/include/linux/hardirq.h
+@@ -163,7 +163,7 @@ extern void rcu_nmi_exit(void);
+  */
+ #define __irq_enter()					\
+ 	do {						\
+-		vtime_account_irq_enter(current);	\
++		account_irq_enter_time(current);	\
+ 		add_preempt_count(HARDIRQ_OFFSET);	\
+ 		trace_hardirq_enter();			\
+ 	} while (0)
+@@ -179,7 +179,7 @@ extern void irq_enter(void);
+ #define __irq_exit()					\
+ 	do {						\
+ 		trace_hardirq_exit();			\
+-		vtime_account_irq_exit(current);	\
++		account_irq_exit_time(current);		\
+ 		sub_preempt_count(HARDIRQ_OFFSET);	\
+ 	} while (0)
+ 
+diff --git a/include/linux/init_task.h b/include/linux/init_task.h
+index 366ec8b..a284ad8 100644
+--- a/include/linux/init_task.h
++++ b/include/linux/init_task.h
+@@ -10,6 +10,7 @@
+ #include <linux/pid_namespace.h>
+ #include <linux/user_namespace.h>
+ #include <linux/securebits.h>
++#include <linux/seqlock.h>
+ #include <net/net_namespace.h>
+ 
+ #ifdef CONFIG_SMP
+@@ -147,6 +148,15 @@ extern struct task_group root_task_group;
+ # define INIT_TIMER_LIST
+ #endif
+ 
++#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
++# define INIT_VTIME(tsk)						\
++	.vtime_seqlock = __SEQLOCK_UNLOCKED(tsk.vtime_seqlock),	\
++	.vtime_snap = 0,				\
++	.vtime_snap_whence = VTIME_SYS,
++#else
++# define INIT_VTIME(tsk)
++#endif
++
+ #define INIT_TASK_COMM "swapper"
+ 
+ /*
+@@ -217,6 +227,7 @@ extern struct task_group root_task_group;
+ 	INIT_TRACE_RECURSION						\
+ 	INIT_TASK_RCU_PREEMPT(tsk)					\
+ 	INIT_CPUSET_SEQ							\
++	INIT_VTIME(tsk)							\
+ }
+ 
+ 
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 629f84f..6e26f05 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -685,7 +685,7 @@ static inline int kvm_deassign_device(struct kvm *kvm,
+ }
+ #endif /* CONFIG_IOMMU_API */
+ 
+-static inline void guest_enter(void)
++static inline void __guest_enter(void)
+ {
+ 	/*
+ 	 * This is running in ioctl context so we can avoid
+@@ -695,7 +695,7 @@ static inline void guest_enter(void)
+ 	current->flags |= PF_VCPU;
+ }
+ 
+-static inline void guest_exit(void)
++static inline void __guest_exit(void)
+ {
+ 	/*
+ 	 * This is running in ioctl context so we can avoid
+@@ -705,6 +705,22 @@ static inline void guest_exit(void)
+ 	current->flags &= ~PF_VCPU;
+ }
+ 
++#ifdef CONFIG_CONTEXT_TRACKING
++extern void guest_enter(void);
++extern void guest_exit(void);
++
++#else /* !CONFIG_CONTEXT_TRACKING */
++static inline void guest_enter(void)
++{
++	__guest_enter();
++}
++
++static inline void guest_exit(void)
++{
++	__guest_exit();
++}
++#endif /* !CONFIG_CONTEXT_TRACKING */
++
+ static inline void kvm_guest_enter(void)
+ {
+ 	unsigned long flags;
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 5a1d63a..0c6584b 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1429,6 +1429,15 @@ struct task_struct {
+ #if !defined(CONFIG_VIRT_CPU_ACCOUNTING) && !defined(CONFIG_MICROSTATE_ACCT)
+ 	struct cputime prev_cputime;
+ #endif
++#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
++	seqlock_t vtime_seqlock;
++	unsigned long long vtime_snap;
++	enum {
++		VTIME_SLEEPING = 0,
++		VTIME_USER,
++		VTIME_SYS,
++	} vtime_snap_whence;
++#endif
+ 	unsigned long nvcsw, nivcsw; /* context switch counts */
+ 	struct timespec start_time; 		/* monotonic time */
+ 	struct timespec real_start_time;	/* boot based time */
+@@ -1887,11 +1896,13 @@ static inline void put_task_struct(struct task_struct *t)
+ }
+ #endif
+ 
+-static inline cputime_t task_gtime(struct task_struct *t)
+-{
+-	return t->gtime;
+-}
+-
++#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
++extern void task_cputime(struct task_struct *t,
++			 cputime_t *utime, cputime_t *stime);
++extern void task_cputime_scaled(struct task_struct *t,
++				cputime_t *utimescaled, cputime_t *stimescaled);
++extern cputime_t task_gtime(struct task_struct *t);
++#else
+ static inline void task_cputime(struct task_struct *t,
+ 				cputime_t *utime, cputime_t *stime)
+ {
+@@ -1910,6 +1921,12 @@ static inline void task_cputime_scaled(struct task_struct *t,
+ 	if (stimescaled)
+ 		*stimescaled = t->stimescaled;
+ }
++
++static inline cputime_t task_gtime(struct task_struct *t)
++{
++	return t->gtime;
++}
++#endif
+ extern void task_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st);
+ extern void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st);
+ 
+diff --git a/include/linux/vtime.h b/include/linux/vtime.h
+index bb50c3c..71a5782 100644
+--- a/include/linux/vtime.h
++++ b/include/linux/vtime.h
+@@ -8,35 +8,44 @@ extern void vtime_task_switch(struct task_struct *prev);
+ extern void vtime_account_system(struct task_struct *tsk);
+ extern void vtime_account_idle(struct task_struct *tsk);
+ extern void vtime_account_user(struct task_struct *tsk);
+-extern void vtime_account(struct task_struct *tsk);
++extern void vtime_account_irq_enter(struct task_struct *tsk);
+ 
+-#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+-extern bool vtime_accounting_enabled(void);
+-#else
++#ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+ static inline bool vtime_accounting_enabled(void) { return true; }
+ #endif
+ 
+ #else /* !CONFIG_VIRT_CPU_ACCOUNTING */
++
+ static inline void vtime_task_switch(struct task_struct *prev) { }
+ static inline void vtime_account_system(struct task_struct *tsk) { }
+ static inline void vtime_account_user(struct task_struct *tsk) { }
+-static inline void vtime_account(struct task_struct *tsk) { }
++static inline void vtime_account_irq_enter(struct task_struct *tsk) { }
+ static inline bool vtime_accounting_enabled(void) { return false; }
+ #endif
+ 
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+-static inline void arch_vtime_task_switch(struct task_struct *tsk) { }
+-static inline void vtime_user_enter(struct task_struct *tsk)
+-{
+-	vtime_account_system(tsk);
+-}
++extern void arch_vtime_task_switch(struct task_struct *tsk);
++extern void vtime_account_irq_exit(struct task_struct *tsk);
++extern bool vtime_accounting_enabled(void);
++extern void vtime_user_enter(struct task_struct *tsk);
+ static inline void vtime_user_exit(struct task_struct *tsk)
+ {
+ 	vtime_account_user(tsk);
+ }
++extern void vtime_guest_enter(struct task_struct *tsk);
++extern void vtime_guest_exit(struct task_struct *tsk);
++extern void vtime_init_idle(struct task_struct *tsk);
+ #else
++static inline void vtime_account_irq_exit(struct task_struct *tsk)
++{
++	/* On hard|softirq exit we always account to hard|softirq cputime */
++	vtime_account_system(tsk);
++}
+ static inline void vtime_user_enter(struct task_struct *tsk) { }
+ static inline void vtime_user_exit(struct task_struct *tsk) { }
++static inline void vtime_guest_enter(struct task_struct *tsk) { }
++static inline void vtime_guest_exit(struct task_struct *tsk) { }
++static inline void vtime_init_idle(struct task_struct *tsk) { }
+ #endif
+ 
+ #ifdef CONFIG_IRQ_TIME_ACCOUNTING
+@@ -45,25 +54,15 @@ extern void irqtime_account_irq(struct task_struct *tsk);
+ static inline void irqtime_account_irq(struct task_struct *tsk) { }
+ #endif
+ 
+-static inline void vtime_account_irq_enter(struct task_struct *tsk)
++static inline void account_irq_enter_time(struct task_struct *tsk)
+ {
+-	/*
+-	 * Hardirq can interrupt idle task anytime. So we need vtime_account()
+-	 * that performs the idle check in CONFIG_VIRT_CPU_ACCOUNTING.
+-	 * Softirq can also interrupt idle task directly if it calls
+-	 * local_bh_enable(). Such case probably don't exist but we never know.
+-	 * Ksoftirqd is not concerned because idle time is flushed on context
+-	 * switch. Softirqs in the end of hardirqs are also not a problem because
+-	 * the idle time is flushed on hardirq time already.
+-	 */
+-	vtime_account(tsk);
++	vtime_account_irq_enter(tsk);
+ 	irqtime_account_irq(tsk);
+ }
+ 
+-static inline void vtime_account_irq_exit(struct task_struct *tsk)
++static inline void account_irq_exit_time(struct task_struct *tsk)
+ {
+-	/* On hard|softirq exit we always account to hard|softirq cputime */
+-	vtime_account_system(tsk);
++	vtime_account_irq_exit(tsk);
+ 	irqtime_account_irq(tsk);
+ }
+ 
+diff --git a/kernel/context_tracking.c b/kernel/context_tracking.c
+index e88ffc9..4f6ec38 100644
+--- a/kernel/context_tracking.c
++++ b/kernel/context_tracking.c
+@@ -15,10 +15,11 @@
+  */
+ 
+ #include <linux/context_tracking.h>
++#include <linux/kvm_host.h>
+ #include <linux/rcupdate.h>
+ #include <linux/sched.h>
+ #include <linux/hardirq.h>
+-
++#include <linux/export.h>
+ DEFINE_PER_CPU(struct context_tracking, context_tracking) = {
+ #ifdef CONFIG_CONTEXT_TRACKING_FORCE
+ 	.active = true,
+@@ -115,6 +116,24 @@ void user_exit(void)
+  * migrate to some CPU that doesn't do the context tracking. As such the TIF
+  * flag may not be desired there.
+  */
++void guest_enter(void)
++{
++	if (vtime_accounting_enabled())
++		vtime_guest_enter(current);
++	else
++		__guest_enter();
++}
++EXPORT_SYMBOL_GPL(guest_enter);
++
++void guest_exit(void)
++{
++	if (vtime_accounting_enabled())
++		vtime_guest_exit(current);
++	else
++		__guest_exit();
++}
++EXPORT_SYMBOL_GPL(guest_exit);
++
+ void context_tracking_task_switch(struct task_struct *prev,
+ 			     struct task_struct *next)
+ {
+diff --git a/kernel/fork.c b/kernel/fork.c
+index cf5625b..040f487 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1249,6 +1249,12 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ #if !defined(CONFIG_VIRT_CPU_ACCOUNTING) && !defined(CONFIG_MICROSTATE_ACCT)
+ 	p->prev_cputime.utime = p->prev_cputime.stime = 0;
+ #endif
++#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
++	seqlock_init(&p->vtime_seqlock);
++	p->vtime_snap = 0;
++	p->vtime_snap_whence = VTIME_SLEEPING;
++#endif
++
+ #if defined(SPLIT_RSS_COUNTING)
+ 	memset(&p->rss_stat, 0, sizeof(p->rss_stat));
+ #endif
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 94553ab..febe961 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4850,6 +4850,7 @@ void __cpuinit init_idle(struct task_struct *idle, int cpu)
+ 	 */
+ 	idle->sched_class = &idle_sched_class;
+ 	ftrace_graph_init_idle_task(idle, cpu);
++	vtime_init_idle(idle);
+ #if defined(CONFIG_SMP)
+ 	sprintf(idle->comm, "%s/%d", INIT_TASK_COMM, cpu);
+ #endif
+diff --git a/kernel/sched/cputime.c b/kernel/sched/cputime.c
+index 32a97b3..ccff275 100644
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -492,7 +492,7 @@ void vtime_task_switch(struct task_struct *prev)
+  * vtime_account().
+  */
+ #ifndef __ARCH_HAS_VTIME_ACCOUNT
+-void vtime_account(struct task_struct *tsk)
++void vtime_account_irq_enter(struct task_struct *tsk)
+ {
+ 	if (!vtime_accounting_enabled())
+ 		return;
+@@ -516,7 +516,7 @@ void vtime_account(struct task_struct *tsk)
+ 	}
+ 	vtime_account_system(tsk);
+ }
+-EXPORT_SYMBOL_GPL(vtime_account);
++EXPORT_SYMBOL_GPL(vtime_account_irq_enter);
+ #endif /* __ARCH_HAS_VTIME_ACCOUNT */
+ 
+ #else /* !CONFIG_VIRT_CPU_ACCOUNTING */
+@@ -600,28 +600,55 @@ void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime
+ #endif /* !CONFIG_VIRT_CPU_ACCOUNTING */
+ 
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+-static DEFINE_PER_CPU(unsigned long long, cputime_snap);
++static unsigned long long vtime_delta(struct task_struct *tsk)
++{
++	unsigned long long clock;
++
++	clock = sched_clock();
++	if (clock < tsk->vtime_snap)
++		return 0;
+ 
+-static cputime_t get_vtime_delta(void)
++	return clock - tsk->vtime_snap;
++}
++
++static cputime_t get_vtime_delta(struct task_struct *tsk)
+ {
+-	unsigned long long delta;
++	unsigned long long delta = vtime_delta(tsk);
+ 
+-	delta = sched_clock() - __this_cpu_read(cputime_snap);
+-	__this_cpu_add(cputime_snap, delta);
++	WARN_ON_ONCE(tsk->vtime_snap_whence == VTIME_SLEEPING);
++	tsk->vtime_snap += delta;
+ 
+ 	/* CHECKME: always safe to convert nsecs to cputime? */
+ 	return nsecs_to_cputime(delta);
+ }
+ 
++static void __vtime_account_system(struct task_struct *tsk)
++{
++	cputime_t delta_cpu = get_vtime_delta(tsk);
++
++	account_system_time(tsk, irq_count(), delta_cpu, cputime_to_scaled(delta_cpu));
++}
++
+ void vtime_account_system(struct task_struct *tsk)
+ {
+-	cputime_t delta_cpu;
++	if (!vtime_accounting_enabled())
++		return;
++
++	write_seqlock(&tsk->vtime_seqlock);
++	__vtime_account_system(tsk);
++	write_sequnlock(&tsk->vtime_seqlock);
++}
+ 
++void vtime_account_irq_exit(struct task_struct *tsk)
++{
+ 	if (!vtime_accounting_enabled())
+ 		return;
+ 
+-	delta_cpu = get_vtime_delta();
+-	account_system_time(tsk, irq_count(), delta_cpu, cputime_to_scaled(delta_cpu));
++	write_seqlock(&tsk->vtime_seqlock);
++	if (context_tracking_in_user())
++		tsk->vtime_snap_whence = VTIME_USER;
++	__vtime_account_system(tsk);
++	write_sequnlock(&tsk->vtime_seqlock);
+ }
+ 
+ void vtime_account_user(struct task_struct *tsk)
+@@ -631,14 +658,44 @@ void vtime_account_user(struct task_struct *tsk)
+ 	if (!vtime_accounting_enabled())
+ 		return;
+ 
+-	delta_cpu = get_vtime_delta();
++	delta_cpu = get_vtime_delta(tsk);
+ 
++	write_seqlock(&tsk->vtime_seqlock);
++	tsk->vtime_snap_whence = VTIME_SYS;
+ 	account_user_time(tsk, delta_cpu, cputime_to_scaled(delta_cpu));
++	write_sequnlock(&tsk->vtime_seqlock);
++}
++
++void vtime_user_enter(struct task_struct *tsk)
++{
++	if (!vtime_accounting_enabled())
++		return;
++
++	write_seqlock(&tsk->vtime_seqlock);
++	tsk->vtime_snap_whence = VTIME_USER;
++	__vtime_account_system(tsk);
++	write_sequnlock(&tsk->vtime_seqlock);
++}
++
++void vtime_guest_enter(struct task_struct *tsk)
++{
++	write_seqlock(&tsk->vtime_seqlock);
++	__vtime_account_system(tsk);
++	current->flags |= PF_VCPU;
++	write_sequnlock(&tsk->vtime_seqlock);
++}
++
++void vtime_guest_exit(struct task_struct *tsk)
++{
++	write_seqlock(&tsk->vtime_seqlock);
++	__vtime_account_system(tsk);
++	current->flags &= ~PF_VCPU;
++	write_sequnlock(&tsk->vtime_seqlock);
+ }
+ 
+ void vtime_account_idle(struct task_struct *tsk)
+ {
+-	cputime_t delta_cpu = get_vtime_delta();
++	cputime_t delta_cpu = get_vtime_delta(tsk);
+ 
+ 	account_idle_time(delta_cpu);
+ }
+@@ -647,4 +704,116 @@ bool vtime_accounting_enabled(void)
+ {
+ 	return context_tracking_active();
+ }
++
++void arch_vtime_task_switch(struct task_struct *prev)
++{
++	write_seqlock(&prev->vtime_seqlock);
++	prev->vtime_snap_whence = VTIME_SLEEPING;
++	write_sequnlock(&prev->vtime_seqlock);
++
++	write_seqlock(&current->vtime_seqlock);
++	current->vtime_snap_whence = VTIME_SYS;
++	current->vtime_snap = sched_clock();
++	write_sequnlock(&current->vtime_seqlock);
++}
++
++void vtime_init_idle(struct task_struct *t)
++{
++	unsigned long flags;
++
++	write_seqlock_irqsave(&t->vtime_seqlock, flags);
++	t->vtime_snap_whence = VTIME_SYS;
++	t->vtime_snap = sched_clock();
++	write_sequnlock_irqrestore(&t->vtime_seqlock, flags);
++}
++
++cputime_t task_gtime(struct task_struct *t)
++{
++	unsigned long flags;
++	unsigned int seq;
++	cputime_t gtime;
++
++	do {
++		seq = read_seqbegin_irqsave(&t->vtime_seqlock, flags);
++
++		gtime = t->gtime;
++		if (t->flags & PF_VCPU)
++			gtime += vtime_delta(t);
++
++	} while (read_seqretry_irqrestore(&t->vtime_seqlock, seq, flags));
++
++	return gtime;
++}
++
++/*
++ * Fetch cputime raw values from fields of task_struct and
++ * add up the pending nohz execution time since the last
++ * cputime snapshot.
++ */
++static void
++fetch_task_cputime(struct task_struct *t,
++		   cputime_t *u_dst, cputime_t *s_dst,
++		   cputime_t *u_src, cputime_t *s_src,
++		   cputime_t *udelta, cputime_t *sdelta)
++{
++	unsigned long flags;
++	unsigned int seq;
++	unsigned long long delta;
++
++	do {
++		*udelta = 0;
++		*sdelta = 0;
++
++		seq = read_seqbegin_irqsave(&t->vtime_seqlock, flags);
++
++		if (u_dst)
++			*u_dst = *u_src;
++		if (s_dst)
++			*s_dst = *s_src;
++
++		/* Task is sleeping, nothing to add */
++		if (t->vtime_snap_whence == VTIME_SLEEPING ||
++		    is_idle_task(t))
++			continue;
++
++		delta = vtime_delta(t);
++
++		/*
++		 * Task runs either in user or kernel space, add pending nohz time to
++		 * the right place.
++		 */
++		if (t->vtime_snap_whence == VTIME_USER || t->flags & PF_VCPU) {
++			*udelta = delta;
++		} else {
++			if (t->vtime_snap_whence == VTIME_SYS)
++				*sdelta = delta;
++		}
++	} while (read_seqretry_irqrestore(&t->vtime_seqlock, seq, flags));
++}
++
++
++void task_cputime(struct task_struct *t, cputime_t *utime, cputime_t *stime)
++{
++	cputime_t udelta, sdelta;
++
++	fetch_task_cputime(t, utime, stime, &t->utime,
++			   &t->stime, &udelta, &sdelta);
++	if (utime)
++		*utime += udelta;
++	if (stime)
++		*stime += sdelta;
++}
++
++void task_cputime_scaled(struct task_struct *t,
++			 cputime_t *utimescaled, cputime_t *stimescaled)
++{
++	cputime_t udelta, sdelta;
++
++	fetch_task_cputime(t, utimescaled, stimescaled,
++			   &t->utimescaled, &t->stimescaled, &udelta, &sdelta);
++	if (utimescaled)
++		*utimescaled += cputime_to_scaled(udelta);
++	if (stimescaled)
++		*stimescaled += cputime_to_scaled(sdelta);
++}
+ #endif /* CONFIG_VIRT_CPU_ACCOUNTING_GEN */
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index 8be1568..0059e0a 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -359,7 +359,7 @@ asmlinkage void __do_softirq(void)
+ 	int cpu;
+ 
+ 	pending = local_softirq_pending();
+-	vtime_account_irq_enter(current);
++	account_irq_enter_time(current);
+ 
+ 	__local_bh_disable((unsigned long)__builtin_return_address(0),
+ 			   SOFTIRQ_OFFSET);
+@@ -381,7 +381,7 @@ restart:
+ 
+ 	lockdep_softirq_exit();
+ 
+-	vtime_account_irq_exit(current);
++	account_irq_exit_time(current);
+ 	__local_bh_enable(SOFTIRQ_OFFSET);
+ }
+ 
+@@ -490,7 +490,7 @@ static void unlock_softirq(int which)
+ 
+ static void do_single_softirq(int which, int need_rcu_bh_qs)
+ {
+-	vtime_account(current);
++	vtime_account_irq_enter(current);
+ 	current->flags |= PF_IN_SOFTIRQ;
+ 	lockdep_softirq_enter();
+ 	local_irq_enable();
+@@ -498,7 +498,7 @@ static void do_single_softirq(int which, int need_rcu_bh_qs)
+ 	local_irq_disable();
+ 	lockdep_softirq_exit();
+ 	current->flags &= ~PF_IN_SOFTIRQ;
+-	vtime_account(current);
++	vtime_account_irq_exit(current);
+ }
+ 
+ /*
+@@ -753,7 +753,7 @@ static inline void invoke_softirq(void)
+  */
+ void irq_exit(void)
+ {
+-	vtime_account_irq_exit(current);
++	account_irq_exit_time(current);
+ 	trace_hardirq_exit();
+ 	sub_preempt_count(IRQ_EXIT_OFFSET);
+ 	if (!in_interrupt() && local_softirq_pending())
+-- 
+1.8.1.2
+
