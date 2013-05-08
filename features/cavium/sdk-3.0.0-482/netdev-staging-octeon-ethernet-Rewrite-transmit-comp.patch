@@ -1,0 +1,1218 @@
+From f09779de7a18ab8b50f04c09752c6cb8b7da07ee Mon Sep 17 00:00:00 2001
+From: David Daney <david.daney@cavium.com>
+Date: Fri, 29 Jun 2012 15:54:31 -0700
+Subject: [PATCH 104/337] netdev/staging: octeon-ethernet: Rewrite transmit
+ complete handling.
+
+Based On SDK 3.0.0-482
+
+Instead of queuing up the TX SKBs, and running a timer interrupt to
+clean them up, we submit a work queue entry which is handled on the RX
+path.  This gets rid of quite a bit of complexity and locking as well
+as freeing the SKBs in the most timely manner possible.
+
+Signed-off-by: David Daney <david.daney@cavium.com>
+Signed-off-by: Corey Minyard <cminyard@mvista.com>
+Signed-off-by: Jack Tan <jack.tan@windriver.com>
+---
+ drivers/staging/octeon/ethernet-defines.h |    3 +-
+ drivers/staging/octeon/ethernet-mdio.c    |    4 +-
+ drivers/staging/octeon/ethernet-rgmii.c   |   69 +++-----
+ drivers/staging/octeon/ethernet-rx.c      |   25 +++
+ drivers/staging/octeon/ethernet-sgmii.c   |   18 +-
+ drivers/staging/octeon/ethernet-spi.c     |   10 +-
+ drivers/staging/octeon/ethernet-tx.c      |  302 +++++++++--------------------
+ drivers/staging/octeon/ethernet-util.h    |   34 ----
+ drivers/staging/octeon/ethernet.c         |  135 +++++++------
+ drivers/staging/octeon/octeon-ethernet.h  |   27 ++-
+ 10 files changed, 251 insertions(+), 376 deletions(-)
+
+diff --git a/drivers/staging/octeon/ethernet-defines.h b/drivers/staging/octeon/ethernet-defines.h
+index bdaec8d..0ee3fa8 100644
+--- a/drivers/staging/octeon/ethernet-defines.h
++++ b/drivers/staging/octeon/ethernet-defines.h
+@@ -97,8 +97,7 @@
+ /* Maximum number of SKBs to try to free per xmit packet. */
+ #define MAX_OUT_QUEUE_DEPTH 1000
+ 
+-#define FAU_TOTAL_TX_TO_CLEAN (CVMX_FAU_REG_END - sizeof(uint32_t))
+-#define FAU_NUM_PACKET_BUFFERS_TO_FREE (FAU_TOTAL_TX_TO_CLEAN - sizeof(uint32_t))
++#define FAU_NUM_PACKET_BUFFERS_TO_FREE (CVMX_FAU_REG_END - sizeof(u32))
+ 
+ #define TOTAL_NUMBER_OF_PORTS       (CVMX_PIP_NUM_INPUT_PORTS+1)
+ 
+diff --git a/drivers/staging/octeon/ethernet-mdio.c b/drivers/staging/octeon/ethernet-mdio.c
+index bcf16d9..0892d95 100644
+--- a/drivers/staging/octeon/ethernet-mdio.c
++++ b/drivers/staging/octeon/ethernet-mdio.c
+@@ -122,7 +122,7 @@ static void cvm_oct_note_carrier(struct octeon_ethernet *priv,
+ 		pr_notice_ratelimited("%s: %u Mbps %s duplex, port %d\n",
+ 				      priv->netdev->name, li.s.speed,
+ 				      (li.s.full_duplex) ? "Full" : "Half",
+-				      priv->port);
++				      priv->ipd_port);
+ 	} else {
+ 		pr_notice_ratelimited("%s: Link down\n", priv->netdev->name);
+ 	}
+@@ -159,7 +159,7 @@ void cvm_oct_adjust_link(struct net_device *dev)
+ 		link_info.s.full_duplex = priv->phydev->duplex ? 1 : 0;
+ 		link_info.s.speed = priv->phydev->speed;
+ 
+-		cvmx_helper_link_set(priv->port, link_info);
++		cvmx_helper_link_set(priv->ipd_port, link_info);
+ 
+ 		cvm_oct_note_carrier(priv, link_info);
+ 	}
+diff --git a/drivers/staging/octeon/ethernet-rgmii.c b/drivers/staging/octeon/ethernet-rgmii.c
+index 29940fd1c..fe9ca30 100644
+--- a/drivers/staging/octeon/ethernet-rgmii.c
++++ b/drivers/staging/octeon/ethernet-rgmii.c
+@@ -65,7 +65,7 @@ static void cvm_oct_rgmii_poll(struct net_device *dev)
+ 		mutex_lock(&priv->phydev->bus->mdio_lock);
+ 	}
+ 
+-	link_info = cvmx_helper_link_get(priv->port);
++	link_info = cvmx_helper_link_get(priv->ipd_port);
+ 	if (link_info.u64 == priv->link_info) {
+ 
+ 		/*
+@@ -78,12 +78,9 @@ static void cvm_oct_rgmii_poll(struct net_device *dev)
+ 			 * Read the GMXX_RXX_INT_REG[PCTERR] bit and
+ 			 * see if we are getting preamble errors.
+ 			 */
+-			int interface = INTERFACE(priv->port);
+-			int index = INDEX(priv->port);
+ 			union cvmx_gmxx_rxx_int_reg gmxx_rxx_int_reg;
+ 			gmxx_rxx_int_reg.u64 =
+-			    cvmx_read_csr(CVMX_GMXX_RXX_INT_REG
+-					  (index, interface));
++				cvmx_read_csr(CVMX_GMXX_RXX_INT_REG(priv->interface_port, priv->interface));
+ 			if (gmxx_rxx_int_reg.s.pcterr) {
+ 
+ 				/*
+@@ -99,27 +96,23 @@ static void cvm_oct_rgmii_poll(struct net_device *dev)
+ 
+ 				/* Disable preamble checking */
+ 				gmxx_rxx_frm_ctl.u64 =
+-				    cvmx_read_csr(CVMX_GMXX_RXX_FRM_CTL
+-						  (index, interface));
++				    cvmx_read_csr(CVMX_GMXX_RXX_FRM_CTL(priv->interface_port, priv->interface));
+ 				gmxx_rxx_frm_ctl.s.pre_chk = 0;
+-				cvmx_write_csr(CVMX_GMXX_RXX_FRM_CTL
+-					       (index, interface),
++				cvmx_write_csr(CVMX_GMXX_RXX_FRM_CTL(priv->interface_port, priv->interface),
+ 					       gmxx_rxx_frm_ctl.u64);
+ 
+ 				/* Disable FCS stripping */
+ 				ipd_sub_port_fcs.u64 =
+ 				    cvmx_read_csr(CVMX_IPD_SUB_PORT_FCS);
+ 				ipd_sub_port_fcs.s.port_bit &=
+-				    0xffffffffull ^ (1ull << priv->port);
++				    0xffffffffull ^ (1ull << priv->ipd_port);
+ 				cvmx_write_csr(CVMX_IPD_SUB_PORT_FCS,
+ 					       ipd_sub_port_fcs.u64);
+ 
+ 				/* Clear any error bits */
+-				cvmx_write_csr(CVMX_GMXX_RXX_INT_REG
+-					       (index, interface),
++				cvmx_write_csr(CVMX_GMXX_RXX_INT_REG(priv->interface_port, priv->interface),
+ 					       gmxx_rxx_int_reg.u64);
+-				printk_ratelimited("%s: Using 10Mbps with software "
+-						   "preamble removal\n",
++				printk_ratelimited("%s: Using 10Mbps with software preamble removal\n",
+ 						   dev->name);
+ 			}
+ 		}
+@@ -140,27 +133,25 @@ static void cvm_oct_rgmii_poll(struct net_device *dev)
+ 		union cvmx_gmxx_rxx_frm_ctl gmxx_rxx_frm_ctl;
+ 		union cvmx_ipd_sub_port_fcs ipd_sub_port_fcs;
+ 		union cvmx_gmxx_rxx_int_reg gmxx_rxx_int_reg;
+-		int interface = INTERFACE(priv->port);
+-		int index = INDEX(priv->port);
+ 
+ 		/* Enable preamble checking */
+ 		gmxx_rxx_frm_ctl.u64 =
+-		    cvmx_read_csr(CVMX_GMXX_RXX_FRM_CTL(index, interface));
++		    cvmx_read_csr(CVMX_GMXX_RXX_FRM_CTL(priv->interface_port, priv->interface));
+ 		gmxx_rxx_frm_ctl.s.pre_chk = 1;
+-		cvmx_write_csr(CVMX_GMXX_RXX_FRM_CTL(index, interface),
++		cvmx_write_csr(CVMX_GMXX_RXX_FRM_CTL(priv->interface_port, priv->interface),
+ 			       gmxx_rxx_frm_ctl.u64);
+ 		/* Enable FCS stripping */
+ 		ipd_sub_port_fcs.u64 = cvmx_read_csr(CVMX_IPD_SUB_PORT_FCS);
+-		ipd_sub_port_fcs.s.port_bit |= 1ull << priv->port;
++		ipd_sub_port_fcs.s.port_bit |= 1ull << priv->ipd_port;
+ 		cvmx_write_csr(CVMX_IPD_SUB_PORT_FCS, ipd_sub_port_fcs.u64);
+ 		/* Clear any error bits */
+ 		gmxx_rxx_int_reg.u64 =
+-		    cvmx_read_csr(CVMX_GMXX_RXX_INT_REG(index, interface));
+-		cvmx_write_csr(CVMX_GMXX_RXX_INT_REG(index, interface),
++		    cvmx_read_csr(CVMX_GMXX_RXX_INT_REG(priv->interface_port, priv->interface));
++		cvmx_write_csr(CVMX_GMXX_RXX_INT_REG(priv->interface_port, priv->interface),
+ 			       gmxx_rxx_int_reg.u64);
+ 	}
+ 	if (priv->phydev == NULL) {
+-		link_info = cvmx_helper_link_autoconf(priv->port);
++		link_info = cvmx_helper_link_autoconf(priv->ipd_port);
+ 		priv->link_info = link_info.u64;
+ 	}
+ 
+@@ -278,8 +269,6 @@ int cvm_oct_rgmii_open(struct net_device *dev)
+ {
+ 	union cvmx_gmxx_prtx_cfg gmx_cfg;
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+-	int interface = INTERFACE(priv->port);
+-	int index = INDEX(priv->port);
+ 	cvmx_helper_link_info_t link_info;
+ 	int rv;
+ 
+@@ -288,9 +277,9 @@ int cvm_oct_rgmii_open(struct net_device *dev)
+ 		return rv;
+ 
+ 
+-	gmx_cfg.u64 = cvmx_read_csr(CVMX_GMXX_PRTX_CFG(index, interface));
++	gmx_cfg.u64 = cvmx_read_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface));
+ 	gmx_cfg.s.en = 1;
+-	cvmx_write_csr(CVMX_GMXX_PRTX_CFG(index, interface), gmx_cfg.u64);
++	cvmx_write_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface), gmx_cfg.u64);
+ 
+ 	if (!octeon_is_simulation()) {
+ 		if (priv->phydev) {
+@@ -299,7 +288,7 @@ int cvm_oct_rgmii_open(struct net_device *dev)
+ 				netif_carrier_off(dev);
+ 			cvm_oct_adjust_link(dev);
+ 		} else {
+-			link_info = cvmx_helper_link_get(priv->port);
++			link_info = cvmx_helper_link_get(priv->ipd_port);
+ 			if (!link_info.s.link_up)
+ 				netif_carrier_off(dev);
+ 			spin_lock(&priv->poll_lock);
+@@ -330,26 +319,22 @@ int cvm_oct_rgmii_open(struct net_device *dev)
+ 	 * 0 is really a RGMII port.
+ 	 */
+ 	if (((priv->imode == CVMX_HELPER_INTERFACE_MODE_GMII)
+-	     && (priv->port == 0))
++	     && (priv->ipd_port == 0))
+ 	    || (priv->imode == CVMX_HELPER_INTERFACE_MODE_RGMII)) {
+ 
+ 		if (!octeon_is_simulation()) {
+ 
+ 			union cvmx_gmxx_rxx_int_en gmx_rx_int_en;
+-			int interface = INTERFACE(priv->port);
+-			int index = INDEX(priv->port);
+-
+ 			/*
+ 			 * Enable interrupts on inband status changes
+ 			 * for this port.
+ 			 */
+ 			gmx_rx_int_en.u64 =
+-			    cvmx_read_csr(CVMX_GMXX_RXX_INT_EN
+-					  (index, interface));
++			    cvmx_read_csr(CVMX_GMXX_RXX_INT_EN(priv->interface_port, priv->interface));
+ 			gmx_rx_int_en.s.phy_dupx = 1;
+ 			gmx_rx_int_en.s.phy_link = 1;
+ 			gmx_rx_int_en.s.phy_spd = 1;
+-			cvmx_write_csr(CVMX_GMXX_RXX_INT_EN(index, interface),
++			cvmx_write_csr(CVMX_GMXX_RXX_INT_EN(priv->interface_port, priv->interface),
+ 				       gmx_rx_int_en.u64);
+ 		}
+ 	}
+@@ -361,38 +346,32 @@ int cvm_oct_rgmii_stop(struct net_device *dev)
+ {
+ 	union cvmx_gmxx_prtx_cfg gmx_cfg;
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+-	int interface = INTERFACE(priv->port);
+-	int index = INDEX(priv->port);
+ 
+-	gmx_cfg.u64 = cvmx_read_csr(CVMX_GMXX_PRTX_CFG(index, interface));
++	gmx_cfg.u64 = cvmx_read_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface));
+ 	gmx_cfg.s.en = 0;
+-	cvmx_write_csr(CVMX_GMXX_PRTX_CFG(index, interface), gmx_cfg.u64);
++	cvmx_write_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface), gmx_cfg.u64);
+ 
+ 	/*
+ 	 * Only true RGMII ports need to be polled. In GMII mode, port
+ 	 * 0 is really a RGMII port.
+ 	 */
+ 	if (((priv->imode == CVMX_HELPER_INTERFACE_MODE_GMII)
+-	     && (priv->port == 0))
++	     && (priv->ipd_port == 0))
+ 	    || (priv->imode == CVMX_HELPER_INTERFACE_MODE_RGMII)) {
+ 
+ 		if (!octeon_is_simulation()) {
+ 
+ 			union cvmx_gmxx_rxx_int_en gmx_rx_int_en;
+-			int interface = INTERFACE(priv->port);
+-			int index = INDEX(priv->port);
+-
+ 			/*
+ 			 * Disable interrupts on inband status changes
+ 			 * for this port.
+ 			 */
+ 			gmx_rx_int_en.u64 =
+-			    cvmx_read_csr(CVMX_GMXX_RXX_INT_EN
+-					  (index, interface));
++			    cvmx_read_csr(CVMX_GMXX_RXX_INT_EN(priv->interface_port, priv->interface));
+ 			gmx_rx_int_en.s.phy_dupx = 0;
+ 			gmx_rx_int_en.s.phy_link = 0;
+ 			gmx_rx_int_en.s.phy_spd = 0;
+-			cvmx_write_csr(CVMX_GMXX_RXX_INT_EN(index, interface),
++			cvmx_write_csr(CVMX_GMXX_RXX_INT_EN(priv->interface_port, priv->interface),
+ 				       gmx_rx_int_en.u64);
+ 		}
+ 	}
+diff --git a/drivers/staging/octeon/ethernet-rx.c b/drivers/staging/octeon/ethernet-rx.c
+index 0fa9c45..83b78d0 100644
+--- a/drivers/staging/octeon/ethernet-rx.c
++++ b/drivers/staging/octeon/ethernet-rx.c
+@@ -263,6 +263,7 @@ static int cvm_oct_napi_poll(struct napi_struct *napi, int budget)
+ 		struct sk_buff **pskb = NULL;
+ 		int skb_in_hw;
+ 		cvmx_wqe_t *work;
++		union cvmx_buf_ptr  packet_ptr;
+ 
+ 		if (USE_ASYNC_IOBDMA && did_work_request)
+ 			work = cvmx_pow_work_response_async(CVMX_SCR_SCRATCH);
+@@ -279,6 +280,7 @@ static int cvm_oct_napi_poll(struct napi_struct *napi, int budget)
+ 			cvmx_write_csr(CVMX_POW_WQ_INT, wq_int.u64);
+ 			break;
+ 		}
++		packet_ptr = work->packet_ptr;
+ 		pskb = (struct sk_buff **)(cvm_oct_get_buffer_ptr(work->packet_ptr) - sizeof(void *));
+ 		prefetch(pskb);
+ 
+@@ -302,6 +304,29 @@ static int cvm_oct_napi_poll(struct napi_struct *napi, int budget)
+ 				cvm_oct_enable_one_cpu();
+ 		}
+ 
++		/*
++		 * If WORD2[SOFTWARE] then this WQE is a complete for
++		 * a TX packet.
++		 */
++		if (work->word2.s.software) {
++			struct octeon_ethernet *priv;
++			int packet_qos = work->word0.raw.unused;
++			skb = (struct sk_buff *)packet_ptr.u64;
++			priv = netdev_priv(skb->dev);
++			if (!netif_running(skb->dev))
++				netif_wake_queue(skb->dev);
++
++			dev_kfree_skb_any(skb);
++
++			cvmx_fpa_free(work, CVMX_FPA_WQE_POOL, DONT_WRITEBACK(1));
++
++			/*
++			 * We are done with this one, adjust the queue
++			 * depth.
++			 */
++			cvmx_fau_atomic_add32(priv->tx_queue[packet_qos].fau, -1);
++			continue;
++		}
+ 		skb_in_hw = USE_SKBUFFS_IN_HW && work->word2.s.bufs == 1;
+ 		if (likely(skb_in_hw)) {
+ 			skb = *pskb;
+diff --git a/drivers/staging/octeon/ethernet-sgmii.c b/drivers/staging/octeon/ethernet-sgmii.c
+index fb7e441..acc694b 100644
+--- a/drivers/staging/octeon/ethernet-sgmii.c
++++ b/drivers/staging/octeon/ethernet-sgmii.c
+@@ -50,11 +50,11 @@ static void cvm_oct_sgmii_poll(struct net_device *dev)
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+ 	cvmx_helper_link_info_t link_info;
+ 
+-	link_info = cvmx_helper_link_get(priv->port);
++	link_info = cvmx_helper_link_get(priv->ipd_port);
+ 	if (link_info.u64 == priv->link_info)
+ 		return;
+ 
+-	link_info = cvmx_helper_link_autoconf(priv->port);
++	link_info = cvmx_helper_link_autoconf(priv->ipd_port);
+ 	priv->link_info = link_info.u64;
+ 
+ 	/* Tell the core */
+@@ -65,8 +65,6 @@ int cvm_oct_sgmii_open(struct net_device *dev)
+ {
+ 	union cvmx_gmxx_prtx_cfg gmx_cfg;
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+-	int interface = INTERFACE(priv->port);
+-	int index = INDEX(priv->port);
+ 	cvmx_helper_link_info_t link_info;
+ 	int rv;
+ 
+@@ -74,9 +72,9 @@ int cvm_oct_sgmii_open(struct net_device *dev)
+ 	if (rv)
+ 		return rv;
+ 
+-	gmx_cfg.u64 = cvmx_read_csr(CVMX_GMXX_PRTX_CFG(index, interface));
++	gmx_cfg.u64 = cvmx_read_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface));
+ 	gmx_cfg.s.en = 1;
+-	cvmx_write_csr(CVMX_GMXX_PRTX_CFG(index, interface), gmx_cfg.u64);
++	cvmx_write_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface), gmx_cfg.u64);
+ 
+ 	if (!octeon_is_simulation()) {
+ 		if (priv->phydev) {
+@@ -85,7 +83,7 @@ int cvm_oct_sgmii_open(struct net_device *dev)
+ 				netif_carrier_off(dev);
+ 			cvm_oct_adjust_link(dev);
+ 		} else {
+-			link_info = cvmx_helper_link_get(priv->port);
++			link_info = cvmx_helper_link_get(priv->ipd_port);
+ 			if (!link_info.s.link_up)
+ 				netif_carrier_off(dev);
+ 			spin_lock(&priv->poll_lock);
+@@ -101,12 +99,10 @@ int cvm_oct_sgmii_stop(struct net_device *dev)
+ {
+ 	union cvmx_gmxx_prtx_cfg gmx_cfg;
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+-	int interface = INTERFACE(priv->port);
+-	int index = INDEX(priv->port);
+ 
+-	gmx_cfg.u64 = cvmx_read_csr(CVMX_GMXX_PRTX_CFG(index, interface));
++	gmx_cfg.u64 = cvmx_read_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface));
+ 	gmx_cfg.s.en = 0;
+-	cvmx_write_csr(CVMX_GMXX_PRTX_CFG(index, interface), gmx_cfg.u64);
++	cvmx_write_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface), gmx_cfg.u64);
+ 
+ 	spin_lock(&priv->poll_lock);
+ 	priv->poll = NULL;
+diff --git a/drivers/staging/octeon/ethernet-spi.c b/drivers/staging/octeon/ethernet-spi.c
+index 3cb75f9..d8cf4a4 100644
+--- a/drivers/staging/octeon/ethernet-spi.c
++++ b/drivers/staging/octeon/ethernet-spi.c
+@@ -253,7 +253,7 @@ static void cvm_oct_spi_poll(struct net_device *dev)
+ 
+ 	for (interface = 0; interface < 2; interface++) {
+ 
+-		if ((priv->port == interface * 16) && need_retrain[interface]) {
++		if ((priv->ipd_port == interface * 16) && need_retrain[interface]) {
+ 
+ 			if (cvmx_spi_restart_interface
+ 			    (interface, CVMX_SPI_MODE_DUPLEX, 10) == 0) {
+@@ -270,12 +270,12 @@ static void cvm_oct_spi_poll(struct net_device *dev)
+ 		 * we don't waste absurd amounts of time waiting for
+ 		 * TWSI.
+ 		 */
+-		if (priv->port == spi4000_port) {
++		if (priv->ipd_port == spi4000_port) {
+ 			/*
+ 			 * This function does nothing if it is called on an
+ 			 * interface without a SPI4000.
+ 			 */
+-			cvmx_spi4000_check_speed(interface, priv->port);
++			cvmx_spi4000_check_speed(interface, priv->ipd_port);
+ 			/*
+ 			 * Normal ordering increments. By decrementing
+ 			 * we only match once per iteration.
+@@ -300,8 +300,8 @@ int cvm_oct_spi_init(struct net_device *dev)
+ 	}
+ 	number_spi_ports++;
+ 
+-	if ((priv->port == 0) || (priv->port == 16)) {
+-		cvm_oct_spi_enable_error_reporting(INTERFACE(priv->port));
++	if ((priv->ipd_port == 0) || (priv->ipd_port == 16)) {
++		cvm_oct_spi_enable_error_reporting(priv->interface);
+ 		priv->poll = cvm_oct_spi_poll;
+ 	}
+ 	cvm_oct_common_init(dev);
+diff --git a/drivers/staging/octeon/ethernet-tx.c b/drivers/staging/octeon/ethernet-tx.c
+index f51a76d..551846a 100644
+--- a/drivers/staging/octeon/ethernet-tx.c
++++ b/drivers/staging/octeon/ethernet-tx.c
+@@ -68,9 +68,6 @@
+ #define GET_SKBUFF_QOS(skb) 0
+ #endif
+ 
+-static void cvm_oct_tx_do_cleanup(unsigned long arg);
+-static DECLARE_TASKLET(cvm_oct_tx_cleanup_tasklet, cvm_oct_tx_do_cleanup, 0);
+-
+ /* Maximum number of SKBs to try to free per xmit packet. */
+ #define MAX_SKB_TO_FREE (MAX_OUT_QUEUE_DEPTH * 2)
+ 
+@@ -84,59 +81,6 @@ static inline int32_t cvm_oct_adjust_skb_to_free(int32_t skb_to_free, int fau)
+ 	return skb_to_free;
+ }
+ 
+-static void cvm_oct_kick_tx_poll_watchdog(void)
+-{
+-	union cvmx_ciu_timx ciu_timx;
+-	ciu_timx.u64 = 0;
+-	ciu_timx.s.one_shot = 1;
+-	ciu_timx.s.len = cvm_oct_tx_poll_interval;
+-	cvmx_write_csr(CVMX_CIU_TIMX(1), ciu_timx.u64);
+-}
+-
+-void cvm_oct_free_tx_skbs(struct net_device *dev)
+-{
+-	int32_t skb_to_free;
+-	int qos, queues_per_port;
+-	int total_freed = 0;
+-	int total_remaining = 0;
+-	unsigned long flags;
+-	struct octeon_ethernet *priv = netdev_priv(dev);
+-
+-	queues_per_port = cvmx_pko_get_num_queues(priv->port);
+-	/* Drain any pending packets in the free list */
+-	for (qos = 0; qos < queues_per_port; qos++) {
+-		if (skb_queue_len(&priv->tx_free_list[qos]) == 0)
+-			continue;
+-		skb_to_free = cvmx_fau_fetch_and_add32(priv->fau+qos*4, MAX_SKB_TO_FREE);
+-		skb_to_free = cvm_oct_adjust_skb_to_free(skb_to_free, priv->fau+qos*4);
+-
+-
+-		total_freed += skb_to_free;
+-		if (skb_to_free > 0) {
+-			struct sk_buff *to_free_list = NULL;
+-			spin_lock_irqsave(&priv->tx_free_list[qos].lock, flags);
+-			while (skb_to_free > 0) {
+-				struct sk_buff *t = __skb_dequeue(&priv->tx_free_list[qos]);
+-				t->next = to_free_list;
+-				to_free_list = t;
+-				skb_to_free--;
+-			}
+-			spin_unlock_irqrestore(&priv->tx_free_list[qos].lock, flags);
+-			/* Do the actual freeing outside of the lock. */
+-			while (to_free_list) {
+-				struct sk_buff *t = to_free_list;
+-				to_free_list = to_free_list->next;
+-				dev_kfree_skb_any(t);
+-			}
+-		}
+-		total_remaining += skb_queue_len(&priv->tx_free_list[qos]);
+-	}
+-	if (total_freed >= 0 && netif_queue_stopped(dev))
+-		netif_wake_queue(dev);
+-	if (total_remaining)
+-		cvm_oct_kick_tx_poll_watchdog();
+-}
+-
+ /**
+  * cvm_oct_xmit - transmit a packet
+  * @skb:    Packet to send
+@@ -152,13 +96,12 @@ int cvm_oct_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	uint64_t old_scratch2;
+ 	int qos;
+ 	int i;
+-	enum {QUEUE_CORE, QUEUE_HW, QUEUE_DROP} queue_type;
++	enum {QUEUE_HW, QUEUE_WQE, QUEUE_DROP} queue_type;
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+-	struct sk_buff *to_free_list;
+-	int32_t skb_to_free;
+-	int32_t buffers_to_free;
+-	u32 total_to_clean;
++	s32 queue_depth;
++	s32 buffers_to_free;
+ 	unsigned long flags;
++	cvmx_wqe_t *work = NULL;
+ #if REUSE_SKBUFFS_WITHOUT_FREE
+ 	unsigned char *fpa_head;
+ #endif
+@@ -169,21 +112,6 @@ int cvm_oct_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	 */
+ 	prefetch(priv);
+ 
+-	/*
+-	 * The check on CVMX_PKO_QUEUES_PER_PORT_* is designed to
+-	 * completely remove "qos" in the event neither interface
+-	 * supports multiple queues per port.
+-	 */
+-	if ((CVMX_PKO_QUEUES_PER_PORT_INTERFACE0 > 1) ||
+-	    (CVMX_PKO_QUEUES_PER_PORT_INTERFACE1 > 1)) {
+-		qos = GET_SKBUFF_QOS(skb);
+-		if (qos <= 0)
+-			qos = 0;
+-		else if (qos >= cvmx_pko_get_num_queues(priv->port))
+-			qos = 0;
+-	} else
+-		qos = 0;
+-
+ 	if (USE_ASYNC_IOBDMA) {
+ 		/* Save scratch in case userspace is using it */
+ 		CVMX_SYNCIOBDMA;
+@@ -197,9 +125,28 @@ int cvm_oct_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		cvmx_fau_async_fetch_and_add32(CVMX_SCR_SCRATCH + 8,
+ 					       FAU_NUM_PACKET_BUFFERS_TO_FREE,
+ 					       0);
++	}
++
++#ifdef CVM_OCT_LOCKLESS
++	qos = cvmx_get_core_num();
++#else
++	/*
++	 * The check on CVMX_PKO_QUEUES_PER_PORT_* is designed to
++	 * completely remove "qos" in the event neither interface
++	 * supports multiple queues per port.
++	 */
++	if (priv->tx_multiple_queues) {
++		qos = GET_SKBUFF_QOS(skb);
++		if (qos <= 0)
++			qos = 0;
++		else if (qos >= priv->num_tx_queues)
++			qos = 0;
++	} else
++		qos = 0;
++#endif
++	if (USE_ASYNC_IOBDMA) {
+ 		cvmx_fau_async_fetch_and_add32(CVMX_SCR_SCRATCH,
+-					       priv->fau + qos * 4,
+-					       MAX_SKB_TO_FREE);
++					       priv->tx_queue[qos].fau, 1);
+ 	}
+ 
+ 	/*
+@@ -209,17 +156,6 @@ int cvm_oct_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	if (unlikely(skb_shinfo(skb)->nr_frags > 5)) {
+ 		if (unlikely(__skb_linearize(skb))) {
+ 			queue_type = QUEUE_DROP;
+-			if (USE_ASYNC_IOBDMA) {
+-				/* Get the number of skbuffs in use by the hardware */
+-				CVMX_SYNCIOBDMA;
+-				skb_to_free = cvmx_scratch_read64(CVMX_SCR_SCRATCH);
+-			} else {
+-				/* Get the number of skbuffs in use by the hardware */
+-				skb_to_free = cvmx_fau_fetch_and_add32(priv->fau + qos * 4,
+-								       MAX_SKB_TO_FREE);
+-			}
+-			skb_to_free = cvm_oct_adjust_skb_to_free(skb_to_free, priv->fau + qos * 4);
+-			spin_lock_irqsave(&priv->tx_free_list[qos].lock, flags);
+ 			goto skip_xmit;
+ 		}
+ 	}
+@@ -235,13 +171,11 @@ int cvm_oct_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	 */
+ 	if ((skb->len < 64) && OCTEON_IS_MODEL(OCTEON_CN3XXX)) {
+ 		union cvmx_gmxx_prtx_cfg gmx_prt_cfg;
+-		int interface = INTERFACE(priv->port);
+-		int index = INDEX(priv->port);
+ 
+-		if (interface < 2) {
++		if (priv->interface < 2) {
+ 			/* We only need to pad packet in half duplex mode */
+ 			gmx_prt_cfg.u64 =
+-			    cvmx_read_csr(CVMX_GMXX_PRTX_CFG(index, interface));
++			    cvmx_read_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface));
+ 			if (gmx_prt_cfg.s.duplex == 0) {
+ 				int add_bytes = 64 - skb->len;
+ 				if ((skb_tail_pointer(skb) + add_bytes) <=
+@@ -395,43 +329,25 @@ dont_put_skbuff_in_hw:
+ 	if (USE_ASYNC_IOBDMA) {
+ 		/* Get the number of skbuffs in use by the hardware */
+ 		CVMX_SYNCIOBDMA;
+-		skb_to_free = cvmx_scratch_read64(CVMX_SCR_SCRATCH);
++		queue_depth = cvmx_scratch_read64(CVMX_SCR_SCRATCH);
+ 		buffers_to_free = cvmx_scratch_read64(CVMX_SCR_SCRATCH + 8);
+ 	} else {
+ 		/* Get the number of skbuffs in use by the hardware */
+-		skb_to_free = cvmx_fau_fetch_and_add32(priv->fau + qos * 4,
+-						       MAX_SKB_TO_FREE);
+-		buffers_to_free =
+-		    cvmx_fau_fetch_and_add32(FAU_NUM_PACKET_BUFFERS_TO_FREE, 0);
++		queue_depth = cvmx_fau_fetch_and_add32(priv->tx_queue[qos].fau, 1);
++		buffers_to_free = cvmx_fau_fetch_and_add32(FAU_NUM_PACKET_BUFFERS_TO_FREE, 0);
+ 	}
+ 
+-	skb_to_free = cvm_oct_adjust_skb_to_free(skb_to_free, priv->fau+qos*4);
+-
+ 	/*
+ 	 * If we're sending faster than the receive can free them then
+ 	 * don't do the HW free.
+ 	 */
+-	if ((buffers_to_free < -100) && !pko_command.s.dontfree)
++	if (unlikely(buffers_to_free < -100))
+ 		pko_command.s.dontfree = 1;
+ 
+-	if (pko_command.s.dontfree) {
+-		queue_type = QUEUE_CORE;
+-		pko_command.s.reg0 = priv->fau+qos*4;
+-	} else {
+-		queue_type = QUEUE_HW;
+-	}
+-	if (USE_ASYNC_IOBDMA)
+-		cvmx_fau_async_fetch_and_add32(CVMX_SCR_SCRATCH, FAU_TOTAL_TX_TO_CLEAN, 1);
+-
+-	spin_lock_irqsave(&priv->tx_free_list[qos].lock, flags);
+-
+ 	/* Drop this packet if we have too many already queued to the HW */
+-	if (unlikely(skb_queue_len(&priv->tx_free_list[qos]) >= MAX_OUT_QUEUE_DEPTH)) {
++	if (unlikely(queue_depth >= MAX_OUT_QUEUE_DEPTH)) {
+ 		if (dev->tx_queue_len != 0) {
+-			/* Drop the lock when notifying the core.  */
+-			spin_unlock_irqrestore(&priv->tx_free_list[qos].lock, flags);
+ 			netif_stop_queue(dev);
+-			spin_lock_irqsave(&priv->tx_free_list[qos].lock, flags);
+ 		} else {
+ 			/* If not using normal queueing.  */
+ 			queue_type = QUEUE_DROP;
+@@ -439,74 +355,91 @@ dont_put_skbuff_in_hw:
+ 		}
+ 	}
+ 
+-	cvmx_pko_send_packet_prepare(priv->port, priv->queue + qos,
+-				     CVMX_PKO_LOCK_NONE);
++	if (pko_command.s.dontfree)
++		queue_type = QUEUE_WQE;
++	else
++		queue_type = QUEUE_HW;
++
++	if (queue_type == QUEUE_WQE) {
++		work = cvmx_fpa_alloc(CVMX_FPA_WQE_POOL);
++		if (unlikely(!work)) {
++			netdev_err(dev, "Failed WQE allocate\n");
++			queue_type = QUEUE_DROP;
++			goto skip_xmit;
++		}
++
++		pko_command.s.rsp = 1;
++		pko_command.s.wqp = 1;
++		/*
++		 * work->unused will carry the qos for this packet,
++		 * this allows us to find the proper FAU when freeing
++		 * the packet.  We decrement the FAU when the WQE is
++		 * replaced in the pool.
++		 */
++		pko_command.s.reg0 = 0;
++		work->word0.u64 = 0;
++		work->word0.raw.unused = (u8)qos;
++
++		work->word1.u64 = 0;
++		work->word1.tag_type = CVMX_POW_TAG_TYPE_NULL;
++		work->word1.tag = 0;
++		work->word2.u64 = 0;
++		work->word2.s.software = 1;
++		cvmx_wqe_set_grp(work, pow_receive_group);
++		work->packet_ptr.u64 = (unsigned long)skb;
++	}
++
++	local_irq_save(flags);
++
++	cvmx_pko_send_packet_prepare_pkoid(priv->pko_port,
++					   priv->tx_queue[qos].queue,
++					   CVMX_PKO_LOCK_CMD_QUEUE);
+ 
+ 	/* Send the packet to the output queue */
+-	if (unlikely(cvmx_pko_send_packet_finish(priv->port,
+-						 priv->queue + qos,
+-						 pko_command, hw_buffer,
+-						 CVMX_PKO_LOCK_NONE))) {
+-		printk_ratelimited("%s: Failed to send the packet\n", dev->name);
+-		queue_type = QUEUE_DROP;
++	if (queue_type == QUEUE_WQE) {
++		u64 word2 = virt_to_phys(work);
++		if (unlikely(cvmx_pko_send_packet_finish3_pkoid(priv->pko_port,
++							  priv->tx_queue[qos].queue, pko_command, hw_buffer,
++							  word2, CVMX_PKO_LOCK_CMD_QUEUE))) {
++				queue_type = QUEUE_DROP;
++				cvmx_fpa_free(work, CVMX_FPA_WQE_POOL, DONT_WRITEBACK(1));
++				netdev_err(dev, "Failed to send the packet with wqe\n");
++		}
++	} else {
++		if (unlikely(cvmx_pko_send_packet_finish_pkoid(priv->pko_port,
++							 priv->tx_queue[qos].queue,
++							 pko_command, hw_buffer,
++							 CVMX_PKO_LOCK_CMD_QUEUE))) {
++			netdev_err(dev, "Failed to send the packet\n");
++			queue_type = QUEUE_DROP;
++		}
+ 	}
+-skip_xmit:
+-	to_free_list = NULL;
++	local_irq_restore(flags);
+ 
++skip_xmit:
+ 	switch (queue_type) {
+ 	case QUEUE_DROP:
+-		skb->next = to_free_list;
+-		to_free_list = skb;
+-		priv->stats.tx_dropped++;
++		cvmx_fau_atomic_add32(priv->tx_queue[qos].fau, -1);
++		dev_kfree_skb_any(skb);
++		dev->stats.tx_dropped++;
+ 		break;
+ 	case QUEUE_HW:
+ 		cvmx_fau_atomic_add32(FAU_NUM_PACKET_BUFFERS_TO_FREE, -1);
+ 		break;
+-	case QUEUE_CORE:
+-		__skb_queue_tail(&priv->tx_free_list[qos], skb);
++	case QUEUE_WQE:
++		/* Cleanup is done on the RX path when the WQE returns */
+ 		break;
+ 	default:
+ 		BUG();
+ 	}
+ 
+-	while (skb_to_free > 0) {
+-		struct sk_buff *t = __skb_dequeue(&priv->tx_free_list[qos]);
+-		t->next = to_free_list;
+-		to_free_list = t;
+-		skb_to_free--;
+-	}
+-
+-	spin_unlock_irqrestore(&priv->tx_free_list[qos].lock, flags);
+-
+-	/* Do the actual freeing outside of the lock. */
+-	while (to_free_list) {
+-		struct sk_buff *t = to_free_list;
+-		to_free_list = to_free_list->next;
+-		dev_kfree_skb_any(t);
+-	}
+-
+ 	if (USE_ASYNC_IOBDMA) {
+ 		CVMX_SYNCIOBDMA;
+-		total_to_clean = cvmx_scratch_read64(CVMX_SCR_SCRATCH);
+ 		/* Restore the scratch area */
+ 		cvmx_scratch_write64(CVMX_SCR_SCRATCH, old_scratch);
+ 		cvmx_scratch_write64(CVMX_SCR_SCRATCH + 8, old_scratch2);
+-	} else {
+-		total_to_clean = cvmx_fau_fetch_and_add32(FAU_TOTAL_TX_TO_CLEAN, 1);
+-	}
+-
+-	if (total_to_clean & 0x3ff) {
+-		/*
+-		 * Schedule the cleanup tasklet every 1024 packets for
+-		 * the pathological case of high traffic on one port
+-		 * delaying clean up of packets on a different port
+-		 * that is blocked waiting for the cleanup.
+-		 */
+-		tasklet_schedule(&cvm_oct_tx_cleanup_tasklet);
+ 	}
+ 
+-	cvm_oct_kick_tx_poll_watchdog();
+-
+ 	return NETDEV_TX_OK;
+ }
+ 
+@@ -517,57 +450,14 @@ skip_xmit:
+  */
+ void cvm_oct_tx_shutdown_dev(struct net_device *dev)
+ {
+-	struct octeon_ethernet *priv = netdev_priv(dev);
+-	unsigned long flags;
+-	int qos;
+-
+-	for (qos = 0; qos < 16; qos++) {
+-		spin_lock_irqsave(&priv->tx_free_list[qos].lock, flags);
+-		while (skb_queue_len(&priv->tx_free_list[qos]))
+-			dev_kfree_skb_any(__skb_dequeue
+-					  (&priv->tx_free_list[qos]));
+-		spin_unlock_irqrestore(&priv->tx_free_list[qos].lock, flags);
+-	}
+-}
+-
+-static void cvm_oct_tx_do_cleanup(unsigned long arg)
+-{
+-	int port;
+-
+-	for (port = 0; port < TOTAL_NUMBER_OF_PORTS; port++) {
+-		if (cvm_oct_device[port]) {
+-			struct net_device *dev = cvm_oct_device[port];
+-			cvm_oct_free_tx_skbs(dev);
+-		}
+-	}
+-}
+-
+-static irqreturn_t cvm_oct_tx_cleanup_watchdog(int cpl, void *dev_id)
+-{
+-	/* Disable the interrupt.  */
+-	cvmx_write_csr(CVMX_CIU_TIMX(1), 0);
+-	/* Do the work in the tasklet.  */
+-	tasklet_schedule(&cvm_oct_tx_cleanup_tasklet);
+-	return IRQ_HANDLED;
+ }
+ 
+ void cvm_oct_tx_initialize(void)
+ {
+-	int i;
+ 
+-	/* Disable the interrupt.  */
+-	cvmx_write_csr(CVMX_CIU_TIMX(1), 0);
+-	/* Register an IRQ hander for to receive CIU_TIMX(1) interrupts */
+-	i = request_irq(OCTEON_IRQ_TIMER1,
+-			cvm_oct_tx_cleanup_watchdog, 0,
+-			"Ethernet", cvm_oct_device);
+-
+-	if (i)
+-		panic("Could not acquire Ethernet IRQ %d\n", OCTEON_IRQ_TIMER1);
+ }
+ 
+ void cvm_oct_tx_shutdown(void)
+ {
+-	/* Free the interrupt handler */
+-	free_irq(OCTEON_IRQ_TIMER1, cvm_oct_device);
++
+ }
+diff --git a/drivers/staging/octeon/ethernet-util.h b/drivers/staging/octeon/ethernet-util.h
+index 144fb99..608338e 100644
+--- a/drivers/staging/octeon/ethernet-util.h
++++ b/drivers/staging/octeon/ethernet-util.h
+@@ -36,37 +36,3 @@ static inline void *cvm_oct_get_buffer_ptr(union cvmx_buf_ptr packet_ptr)
+ 	return cvmx_phys_to_ptr(((packet_ptr.s.addr >> 7) - packet_ptr.s.back)
+ 				<< 7);
+ }
+-
+-/**
+- * INTERFACE - convert IPD port to locgical interface
+- * @ipd_port: Port to check
+- *
+- * Returns Logical interface
+- */
+-static inline int INTERFACE(int ipd_port)
+-{
+-	if (ipd_port < 32)	/* Interface 0 or 1 for RGMII,GMII,SPI, etc */
+-		return ipd_port >> 4;
+-	else if (ipd_port < 36)	/* Interface 2 for NPI */
+-		return 2;
+-	else if (ipd_port < 40)	/* Interface 3 for loopback */
+-		return 3;
+-	else if (ipd_port == 40)	/* Non existent interface for POW0 */
+-		return 4;
+-	else
+-		panic("Illegal ipd_port %d passed to INTERFACE\n", ipd_port);
+-}
+-
+-/**
+- * INDEX - convert IPD/PKO port number to the port's interface index
+- * @ipd_port: Port to check
+- *
+- * Returns Index into interface port list
+- */
+-static inline int INDEX(int ipd_port)
+-{
+-	if (ipd_port < 32)
+-		return ipd_port & 15;
+-	else
+-		return ipd_port & 3;
+-}
+diff --git a/drivers/staging/octeon/ethernet.c b/drivers/staging/octeon/ethernet.c
+index 1987465..919f3e0 100644
+--- a/drivers/staging/octeon/ethernet.c
++++ b/drivers/staging/octeon/ethernet.c
+@@ -201,14 +201,14 @@ static struct net_device_stats *cvm_oct_common_get_stats(struct net_device *dev)
+ 	cvmx_pko_port_status_t tx_status;
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+ 
+-	if (priv->port < CVMX_PIP_NUM_INPUT_PORTS) {
++	if (priv->ipd_port < CVMX_PIP_NUM_INPUT_PORTS) {
+ 		if (octeon_is_simulation()) {
+ 			/* The simulator doesn't support statistics */
+ 			memset(&rx_status, 0, sizeof(rx_status));
+ 			memset(&tx_status, 0, sizeof(tx_status));
+ 		} else {
+-			cvmx_pip_get_port_status(priv->port, 1, &rx_status);
+-			cvmx_pko_get_port_status(priv->port, 1, &tx_status);
++			cvmx_pip_get_port_status(priv->ipd_port, 1, &rx_status);
++			cvmx_pko_get_port_status(priv->ipd_port, 1, &tx_status);
+ 		}
+ 
+ 		priv->stats.rx_packets += rx_status.inb_packets;
+@@ -245,8 +245,6 @@ static struct net_device_stats *cvm_oct_common_get_stats(struct net_device *dev)
+ static int cvm_oct_common_change_mtu(struct net_device *dev, int new_mtu)
+ {
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+-	int interface = INTERFACE(priv->port);
+-	int index = INDEX(priv->port);
+ #if defined(CONFIG_VLAN_8021Q) || defined(CONFIG_VLAN_8021Q_MODULE)
+ 	int vlan_bytes = 4;
+ #else
+@@ -265,8 +263,8 @@ static int cvm_oct_common_change_mtu(struct net_device *dev, int new_mtu)
+ 	}
+ 	dev->mtu = new_mtu;
+ 
+-	if ((interface < 2)
+-	    && (cvmx_helper_interface_get_mode(interface) !=
++	if ((priv->interface < 2)
++	    && (cvmx_helper_interface_get_mode(priv->interface) !=
+ 		CVMX_HELPER_INTERFACE_MODE_SPI)) {
+ 		/* Add ethernet header and FCS, and VLAN if configured. */
+ 		int max_packet = new_mtu + 14 + 4 + vlan_bytes;
+@@ -274,7 +272,7 @@ static int cvm_oct_common_change_mtu(struct net_device *dev, int new_mtu)
+ 		if (OCTEON_IS_MODEL(OCTEON_CN3XXX)
+ 		    || OCTEON_IS_MODEL(OCTEON_CN58XX)) {
+ 			/* Signal errors on packets larger than the MTU */
+-			cvmx_write_csr(CVMX_GMXX_RXX_FRM_MAX(index, interface),
++			cvmx_write_csr(CVMX_GMXX_RXX_FRM_MAX(priv->interface_port, priv->interface),
+ 				       max_packet);
+ 		} else {
+ 			/*
+@@ -285,7 +283,7 @@ static int cvm_oct_common_change_mtu(struct net_device *dev, int new_mtu)
+ 			frm_len_chk.u64 = 0;
+ 			frm_len_chk.s.minlen = 64;
+ 			frm_len_chk.s.maxlen = max_packet;
+-			cvmx_write_csr(CVMX_PIP_FRM_LEN_CHKX(interface),
++			cvmx_write_csr(CVMX_PIP_FRM_LEN_CHKX(priv->interface),
+ 				       frm_len_chk.u64);
+ 		}
+ 		/*
+@@ -293,7 +291,7 @@ static int cvm_oct_common_change_mtu(struct net_device *dev, int new_mtu)
+ 		 * the MTU. The jabber register must be set to a
+ 		 * multiple of 8 bytes, so round up.
+ 		 */
+-		cvmx_write_csr(CVMX_GMXX_RXX_JABBER(index, interface),
++		cvmx_write_csr(CVMX_GMXX_RXX_JABBER(priv->interface_port, priv->interface),
+ 			       (max_packet + 7) & ~7u);
+ 	}
+ 	return 0;
+@@ -307,11 +305,9 @@ static void cvm_oct_common_set_multicast_list(struct net_device *dev)
+ {
+ 	union cvmx_gmxx_prtx_cfg gmx_cfg;
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+-	int interface = INTERFACE(priv->port);
+-	int index = INDEX(priv->port);
+ 
+-	if ((interface < 2)
+-	    && (cvmx_helper_interface_get_mode(interface) !=
++	if ((priv->interface < 2)
++	    && (cvmx_helper_interface_get_mode(priv->interface) !=
+ 		CVMX_HELPER_INTERFACE_MODE_SPI)) {
+ 		union cvmx_gmxx_rxx_adr_ctl control;
+ 		control.u64 = 0;
+@@ -336,20 +332,18 @@ static void cvm_oct_common_set_multicast_list(struct net_device *dev)
+ 			control.s.cam_mode = 1;
+ 
+ 		gmx_cfg.u64 =
+-		    cvmx_read_csr(CVMX_GMXX_PRTX_CFG(index, interface));
+-		cvmx_write_csr(CVMX_GMXX_PRTX_CFG(index, interface),
++		    cvmx_read_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface));
++		cvmx_write_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface),
+ 			       gmx_cfg.u64 & ~1ull);
+ 
+-		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CTL(index, interface),
++		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CTL(priv->interface_port, priv->interface),
+ 			       control.u64);
+ 		if (dev->flags & IFF_PROMISC)
+-			cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM_EN
+-				       (index, interface), 0);
++			cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM_EN(priv->interface_port, priv->interface), 0);
+ 		else
+-			cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM_EN
+-				       (index, interface), 1);
++			cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM_EN(priv->interface_port, priv->interface), 1);
+ 
+-		cvmx_write_csr(CVMX_GMXX_PRTX_CFG(index, interface),
++		cvmx_write_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface),
+ 			       gmx_cfg.u64);
+ 	}
+ }
+@@ -365,11 +359,9 @@ static int cvm_oct_set_mac_filter(struct net_device *dev)
+ {
+ 	struct octeon_ethernet *priv = netdev_priv(dev);
+ 	union cvmx_gmxx_prtx_cfg gmx_cfg;
+-	int interface = INTERFACE(priv->port);
+-	int index = INDEX(priv->port);
+ 
+-	if ((interface < 2)
+-	    && (cvmx_helper_interface_get_mode(interface) !=
++	if ((priv->interface < 2)
++	    && (cvmx_helper_interface_get_mode(priv->interface) !=
+ 		CVMX_HELPER_INTERFACE_MODE_SPI)) {
+ 		int i;
+ 		uint8_t *ptr = dev->dev_addr;
+@@ -378,25 +370,25 @@ static int cvm_oct_set_mac_filter(struct net_device *dev)
+ 			mac = (mac << 8) | (uint64_t)ptr[i];
+ 
+ 		gmx_cfg.u64 =
+-		    cvmx_read_csr(CVMX_GMXX_PRTX_CFG(index, interface));
+-		cvmx_write_csr(CVMX_GMXX_PRTX_CFG(index, interface),
++		    cvmx_read_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface));
++		cvmx_write_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface),
+ 			       gmx_cfg.u64 & ~1ull);
+ 
+-		cvmx_write_csr(CVMX_GMXX_SMACX(index, interface), mac);
+-		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM0(index, interface),
++		cvmx_write_csr(CVMX_GMXX_SMACX(priv->interface_port, priv->interface), mac);
++		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM0(priv->interface_port, priv->interface),
+ 			       ptr[0]);
+-		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM1(index, interface),
++		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM1(priv->interface_port, priv->interface),
+ 			       ptr[1]);
+-		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM2(index, interface),
++		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM2(priv->interface_port, priv->interface),
+ 			       ptr[2]);
+-		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM3(index, interface),
++		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM3(priv->interface_port, priv->interface),
+ 			       ptr[3]);
+-		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM4(index, interface),
++		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM4(priv->interface_port, priv->interface),
+ 			       ptr[4]);
+-		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM5(index, interface),
++		cvmx_write_csr(CVMX_GMXX_RXX_ADR_CAM5(priv->interface_port, priv->interface),
+ 			       ptr[5]);
+ 		cvm_oct_common_set_multicast_list(dev);
+-		cvmx_write_csr(CVMX_GMXX_PRTX_CFG(index, interface),
++		cvmx_write_csr(CVMX_GMXX_PRTX_CFG(priv->interface_port, priv->interface),
+ 			       gmx_cfg.u64);
+ 	}
+ 	return 0;
+@@ -432,7 +424,7 @@ int cvm_oct_common_init(struct net_device *dev)
+ 		eth_hw_addr_random(dev);
+ 	}
+ 
+-	if (priv->queue != -1) {
++	if (priv->num_tx_queues != -1) {
+ 		dev->features |= NETIF_F_SG;
+ 		if (USE_HW_TCPUDP_CHECKSUM)
+ 			dev->features |= NETIF_F_IP_CSUM;
+@@ -513,6 +505,9 @@ static const struct net_device_ops cvm_oct_rgmii_netdev_ops = {
+ 
+ extern void octeon_mdiobus_force_mod_depencency(void);
+ 
++static int num_devices_extra_wqe;
++#define PER_DEVICE_EXTRA_WQE (MAX_OUT_QUEUE_DEPTH)
++
+ static struct device_node * __devinit cvm_oct_of_get_child(const struct device_node *parent,
+ 							   int reg_val)
+ {
+@@ -601,44 +596,54 @@ static int __devinit cvm_oct_probe(struct platform_device *pdev)
+ 	 */
+ 	cvmx_fau_atomic_write32(FAU_NUM_PACKET_BUFFERS_TO_FREE, 0);
+ 
+-	/* Initialize the FAU used for counting tx SKBs that need to be freed */
+-	cvmx_fau_atomic_write32(FAU_TOTAL_TX_TO_CLEAN, 0);
+-
+ 	num_interfaces = cvmx_helper_get_number_of_interfaces();
+ 	for (interface = 0; interface < num_interfaces; interface++) {
+ 		cvmx_helper_interface_mode_t imode =
+ 		    cvmx_helper_interface_get_mode(interface);
+ 		int num_ports = cvmx_helper_ports_on_interface(interface);
+-		int port;
+-		int port_index;
++		int interface_port;
+ 
+-		for (port_index = 0, port = cvmx_helper_get_ipd_port(interface, 0);
+-		     port < cvmx_helper_get_ipd_port(interface, num_ports);
+-		     port_index++, port++) {
++		for (interface_port = 0; interface_port < num_ports;
++		     interface_port++) {
+ 			struct octeon_ethernet *priv;
++			int base_queue;
+ 			struct net_device *dev =
+ 			    alloc_etherdev(sizeof(struct octeon_ethernet));
+ 			if (!dev) {
+-				pr_err("Failed to allocate ethernet device for port %d\n", port);
++				pr_err("Failed to allocate ethernet device for port %d:%d\n",
++				       interface, interface_port);
+ 				continue;
+ 			}
+ 
+ 			/* Initialize the device private structure. */
+ 			priv = netdev_priv(dev);
+-			priv->of_node = cvm_oct_node_for_port(pip, interface, port_index);
++			priv->of_node = cvm_oct_node_for_port(pip, interface, interface_port);
+ 			priv->netdev = dev;
++			priv->interface = interface;
++			priv->interface_port = interface_port;
+ 			spin_lock_init(&priv->poll_lock);
+ 			INIT_DELAYED_WORK(&priv->port_periodic_work,
+ 					  cvm_oct_periodic_worker);
+ 			priv->imode = imode;
+-			priv->port = port;
+-			priv->queue = cvmx_pko_get_base_queue(priv->port);
+-			priv->fau = fau - cvmx_pko_get_num_queues(port) * 4;
+-			for (qos = 0; qos < 16; qos++)
+-				skb_queue_head_init(&priv->tx_free_list[qos]);
+-			for (qos = 0; qos < cvmx_pko_get_num_queues(port);
+-			     qos++)
+-				cvmx_fau_atomic_write32(priv->fau + qos * 4, 0);
++			priv->ipd_port = cvmx_helper_get_ipd_port(interface, interface_port);
++			priv->pko_port = cvmx_helper_get_pko_port(interface, interface_port);
++			base_queue = cvmx_pko_get_base_queue(priv->ipd_port);
++			priv->num_tx_queues = cvmx_pko_get_num_queues(priv->ipd_port);
++
++			BUG_ON(priv->num_tx_queues < 1);
++			BUG_ON(priv->num_tx_queues > 32);
++
++			for (qos = 0; qos < priv->num_tx_queues; qos++) {
++				priv->tx_queue[qos].queue = base_queue + qos;
++				fau = fau - sizeof(u32);
++				priv->tx_queue[qos].fau = fau;
++				cvmx_fau_atomic_write32(priv->tx_queue[qos].fau, 0);
++			}
++
++			/* Cache the fact that there may be multiple queues */
++			priv->tx_multiple_queues =
++				(CVMX_PKO_QUEUES_PER_PORT_INTERFACE0 > 1) ||
++				(CVMX_PKO_QUEUES_PER_PORT_INTERFACE1 > 1);
+ 
+ 			switch (priv->imode) {
+ 
+@@ -684,15 +689,19 @@ static int __devinit cvm_oct_probe(struct platform_device *pdev)
+ 			if (!dev->netdev_ops) {
+ 				free_netdev(dev);
+ 			} else if (register_netdev(dev) < 0) {
+-				pr_err("Failed to register ethernet device "
+-					 "for interface %d, port %d\n",
+-					 interface, priv->port);
++				pr_err("Failed to register ethernet device for interface %d, port %d\n",
++					 interface, priv->ipd_port);
+ 				free_netdev(dev);
+ 			} else {
+-				cvm_oct_device[priv->port] = dev;
+-				fau -=
+-				    cvmx_pko_get_num_queues(priv->port) *
+-				    sizeof(uint32_t);
++				cvm_oct_device[priv->ipd_port] = dev;
++				/*
++				 * Each transmit queue will need its
++				 * own MAX_OUT_QUEUE_DEPTH worth of
++				 * WQE to track the transmit skbs.
++				 */
++				cvm_oct_mem_fill_fpa(CVMX_FPA_WQE_POOL, CVMX_FPA_WQE_POOL_SIZE,
++						     PER_DEVICE_EXTRA_WQE);
++				num_devices_extra_wqe++;
+ 				queue_delayed_work(cvm_oct_poll_queue,
+ 						   &priv->port_periodic_work, HZ);
+ 			}
+@@ -754,7 +763,7 @@ static int __devexit cvm_oct_remove(struct platform_device *pdev)
+ 	cvm_oct_mem_empty_fpa(CVMX_FPA_PACKET_POOL, CVMX_FPA_PACKET_POOL_SIZE,
+ 			      num_packet_buffers);
+ 	cvm_oct_mem_empty_fpa(CVMX_FPA_WQE_POOL, CVMX_FPA_WQE_POOL_SIZE,
+-			      num_packet_buffers);
++			      num_packet_buffers + num_devices_extra_wqe * PER_DEVICE_EXTRA_WQE);
+ 	if (CVMX_FPA_OUTPUT_BUFFER_POOL != CVMX_FPA_PACKET_POOL)
+ 		cvm_oct_mem_empty_fpa(CVMX_FPA_OUTPUT_BUFFER_POOL,
+ 				      CVMX_FPA_OUTPUT_BUFFER_POOL_SIZE, 128);
+diff --git a/drivers/staging/octeon/octeon-ethernet.h b/drivers/staging/octeon/octeon-ethernet.h
+index 991979f..c96a2e7 100644
+--- a/drivers/staging/octeon/octeon-ethernet.h
++++ b/drivers/staging/octeon/octeon-ethernet.h
+@@ -41,21 +41,32 @@
+  * driver state stored in netdev_priv(dev).
+  */
+ struct octeon_ethernet {
+-	/* PKO hardware output port */
+-	int port;
++	int ipd_port;
++	int pko_port;
++	int interface;
++	int interface_port;
++
+ 	/* My netdev. */
+ 	struct net_device *netdev;
+-	/* PKO hardware queue for the port */
+-	int queue;
+-	/* Hardware fetch and add to count outstanding tx buffers */
+-	int fau;
++
+ 	/*
+ 	 * Type of port. This is one of the enums in
+ 	 * cvmx_helper_interface_mode_t
+ 	 */
+ 	int imode;
+-	/* List of outstanding tx buffers per queue */
+-	struct sk_buff_head tx_free_list[16];
++
++	unsigned int tx_multiple_queues:1;
++
++	/* Number of elements in tx_queue below */
++	int                     num_tx_queues;
++
++	struct {
++		/* PKO hardware queue for the port */
++		int	queue;
++		/* Hardware fetch and add to count outstanding tx buffers */
++		int	fau;
++	} tx_queue[32];
++
+ 	/* Device statistics */
+ 	struct net_device_stats stats;
+ 	struct phy_device *phydev;
+-- 
+1.7.5.4
+

@@ -1,0 +1,373 @@
+From b4d410cb4b64ae6362264f67314d646460685ffd Mon Sep 17 00:00:00 2001
+From: David Daney <david.daney@cavium.com>
+Date: Fri, 5 Aug 2011 12:56:21 -0700
+Subject: [PATCH 070/337] i2c: i2c-octeon: Use High Level Controller when
+ possible.
+
+Based On SDK 3.0.0-482
+
+Most I2C transactions can be done with the HLC, using it saves a bunch
+of interrupt overhead.
+
+Signed-off-by: David Daney <david.daney@cavium.com>
+Signed-off-by: Corey Minyard <cminyard@mvista.com>
+Signed-off-by: Jack Tan <jack.tan@windriver.com>
+---
+ drivers/i2c/busses/i2c-octeon.c |  311 ++++++++++++++++++++++++++++++++++++++-
+ 1 files changed, 307 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-octeon.c b/drivers/i2c/busses/i2c-octeon.c
+index cf93084..1e41780 100644
+--- a/drivers/i2c/busses/i2c-octeon.c
++++ b/drivers/i2c/busses/i2c-octeon.c
+@@ -32,18 +32,28 @@
+ #define DRV_VERSION	"2.0"
+ 
+ /* register offsets */
+-#define SW_TWSI	 0x00
+-#define TWSI_INT 0x10
++#define SW_TWSI		0x00
++#define TWSI_INT	0x10
++#define SW_TWSI_EXT	0x18
+ 
+ /* Controller command patterns */
+ #define SW_TWSI_V               0x8000000000000000ull
++#define SW_TWSI_EIA		(1ull << 61)
++#define SW_TWSI_R		(1ull << 56)
++#define SW_TWSI_SOVR		(1ull << 55)
++#define SW_TWSI_OP_7		(0ull << 57)
++#define SW_TWSI_OP_7_IA		(1ull << 57)
++#define SW_TWSI_OP_10		(2ull << 57)
++#define SW_TWSI_OP_10_IA	(3ull << 57)
++#define SW_TWSI_SIZE_SHIFT	52
++#define SW_TWSI_A_SHIFT		40
++#define SW_TWSI_IA_SHIFT	32
+ #define SW_TWSI_EOP_TWSI_DATA   0x0C00000100000000ull
+ #define SW_TWSI_EOP_TWSI_CTL    0x0C00000200000000ull
+ #define SW_TWSI_EOP_TWSI_CLKCTL 0x0C00000300000000ull
+ #define SW_TWSI_EOP_TWSI_STAT   0x0C00000300000000ull
+ #define SW_TWSI_EOP_TWSI_RST    0x0C00000700000000ull
+ #define SW_TWSI_OP_TWSI_CLK     0x0800000000000000ull
+-#define SW_TWSI_R               0x0100000000000000ull
+ 
+ /* Controller command and status bits */
+ #define TWSI_CTL_CE   0x80
+@@ -412,6 +422,278 @@ static int octeon_i2c_read(struct octeon_i2c *i2c, int target,
+ 	return 0;
+ }
+ 
++static bool octeon_i2c_hlc_test_ready(struct octeon_i2c *i2c)
++{
++	u64 v = __raw_readq(i2c->twsi_base + SW_TWSI);
++	return (v & SW_TWSI_V) == 0;
++}
++
++static void octeon_i2c_hlc_int_enable(struct octeon_i2c *i2c)
++{
++	octeon_i2c_write_int(i2c, 0x10);
++}
++
++static void octeon_i2c_hlc_int_clear(struct octeon_i2c *i2c)
++{
++	octeon_i2c_write_int(i2c, 0x3);
++}
++
++/**
++ * octeon_i2c_hlc_wait - wait for an HLC operation to complete.
++ * @i2c: The struct octeon_i2c.
++ *
++ * Returns 0 on success, otherwise a negative errno.
++ */
++static int octeon_i2c_hlc_wait(struct octeon_i2c *i2c)
++{
++	int result;
++
++	if (i2c->broken_irq_mode) {
++		/*
++		 * Some chip revisions seem to not assert the irq in
++		 * the interrupt controller.  So we must poll for the
++		 * IFLG change.
++		 */
++		u64 end = get_jiffies_64() + i2c->adap.timeout;
++
++		while (!octeon_i2c_hlc_test_ready(i2c) && get_jiffies_64() <= end)
++			udelay(50);
++
++		return octeon_i2c_hlc_test_ready(i2c) ? 0 : -ETIMEDOUT;
++	}
++
++	octeon_i2c_hlc_int_enable(i2c);
++
++	result = wait_event_interruptible_timeout(i2c->queue,
++						  octeon_i2c_hlc_test_ready(i2c),
++						  i2c->adap.timeout);
++
++	octeon_i2c_int_disable(i2c);
++
++
++	if (result <= 0 && octeon_i2c_hlc_test_ready(i2c)) {
++		dev_err(i2c->dev, "broken irq connection detected, switching to polling mode.\n");
++		i2c->broken_irq_mode = 1;
++		return 0;
++	}
++
++	if (result < 0) {
++		dev_dbg(i2c->dev, "%s: wait interrupted\n", __func__);
++		return result;
++	} else if (result == 0) {
++		dev_dbg(i2c->dev, "%s: timeout\n", __func__);
++		return -ETIMEDOUT;
++	}
++
++	return 0;
++}
++
++static int octeon_i2c_simple_read(struct octeon_i2c *i2c, struct i2c_msg *msgs)
++{
++	u64 cmd;
++	int i, j;
++	int ret = 0;
++
++retry:
++	cmd = SW_TWSI_V | SW_TWSI_R | SW_TWSI_SOVR;
++	/* SIZE */
++	cmd |= (u64)(msgs[0].len - 1) << SW_TWSI_SIZE_SHIFT;
++	/* A */
++	cmd |= (u64)(msgs[0].addr & 0x7full) << SW_TWSI_A_SHIFT;
++
++	if (msgs[0].flags & I2C_M_TEN)
++		cmd |= SW_TWSI_OP_10;
++	else
++		cmd |= SW_TWSI_OP_7;
++
++	octeon_i2c_hlc_int_clear(i2c);
++	__raw_writeq(cmd, i2c->twsi_base + SW_TWSI);
++
++	ret = octeon_i2c_hlc_wait(i2c);
++
++	if (ret)
++		goto err;
++
++	cmd = __raw_readq(i2c->twsi_base + SW_TWSI);
++
++	if ((cmd & SW_TWSI_R) == 0) {
++		switch (cmd & 0xff) {
++		case 0x38:
++		case 0x68:
++		case 0x78:
++		case 0xb0:
++			/* Lost arbitration */
++			goto retry;
++		default:
++			ret = -EIO;
++			goto err;
++		}
++	}
++
++	for (i = 0, j = msgs[0].len - 1; i  < msgs[0].len && i < 4; i++, j--)
++		msgs[0].buf[j] = (cmd >> (8 * i)) & 0xff;
++
++	if (msgs[0].len >= 4) {
++		cmd = __raw_readq(i2c->twsi_base + SW_TWSI_EXT);
++		for (i = 0; i  < msgs[0].len - 4 && i < 4; i++, j--)
++			msgs[0].buf[j] = (cmd >> (8 * i)) & 0xff;
++	}
++
++err:
++	return ret;
++}
++
++static int octeon_i2c_simple_write(struct octeon_i2c *i2c, struct i2c_msg *msgs)
++{
++	u64 cmd;
++	int i, j;
++	int ret = 0;
++
++	cmd = SW_TWSI_V | SW_TWSI_SOVR;
++	/* SIZE */
++	cmd |= (u64)(msgs[0].len - 1) << SW_TWSI_SIZE_SHIFT;
++	/* A */
++	cmd |= (u64)(msgs[0].addr & 0x7full) << SW_TWSI_A_SHIFT;
++
++	if (msgs[0].flags & I2C_M_TEN)
++		cmd |= SW_TWSI_OP_10;
++	else
++		cmd |= SW_TWSI_OP_7;
++
++	for (i = 0, j = msgs[0].len - 1; i  < msgs[0].len && i < 4; i++, j--)
++		cmd |= (u64)msgs[0].buf[j] << (8 * i);
++
++	if (msgs[0].len >= 4) {
++		u64 ext = 0;
++		for (i = 0; i < msgs[0].len - 4 && i < 4; i++, j--)
++			ext |= (u64)msgs[0].buf[j] << (8 * i);
++		__raw_writeq(ext, i2c->twsi_base + SW_TWSI_EXT);
++	}
++
++	octeon_i2c_hlc_int_clear(i2c);
++	__raw_writeq(cmd, i2c->twsi_base + SW_TWSI);
++
++	ret = octeon_i2c_hlc_wait(i2c);
++
++	if (ret)
++		goto err;
++
++	cmd = __raw_readq(i2c->twsi_base + SW_TWSI);
++
++	if ((cmd & SW_TWSI_R) == 0)
++		ret = -EIO;
++err:
++	return ret;
++}
++
++static int octeon_i2c_ia_read(struct octeon_i2c *i2c, struct i2c_msg *msgs)
++{
++	u64 cmd;
++	int i, j;
++	int ret = 0;
++
++	cmd = SW_TWSI_V | SW_TWSI_R | SW_TWSI_SOVR;
++	/* SIZE */
++	cmd |= (u64)(msgs[1].len - 1) << SW_TWSI_SIZE_SHIFT;
++	/* A */
++	cmd |= (u64)(msgs[0].addr & 0x7full) << SW_TWSI_A_SHIFT;
++
++	if (msgs[0].flags & I2C_M_TEN)
++		cmd |= SW_TWSI_OP_10_IA;
++	else
++		cmd |= SW_TWSI_OP_7_IA;
++
++	if (msgs[0].len == 2) {
++		u64 ext = 0;
++		cmd |= SW_TWSI_EIA;
++		ext = (u64)msgs[0].buf[0] << SW_TWSI_IA_SHIFT;
++		cmd |= (u64)msgs[0].buf[1] << SW_TWSI_IA_SHIFT;
++		__raw_writeq(ext, i2c->twsi_base + SW_TWSI_EXT);
++	} else {
++		cmd |= (u64)msgs[0].buf[0] << SW_TWSI_IA_SHIFT;
++	}
++
++	octeon_i2c_hlc_int_clear(i2c);
++	__raw_writeq(cmd, i2c->twsi_base + SW_TWSI);
++
++	ret = octeon_i2c_hlc_wait(i2c);
++
++	if (ret)
++		goto err;
++
++	cmd = __raw_readq(i2c->twsi_base + SW_TWSI);
++
++	if ((cmd & SW_TWSI_R) == 0)
++		ret = -EIO;
++
++	for (i = 0, j = msgs[1].len - 1; i  < msgs[1].len && i < 4; i++, j--)
++		msgs[1].buf[j] = (cmd >> (8 * i)) & 0xff;
++
++	if (msgs[1].len >= 4) {
++		cmd = __raw_readq(i2c->twsi_base + SW_TWSI_EXT);
++		for (i = 0; i  < msgs[1].len - 4 && i < 4; i++, j--)
++			msgs[1].buf[j] = (cmd >> (8 * i)) & 0xff;
++	}
++
++err:
++	return ret;
++}
++
++static int octeon_i2c_ia_write(struct octeon_i2c *i2c, struct i2c_msg *msgs)
++{
++	u64 cmd;
++	int i, j;
++	int ret = 0;
++	u64 ext = 0;
++	bool set_ext = false;
++
++	cmd = SW_TWSI_V | SW_TWSI_SOVR;
++	/* SIZE */
++	cmd |= (u64)(msgs[1].len - 1) << SW_TWSI_SIZE_SHIFT;
++	/* A */
++	cmd |= (u64)(msgs[0].addr & 0x7full) << SW_TWSI_A_SHIFT;
++
++	if (msgs[0].flags & I2C_M_TEN)
++		cmd |= SW_TWSI_OP_10_IA;
++	else
++		cmd |= SW_TWSI_OP_7_IA;
++
++	if (msgs[0].len == 2) {
++		cmd |= SW_TWSI_EIA;
++		ext |= (u64)msgs[0].buf[0] << SW_TWSI_IA_SHIFT;
++		set_ext = true;
++		cmd |= (u64)msgs[0].buf[1] << SW_TWSI_IA_SHIFT;
++	} else {
++		cmd |= (u64)msgs[0].buf[0] << SW_TWSI_IA_SHIFT;
++	}
++	for (i = 0, j = msgs[1].len - 1; i  < msgs[1].len && i < 4; i++, j--)
++		cmd |= (u64)msgs[1].buf[j] << (8 * i);
++
++	if (msgs[1].len >= 4) {
++		for (i = 0; i < msgs[1].len - 4 && i < 4; i++, j--)
++			ext |= (u64)msgs[1].buf[j] << (8 * i);
++		set_ext = true;
++	}
++	if (set_ext)
++		__raw_writeq(ext, i2c->twsi_base + SW_TWSI_EXT);
++
++	octeon_i2c_hlc_int_clear(i2c);
++	__raw_writeq(cmd, i2c->twsi_base + SW_TWSI);
++
++	ret = octeon_i2c_hlc_wait(i2c);
++
++	if (ret)
++		goto err;
++
++	cmd = __raw_readq(i2c->twsi_base + SW_TWSI);
++
++	if ((cmd & SW_TWSI_R) == 0)
++		ret = -EIO;
++
++err:
++	return ret;
++}
++
+ /**
+  * octeon_i2c_xfer - The driver's master_xfer function.
+  * @adap: Pointer to the i2c_adapter structure.
+@@ -430,6 +712,27 @@ static int octeon_i2c_xfer(struct i2c_adapter *adap,
+ 	int ret = 0;
+ 	struct octeon_i2c *i2c = i2c_get_adapdata(adap);
+ 
++	if (num == 1) {
++		if (msgs[0].len > 0 && msgs[0].len <= 8) {
++			if (msgs[0].flags & I2C_M_RD)
++				ret = octeon_i2c_simple_read(i2c, msgs);
++			else
++				ret = octeon_i2c_simple_write(i2c, msgs);
++			goto out;
++		}
++	} else if (num == 2) {
++		if ((msgs[0].flags & I2C_M_RD) == 0 &&
++		    msgs[0].len > 0 && msgs[0].len <= 2 &&
++		    msgs[1].len > 0 && msgs[1].len <= 8 &&
++		    msgs[0].addr == msgs[1].addr) {
++			if (msgs[1].flags & I2C_M_RD)
++				ret = octeon_i2c_ia_read(i2c, msgs);
++			else
++				ret = octeon_i2c_ia_write(i2c, msgs);
++			goto out;
++		}
++	}
++
+ 	for (i = 0; ret == 0 && i < num; i++) {
+ 		pmsg = &msgs[i];
+ 		dev_dbg(i2c->dev,
+@@ -444,7 +747,7 @@ static int octeon_i2c_xfer(struct i2c_adapter *adap,
+ 						pmsg->len);
+ 	}
+ 	octeon_i2c_stop(i2c);
+-
++out:
+ 	return (ret != 0) ? ret : num;
+ }
+ 
+-- 
+1.7.5.4
+
