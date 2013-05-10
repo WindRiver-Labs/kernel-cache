@@ -1,0 +1,223 @@
+From 640513120f1209d07e723eeb08f3709cfb58d449 Mon Sep 17 00:00:00 2001
+From: David Daney <david.daney@cavium.com>
+Date: Wed, 4 Jul 2012 12:49:27 -0700
+Subject: [PATCH 112/337] netdev/staging: octeon-ethernet: Zero copy jumbo
+ packets on receive.
+
+Based On SDK 3.0.0-482
+
+Build a fragment list for jumbo packets that span multiple receive
+buffers.
+
+Signed-off-by: David Daney <david.daney@cavium.com>
+Signed-off-by: Corey Minyard <cminyard@mvista.com>
+Signed-off-by: Jack Tan <jack.tan@windriver.com>
+---
+ drivers/staging/octeon/ethernet-rx.c |   89 ++++++++++++++++++++++++++-------
+ drivers/staging/octeon/ethernet.c    |    8 +--
+ 2 files changed, 73 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/staging/octeon/ethernet-rx.c b/drivers/staging/octeon/ethernet-rx.c
+index 7daacf9..f0bce44d 100644
+--- a/drivers/staging/octeon/ethernet-rx.c
++++ b/drivers/staging/octeon/ethernet-rx.c
+@@ -225,8 +225,7 @@ static inline int cvm_oct_check_rcv_error(cvmx_wqe_t *work)
+ 		    cvmx_read_csr(CVMX_GMXX_RXX_FRM_CTL(index, interface));
+ 		if (gmxx_rxx_frm_ctl.s.pre_chk == 0) {
+ 
+-			uint8_t *ptr =
+-			    cvmx_phys_to_ptr(work->packet_ptr.s.addr);
++			uint8_t *ptr = phys_to_virt(work->packet_ptr.s.addr);
+ 			int i = 0;
+ 
+ 			while (i < work->word1.len - 1) {
+@@ -289,7 +288,7 @@ static int cvm_oct_napi_poll(struct napi_struct *napi, int budget)
+ 	uint64_t	old_scratch;
+ 	int		rx_count = 0;
+ 	int		did_work_request = 0;
+-	int		packet_not_copied;
++	bool		packet_copied;
+ 
+ 	/* Prefetch cvm_oct_device since we know we need it soon */
+ 	prefetch(cvm_oct_device);
+@@ -315,6 +314,10 @@ static int cvm_oct_napi_poll(struct napi_struct *napi, int budget)
+ 		struct sk_buff **pskb = NULL;
+ 		int skb_in_hw;
+ 		cvmx_wqe_t *work;
++		unsigned int segments;
++		int packets_to_replace = 0;
++		unsigned int packet_len;
++
+ 		union cvmx_buf_ptr  packet_ptr;
+ 
+ 		if (USE_ASYNC_IOBDMA && did_work_request)
+@@ -378,7 +381,8 @@ static int cvm_oct_napi_poll(struct napi_struct *napi, int budget)
+ 			cvmx_fau_atomic_add32(priv->tx_queue[packet_qos].fau, -1);
+ 			continue;
+ 		}
+-		skb_in_hw = USE_SKBUFFS_IN_HW && work->word2.s.bufs == 1;
++		segments = work->word2.s.bufs;
++		skb_in_hw = USE_SKBUFFS_IN_HW && segments > 0;
+ 		if (likely(skb_in_hw)) {
+ 			skb = *pskb;
+ 			prefetch(&skb->head);
+@@ -392,23 +396,71 @@ static int cvm_oct_napi_poll(struct napi_struct *napi, int budget)
+ 				continue;
+ 		}
+ 
++		packet_len = work->word1.len;
+ 		/*
+ 		 * We can only use the zero copy path if skbuffs are
+ 		 * in the FPA pool and the packet fits in a single
+ 		 * buffer.
+ 		 */
+ 		if (likely(skb_in_hw)) {
+-			skb->data = skb->head + work->packet_ptr.s.addr - cvmx_ptr_to_phys(skb->head);
++			skb->data = phys_to_virt(packet_ptr.s.addr);
+ 			prefetch(skb->data);
+-			skb->len = work->word1.len;
+-			skb_set_tail_pointer(skb, skb->len);
+-			packet_not_copied = 1;
++			skb->len = packet_len;
++			packets_to_replace = segments;
++			if (likely(segments == 1)) {
++				skb_set_tail_pointer(skb, skb->len);
++			} else {
++				struct sk_buff *current_skb = skb;
++				struct sk_buff *next_skb = NULL;
++				unsigned int segment_size;
++				bool first_frag = true;
++
++				skb_frag_list_init(skb);
++				/* Multi-segment packet. */
++				for (;;) {
++					/*
++					 * Octeon Errata PKI-100: The segment size is
++					 * wrong. Until it is fixed, calculate the
++					 * segment size based on the packet pool
++					 * buffer size. When it is fixed, the
++					 * following line should be replaced with this
++					 * one: int segment_size =
++					 * segment_ptr.s.size;
++					 */
++					segment_size = CVMX_FPA_PACKET_POOL_SIZE -
++						(packet_ptr.s.addr - (((packet_ptr.s.addr >> 7) - packet_ptr.s.back) << 7));
++					if (segment_size > packet_len)
++						segment_size = packet_len;
++					if (!first_frag) {
++						current_skb->len = segment_size;
++						skb->data_len += segment_size;
++						skb->truesize += current_skb->truesize;
++					}
++					skb_set_tail_pointer(current_skb, segment_size);
++					packet_len -= segment_size;
++					segments--;
++					if (segments == 0)
++						break;
++					packet_ptr = *(union cvmx_buf_ptr *)phys_to_virt(packet_ptr.s.addr - 8);
++					next_skb = *cvm_oct_packet_to_skb(cvm_oct_get_buffer_ptr(packet_ptr));
++					if (first_frag) {
++						skb_frag_add_head(current_skb, next_skb);
++					} else {
++						current_skb->next = next_skb;
++						next_skb->next = NULL;
++					}
++					current_skb = next_skb;
++					first_frag = false;
++					current_skb->data = phys_to_virt(packet_ptr.s.addr);
++				}
++			}
++			packet_copied = false;
+ 		} else {
+ 			/*
+ 			 * We have to copy the packet. First allocate
+ 			 * an skbuff for it.
+ 			 */
+-			skb = dev_alloc_skb(work->word1.len);
++			skb = dev_alloc_skb(packet_len);
+ 			if (!skb) {
+ 				printk_ratelimited("Port %d failed to allocate skbuff, packet dropped\n",
+ 						   work->word1.cn38xx.ipprt);
+@@ -433,16 +485,15 @@ static int cvm_oct_napi_poll(struct napi_struct *napi, int budget)
+ 					else
+ 						ptr += 6;
+ 				}
+-				memcpy(skb_put(skb, work->word1.len), ptr, work->word1.len);
++				memcpy(skb_put(skb, packet_len), ptr, packet_len);
+ 				/* No packet buffers to free */
+ 			} else {
+ 				int segments = work->word2.s.bufs;
+ 				union cvmx_buf_ptr segment_ptr = work->packet_ptr;
+-				int len = work->word1.len;
+ 
+ 				while (segments--) {
+ 					union cvmx_buf_ptr next_ptr =
+-					    *(union cvmx_buf_ptr *)cvmx_phys_to_ptr(segment_ptr.s.addr - 8);
++					    *(union cvmx_buf_ptr *)phys_to_virt(segment_ptr.s.addr - 8);
+ 
+ 			/*
+ 			 * Octeon Errata PKI-100: The segment size is
+@@ -459,17 +510,17 @@ static int cvm_oct_napi_poll(struct napi_struct *napi, int budget)
+ 					 * Don't copy more than what
+ 					 * is left in the packet.
+ 					 */
+-					if (segment_size > len)
+-						segment_size = len;
++					if (segment_size > packet_len)
++						segment_size = packet_len;
+ 					/* Copy the data into the packet */
+ 					memcpy(skb_put(skb, segment_size),
+-					       cvmx_phys_to_ptr(segment_ptr.s.addr),
++					       phys_to_virt(segment_ptr.s.addr),
+ 					       segment_size);
+-					len -= segment_size;
++					packet_len -= segment_size;
+ 					segment_ptr = next_ptr;
+ 				}
+ 			}
+-			packet_not_copied = 0;
++			packet_copied = true;
+ 		}
+ 
+ 		if (likely((work->word1.cn38xx.ipprt < TOTAL_NUMBER_OF_PORTS) &&
+@@ -529,14 +580,14 @@ static int cvm_oct_napi_poll(struct napi_struct *napi, int budget)
+ 		 * Check to see if the skbuff and work share the same
+ 		 * packet buffer.
+ 		 */
+-		if (USE_SKBUFFS_IN_HW && likely(packet_not_copied)) {
++		if (USE_SKBUFFS_IN_HW && likely(!packet_copied)) {
+ 			/*
+ 			 * This buffer needs to be replaced, increment
+ 			 * the number of buffers we need to free by
+ 			 * one.
+ 			 */
+ 			cvmx_fau_atomic_add32(FAU_NUM_PACKET_BUFFERS_TO_FREE,
+-					      1);
++					      packets_to_replace);
+ 
+ 			cvmx_fpa_free(work, CVMX_FPA_WQE_POOL,
+ 				      DONT_WRITEBACK(1));
+diff --git a/drivers/staging/octeon/ethernet.c b/drivers/staging/octeon/ethernet.c
+index c6dbda3..7e6ca1d 100644
+--- a/drivers/staging/octeon/ethernet.c
++++ b/drivers/staging/octeon/ethernet.c
+@@ -193,13 +193,11 @@ int cvm_oct_free_work(void *work_queue_entry)
+ 	union cvmx_buf_ptr segment_ptr = work->packet_ptr;
+ 
+ 	while (segments--) {
+-		union cvmx_buf_ptr next_ptr = *(union cvmx_buf_ptr *)
+-			cvmx_phys_to_ptr(segment_ptr.s.addr - 8);
+-		if (unlikely(!segment_ptr.s.i))
++		union cvmx_buf_ptr next_ptr = *(union cvmx_buf_ptr *)phys_to_virt(segment_ptr.s.addr - 8);
++		if (!segment_ptr.s.i)
+ 			cvmx_fpa_free(cvm_oct_get_buffer_ptr(segment_ptr),
+ 				      segment_ptr.s.pool,
+-				      DONT_WRITEBACK(CVMX_FPA_PACKET_POOL_SIZE /
+-						     128));
++				      DONT_WRITEBACK(CVMX_FPA_PACKET_POOL_SIZE / 128));
+ 		segment_ptr = next_ptr;
+ 	}
+ 	cvmx_fpa_free(work, CVMX_FPA_WQE_POOL, DONT_WRITEBACK(1));
+-- 
+1.7.5.4
+

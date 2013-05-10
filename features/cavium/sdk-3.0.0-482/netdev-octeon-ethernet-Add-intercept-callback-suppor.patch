@@ -1,0 +1,337 @@
+From e4f8b86653955eeb8739e88a4af34db9e017fedd Mon Sep 17 00:00:00 2001
+From: David Daney <david.daney@cavium.com>
+Date: Tue, 11 Dec 2012 16:11:22 -0800
+Subject: [PATCH 265/337] netdev/octeon-ethernet: Add intercept callback
+ support.
+
+Based On SDK 3.0.0-482
+
+Signed-off-by: David Daney <david.daney@cavium.com>
+Signed-off-by: Corey Minyard <cminyard@mvista.com>
+Signed-off-by: Jack Tan <jack.tan@windriver.com>
+---
+ drivers/net/ethernet/octeon/ethernet-napi.c   |   74 ++++++++++++++----
+ drivers/net/ethernet/octeon/ethernet-tx.c     |  103 +++++++++++++++++++++++++
+ drivers/net/ethernet/octeon/ethernet.c        |   41 +++++++++-
+ drivers/net/ethernet/octeon/octeon-ethernet.h |    5 +
+ 4 files changed, 203 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/ethernet/octeon/ethernet-napi.c b/drivers/net/ethernet/octeon/ethernet-napi.c
+index af467b8..a5ba19e 100644
+--- a/drivers/net/ethernet/octeon/ethernet-napi.c
++++ b/drivers/net/ethernet/octeon/ethernet-napi.c
+@@ -90,6 +90,7 @@ static int CVM_OCT_NAPI_POLL(struct napi_struct *napi, int budget)
+ 		struct sk_buff *skb = NULL;
+ 		struct sk_buff **pskb = NULL;
+ 		struct octeon_ethernet *priv;
++		enum cvm_oct_callback_result callback_result;
+ 		bool skb_in_hw;
+ 		cvmx_wqe_t *work;
+ 		int port;
+@@ -373,12 +374,49 @@ static int CVM_OCT_NAPI_POLL(struct napi_struct *napi, int budget)
+ 					atomic64_add(1, (atomic64_t *)&priv->netdev->stats.rx_packets);
+ 					atomic64_add(skb->len, (atomic64_t *)&priv->netdev->stats.rx_bytes);
+ 				}
+-				netif_receive_skb(skb);
+-				rx_count++;
++				if (priv->intercept_cb) {
++					callback_result = priv->intercept_cb(priv->netdev, work, skb);
++					switch (callback_result) {
++					case CVM_OCT_PASS:
++						netif_receive_skb(skb);
++						rx_count++;
++						break;
++					case CVM_OCT_DROP:
++						dev_kfree_skb_any(skb);
++						atomic64_add(1, (atomic64_t *)&priv->netdev->stats.rx_dropped);
++						break;
++					case CVM_OCT_TAKE_OWNERSHIP_WORK:
++						/*
++						 * Interceptor took
++						 * our work, but we
++						 * need to free the
++						 * skbuff
++						 */
++						if (USE_SKBUFFS_IN_HW && likely(!packet_copied)) {
++							/*
++							 * We can't free the skbuff since its data is
++							 * the same as the work. In this case we don't
++							 * do anything
++							 */
++						} else {
++							dev_kfree_skb_any(skb);
++						}
++						break;
++					case CVM_OCT_TAKE_OWNERSHIP_SKB:
++						/* Interceptor took our packet */
++						break;
++					}
++				} else {
++					netif_receive_skb(skb);
++					callback_result = CVM_OCT_PASS;
++					rx_count++;
++				}
+ 			} else {
+ 				/* Drop any packet received for a device that isn't up */
+ 				atomic64_add(1, (atomic64_t *)&priv->netdev->stats.rx_dropped);
+ 				dev_kfree_skb_any(skb);
++				callback_result = CVM_OCT_DROP;
++
+ 			}
+ 		} else {
+ 			/* Drop any packet received for a device that
+@@ -387,22 +425,26 @@ static int CVM_OCT_NAPI_POLL(struct napi_struct *napi, int budget)
+ 			printk_ratelimited("Port %d not controlled by Linux, packet dropped\n",
+ 					   port);
+ 			dev_kfree_skb_any(skb);
++			callback_result = CVM_OCT_DROP;
+ 		}
+-		/* Check to see if the skbuff and work share the same
+-		 * packet buffer.
+-		 */
+-		if (USE_SKBUFFS_IN_HW && likely(!packet_copied)) {
+-			/* This buffer needs to be replaced, increment
+-			 * the number of buffers we need to free by
+-			 * one.
++		/* We only need to free the work if the interceptor didn't
++		   take over ownership of it */
++		if (callback_result != CVM_OCT_TAKE_OWNERSHIP_WORK) {
++			/* Check to see if the skbuff and work share the same
++			 * packet buffer.
+ 			 */
+-			cvmx_fau_atomic_add32(FAU_NUM_PACKET_BUFFERS_TO_FREE,
+-					      packets_to_replace);
+-
+-			cvmx_fpa_free(work, wqe_pool,
+-				      DONT_WRITEBACK(1));
+-		} else {
+-			cvm_oct_free_work(work);
++			if (USE_SKBUFFS_IN_HW && likely(!packet_copied)) {
++				/* This buffer needs to be replaced, increment
++				 * the number of buffers we need to free by
++				 * one.
++				 */
++				cvmx_fau_atomic_add32(FAU_NUM_PACKET_BUFFERS_TO_FREE,
++						      packets_to_replace);
++
++				cvmx_fpa_free(work, wqe_pool, DONT_WRITEBACK(1));
++			} else {
++				cvm_oct_free_work(work);
++			}
+ 		}
+ 	}
+ 	/* Restore the original POW group mask */
+diff --git a/drivers/net/ethernet/octeon/ethernet-tx.c b/drivers/net/ethernet/octeon/ethernet-tx.c
+index 2dd4c0f..9c700f9 100644
+--- a/drivers/net/ethernet/octeon/ethernet-tx.c
++++ b/drivers/net/ethernet/octeon/ethernet-tx.c
+@@ -128,3 +128,106 @@ static inline void cvm_oct_set_back(struct sk_buff *skb,
+ 
+ #undef CVM_OCT_LOCKLESS
+ #include "ethernet-xmit.c"
++
++/**
++ * cvm_oct_transmit_qos - transmit a work queue entry out of the ethernet port.
++ *
++ * Both the work queue entry and the packet data can optionally be
++ * freed. The work will be freed on error as well.
++ *
++ * @dev: Device to transmit out.
++ * @work_queue_entry: Work queue entry to send
++ * @do_free: True if the work queue entry and packet data should be
++ *           freed. If false, neither will be freed.
++ * @qos: Index into the queues for this port to transmit on. This is
++ *       used to implement QoS if their are multiple queues per
++ *       port. This parameter must be between 0 and the number of
++ *       queues per port minus 1. Values outside of this range will be
++ *       change to zero.
++ *
++ * Returns Zero on success, negative on failure.
++ */
++int cvm_oct_transmit_qos(struct net_device *dev,
++			 void *work_queue_entry,
++			 int do_free,
++			 int qos)
++{
++	unsigned long			flags;
++	cvmx_buf_ptr_t			hw_buffer;
++	cvmx_pko_command_word0_t	pko_command;
++	int				dropped;
++	struct octeon_ethernet		*priv = netdev_priv(dev);
++	cvmx_wqe_t			*work = work_queue_entry;
++	cvmx_pko_lock_t lock_type;
++
++	if (!(dev->flags & IFF_UP)) {
++		netdev_err(dev, "Error: Device not up\n");
++		if (do_free)
++			cvm_oct_free_work(work);
++		return -1;
++	}
++
++	if (priv->tx_lockless) {
++		qos = cvmx_get_core_num();
++		lock_type = CVMX_PKO_LOCK_NONE;
++	} else {
++		/*
++		 * The check on CVMX_PKO_QUEUES_PER_PORT_* is designed to
++		 * completely remove "qos" in the event neither interface
++		 * supports multiple queues per port
++		 */
++		if (priv->tx_multiple_queues) {
++			if (qos <= 0)
++				qos = 0;
++			else if (qos >= priv->num_tx_queues)
++				qos = 0;
++		} else
++			qos = 0;
++		lock_type = CVMX_PKO_LOCK_CMD_QUEUE;
++	}
++
++	/* Start off assuming no drop */
++	dropped = 0;
++
++	local_irq_save(flags);
++
++	cvmx_pko_send_packet_prepare_pkoid(priv->pko_port, priv->tx_queue[qos].queue, lock_type);
++
++	/* Build the PKO buffer pointer */
++	hw_buffer.u64 = 0;
++	hw_buffer.s.addr = work->packet_ptr.s.addr;
++	hw_buffer.s.pool = packet_pool;
++	hw_buffer.s.size = FPA_PACKET_POOL_SIZE;
++	hw_buffer.s.back = work->packet_ptr.s.back;
++
++	/* Build the PKO command */
++	pko_command.u64 = 0;
++	pko_command.s.n2 = 1; /* Don't pollute L2 with the outgoing packet */
++	pko_command.s.dontfree = !do_free;
++	pko_command.s.segs = work->word2.s.bufs;
++	pko_command.s.total_bytes = work->word1.len;
++
++	/* Check if we can use the hardware checksumming */
++	if (unlikely(work->word2.s.not_IP || work->word2.s.IP_exc))
++		pko_command.s.ipoffp1 = 0;
++	else
++		pko_command.s.ipoffp1 = sizeof(struct ethhdr) + 1;
++
++	/* Send the packet to the output queue */
++	if (unlikely(cvmx_pko_send_packet_finish_pkoid(priv->pko_port, priv->tx_queue[qos].queue, pko_command, hw_buffer, lock_type))) {
++		netdev_err(dev, "Error: Failed to send the packet\n");
++		dropped = -1;
++	}
++	local_irq_restore(flags);
++
++	if (unlikely(dropped)) {
++		if (do_free)
++			cvm_oct_free_work(work);
++		dev->stats.tx_dropped++;
++	} else
++	if (do_free)
++		cvmx_fpa_free(work, wqe_pool, DONT_WRITEBACK(1));
++
++	return dropped;
++}
++EXPORT_SYMBOL(cvm_oct_transmit_qos);
+diff --git a/drivers/net/ethernet/octeon/ethernet.c b/drivers/net/ethernet/octeon/ethernet.c
+index ece8db1..6163b66 100644
+--- a/drivers/net/ethernet/octeon/ethernet.c
++++ b/drivers/net/ethernet/octeon/ethernet.c
+@@ -331,6 +331,35 @@ static __devinit int cvm_oct_configure_common_hw(void)
+ }
+ 
+ /**
++ * cvm_oct_register_callback -  Register a intercept callback for the named device.
++ *
++ * It returns the net_device structure for the ethernet port. Usign a
++ * callback of NULL will remove the callback. Note that this callback
++ * must not disturb scratch. It will be called with SYNCIOBDMAs in
++ * progress and userspace may be using scratch. It also must not
++ * disturb the group mask.
++ *
++ * @device_name: Device name to register for. (Example: "eth0")
++ * @callback: Intercept callback to set.
++ *
++ * Returns the net_device structure for the ethernet port or NULL on failure.
++ */
++struct net_device *cvm_oct_register_callback(const char *device_name, cvm_oct_callback_t callback)
++{
++	struct octeon_ethernet *priv;
++
++	list_for_each_entry(priv, &cvm_oct_list, list) {
++		if (strcmp(device_name, priv->netdev->name) == 0) {
++			priv->intercept_cb = callback;
++			wmb();
++			return priv->netdev;
++		}
++	}
++	return NULL;
++}
++EXPORT_SYMBOL(cvm_oct_register_callback);
++
++/**
+  * cvm_oct_free_work- Free a work queue entry
+  *
+  * @work_queue_entry: Work queue entry to free
+@@ -969,7 +998,8 @@ static int __devinit cvm_oct_probe(struct platform_device *pdev)
+ 
+ 			case CVMX_HELPER_INTERFACE_MODE_XAUI:
+ 			case CVMX_HELPER_INTERFACE_MODE_RXAUI:
+-				dev->netdev_ops = priv->tx_multiple_queues ?
++				priv->tx_lockless = priv->tx_multiple_queues && !disable_lockless_pko;
++				dev->netdev_ops = priv->tx_lockless ?
+ 					&cvm_oct_sgmii_lockless_netdev_ops : &cvm_oct_sgmii_netdev_ops;
+ 				strcpy(dev->name, "xaui%d");
+ 				break;
+@@ -980,20 +1010,23 @@ static int __devinit cvm_oct_probe(struct platform_device *pdev)
+ 				break;
+ 
+ 			case CVMX_HELPER_INTERFACE_MODE_SGMII:
+-				dev->netdev_ops = priv->tx_multiple_queues ?
++				priv->tx_lockless = priv->tx_multiple_queues && !disable_lockless_pko;
++				dev->netdev_ops = priv->tx_lockless ?
+ 					&cvm_oct_sgmii_lockless_netdev_ops : &cvm_oct_sgmii_netdev_ops;
+ 				strcpy(dev->name, "eth%d");
+ 				break;
+ 
+ 			case CVMX_HELPER_INTERFACE_MODE_SPI:
+-				dev->netdev_ops = priv->tx_multiple_queues ?
++				priv->tx_lockless = priv->tx_multiple_queues && !disable_lockless_pko;
++				dev->netdev_ops = priv->tx_lockless ?
+ 					&cvm_oct_spi_lockless_netdev_ops : &cvm_oct_spi_netdev_ops;
+ 				strcpy(dev->name, "spi%d");
+ 				break;
+ 
+ 			case CVMX_HELPER_INTERFACE_MODE_RGMII:
+ 			case CVMX_HELPER_INTERFACE_MODE_GMII:
+-				dev->netdev_ops = priv->tx_multiple_queues ?
++				priv->tx_lockless = priv->tx_multiple_queues && !disable_lockless_pko;
++				dev->netdev_ops = priv->tx_lockless ?
+ 					&cvm_oct_rgmii_lockless_netdev_ops : &cvm_oct_rgmii_netdev_ops;
+ 				strcpy(dev->name, "eth%d");
+ 				break;
+diff --git a/drivers/net/ethernet/octeon/octeon-ethernet.h b/drivers/net/ethernet/octeon/octeon-ethernet.h
+index 7c7ebf3..b5f8c9e 100644
+--- a/drivers/net/ethernet/octeon/octeon-ethernet.h
++++ b/drivers/net/ethernet/octeon/octeon-ethernet.h
+@@ -35,6 +35,7 @@
+ 
+ #include <asm/octeon/cvmx-helper.h>
+ #include <asm/octeon/cvmx-fau.h>
++#include <asm/octeon/octeon-ethernet-user.h>
+ 
+ /**
+  * This is the definition of the Ethernet driver's private
+@@ -62,6 +63,10 @@ struct octeon_ethernet {
+ 	unsigned int tx_timestamp_hw:1;
+ 	unsigned int rx_timestamp_hw:1;
+ 	unsigned int tx_multiple_queues:1;
++	unsigned int tx_lockless:1;
++
++	/* Optional intecept callback defined above */
++	cvm_oct_callback_t      intercept_cb;
+ 
+ 	/* Number of elements in tx_queue below */
+ 	int                     num_tx_queues;
+-- 
+1.7.5.4
+
