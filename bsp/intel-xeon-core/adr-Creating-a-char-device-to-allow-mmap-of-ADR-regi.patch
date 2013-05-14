@@ -1,0 +1,485 @@
+From 7b24b5fccbe669521a8cbb70b3a02dfcd005943c Mon Sep 17 00:00:00 2001
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Fri, 1 Mar 2013 11:13:04 -0700
+Subject: [PATCH 70/70] adr: Creating a char device to allow mmap of ADR
+ region
+
+This patch is provided by dave.jiang@intel.com via e-mail, and not
+committed to mainline yet.
+
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Signed-off-by: Yunguo Wei <yunguo.wei@windriver.com>
+---
+ drivers/block/adrbd.c    |  327 +++++++++++++++++++++++++++++++++++++++++++++-
+ include/uapi/linux/adr.h |   68 ++++++++++
+ 2 files changed, 393 insertions(+), 2 deletions(-)
+ create mode 100644 include/uapi/linux/adr.h
+
+diff --git a/drivers/block/adrbd.c b/drivers/block/adrbd.c
+index 8e99164..f50c7de 100644
+--- a/drivers/block/adrbd.c
++++ b/drivers/block/adrbd.c
+@@ -67,6 +67,12 @@
+ #include <linux/bio.h>
+ #include <linux/platform_device.h>
+ #include <linux/hdreg.h>
++#include <linux/cdev.h>
++#include <uapi/linux/adr.h>
++
++static int adr_mmap_type = 0;
++module_param(adr_mmap_type, int, 0);
++MODULE_PARM_DESC(adr_mmap_type, "ADR mem mmap type: 0: wb, 1: wc, 2: uncached");
+ 
+ static sector_t hardsect_size = 4096/*512*/;
+ 
+@@ -74,11 +80,15 @@ static sector_t hardsect_size = 4096/*512*/;
+ 
+ struct adr_dev {
+ 	int dev_id;
+-	size_t size;
++	phys_addr_t phys_start;
++	unsigned long pfn;
++	u64 size;
+ 	sector_t sectors;
+ 	void *adr_start;
+ 	struct request_queue *queue;
+ 	struct gendisk *gd;
++	struct mutex cmutex;
++	struct device *dev;
+ };
+ 
+ #define MAX_ADR_REGIONS 4
+@@ -86,6 +96,9 @@ struct adrbd {
+ 	struct adr_dev adev[MAX_ADR_REGIONS];
+ 	struct platform_device *pdev;
+ 	int adr_major;
++	struct cdev cdev;
++	int cdev_major;
++	struct class *cdev_class;
+ 	int idx;
+ };
+ 
+@@ -221,6 +234,304 @@ adr_ioctl(struct block_device *bdev, fmode_t mode,
+ 	return 0;
+ }
+ 
++static struct device_attribute adr_cdev_attrs[] = {
++	__ATTR_NULL
++};
++
++static char *adr_cdev_node(struct device *dev, umode_t *mode)
++{
++	if (mode)
++		*mode = S_IRUGO | S_IWUSR;
++
++	return kasprintf(GFP_KERNEL, "adrcd%s", dev_name(dev));
++}
++
++static ssize_t
++adr_cdev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
++{
++	struct adr_dev *adev = filp->private_data;
++	ssize_t res = 0;
++
++	if (mutex_lock_interruptible(&adev->cmutex))
++		return -ERESTARTSYS;
++
++	if (*f_pos >= adev->size)
++		goto out;
++
++	if (*f_pos + count > adev->size)
++		count = adev->size - *f_pos;
++
++	if (copy_to_user(buf, adev->adr_start + *f_pos, count)) {
++		res = -EFAULT;
++		goto out;
++	}
++
++	*f_pos += count;
++	res = count;
++out:
++	mutex_unlock(&adev->cmutex);
++	return res;
++
++}
++
++static ssize_t
++adr_cdev_write(struct file *filp, const char __user *buf,
++	       size_t count, loff_t *f_pos)
++{
++	struct adr_dev *adev = filp->private_data;
++	int res = 0;
++
++	if (mutex_lock_interruptible(&adev->cmutex))
++		return -ERESTARTSYS;
++
++	if (*f_pos >= adev->size)
++		goto out;
++
++	if (*f_pos + count > adev->size)
++		count = adev->size - *f_pos;
++
++	if (__copy_from_user_nocache(adev->adr_start + *f_pos, buf, count)) {
++		res = -EFAULT;
++		goto out;
++	}
++
++	*f_pos += count;
++	res = count;
++
++out:
++	mutex_unlock(&adev->cmutex);
++	return res;
++}
++
++static loff_t adr_cdev_llseek(struct file *filp, loff_t offset, int origin)
++{
++	struct adr_dev *adev = filp->private_data;
++
++	if (mutex_lock_interruptible(&adev->cmutex))
++		return -ERESTARTSYS;
++
++	switch (origin) {
++	case SEEK_END:
++		offset += adev->size;
++		break;
++	case SEEK_CUR:
++		offset += filp->f_pos;
++		break;
++	case SEEK_SET:
++		break;
++	default:
++		mutex_unlock(&adev->cmutex);
++		return -EINVAL;
++	}
++
++	if (offset < 0 || offset > adev->size)
++		offset = -EINVAL;
++	else {
++		filp->f_pos = offset;
++		filp->f_version = 0;
++	}
++
++	mutex_unlock(&adev->cmutex);
++
++	return offset;
++}
++
++static int
++adr_cdev_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++{
++	return VM_FAULT_SIGBUS;
++}
++
++static struct vm_operations_struct adr_cdev_vm_ops = {
++	.fault = adr_cdev_fault,
++};
++
++static int adr_cdev_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	struct adr_dev *adev = filp->private_data;
++	int res;
++	unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
++	phys_addr_t physical = adev->phys_start + off;
++	unsigned long vsize = vma->vm_end - vma->vm_start;
++	unsigned long psize = adev->size - off;
++
++	if (vsize > psize)
++		return -EINVAL;
++
++	vma->vm_ops = &adr_cdev_vm_ops;
++
++	switch (adr_mmap_type) {
++		case 0:
++		default:
++			break;
++		case 1:
++			pgprot_writecombine(vma->vm_page_prot);
++			break;
++
++		case 2:
++			pgprot_noncached(vma->vm_page_prot);
++			break;
++	}
++
++	res = remap_pfn_range(vma,
++			      vma->vm_start,
++			      physical,
++			      vsize,
++			      vma->vm_page_prot);
++	if (res)
++		return -EAGAIN;
++
++	return 0;
++}
++
++static int
++adr_cdev_fsync(struct file *filp, loff_t start, loff_t end, int datasync)
++{
++	struct adr_dev *adev = filp->private_data;
++	struct adrbd *adrbd = to_adrbd(adev, adev->dev_id);
++
++	dev_dbg(&adrbd->pdev->dev, "fsync: start: %#llx  end: %#llx",
++		start, end);
++
++	if (mutex_lock_interruptible(&adev->cmutex))
++		return -ERESTARTSYS;
++
++	/*
++	 * fsync from user space takes no range parameter
++	 * and the range passed down is from 0 to f's. therefore
++	 * we'll just sync the whole range
++	 */
++	clflush_cache_range(adev->adr_start, adev->size);
++
++	mutex_unlock(&adev->cmutex);
++
++	return 0;
++}
++
++static long
++adr_cdev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	struct adr_dev *adev = filp->private_data;
++
++	switch (cmd) {
++	case ADR_SIZE:
++		return put_user(adev->size, (u64 __user *)arg);
++
++	case ADR_FLUSH_RANGE:
++	{
++		struct adr_range range;
++
++		if (copy_from_user(&range, (struct adr_range __user *)arg,
++				   sizeof(struct adr_range)))
++			return -EFAULT;
++
++		if (range.offset >= adev->size)
++			return -EINVAL;
++
++		if (range.offset + range.size > adev->size)
++			range.size = adev->size - range.offset;
++
++		if (mutex_lock_interruptible(&adev->cmutex))
++			return -ERESTARTSYS;
++
++		clflush_cache_range(adev->adr_start + range.offset,
++				    range.size);
++
++		mutex_unlock(&adev->cmutex);
++		break;
++	}
++
++	default:
++		return -ENOTTY;
++	}
++
++	return 0;
++}
++
++static int adr_cdev_open(struct inode *inode, struct file *filp)
++{
++	struct adrbd *adrbd = container_of(inode->i_cdev, struct adrbd, cdev);
++
++	/* assign ADR region based on minor created */
++	filp->private_data = &adrbd->adev[iminor(inode)];
++
++	return 0;
++}
++
++static int adr_cdev_release(struct inode *inode, struct file *filp)
++{
++	/* flush all data? */
++
++	filp->private_data = 0;
++
++	return 0;
++}
++
++static const struct file_operations adr_cdev_fops = {
++	.owner =	THIS_MODULE,
++	.llseek =	adr_cdev_llseek,
++	.read =		adr_cdev_read,
++	.write =	adr_cdev_write,
++	.open =		adr_cdev_open,
++	.release =	adr_cdev_release,
++	.mmap =		adr_cdev_mmap,
++	.fsync =	adr_cdev_fsync,
++	.unlocked_ioctl = adr_cdev_ioctl,
++};
++
++static int adr_init_cdev(struct adrbd *adrbd)
++{
++	dev_t dev;
++	int res;
++	int i;
++
++	res = alloc_chrdev_region(&dev, 0, adrbd->idx, "adrcdev");
++	adrbd->cdev_major = MAJOR(dev);
++
++	cdev_init(&adrbd->cdev, &adr_cdev_fops);
++	adrbd->cdev.owner = THIS_MODULE;
++
++	res = cdev_add(&adrbd->cdev, dev, adrbd->idx);
++	if (res < 0) {
++		dev_err(&adrbd->pdev->dev, "Failed adding adr char dev\n");
++		return -ENODEV;
++	}
++
++	adrbd->cdev_class = class_create(THIS_MODULE, "adr");
++	if (IS_ERR(adrbd->cdev_class)) {
++		dev_err(&adrbd->pdev->dev, "Failed to create adr class\n");
++		return PTR_ERR(adrbd->cdev_class);
++	}
++
++	adrbd->cdev_class->dev_attrs = adr_cdev_attrs;
++	adrbd->cdev_class->devnode = adr_cdev_node;
++
++	for (i = 0; i < adrbd->idx; i++) {
++		adrbd->adev[i].dev = device_create(adrbd->cdev_class,
++				&platform_bus,
++				MKDEV(adrbd->cdev_major, i),
++				&adrbd->adev[i], "%d", i);
++		if (IS_ERR(adrbd->adev[i].dev)) {
++			res = PTR_ERR(adrbd->adev[i].dev);
++			goto fail_dev;
++		}
++		mutex_init(&adrbd->adev[i].cmutex);
++		dev_info(&adrbd->pdev->dev, "adrcd%d (%d.%d) created\n",
++			 i, adrbd->cdev_major, i);
++	}
++
++	return 0;
++
++fail_dev:
++	for (i = 0; i < adrbd->idx; i++)
++		device_destroy(adrbd->cdev_class, MKDEV(adrbd->cdev_major, i));
++
++	class_destroy(adrbd->cdev_class);
++	cdev_del(&adrbd->cdev);
++	unregister_chrdev_region(MKDEV(adrbd->cdev_major, 0), adrbd->idx);
++	return res;
++}
++
+ static struct block_device_operations adev_ops = {
+ 	.owner		= THIS_MODULE,
+ 	.ioctl		= adr_ioctl
+@@ -314,6 +625,8 @@ static int adrbd_probe(struct platform_device *pdev)
+ 		adrbd->adev[i].size = size;
+ 		adrbd->adev[i].sectors = size / hardsect_size;
+ 		adrbd->adev[i].adr_start = page_address(pfn_to_page(start_pfn));
++		adrbd->adev[i].phys_start = res->start;
++		adrbd->adev[i].pfn = start_pfn;
+ 
+ 		dev_dbg(&pdev->dev, "physical start: %#llx\n", res->start);
+ 		dev_dbg(&pdev->dev, "physical end: %#llx\n", res->end);
+@@ -330,7 +643,7 @@ static int adrbd_probe(struct platform_device *pdev)
+ 			continue;
+ 		}
+ 
+-		dev_info(&pdev->dev, "ADRBD.%d (%d.%d) registered: %lu bytes.\n",
++		dev_info(&pdev->dev, "ADRBD.%d (%d.%d) registered: %llu bytes.\n",
+ 			 adrbd->adev[i].dev_id, adrbd->adr_major,
+ 			 adrbd->adev[i].gd->first_minor,
+ 			 adrbd->adev[i].size);
+@@ -342,6 +655,8 @@ static int adrbd_probe(struct platform_device *pdev)
+ 		return -ENODEV;
+ 	}
+ 
++	adr_init_cdev(adrbd);
++
+ 	platform_set_drvdata(pdev, adrbd);
+ 
+ 	return 0;
+@@ -353,6 +668,14 @@ static int adrbd_remove(struct platform_device *pdev)
+ 	int i;
+ 	int devs = adrbd->idx;
+ 
++
++	for (i = 0; i < adrbd->idx; i++)
++		device_destroy(adrbd->cdev_class, MKDEV(adrbd->cdev_major, i));
++
++	class_destroy(adrbd->cdev_class);
++	cdev_del(&adrbd->cdev);
++	unregister_chrdev_region(MKDEV(adrbd->cdev_major, 0), adrbd->idx);
++
+ 	for (i = 0; i < devs; i++) {
+ 		struct gendisk *disk = adrbd->adev[i].gd;
+ 
+diff --git a/include/uapi/linux/adr.h b/include/uapi/linux/adr.h
+new file mode 100644
+index 0000000..93745ad
+--- /dev/null
++++ b/include/uapi/linux/adr.h
+@@ -0,0 +1,68 @@
++/*
++ * This file is provided under a dual BSD/GPLv2 license.  When using or
++ *   redistributing this file, you may do so under either license.
++ *
++ *   GPL LICENSE SUMMARY
++ *
++ *   Copyright(c) 2012 Intel Corporation. All rights reserved.
++ *
++ *   This program is free software; you can redistribute it and/or modify
++ *   it under the terms of version 2 of the GNU General Public License as
++ *   published by the Free Software Foundation.
++ *
++ *   This program is distributed in the hope that it will be useful, but
++ *   WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *   General Public License for more details.
++ *
++ *   You should have received a copy of the GNU General Public License
++ *   along with this program; if not, write to the Free Software
++ *   Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *   The full GNU General Public License is included in this distribution
++ *   in the file called LICENSE.GPL.
++ *
++ *   BSD LICENSE
++ *
++ *   Copyright(c) 2012 Intel Corporation. All rights reserved.
++ *
++ *   Redistribution and use in source and binary forms, with or without
++ *   modification, are permitted provided that the following conditions
++ *   are met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copy
++ *       notice, this list of conditions and the following disclaimer in
++ *       the documentation and/or other materials provided with the
++ *       distribution.
++ *     * Neither the name of Intel Corporation nor the names of its
++ *       contributors may be used to endorse or promote products derived
++ *       from this software without specific prior written permission.
++ *
++ *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ *   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * Intel ADR char device
++ *
++ */
++#ifndef _UAPI_LINUX_ADR_H_
++#define _UAPI_LINUX_ADR_H_
++
++struct adr_range {
++	uint64_t offset; /* offset includes mmap offset */
++	uint64_t size; /* size of memory to be flushed */
++};
++
++#define ADR_SIZE	_IOR('p', 0x01, unsigned long)	/* ADR device size */
++#define ADR_FLUSH_RANGE	_IOW('p', 0x02, struct adr_range) /* ADR flush range */
++
++#endif
+-- 
+1.7.5.4
+

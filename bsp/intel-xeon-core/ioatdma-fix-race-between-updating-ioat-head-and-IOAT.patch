@@ -1,0 +1,323 @@
+From 95d72236706e8dfbba40eb4056a17cc799f731d9 Mon Sep 17 00:00:00 2001
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Tue, 26 Mar 2013 13:37:40 -0700
+Subject: [PATCH 46/70] ioatdma: fix race between updating ioat->head and
+ IOAT_COMPLETION_PENDING
+
+Upstream: 4dec23d7718e6f1f5e1773698d112025169e7d49
+
+There is a race that can hit during __cleanup() when the ioat->head pointer is
+incremented during descriptor submission. The __cleanup() can clear the
+PENDING flag when it does not see any active descriptors. This causes new
+submitted descriptors to be ignored because the COMPLETION_PENDING flag is
+cleared. This was introduced when code was adapted from ioatdma v1 to ioatdma
+v2. For v2 and v3, IOAT_COMPLETION_PENDING flag will be abandoned and a new
+flag IOAT_CHAN_ACTIVE will be utilized. This flag will also be protected under
+the prep_lock when being modified in order to avoid the race.
+
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Dan Williams <djbw@fb.com>
+Signed-off-by: Vinod Koul <vinod.koul@intel.com>
+Signed-off-by: Yunguo Wei <yunguo.wei@windriver.com>
+---
+ drivers/dma/ioat/dma.h    |    1 +
+ drivers/dma/ioat/dma_v2.c |  113 +++++++++++++++++++++++++-------------------
+ drivers/dma/ioat/dma_v3.c |  111 +++++++++++++++++++++++++-------------------
+ 3 files changed, 128 insertions(+), 97 deletions(-)
+
+diff --git a/drivers/dma/ioat/dma.h b/drivers/dma/ioat/dma.h
+index 5e8fe01..1020598 100644
+--- a/drivers/dma/ioat/dma.h
++++ b/drivers/dma/ioat/dma.h
+@@ -97,6 +97,7 @@ struct ioat_chan_common {
+ 	#define IOAT_KOBJ_INIT_FAIL 3
+ 	#define IOAT_RESHAPE_PENDING 4
+ 	#define IOAT_RUN 5
++	#define IOAT_CHAN_ACTIVE 6
+ 	struct timer_list timer;
+ 	#define COMPLETION_TIMEOUT msecs_to_jiffies(100)
+ 	#define IDLE_TIMEOUT msecs_to_jiffies(2000)
+diff --git a/drivers/dma/ioat/dma_v2.c b/drivers/dma/ioat/dma_v2.c
+index 8689576..6d22fc3 100644
+--- a/drivers/dma/ioat/dma_v2.c
++++ b/drivers/dma/ioat/dma_v2.c
+@@ -269,61 +269,22 @@ static void ioat2_restart_channel(struct ioat2_dma_chan *ioat)
+ 	__ioat2_restart_chan(ioat);
+ }
+ 
+-void ioat2_timer_event(unsigned long data)
++static void check_active(struct ioat2_dma_chan *ioat)
+ {
+-	struct ioat2_dma_chan *ioat = to_ioat2_chan((void *) data);
+ 	struct ioat_chan_common *chan = &ioat->base;
+ 
+-	if (test_bit(IOAT_COMPLETION_PENDING, &chan->state)) {
+-		dma_addr_t phys_complete;
+-		u64 status;
+-
+-		status = ioat_chansts(chan);
+-
+-		/* when halted due to errors check for channel
+-		 * programming errors before advancing the completion state
+-		 */
+-		if (is_ioat_halted(status)) {
+-			u32 chanerr;
+-
+-			chanerr = readl(chan->reg_base + IOAT_CHANERR_OFFSET);
+-			dev_err(to_dev(chan), "%s: Channel halted (%x)\n",
+-				__func__, chanerr);
+-			if (test_bit(IOAT_RUN, &chan->state))
+-				BUG_ON(is_ioat_bug(chanerr));
+-			else /* we never got off the ground */
+-				return;
+-		}
+-
+-		/* if we haven't made progress and we have already
+-		 * acknowledged a pending completion once, then be more
+-		 * forceful with a restart
+-		 */
+-		spin_lock_bh(&chan->cleanup_lock);
+-		if (ioat_cleanup_preamble(chan, &phys_complete)) {
+-			__cleanup(ioat, phys_complete);
+-		} else if (test_bit(IOAT_COMPLETION_ACK, &chan->state)) {
+-			spin_lock_bh(&ioat->prep_lock);
+-			ioat2_restart_channel(ioat);
+-			spin_unlock_bh(&ioat->prep_lock);
+-		} else {
+-			set_bit(IOAT_COMPLETION_ACK, &chan->state);
+-			mod_timer(&chan->timer, jiffies + COMPLETION_TIMEOUT);
+-		}
+-		spin_unlock_bh(&chan->cleanup_lock);
+-	} else {
+-		u16 active;
++	if (ioat2_ring_active(ioat)) {
++		mod_timer(&chan->timer, jiffies + COMPLETION_TIMEOUT);
++		return;
++	}
+ 
++	if (test_and_clear_bit(IOAT_CHAN_ACTIVE, &chan->state))
++		mod_timer(&chan->timer, jiffies + IDLE_TIMEOUT);
++	else if (ioat->alloc_order > ioat_get_alloc_order()) {
+ 		/* if the ring is idle, empty, and oversized try to step
+ 		 * down the size
+ 		 */
+-		spin_lock_bh(&chan->cleanup_lock);
+-		spin_lock_bh(&ioat->prep_lock);
+-		active = ioat2_ring_active(ioat);
+-		if (active == 0 && ioat->alloc_order > ioat_get_alloc_order())
+-			reshape_ring(ioat, ioat->alloc_order-1);
+-		spin_unlock_bh(&ioat->prep_lock);
+-		spin_unlock_bh(&chan->cleanup_lock);
++		reshape_ring(ioat, ioat->alloc_order - 1);
+ 
+ 		/* keep shrinking until we get back to our minimum
+ 		 * default size
+@@ -331,6 +292,60 @@ void ioat2_timer_event(unsigned long data)
+ 		if (ioat->alloc_order > ioat_get_alloc_order())
+ 			mod_timer(&chan->timer, jiffies + IDLE_TIMEOUT);
+ 	}
++
++}
++
++void ioat2_timer_event(unsigned long data)
++{
++	struct ioat2_dma_chan *ioat = to_ioat2_chan((void *) data);
++	struct ioat_chan_common *chan = &ioat->base;
++	dma_addr_t phys_complete;
++	u64 status;
++
++	status = ioat_chansts(chan);
++
++	/* when halted due to errors check for channel
++	 * programming errors before advancing the completion state
++	 */
++	if (is_ioat_halted(status)) {
++		u32 chanerr;
++
++		chanerr = readl(chan->reg_base + IOAT_CHANERR_OFFSET);
++		dev_err(to_dev(chan), "%s: Channel halted (%x)\n",
++			__func__, chanerr);
++		if (test_bit(IOAT_RUN, &chan->state))
++			BUG_ON(is_ioat_bug(chanerr));
++		else /* we never got off the ground */
++			return;
++	}
++
++	/* if we haven't made progress and we have already
++	 * acknowledged a pending completion once, then be more
++	 * forceful with a restart
++	 */
++	spin_lock_bh(&chan->cleanup_lock);
++	if (ioat_cleanup_preamble(chan, &phys_complete))
++		__cleanup(ioat, phys_complete);
++	else if (test_bit(IOAT_COMPLETION_ACK, &chan->state)) {
++		spin_lock_bh(&ioat->prep_lock);
++		ioat2_restart_channel(ioat);
++		spin_unlock_bh(&ioat->prep_lock);
++		spin_unlock_bh(&chan->cleanup_lock);
++		return;
++	} else {
++		set_bit(IOAT_COMPLETION_ACK, &chan->state);
++		mod_timer(&chan->timer, jiffies + COMPLETION_TIMEOUT);
++	}
++
++
++	if (ioat2_ring_active(ioat))
++		mod_timer(&chan->timer, jiffies + COMPLETION_TIMEOUT);
++	else {
++		spin_lock_bh(&ioat->prep_lock);
++		check_active(ioat);
++		spin_unlock_bh(&ioat->prep_lock);
++	}
++	spin_unlock_bh(&chan->cleanup_lock);
+ }
+ 
+ static int ioat2_reset_hw(struct ioat_chan_common *chan)
+@@ -404,7 +419,7 @@ static dma_cookie_t ioat2_tx_submit_unlock(struct dma_async_tx_descriptor *tx)
+ 	cookie = dma_cookie_assign(tx);
+ 	dev_dbg(to_dev(&ioat->base), "%s: cookie: %d\n", __func__, cookie);
+ 
+-	if (!test_and_set_bit(IOAT_COMPLETION_PENDING, &chan->state))
++	if (!test_and_set_bit(IOAT_CHAN_ACTIVE, &chan->state))
+ 		mod_timer(&chan->timer, jiffies + COMPLETION_TIMEOUT);
+ 
+ 	/* make descriptor updates visible before advancing ioat->head,
+diff --git a/drivers/dma/ioat/dma_v3.c b/drivers/dma/ioat/dma_v3.c
+index 38ccbb3..6e2c479 100644
+--- a/drivers/dma/ioat/dma_v3.c
++++ b/drivers/dma/ioat/dma_v3.c
+@@ -342,61 +342,22 @@ static void ioat3_restart_channel(struct ioat2_dma_chan *ioat)
+ 	__ioat2_restart_chan(ioat);
+ }
+ 
+-static void ioat3_timer_event(unsigned long data)
++static void check_active(struct ioat2_dma_chan *ioat)
+ {
+-	struct ioat2_dma_chan *ioat = to_ioat2_chan((void *) data);
+ 	struct ioat_chan_common *chan = &ioat->base;
+ 
+-	if (test_bit(IOAT_COMPLETION_PENDING, &chan->state)) {
+-		dma_addr_t phys_complete;
+-		u64 status;
+-
+-		status = ioat_chansts(chan);
+-
+-		/* when halted due to errors check for channel
+-		 * programming errors before advancing the completion state
+-		 */
+-		if (is_ioat_halted(status)) {
+-			u32 chanerr;
+-
+-			chanerr = readl(chan->reg_base + IOAT_CHANERR_OFFSET);
+-			dev_err(to_dev(chan), "%s: Channel halted (%x)\n",
+-				__func__, chanerr);
+-			if (test_bit(IOAT_RUN, &chan->state))
+-				BUG_ON(is_ioat_bug(chanerr));
+-			else /* we never got off the ground */
+-				return;
+-		}
+-
+-		/* if we haven't made progress and we have already
+-		 * acknowledged a pending completion once, then be more
+-		 * forceful with a restart
+-		 */
+-		spin_lock_bh(&chan->cleanup_lock);
+-		if (ioat_cleanup_preamble(chan, &phys_complete))
+-			__cleanup(ioat, phys_complete);
+-		else if (test_bit(IOAT_COMPLETION_ACK, &chan->state)) {
+-			spin_lock_bh(&ioat->prep_lock);
+-			ioat3_restart_channel(ioat);
+-			spin_unlock_bh(&ioat->prep_lock);
+-		} else {
+-			set_bit(IOAT_COMPLETION_ACK, &chan->state);
+-			mod_timer(&chan->timer, jiffies + COMPLETION_TIMEOUT);
+-		}
+-		spin_unlock_bh(&chan->cleanup_lock);
+-	} else {
+-		u16 active;
++	if (ioat2_ring_active(ioat)) {
++		mod_timer(&chan->timer, jiffies + COMPLETION_TIMEOUT);
++		return;
++	}
+ 
++	if (test_and_clear_bit(IOAT_CHAN_ACTIVE, &chan->state))
++		mod_timer(&chan->timer, jiffies + IDLE_TIMEOUT);
++	else if (ioat->alloc_order > ioat_get_alloc_order()) {
+ 		/* if the ring is idle, empty, and oversized try to step
+ 		 * down the size
+ 		 */
+-		spin_lock_bh(&chan->cleanup_lock);
+-		spin_lock_bh(&ioat->prep_lock);
+-		active = ioat2_ring_active(ioat);
+-		if (active == 0 && ioat->alloc_order > ioat_get_alloc_order())
+-			reshape_ring(ioat, ioat->alloc_order-1);
+-		spin_unlock_bh(&ioat->prep_lock);
+-		spin_unlock_bh(&chan->cleanup_lock);
++		reshape_ring(ioat, ioat->alloc_order - 1);
+ 
+ 		/* keep shrinking until we get back to our minimum
+ 		 * default size
+@@ -404,6 +365,60 @@ static void ioat3_timer_event(unsigned long data)
+ 		if (ioat->alloc_order > ioat_get_alloc_order())
+ 			mod_timer(&chan->timer, jiffies + IDLE_TIMEOUT);
+ 	}
++
++}
++
++void ioat3_timer_event(unsigned long data)
++{
++	struct ioat2_dma_chan *ioat = to_ioat2_chan((void *) data);
++	struct ioat_chan_common *chan = &ioat->base;
++	dma_addr_t phys_complete;
++	u64 status;
++
++	status = ioat_chansts(chan);
++
++	/* when halted due to errors check for channel
++	 * programming errors before advancing the completion state
++	 */
++	if (is_ioat_halted(status)) {
++		u32 chanerr;
++
++		chanerr = readl(chan->reg_base + IOAT_CHANERR_OFFSET);
++		dev_err(to_dev(chan), "%s: Channel halted (%x)\n",
++			__func__, chanerr);
++		if (test_bit(IOAT_RUN, &chan->state))
++			BUG_ON(is_ioat_bug(chanerr));
++		else /* we never got off the ground */
++			return;
++	}
++
++	/* if we haven't made progress and we have already
++	 * acknowledged a pending completion once, then be more
++	 * forceful with a restart
++	 */
++	spin_lock_bh(&chan->cleanup_lock);
++	if (ioat_cleanup_preamble(chan, &phys_complete))
++		__cleanup(ioat, phys_complete);
++	else if (test_bit(IOAT_COMPLETION_ACK, &chan->state)) {
++		spin_lock_bh(&ioat->prep_lock);
++		ioat3_restart_channel(ioat);
++		spin_unlock_bh(&ioat->prep_lock);
++		spin_unlock_bh(&chan->cleanup_lock);
++		return;
++	} else {
++		set_bit(IOAT_COMPLETION_ACK, &chan->state);
++		mod_timer(&chan->timer, jiffies + COMPLETION_TIMEOUT);
++	}
++
++
++	if (ioat2_ring_active(ioat))
++		mod_timer(&chan->timer, jiffies + COMPLETION_TIMEOUT);
++	else {
++		spin_lock_bh(&ioat->prep_lock);
++		check_active(ioat);
++		spin_unlock_bh(&ioat->prep_lock);
++	}
++	spin_unlock_bh(&chan->cleanup_lock);
+ }
+ 
+ static enum dma_status
+-- 
+1.7.5.4
+
