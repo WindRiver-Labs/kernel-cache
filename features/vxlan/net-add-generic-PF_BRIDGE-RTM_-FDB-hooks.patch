@@ -1,0 +1,573 @@
+From fbd83c54925f9c9c951ae7b0ee028b20124484f6 Mon Sep 17 00:00:00 2001
+From: John Fastabend <john.r.fastabend@intel.com>
+Date: Sun, 15 Apr 2012 06:43:56 +0000
+Subject: [PATCH 01/39] net: add generic PF_BRIDGE:RTM_ FDB hooks
+
+commit 77162022ab26a1f99d3af30c03760a76f86e193d upstream.
+
+This adds two new flags NTF_MASTER and NTF_SELF that can
+now be used to specify where PF_BRIDGE netlink commands should
+be sent. NTF_MASTER sends the commands to the 'dev->master'
+device for parsing. Typically this will be the linux net/bridge,
+or open-vswitch devices. Also without any flags set the command
+will be handled by the master device as well so that current user
+space tools continue to work as expected.
+
+The NTF_SELF flag will push the PF_BRIDGE commands to the
+device. In the basic example below the commands are then parsed
+and programmed in the embedded bridge.
+
+Note if both NTF_SELF and NTF_MASTER bits are set then the
+command will be sent to both 'dev->master' and 'dev' this allows
+user space to easily keep the embedded bridge and software bridge
+in sync.
+
+There is a slight complication in the case with both flags set
+when an error occurs. To resolve this the rtnl handler clears
+the NTF_ flag in the netlink ack to indicate which sets completed
+successfully. The add/del handlers will abort as soon as any
+error occurs.
+
+To support this new net device ops were added to call into
+the device and the existing bridging code was refactored
+to use these. There should be no required changes in user space
+to support the current bridge behavior.
+
+A basic setup with a SR-IOV enabled NIC looks like this,
+
+          veth0  veth2
+            |      |
+          ------------
+          |  bridge0 |   <---- software bridging
+          ------------
+               /
+               /
+  ethx.y      ethx
+    VF         PF
+     \         \          <---- propagate FDB entries to HW
+     \         \
+  --------------------
+  |  Embedded Bridge |    <---- hardware offloaded switching
+  --------------------
+
+In this case the embedded bridge must be managed to allow 'veth0'
+to communicate with 'ethx.y' correctly. At present drivers managing
+the embedded bridge either send frames onto the network which
+then get dropped by the switch OR the embedded bridge will flood
+these frames. With this patch we have a mechanism to manage the
+embedded bridge correctly from user space. This example is specific
+to SR-IOV but replacing the VF with another PF or dropping this
+into the DSA framework generates similar management issues.
+
+Examples session using the 'br'[1] tool to add, dump and then
+delete a mac address with a new "embedded" option and enabled
+ixgbe driver:
+
+ # br fdb add 22:35:19:ac:60:59 dev eth3
+ # br fdb
+port    mac addr                flags
+veth0   22:35:19:ac:60:58       static
+veth0   9a:5f:81:f7:f6:ec       local
+eth3    00:1b:21:55:23:59       local
+eth3    22:35:19:ac:60:59       static
+veth0   22:35:19:ac:60:57       static
+ #br fdb add 22:35:19:ac:60:59 embedded dev eth3
+ #br fdb
+port    mac addr                flags
+veth0   22:35:19:ac:60:58       static
+veth0   9a:5f:81:f7:f6:ec       local
+eth3    00:1b:21:55:23:59       local
+eth3    22:35:19:ac:60:59       static
+veth0   22:35:19:ac:60:57       static
+eth3    22:35:19:ac:60:59       local embedded
+ #br fdb del 22:35:19:ac:60:59 embedded dev eth3
+
+I added a couple lines to 'br' to set the flags correctly is all. It
+is my opinion that the merit of this patch is now embedded and SW
+bridges can both be modeled correctly in user space using very nearly
+the same message passing.
+
+[1] 'br' tool was published as an RFC here and will be renamed 'bridge'
+    http://patchwork.ozlabs.org/patch/117664/
+
+Thanks to Jamal Hadi Salim, Stephen Hemminger and Ben Hutchings for
+valuable feedback, suggestions, and review.
+
+v2: fixed api descriptions and error case with both NTF_SELF and
+    NTF_MASTER set plus updated patch description.
+
+Signed-off-by: Michel Thebeau <michel.thebeau@windriver.com>
+[ Michel:
+  - drop unused declaration ndo_dflt_fdb_dump();
+  - add #ifdef protection;
+  - keep previous version of br_fdb_dump(), br_fdb_add(), etc using
+    #ifdef to use alternate code for vxlan integration
+]
+
+Signed-off-by: John Fastabend <john.r.fastabend@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ include/linux/neighbour.h |    5 ++
+ include/linux/netdevice.h |   27 ++++++++
+ net/bridge/br_device.c    |    5 ++
+ net/bridge/br_fdb.c       |   93 +++++++++++++++++++++++++-
+ net/bridge/br_netlink.c   |    2 +
+ net/bridge/br_private.h   |   15 +++++
+ net/core/rtnetlink.c      |  158 +++++++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 304 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/neighbour.h b/include/linux/neighbour.h
+index b188f68..257ed73 100644
+--- a/include/linux/neighbour.h
++++ b/include/linux/neighbour.h
+@@ -33,6 +33,11 @@ enum {
+ #define NTF_PROXY	0x08	/* == ATF_PUBL */
+ #define NTF_ROUTER	0x80
+ 
++#ifdef CONFIG_VXLAN
++#define NTF_SELF	0x02
++#define NTF_MASTER	0x04
++#endif /* CONFIG_VXLAN */
++
+ /*
+  *	Neighbor Cache Entry States.
+  */
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 2df3cc3..2111103 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -55,6 +55,9 @@
+ #include <net/netprio_cgroup.h>
+ 
+ #include <linux/netdev_features.h>
++#ifdef CONFIG_VXLAN
++#include <linux/neighbour.h>
++#endif /* CONFIG_VXLAN */
+ 
+ struct netpoll_info;
+ struct device;
+@@ -906,6 +909,16 @@ struct netdev_fcoe_hbainfo {
+  *	feature set might be less than what was returned by ndo_fix_features()).
+  *	Must return >0 or -errno if it changed dev->features itself.
+  *
++ * int (*ndo_fdb_add)(struct ndmsg *ndm, struct net_device *dev,
++ *		      unsigned char *addr, u16 flags)
++ *	Adds an FDB entry to dev for addr.
++ * int (*ndo_fdb_del)(struct ndmsg *ndm, struct net_device *dev,
++ *		      unsigned char *addr)
++ *	Deletes the FDB entry from dev coresponding to addr.
++ * int (*ndo_fdb_dump)(struct sk_buff *skb, struct netlink_callback *cb,
++ *		       struct net_device *dev, int idx)
++ *	Used to add FDB entries to dump requests. Implementers should add
++ *	entries to skb and update idx with the number of entries.
+  */
+ struct net_device_ops {
+ 	int			(*ndo_init)(struct net_device *dev);
+@@ -1003,6 +1016,20 @@ struct net_device_ops {
+ 						    netdev_features_t features);
+ 	int			(*ndo_neigh_construct)(struct neighbour *n);
+ 	void			(*ndo_neigh_destroy)(struct neighbour *n);
++
++#ifdef CONFIG_VXLAN
++	int			(*ndo_fdb_add)(struct ndmsg *ndm,
++					       struct net_device *dev,
++					       unsigned char *addr,
++					       u16 flags);
++	int			(*ndo_fdb_del)(struct ndmsg *ndm,
++					       struct net_device *dev,
++					       unsigned char *addr);
++	int			(*ndo_fdb_dump)(struct sk_buff *skb,
++						struct netlink_callback *cb,
++						struct net_device *dev,
++						int idx);
++#endif /* CONFIG_VXLAN */
+ };
+ 
+ /*
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index ba829de..08c4120 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -317,6 +317,11 @@ static const struct net_device_ops br_netdev_ops = {
+ 	.ndo_add_slave		 = br_add_slave,
+ 	.ndo_del_slave		 = br_del_slave,
+ 	.ndo_fix_features        = br_fix_features,
++#ifdef CONFIG_VXLAN
++	.ndo_fdb_add		 = br_fdb_add,
++	.ndo_fdb_del		 = br_fdb_delete,
++	.ndo_fdb_dump		 = br_fdb_dump,
++#endif /* CONFIG_VXLAN */
+ };
+ 
+ static void br_dev_free(struct net_device *dev)
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index 5ba0c84..fa45eb7 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -535,6 +535,41 @@ errout:
+ }
+ 
+ /* Dump information about entries, in response to GETNEIGH */
++#ifdef CONFIG_VXLAN
++int br_fdb_dump(struct sk_buff *skb,
++		struct netlink_callback *cb,
++		struct net_device *dev,
++		int idx)
++{
++	struct net_bridge *br = netdev_priv(dev);
++	int i;
++
++	if (!(dev->priv_flags & IFF_EBRIDGE))
++		goto out;
++
++	for (i = 0; i < BR_HASH_SIZE; i++) {
++		struct hlist_node *h;
++		struct net_bridge_fdb_entry *f;
++
++		hlist_for_each_entry_rcu(f, h, &br->hash[i], hlist) {
++			if (idx < cb->args[0])
++				goto skip;
++
++			if (fdb_fill_info(skb, br, f,
++					  NETLINK_CB(cb->skb).pid,
++					  cb->nlh->nlmsg_seq,
++					  RTM_NEWNEIGH,
++					  NLM_F_MULTI) < 0)
++				break;
++skip:
++			++idx;
++		}
++	}
++
++out:
++	return idx;
++}
++#else
+ int br_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ {
+ 	struct net *net = sock_net(skb->sk);
+@@ -574,6 +609,7 @@ skip:
+ 
+ 	return skb->len;
+ }
++#endif /* CONFIG_VXLAN */
+ 
+ /* Update (create or replace) forwarding database entry */
+ static int fdb_add_entry(struct net_bridge_port *source, const __u8 *addr,
+@@ -614,6 +650,38 @@ static int fdb_add_entry(struct net_bridge_port *source, const __u8 *addr,
+ }
+ 
+ /* Add new permanent fdb entry with RTM_NEWNEIGH */
++#ifdef CONFIG_VXLAN
++int br_fdb_add(struct ndmsg *ndm, struct net_device *dev,
++	       unsigned char *addr, u16 nlh_flags)
++{
++	struct net_bridge_port *p;
++	int err = 0;
++
++	if (!(ndm->ndm_state & (NUD_PERMANENT|NUD_NOARP|NUD_REACHABLE))) {
++		pr_info("bridge: RTM_NEWNEIGH with invalid state %#x\n", ndm->ndm_state);
++		return -EINVAL;
++	}
++
++	p = br_port_get_rtnl(dev);
++	if (p == NULL) {
++		pr_info("bridge: RTM_NEWNEIGH %s not a bridge port\n",
++			dev->name);
++		return -EINVAL;
++	}
++
++	if (ndm->ndm_flags & NTF_USE) {
++		rcu_read_lock();
++		br_fdb_update(p->br, p, addr);
++		rcu_read_unlock();
++	} else {
++		spin_lock_bh(&p->br->hash_lock);
++		err = fdb_add_entry(p, addr, ndm->ndm_state, nlh_flags);
++		spin_unlock_bh(&p->br->hash_lock);
++	}
++
++	return err;
++}
++#else
+ int br_fdb_add(struct sk_buff *skb, struct nlmsghdr *nlh, void *arg)
+ {
+ 	struct net *net = sock_net(skb->sk);
+@@ -676,8 +744,9 @@ int br_fdb_add(struct sk_buff *skb, struct nlmsghdr *nlh, void *arg)
+ 
+ 	return err;
+ }
++#endif /* CONFIG_VXLAN */
+ 
+-static int fdb_delete_by_addr(struct net_bridge_port *p, const u8 *addr)
++static int fdb_delete_by_addr(struct net_bridge_port *p, u8 *addr)
+ {
+ 	struct net_bridge *br = p->br;
+ 	struct hlist_head *head = &br->hash[br_mac_hash(addr)];
+@@ -692,6 +761,27 @@ static int fdb_delete_by_addr(struct net_bridge_port *p, const u8 *addr)
+ }
+ 
+ /* Remove neighbor entry with RTM_DELNEIGH */
++#ifdef CONFIG_VXLAN
++int br_fdb_delete(struct ndmsg *ndm, struct net_device *dev,
++		  unsigned char *addr)
++{
++	struct net_bridge_port *p;
++	int err;
++
++	p = br_port_get_rtnl(dev);
++	if (p == NULL) {
++		pr_info("bridge: RTM_DELNEIGH %s not a bridge port\n",
++			dev->name);
++		return -EINVAL;
++	}
++
++	spin_lock_bh(&p->br->hash_lock);
++	err = fdb_delete_by_addr(p, addr);
++	spin_unlock_bh(&p->br->hash_lock);
++
++	return err;
++}
++#else
+ int br_fdb_delete(struct sk_buff *skb, struct nlmsghdr *nlh, void *arg)
+ {
+ 	struct net *net = sock_net(skb->sk);
+@@ -739,3 +829,4 @@ int br_fdb_delete(struct sk_buff *skb, struct nlmsghdr *nlh, void *arg)
+ 
+ 	return err;
+ }
++#endif /* CONFIG_VXLAN */
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index cbf9ccd..46c21ff 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -235,6 +235,7 @@ int __init br_netlink_init(void)
+ 			      br_rtm_setlink, NULL, NULL);
+ 	if (err)
+ 		goto err3;
++#ifndef CONFIG_VXLAN
+ 	err = __rtnl_register(PF_BRIDGE, RTM_NEWNEIGH,
+ 			      br_fdb_add, NULL, NULL);
+ 	if (err)
+@@ -247,6 +248,7 @@ int __init br_netlink_init(void)
+ 			      NULL, br_fdb_dump, NULL);
+ 	if (err)
+ 		goto err3;
++#endif /* CONFIG_VXLAN */
+ 
+ 	return 0;
+ 
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 51e8826..0fb5c8e 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -359,9 +359,24 @@ extern int br_fdb_insert(struct net_bridge *br,
+ extern void br_fdb_update(struct net_bridge *br,
+ 			  struct net_bridge_port *source,
+ 			  const unsigned char *addr);
++
++#ifdef CONFIG_VXLAN
++extern int br_fdb_delete(struct ndmsg *ndm,
++			 struct net_device *dev,
++			 unsigned char *addr);
++extern int br_fdb_add(struct ndmsg *nlh,
++		      struct net_device *dev,
++		      unsigned char *addr,
++		      u16 nlh_flags);
++extern int br_fdb_dump(struct sk_buff *skb,
++		       struct netlink_callback *cb,
++		       struct net_device *dev,
++		       int idx);
++#else
+ extern int br_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb);
+ extern int br_fdb_add(struct sk_buff *skb, struct nlmsghdr *nlh, void *arg);
+ extern int br_fdb_delete(struct sk_buff *skb, struct nlmsghdr *nlh, void *arg);
++#endif /* CONFIG_VXLAN */
+ 
+ /* br_forward.c */
+ extern void br_deliver(const struct net_bridge_port *to,
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index 900fc61..dec5913 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -36,6 +36,10 @@
+ #include <linux/mutex.h>
+ #include <linux/if_addr.h>
+ #include <linux/pci.h>
++#ifdef CONFIG_VXLAN
++#include <linux/if_bridge.h>
++#include <linux/etherdevice.h>
++#endif /* CONFIG_VXLAN */
+ 
+ #include <asm/uaccess.h>
+ 
+@@ -1979,6 +1983,154 @@ errout:
+ 		rtnl_set_sk_err(net, RTNLGRP_LINK, err);
+ }
+ 
++#ifdef CONFIG_VXLAN
++static int rtnl_fdb_add(struct sk_buff *skb, struct nlmsghdr *nlh, void *arg)
++{
++	struct net *net = sock_net(skb->sk);
++	struct net_device *master = NULL;
++	struct ndmsg *ndm;
++	struct nlattr *tb[NDA_MAX+1];
++	struct net_device *dev;
++	u8 *addr;
++	int err;
++
++	err = nlmsg_parse(nlh, sizeof(*ndm), tb, NDA_MAX, NULL);
++	if (err < 0)
++		return err;
++
++	ndm = nlmsg_data(nlh);
++	if (ndm->ndm_ifindex == 0) {
++		pr_info("PF_BRIDGE: RTM_NEWNEIGH with invalid ifindex\n");
++		return -EINVAL;
++	}
++
++	dev = __dev_get_by_index(net, ndm->ndm_ifindex);
++	if (dev == NULL) {
++		pr_info("PF_BRIDGE: RTM_NEWNEIGH with unknown ifindex\n");
++		return -ENODEV;
++	}
++
++	if (!tb[NDA_LLADDR] || nla_len(tb[NDA_LLADDR]) != ETH_ALEN) {
++		pr_info("PF_BRIDGE: RTM_NEWNEIGH with invalid address\n");
++		return -EINVAL;
++	}
++
++	addr = nla_data(tb[NDA_LLADDR]);
++	if (!is_valid_ether_addr(addr)) {
++		pr_info("PF_BRIDGE: RTM_NEWNEIGH with invalid ether address\n");
++		return -EINVAL;
++	}
++
++	err = -EOPNOTSUPP;
++
++	/* Support fdb on master device the net/bridge default case */
++	if ((!ndm->ndm_flags || ndm->ndm_flags & NTF_MASTER) &&
++	    (dev->priv_flags & IFF_BRIDGE_PORT)) {
++		master = dev->master;
++		err = master->netdev_ops->ndo_fdb_add(ndm, dev, addr,
++						      nlh->nlmsg_flags);
++		if (err)
++			goto out;
++		else
++			ndm->ndm_flags &= ~NTF_MASTER;
++	}
++
++	/* Embedded bridge, macvlan, and any other device support */
++	if ((ndm->ndm_flags & NTF_SELF) && dev->netdev_ops->ndo_fdb_add) {
++		err = dev->netdev_ops->ndo_fdb_add(ndm, dev, addr,
++						   nlh->nlmsg_flags);
++
++		if (!err)
++			ndm->ndm_flags &= ~NTF_SELF;
++	}
++out:
++	return err;
++}
++
++static int rtnl_fdb_del(struct sk_buff *skb, struct nlmsghdr *nlh, void *arg)
++{
++	struct net *net = sock_net(skb->sk);
++	struct ndmsg *ndm;
++	struct nlattr *llattr;
++	struct net_device *dev;
++	int err = -EINVAL;
++	__u8 *addr;
++
++	if (nlmsg_len(nlh) < sizeof(*ndm))
++		return -EINVAL;
++
++	ndm = nlmsg_data(nlh);
++	if (ndm->ndm_ifindex == 0) {
++		pr_info("PF_BRIDGE: RTM_DELNEIGH with invalid ifindex\n");
++		return -EINVAL;
++	}
++
++	dev = __dev_get_by_index(net, ndm->ndm_ifindex);
++	if (dev == NULL) {
++		pr_info("PF_BRIDGE: RTM_DELNEIGH with unknown ifindex\n");
++		return -ENODEV;
++	}
++
++	llattr = nlmsg_find_attr(nlh, sizeof(*ndm), NDA_LLADDR);
++	if (llattr == NULL || nla_len(llattr) != ETH_ALEN) {
++		pr_info("PF_BRIGDE: RTM_DELNEIGH with invalid address\n");
++		return -EINVAL;
++	}
++
++	addr = nla_data(llattr);
++	err = -EOPNOTSUPP;
++
++	/* Support fdb on master device the net/bridge default case */
++	if ((!ndm->ndm_flags || ndm->ndm_flags & NTF_MASTER) &&
++	    (dev->priv_flags & IFF_BRIDGE_PORT)) {
++		struct net_device *master = dev->master;
++
++		if (master->netdev_ops->ndo_fdb_del)
++			err = master->netdev_ops->ndo_fdb_del(ndm, dev, addr);
++
++		if (err)
++			goto out;
++		else
++			ndm->ndm_flags &= ~NTF_MASTER;
++	}
++
++	/* Embedded bridge, macvlan, and any other device support */
++	if ((ndm->ndm_flags & NTF_SELF) && dev->netdev_ops->ndo_fdb_del) {
++		err = dev->netdev_ops->ndo_fdb_del(ndm, dev, addr);
++
++		if (!err)
++			ndm->ndm_flags &= ~NTF_SELF;
++	}
++out:
++	return err;
++}
++
++static int rtnl_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb)
++{
++	int idx = 0;
++	struct net *net = sock_net(skb->sk);
++	struct net_device *dev;
++
++	rcu_read_lock();
++	for_each_netdev_rcu(net, dev) {
++		if (dev->priv_flags & IFF_BRIDGE_PORT) {
++			struct net_device *master = dev->master;
++			const struct net_device_ops *ops = master->netdev_ops;
++
++			if (ops->ndo_fdb_dump)
++				idx = ops->ndo_fdb_dump(skb, cb, dev, idx);
++		}
++
++		if (dev->netdev_ops->ndo_fdb_dump)
++			idx = dev->netdev_ops->ndo_fdb_dump(skb, cb, dev, idx);
++	}
++	rcu_read_unlock();
++
++	cb->args[0] = idx;
++	return skb->len;
++}
++#endif /* CONFIG_VXLAN */
++
+ /* Protected by RTNL sempahore.  */
+ static struct rtattr **rta_buf;
+ static int rtattr_max;
+@@ -2151,5 +2303,11 @@ void __init rtnetlink_init(void)
+ 
+ 	rtnl_register(PF_UNSPEC, RTM_GETADDR, NULL, rtnl_dump_all, NULL);
+ 	rtnl_register(PF_UNSPEC, RTM_GETROUTE, NULL, rtnl_dump_all, NULL);
++
++#ifdef CONFIG_VXLAN
++	rtnl_register(PF_BRIDGE, RTM_NEWNEIGH, rtnl_fdb_add, NULL, NULL);
++	rtnl_register(PF_BRIDGE, RTM_DELNEIGH, rtnl_fdb_del, NULL, NULL);
++	rtnl_register(PF_BRIDGE, RTM_GETNEIGH, NULL, rtnl_fdb_dump, NULL);
++#endif /* CONFIG_VXLAN */
+ }
+ 
+-- 
+1.7.9.7
+
