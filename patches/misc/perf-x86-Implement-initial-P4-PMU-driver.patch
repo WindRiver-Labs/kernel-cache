@@ -1,0 +1,1616 @@
+From fe225ea1aa89ae1b7f99d94c02e661b11d1c2565 Mon Sep 17 00:00:00 2001
+From: Xufeng Zhang <xufeng.zhang@windriver.com>
+Date: Thu, 13 Jun 2013 10:24:23 +0800
+Subject: [PATCH 15/29] perf, x86: Implement initial P4 PMU driver
+
+commit a072738e04f0eb26370e39ec679e9a0d65e49aea upstream
+
+The netburst PMU is way different from the "architectural
+perfomance monitoring" specification that current CPUs use.
+P4 uses a tuple of ESCR+CCCR+COUNTER MSR registers to handle
+perfomance monitoring events.
+
+A few implementational details:
+
+1) We need a separate x86_pmu::hw_config helper in struct
+   x86_pmu since register bit-fields are quite different from P6,
+   Core and later cpu series.
+
+2) For the same reason is a x86_pmu::schedule_events helper
+   introduced.
+
+3) hw_perf_event::config consists of packed ESCR+CCCR values.
+   It's allowed since in reality both registers only use a half
+   of their size. Of course before making a real write into a
+   particular MSR we need to unpack the value and extend it to
+   a proper size.
+
+4) The tuple of packed ESCR+CCCR in hw_perf_event::config
+   doesn't describe the memory address of ESCR MSR register
+   so that we need to keep a mapping between these tuples
+   used and available ESCR (various P4 events may use same
+   ESCRs but not simultaneously), for this sake every active
+   event has a per-cpu map of hw_perf_event::idx <--> ESCR
+   addresses.
+
+5) Since hw_perf_event::idx is an offset to counter/control register
+   we need to lift X86_PMC_MAX_GENERIC up, otherwise kernel
+   strips it down to 8 registers and event armed may never be turned
+   off (ie the bit in active_mask is set but the loop never reaches
+   this index to check), thanks to Peter Zijlstra
+
+Restrictions:
+
+ - No cascaded counters support (do we ever need them?)
+ - No dependent events support (so PERF_COUNT_HW_INSTRUCTIONS
+   doesn't work for now)
+ - There are events with same counters which can't work simultaneously
+   (need to use intersected ones due to broken counter 1)
+ - No PERF_COUNT_HW_CACHE_ events yet
+
+Todo:
+
+ - Implement dependent events
+ - Need proper hashing for event opcodes (no linear search, good for
+   debugging stage but not in real loads)
+ - Some events counted during a clock cycle -- need to set threshold
+   for them and count every clock cycle just to get summary statistics
+   (ie to behave the same way as other PMUs do)
+ - Need to swicth to use event_constraints
+ - To support RAW events we need to encode a global list of P4 events
+   into p4_templates
+ - Cache events need to be added
+
+Event support status matrix:
+
+ Event                  status
+ -----------------------------
+ cycles                 works
+ cache-references       works
+ cache-misses           works
+ branch-misses          works
+ bus-cycles             partially (does not work on 64bit cpu with HT enabled)
+ instruction            doesnt work (needs dependent event [mop tagging])
+ branches               doesnt work
+
+Signed-off-by: Cyrill Gorcunov <gorcunov@openvz.org>
+Signed-off-by: Lin Ming <ming.m.lin@intel.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Robert Richter <robert.richter@amd.com>
+Cc: Frederic Weisbecker <fweisbec@gmail.com>
+LKML-Reference: <20100311165439.GB5129@lenovo>
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Xufeng Zhang <xufeng.zhang@windriver.com>
+---
+ arch/x86/include/asm/perf_event.h      |    2 +-
+ arch/x86/include/asm/perf_event_p4.h   |  707 ++++++++++++++++++++++++++++++++
+ arch/x86/kernel/cpu/perf_event.c       |   46 ++-
+ arch/x86/kernel/cpu/perf_event_amd.c   |    2 +
+ arch/x86/kernel/cpu/perf_event_intel.c |   15 +-
+ arch/x86/kernel/cpu/perf_event_p4.c    |  607 +++++++++++++++++++++++++++
+ arch/x86/kernel/cpu/perf_event_p6.c    |    2 +
+ 7 files changed, 1358 insertions(+), 23 deletions(-)
+ create mode 100644 arch/x86/include/asm/perf_event_p4.h
+ create mode 100644 arch/x86/kernel/cpu/perf_event_p4.c
+
+diff --git a/arch/x86/include/asm/perf_event.h b/arch/x86/include/asm/perf_event.h
+index 1e979f7..e36cb3a 100644
+--- a/arch/x86/include/asm/perf_event.h
++++ b/arch/x86/include/asm/perf_event.h
+@@ -5,7 +5,7 @@
+  * Performance event hw details:
+  */
+ 
+-#define X86_PMC_MAX_GENERIC					8
++#define X86_PMC_MAX_GENERIC				       32
+ #define X86_PMC_MAX_FIXED					3
+ 
+ #define X86_PMC_IDX_GENERIC				        0
+diff --git a/arch/x86/include/asm/perf_event_p4.h b/arch/x86/include/asm/perf_event_p4.h
+new file mode 100644
+index 0000000..829f471
+--- /dev/null
++++ b/arch/x86/include/asm/perf_event_p4.h
+@@ -0,0 +1,707 @@
++/*
++ * Netburst Perfomance Events (P4, old Xeon)
++ */
++
++#ifndef PERF_EVENT_P4_H
++#define PERF_EVENT_P4_H
++
++#include <linux/cpu.h>
++#include <linux/bitops.h>
++
++/*
++ * NetBurst has perfomance MSRs shared between
++ * threads if HT is turned on, ie for both logical
++ * processors (mem: in turn in Atom with HT support
++ * perf-MSRs are not shared and every thread has its
++ * own perf-MSRs set)
++ */
++#define ARCH_P4_TOTAL_ESCR		(46)
++#define ARCH_P4_RESERVED_ESCR		(2) /* IQ_ESCR(0,1) not always present */
++#define ARCH_P4_MAX_ESCR		(ARCH_P4_TOTAL_ESCR - ARCH_P4_RESERVED_ESCR)
++#define ARCH_P4_MAX_CCCR		(18)
++#define ARCH_P4_MAX_COUNTER		(ARCH_P4_MAX_CCCR / 2)
++
++#define P4_EVNTSEL_EVENT_MASK		0x7e000000U
++#define P4_EVNTSEL_EVENT_SHIFT		25
++#define P4_EVNTSEL_EVENTMASK_MASK	0x01fffe00U
++#define P4_EVNTSEL_EVENTMASK_SHIFT	9
++#define P4_EVNTSEL_TAG_MASK		0x000001e0U
++#define P4_EVNTSEL_TAG_SHIFT		5
++#define P4_EVNTSEL_TAG_ENABLE		0x00000010U
++#define P4_EVNTSEL_T0_OS		0x00000008U
++#define P4_EVNTSEL_T0_USR		0x00000004U
++#define P4_EVNTSEL_T1_OS		0x00000002U
++#define P4_EVNTSEL_T1_USR		0x00000001U
++
++/* Non HT mask */
++#define P4_EVNTSEL_MASK				\
++	(P4_EVNTSEL_EVENT_MASK		|	\
++	P4_EVNTSEL_EVENTMASK_MASK	|	\
++	P4_EVNTSEL_TAG_MASK		|	\
++	P4_EVNTSEL_TAG_ENABLE		|	\
++	P4_EVNTSEL_T0_OS		|	\
++	P4_EVNTSEL_T0_USR)
++
++/* HT mask */
++#define P4_EVNTSEL_MASK_HT			\
++	(P4_EVNTSEL_MASK		|	\
++	P4_EVNTSEL_T1_OS		|	\
++	P4_EVNTSEL_T1_USR)
++
++#define P4_CCCR_OVF			0x80000000U
++#define P4_CCCR_CASCADE			0x40000000U
++#define P4_CCCR_OVF_PMI_T0		0x04000000U
++#define P4_CCCR_OVF_PMI_T1		0x08000000U
++#define P4_CCCR_FORCE_OVF		0x02000000U
++#define P4_CCCR_EDGE			0x01000000U
++#define P4_CCCR_THRESHOLD_MASK		0x00f00000U
++#define P4_CCCR_THRESHOLD_SHIFT		20
++#define P4_CCCR_THRESHOLD(v)		((v) << P4_CCCR_THRESHOLD_SHIFT)
++#define P4_CCCR_COMPLEMENT		0x00080000U
++#define P4_CCCR_COMPARE			0x00040000U
++#define P4_CCCR_ESCR_SELECT_MASK	0x0000e000U
++#define P4_CCCR_ESCR_SELECT_SHIFT	13
++#define P4_CCCR_ENABLE			0x00001000U
++#define P4_CCCR_THREAD_SINGLE		0x00010000U
++#define P4_CCCR_THREAD_BOTH		0x00020000U
++#define P4_CCCR_THREAD_ANY		0x00030000U
++
++/* Non HT mask */
++#define P4_CCCR_MASK				\
++	(P4_CCCR_OVF			|	\
++	P4_CCCR_CASCADE			|	\
++	P4_CCCR_OVF_PMI_T0		|	\
++	P4_CCCR_FORCE_OVF		|	\
++	P4_CCCR_EDGE			|	\
++	P4_CCCR_THRESHOLD_MASK		|	\
++	P4_CCCR_COMPLEMENT		|	\
++	P4_CCCR_COMPARE			|	\
++	P4_CCCR_ESCR_SELECT_MASK	|	\
++	P4_CCCR_ENABLE)
++
++/* HT mask */
++#define P4_CCCR_MASK_HT				\
++	(P4_CCCR_MASK			|	\
++	P4_CCCR_THREAD_ANY)
++
++/*
++ * format is 32 bit: ee ss aa aa
++ * where
++ *	ee - 8 bit event
++ *	ss - 8 bit selector
++ *	aa aa - 16 bits reserved for tags/attributes
++ */
++#define P4_EVENT_PACK(event, selector)		(((event) << 24) | ((selector) << 16))
++#define P4_EVENT_UNPACK_EVENT(packed)		(((packed) >> 24) & 0xff)
++#define P4_EVENT_UNPACK_SELECTOR(packed)	(((packed) >> 16) & 0xff)
++#define P4_EVENT_PACK_ATTR(attr)		((attr))
++#define P4_EVENT_UNPACK_ATTR(packed)		((packed) & 0xffff)
++#define P4_MAKE_EVENT_ATTR(class, name, bit)	class##_##name = (1 << bit)
++#define P4_EVENT_ATTR(class, name)		class##_##name
++#define P4_EVENT_ATTR_STR(class, name)		__stringify(class##_##name)
++
++/*
++ * config field is 64bit width and consists of
++ * HT << 63 | ESCR << 32 | CCCR
++ * where HT is HyperThreading bit (since ESCR
++ * has it reserved we may use it for own purpose)
++ *
++ * note that this is NOT the addresses of respective
++ * ESCR and CCCR but rather an only packed value should
++ * be unpacked and written to a proper addresses
++ *
++ * the base idea is to pack as much info as
++ * possible
++ */
++#define p4_config_pack_escr(v)		(((u64)(v)) << 32)
++#define p4_config_pack_cccr(v)		(((u64)(v)) & 0xffffffffULL)
++#define p4_config_unpack_escr(v)	(((u64)(v)) >> 32)
++#define p4_config_unpack_cccr(v)	(((u64)(v)) & 0xffffffffULL)
++
++#define p4_config_unpack_emask(v)			\
++	({						\
++		u32 t = p4_config_unpack_escr((v));	\
++		t  &= P4_EVNTSEL_EVENTMASK_MASK;	\
++		t >>= P4_EVNTSEL_EVENTMASK_SHIFT;	\
++		t;					\
++	})
++
++#define P4_CONFIG_HT_SHIFT		63
++#define P4_CONFIG_HT			(1ULL << P4_CONFIG_HT_SHIFT)
++
++static inline u32 p4_config_unpack_opcode(u64 config)
++{
++	u32 e, s;
++
++	/*
++	 * we don't care about HT presence here since
++	 * event opcode doesn't depend on it
++	 */
++	e = (p4_config_unpack_escr(config) & P4_EVNTSEL_EVENT_MASK) >> P4_EVNTSEL_EVENT_SHIFT;
++	s = (p4_config_unpack_cccr(config) & P4_CCCR_ESCR_SELECT_MASK) >> P4_CCCR_ESCR_SELECT_SHIFT;
++
++	return P4_EVENT_PACK(e, s);
++}
++
++static inline bool p4_is_event_cascaded(u64 config)
++{
++	u32 cccr = p4_config_unpack_cccr(config);
++	return !!(cccr & P4_CCCR_CASCADE);
++}
++
++static inline int p4_ht_config_thread(u64 config)
++{
++	return !!(config & P4_CONFIG_HT);
++}
++
++static inline u64 p4_set_ht_bit(u64 config)
++{
++	return config | P4_CONFIG_HT;
++}
++
++static inline u64 p4_clear_ht_bit(u64 config)
++{
++	return config & ~P4_CONFIG_HT;
++}
++
++static inline int p4_ht_active(void)
++{
++#ifdef CONFIG_SMP
++	return smp_num_siblings > 1;
++#endif
++	return 0;
++}
++
++static inline int p4_ht_thread(int cpu)
++{
++#ifdef CONFIG_SMP
++	if (smp_num_siblings == 2)
++		return cpu != cpumask_first(__get_cpu_var(cpu_sibling_map));
++#endif
++	return 0;
++}
++
++static inline int p4_should_swap_ts(u64 config, int cpu)
++{
++	return p4_ht_config_thread(config) ^ p4_ht_thread(cpu);
++}
++
++static inline u32 p4_default_cccr_conf(int cpu)
++{
++	/*
++	 * Note that P4_CCCR_THREAD_ANY is "required" on
++	 * non-HT machines (on HT machines we count TS events
++	 * regardless the state of second logical processor
++	 */
++	u32 cccr = P4_CCCR_THREAD_ANY;
++
++	if (!p4_ht_thread(cpu))
++		cccr |= P4_CCCR_OVF_PMI_T0;
++	else
++		cccr |= P4_CCCR_OVF_PMI_T1;
++
++	return cccr;
++}
++
++static inline u32 p4_default_escr_conf(int cpu, int exclude_os, int exclude_usr)
++{
++	u32 escr = 0;
++
++	if (!p4_ht_thread(cpu)) {
++		if (!exclude_os)
++			escr |= P4_EVNTSEL_T0_OS;
++		if (!exclude_usr)
++			escr |= P4_EVNTSEL_T0_USR;
++	} else {
++		if (!exclude_os)
++			escr |= P4_EVNTSEL_T1_OS;
++		if (!exclude_usr)
++			escr |= P4_EVNTSEL_T1_USR;
++	}
++
++	return escr;
++}
++
++/*
++ * Comments below the event represent ESCR restriction
++ * for this event and counter index per ESCR
++ *
++ * MSR_P4_IQ_ESCR0 and MSR_P4_IQ_ESCR1 are available only on early
++ * processor builds (family 0FH, models 01H-02H). These MSRs
++ * are not available on later versions, so that we don't use
++ * them completely
++ *
++ * Also note that CCCR1 do not have P4_CCCR_ENABLE bit properly
++ * working so that we should not use this CCCR and respective
++ * counter as result
++ */
++#define P4_TC_DELIVER_MODE		P4_EVENT_PACK(0x01, 0x01)
++	/*
++	 * MSR_P4_TC_ESCR0:	4, 5
++	 * MSR_P4_TC_ESCR1:	6, 7
++	 */
++
++#define P4_BPU_FETCH_REQUEST		P4_EVENT_PACK(0x03, 0x00)
++	/*
++	 * MSR_P4_BPU_ESCR0:	0, 1
++	 * MSR_P4_BPU_ESCR1:	2, 3
++	 */
++
++#define P4_ITLB_REFERENCE		P4_EVENT_PACK(0x18, 0x03)
++	/*
++	 * MSR_P4_ITLB_ESCR0:	0, 1
++	 * MSR_P4_ITLB_ESCR1:	2, 3
++	 */
++
++#define P4_MEMORY_CANCEL		P4_EVENT_PACK(0x02, 0x05)
++	/*
++	 * MSR_P4_DAC_ESCR0:	8, 9
++	 * MSR_P4_DAC_ESCR1:	10, 11
++	 */
++
++#define P4_MEMORY_COMPLETE		P4_EVENT_PACK(0x08, 0x02)
++	/*
++	 * MSR_P4_SAAT_ESCR0:	8, 9
++	 * MSR_P4_SAAT_ESCR1:	10, 11
++	 */
++
++#define P4_LOAD_PORT_REPLAY		P4_EVENT_PACK(0x04, 0x02)
++	/*
++	 * MSR_P4_SAAT_ESCR0:	8, 9
++	 * MSR_P4_SAAT_ESCR1:	10, 11
++	 */
++
++#define P4_STORE_PORT_REPLAY		P4_EVENT_PACK(0x05, 0x02)
++	/*
++	 * MSR_P4_SAAT_ESCR0:	8, 9
++	 * MSR_P4_SAAT_ESCR1:	10, 11
++	 */
++
++#define P4_MOB_LOAD_REPLAY		P4_EVENT_PACK(0x03, 0x02)
++	/*
++	 * MSR_P4_MOB_ESCR0:	0, 1
++	 * MSR_P4_MOB_ESCR1:	2, 3
++	 */
++
++#define P4_PAGE_WALK_TYPE		P4_EVENT_PACK(0x01, 0x04)
++	/*
++	 * MSR_P4_PMH_ESCR0:	0, 1
++	 * MSR_P4_PMH_ESCR1:	2, 3
++	 */
++
++#define P4_BSQ_CACHE_REFERENCE		P4_EVENT_PACK(0x0c, 0x07)
++	/*
++	 * MSR_P4_BSU_ESCR0:	0, 1
++	 * MSR_P4_BSU_ESCR1:	2, 3
++	 */
++
++#define P4_IOQ_ALLOCATION		P4_EVENT_PACK(0x03, 0x06)
++	/*
++	 * MSR_P4_FSB_ESCR0:	0, 1
++	 * MSR_P4_FSB_ESCR1:	2, 3
++	 */
++
++#define P4_IOQ_ACTIVE_ENTRIES		P4_EVENT_PACK(0x1a, 0x06)
++	/*
++	 * MSR_P4_FSB_ESCR1:	2, 3
++	 */
++
++#define P4_FSB_DATA_ACTIVITY		P4_EVENT_PACK(0x17, 0x06)
++	/*
++	 * MSR_P4_FSB_ESCR0:	0, 1
++	 * MSR_P4_FSB_ESCR1:	2, 3
++	 */
++
++#define P4_BSQ_ALLOCATION		P4_EVENT_PACK(0x05, 0x07)
++	/*
++	 * MSR_P4_BSU_ESCR0:	0, 1
++	 */
++
++#define P4_BSQ_ACTIVE_ENTRIES		P4_EVENT_PACK(0x06, 0x07)
++	/*
++	 * MSR_P4_BSU_ESCR1:	2, 3
++	 */
++
++#define P4_SSE_INPUT_ASSIST		P4_EVENT_PACK(0x34, 0x01)
++	/*
++	 * MSR_P4_FIRM_ESCR:	8, 9
++	 * MSR_P4_FIRM_ESCR:	10, 11
++	 */
++
++#define P4_PACKED_SP_UOP		P4_EVENT_PACK(0x08, 0x01)
++	/*
++	 * MSR_P4_FIRM_ESCR0:	8, 9
++	 * MSR_P4_FIRM_ESCR1:	10, 11
++	 */
++
++#define P4_PACKED_DP_UOP		P4_EVENT_PACK(0x0c, 0x01)
++	/*
++	 * MSR_P4_FIRM_ESCR0:	8, 9
++	 * MSR_P4_FIRM_ESCR1:	10, 11
++	 */
++
++#define P4_SCALAR_SP_UOP		P4_EVENT_PACK(0x0a, 0x01)
++	/*
++	 * MSR_P4_FIRM_ESCR0:	8, 9
++	 * MSR_P4_FIRM_ESCR1:	10, 11
++	 */
++
++#define P4_SCALAR_DP_UOP		P4_EVENT_PACK(0x0e, 0x01)
++	/*
++	 * MSR_P4_FIRM_ESCR0:	8, 9
++	 * MSR_P4_FIRM_ESCR1:	10, 11
++	 */
++
++#define P4_64BIT_MMX_UOP		P4_EVENT_PACK(0x02, 0x01)
++	/*
++	 * MSR_P4_FIRM_ESCR0:	8, 9
++	 * MSR_P4_FIRM_ESCR1:	10, 11
++	 */
++
++#define P4_128BIT_MMX_UOP		P4_EVENT_PACK(0x1a, 0x01)
++	/*
++	 * MSR_P4_FIRM_ESCR0:	8, 9
++	 * MSR_P4_FIRM_ESCR1:	10, 11
++	 */
++
++#define P4_X87_FP_UOP			P4_EVENT_PACK(0x04, 0x01)
++	/*
++	 * MSR_P4_FIRM_ESCR0:	8, 9
++	 * MSR_P4_FIRM_ESCR1:	10, 11
++	 */
++
++#define P4_TC_MISC			P4_EVENT_PACK(0x06, 0x01)
++	/*
++	 * MSR_P4_TC_ESCR0:	4, 5
++	 * MSR_P4_TC_ESCR1:	6, 7
++	 */
++
++#define P4_GLOBAL_POWER_EVENTS		P4_EVENT_PACK(0x13, 0x06)
++	/*
++	 * MSR_P4_FSB_ESCR0:	0, 1
++	 * MSR_P4_FSB_ESCR1:	2, 3
++	 */
++
++#define P4_TC_MS_XFER			P4_EVENT_PACK(0x05, 0x00)
++	/*
++	 * MSR_P4_MS_ESCR0:	4, 5
++	 * MSR_P4_MS_ESCR1:	6, 7
++	 */
++
++#define P4_UOP_QUEUE_WRITES		P4_EVENT_PACK(0x09, 0x00)
++	/*
++	 * MSR_P4_MS_ESCR0:	4, 5
++	 * MSR_P4_MS_ESCR1:	6, 7
++	 */
++
++#define P4_RETIRED_MISPRED_BRANCH_TYPE	P4_EVENT_PACK(0x05, 0x02)
++	/*
++	 * MSR_P4_TBPU_ESCR0:	4, 5
++	 * MSR_P4_TBPU_ESCR0:	6, 7
++	 */
++
++#define P4_RETIRED_BRANCH_TYPE		P4_EVENT_PACK(0x04, 0x02)
++	/*
++	 * MSR_P4_TBPU_ESCR0:	4, 5
++	 * MSR_P4_TBPU_ESCR0:	6, 7
++	 */
++
++#define P4_RESOURCE_STALL		P4_EVENT_PACK(0x01, 0x01)
++	/*
++	 * MSR_P4_ALF_ESCR0:	12, 13, 16
++	 * MSR_P4_ALF_ESCR1:	14, 15, 17
++	 */
++
++#define P4_WC_BUFFER			P4_EVENT_PACK(0x05, 0x05)
++	/*
++	 * MSR_P4_DAC_ESCR0:	8, 9
++	 * MSR_P4_DAC_ESCR1:	10, 11
++	 */
++
++#define P4_B2B_CYCLES			P4_EVENT_PACK(0x16, 0x03)
++	/*
++	 * MSR_P4_FSB_ESCR0:	0, 1
++	 * MSR_P4_FSB_ESCR1:	2, 3
++	 */
++
++#define P4_BNR				P4_EVENT_PACK(0x08, 0x03)
++	/*
++	 * MSR_P4_FSB_ESCR0:	0, 1
++	 * MSR_P4_FSB_ESCR1:	2, 3
++	 */
++
++#define P4_SNOOP			P4_EVENT_PACK(0x06, 0x03)
++	/*
++	 * MSR_P4_FSB_ESCR0:	0, 1
++	 * MSR_P4_FSB_ESCR1:	2, 3
++	 */
++
++#define P4_RESPONSE			P4_EVENT_PACK(0x04, 0x03)
++	/*
++	 * MSR_P4_FSB_ESCR0:	0, 1
++	 * MSR_P4_FSB_ESCR1:	2, 3
++	 */
++
++#define P4_FRONT_END_EVENT		P4_EVENT_PACK(0x08, 0x05)
++	/*
++	 * MSR_P4_CRU_ESCR2:	12, 13, 16
++	 * MSR_P4_CRU_ESCR3:	14, 15, 17
++	 */
++
++#define P4_EXECUTION_EVENT		P4_EVENT_PACK(0x0c, 0x05)
++	/*
++	 * MSR_P4_CRU_ESCR2:	12, 13, 16
++	 * MSR_P4_CRU_ESCR3:	14, 15, 17
++	 */
++
++#define P4_REPLAY_EVENT			P4_EVENT_PACK(0x09, 0x05)
++	/*
++	 * MSR_P4_CRU_ESCR2:	12, 13, 16
++	 * MSR_P4_CRU_ESCR3:	14, 15, 17
++	 */
++
++#define P4_INSTR_RETIRED		P4_EVENT_PACK(0x02, 0x04)
++	/*
++	 * MSR_P4_CRU_ESCR2:	12, 13, 16
++	 * MSR_P4_CRU_ESCR3:	14, 15, 17
++	 */
++
++#define P4_UOPS_RETIRED			P4_EVENT_PACK(0x01, 0x04)
++	/*
++	 * MSR_P4_CRU_ESCR2:	12, 13, 16
++	 * MSR_P4_CRU_ESCR3:	14, 15, 17
++	 */
++
++#define P4_UOP_TYPE			P4_EVENT_PACK(0x02, 0x02)
++	/*
++	 * MSR_P4_RAT_ESCR0:	12, 13, 16
++	 * MSR_P4_RAT_ESCR1:	14, 15, 17
++	 */
++
++#define P4_BRANCH_RETIRED		P4_EVENT_PACK(0x06, 0x05)
++	/*
++	 * MSR_P4_CRU_ESCR2:	12, 13, 16
++	 * MSR_P4_CRU_ESCR3:	14, 15, 17
++	 */
++
++#define P4_MISPRED_BRANCH_RETIRED	P4_EVENT_PACK(0x03, 0x04)
++	/*
++	 * MSR_P4_CRU_ESCR0:	12, 13, 16
++	 * MSR_P4_CRU_ESCR1:	14, 15, 17
++	 */
++
++#define P4_X87_ASSIST			P4_EVENT_PACK(0x03, 0x05)
++	/*
++	 * MSR_P4_CRU_ESCR2:	12, 13, 16
++	 * MSR_P4_CRU_ESCR3:	14, 15, 17
++	 */
++
++#define P4_MACHINE_CLEAR		P4_EVENT_PACK(0x02, 0x05)
++	/*
++	 * MSR_P4_CRU_ESCR2:	12, 13, 16
++	 * MSR_P4_CRU_ESCR3:	14, 15, 17
++	 */
++
++#define P4_INSTR_COMPLETED		P4_EVENT_PACK(0x07, 0x04)
++	/*
++	 * MSR_P4_CRU_ESCR0:	12, 13, 16
++	 * MSR_P4_CRU_ESCR1:	14, 15, 17
++	 */
++
++/*
++ * a caller should use P4_EVENT_ATTR helper to
++ * pick the attribute needed, for example
++ *
++ *	P4_EVENT_ATTR(P4_TC_DELIVER_MODE, DD)
++ */
++enum P4_EVENTS_ATTR {
++	P4_MAKE_EVENT_ATTR(P4_TC_DELIVER_MODE, DD, 0),
++	P4_MAKE_EVENT_ATTR(P4_TC_DELIVER_MODE, DB, 1),
++	P4_MAKE_EVENT_ATTR(P4_TC_DELIVER_MODE, DI, 2),
++	P4_MAKE_EVENT_ATTR(P4_TC_DELIVER_MODE, BD, 3),
++	P4_MAKE_EVENT_ATTR(P4_TC_DELIVER_MODE, BB, 4),
++	P4_MAKE_EVENT_ATTR(P4_TC_DELIVER_MODE, BI, 5),
++	P4_MAKE_EVENT_ATTR(P4_TC_DELIVER_MODE, ID, 6),
++
++	P4_MAKE_EVENT_ATTR(P4_BPU_FETCH_REQUEST, TCMISS, 0),
++
++	P4_MAKE_EVENT_ATTR(P4_ITLB_REFERENCE, HIT, 0),
++	P4_MAKE_EVENT_ATTR(P4_ITLB_REFERENCE, MISS, 1),
++	P4_MAKE_EVENT_ATTR(P4_ITLB_REFERENCE, HIT_UK, 2),
++
++	P4_MAKE_EVENT_ATTR(P4_MEMORY_CANCEL, ST_RB_FULL, 2),
++	P4_MAKE_EVENT_ATTR(P4_MEMORY_CANCEL, 64K_CONF, 3),
++
++	P4_MAKE_EVENT_ATTR(P4_MEMORY_COMPLETE, LSC, 0),
++	P4_MAKE_EVENT_ATTR(P4_MEMORY_COMPLETE, SSC, 1),
++
++	P4_MAKE_EVENT_ATTR(P4_LOAD_PORT_REPLAY, SPLIT_LD, 1),
++
++	P4_MAKE_EVENT_ATTR(P4_STORE_PORT_REPLAY, SPLIT_ST, 1),
++
++	P4_MAKE_EVENT_ATTR(P4_MOB_LOAD_REPLAY, NO_STA, 1),
++	P4_MAKE_EVENT_ATTR(P4_MOB_LOAD_REPLAY, NO_STD, 3),
++	P4_MAKE_EVENT_ATTR(P4_MOB_LOAD_REPLAY, PARTIAL_DATA, 4),
++	P4_MAKE_EVENT_ATTR(P4_MOB_LOAD_REPLAY, UNALGN_ADDR, 5),
++
++	P4_MAKE_EVENT_ATTR(P4_PAGE_WALK_TYPE, DTMISS, 0),
++	P4_MAKE_EVENT_ATTR(P4_PAGE_WALK_TYPE, ITMISS, 1),
++
++	P4_MAKE_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_2ndL_HITS, 0),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_2ndL_HITE, 1),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_2ndL_HITM, 2),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_3rdL_HITS, 3),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_3rdL_HITE, 4),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_3rdL_HITM, 5),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_2ndL_MISS, 8),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_3rdL_MISS, 9),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, WR_2ndL_MISS, 10),
++
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ALLOCATION, DEFAULT, 0),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ALLOCATION, ALL_READ, 5),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ALLOCATION, ALL_WRITE, 6),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ALLOCATION, MEM_UC, 7),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ALLOCATION, MEM_WC, 8),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ALLOCATION, MEM_WT, 9),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ALLOCATION, MEM_WP, 10),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ALLOCATION, MEM_WB, 11),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ALLOCATION, OWN, 13),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ALLOCATION, OTHER, 14),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ALLOCATION, PREFETCH, 15),
++
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ACTIVE_ENTRIES, DEFAULT, 0),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ACTIVE_ENTRIES, ALL_READ, 5),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ACTIVE_ENTRIES, ALL_WRITE, 6),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ACTIVE_ENTRIES, MEM_UC, 7),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ACTIVE_ENTRIES, MEM_WC, 8),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ACTIVE_ENTRIES, MEM_WT, 9),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ACTIVE_ENTRIES, MEM_WP, 10),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ACTIVE_ENTRIES, MEM_WB, 11),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ACTIVE_ENTRIES, OWN, 13),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ACTIVE_ENTRIES, OTHER, 14),
++	P4_MAKE_EVENT_ATTR(P4_IOQ_ACTIVE_ENTRIES, PREFETCH, 15),
++
++	P4_MAKE_EVENT_ATTR(P4_FSB_DATA_ACTIVITY, DRDY_DRV, 0),
++	P4_MAKE_EVENT_ATTR(P4_FSB_DATA_ACTIVITY, DRDY_OWN, 1),
++	P4_MAKE_EVENT_ATTR(P4_FSB_DATA_ACTIVITY, DRDY_OTHER, 2),
++	P4_MAKE_EVENT_ATTR(P4_FSB_DATA_ACTIVITY, DBSY_DRV, 3),
++	P4_MAKE_EVENT_ATTR(P4_FSB_DATA_ACTIVITY, DBSY_OWN, 4),
++	P4_MAKE_EVENT_ATTR(P4_FSB_DATA_ACTIVITY, DBSY_OTHER, 5),
++
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, REQ_TYPE0, 0),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, REQ_TYPE1, 1),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, REQ_LEN0, 2),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, REQ_LEN1, 3),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, REQ_IO_TYPE, 5),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, REQ_LOCK_TYPE, 6),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, REQ_CACHE_TYPE, 7),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, REQ_SPLIT_TYPE, 8),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, REQ_DEM_TYPE, 9),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, REQ_ORD_TYPE, 10),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, MEM_TYPE0, 11),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, MEM_TYPE1, 12),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ALLOCATION, MEM_TYPE2, 13),
++
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, REQ_TYPE0, 0),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, REQ_TYPE1, 1),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, REQ_LEN0, 2),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, REQ_LEN1, 3),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, REQ_IO_TYPE, 5),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, REQ_LOCK_TYPE, 6),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, REQ_CACHE_TYPE, 7),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, REQ_SPLIT_TYPE, 8),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, REQ_DEM_TYPE, 9),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, REQ_ORD_TYPE, 10),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, MEM_TYPE0, 11),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, MEM_TYPE1, 12),
++	P4_MAKE_EVENT_ATTR(P4_BSQ_ACTIVE_ENTRIES, MEM_TYPE2, 13),
++
++	P4_MAKE_EVENT_ATTR(P4_SSE_INPUT_ASSIST, ALL, 15),
++
++	P4_MAKE_EVENT_ATTR(P4_PACKED_SP_UOP, ALL, 15),
++
++	P4_MAKE_EVENT_ATTR(P4_PACKED_DP_UOP, ALL, 15),
++
++	P4_MAKE_EVENT_ATTR(P4_SCALAR_SP_UOP, ALL, 15),
++
++	P4_MAKE_EVENT_ATTR(P4_SCALAR_DP_UOP, ALL, 15),
++
++	P4_MAKE_EVENT_ATTR(P4_64BIT_MMX_UOP, ALL, 15),
++
++	P4_MAKE_EVENT_ATTR(P4_128BIT_MMX_UOP, ALL, 15),
++
++	P4_MAKE_EVENT_ATTR(P4_X87_FP_UOP, ALL, 15),
++
++	P4_MAKE_EVENT_ATTR(P4_TC_MISC, FLUSH, 4),
++
++	P4_MAKE_EVENT_ATTR(P4_GLOBAL_POWER_EVENTS, RUNNING, 0),
++
++	P4_MAKE_EVENT_ATTR(P4_TC_MS_XFER, CISC, 0),
++
++	P4_MAKE_EVENT_ATTR(P4_UOP_QUEUE_WRITES, FROM_TC_BUILD, 0),
++	P4_MAKE_EVENT_ATTR(P4_UOP_QUEUE_WRITES, FROM_TC_DELIVER, 1),
++	P4_MAKE_EVENT_ATTR(P4_UOP_QUEUE_WRITES, FROM_ROM, 2),
++
++	P4_MAKE_EVENT_ATTR(P4_RETIRED_MISPRED_BRANCH_TYPE, CONDITIONAL, 1),
++	P4_MAKE_EVENT_ATTR(P4_RETIRED_MISPRED_BRANCH_TYPE, CALL, 2),
++	P4_MAKE_EVENT_ATTR(P4_RETIRED_MISPRED_BRANCH_TYPE, RETURN, 3),
++	P4_MAKE_EVENT_ATTR(P4_RETIRED_MISPRED_BRANCH_TYPE, INDIRECT, 4),
++
++	P4_MAKE_EVENT_ATTR(P4_RETIRED_BRANCH_TYPE, CONDITIONAL, 1),
++	P4_MAKE_EVENT_ATTR(P4_RETIRED_BRANCH_TYPE, CALL, 2),
++	P4_MAKE_EVENT_ATTR(P4_RETIRED_BRANCH_TYPE, RETURN, 3),
++	P4_MAKE_EVENT_ATTR(P4_RETIRED_BRANCH_TYPE, INDIRECT, 4),
++
++	P4_MAKE_EVENT_ATTR(P4_RESOURCE_STALL, SBFULL, 5),
++
++	P4_MAKE_EVENT_ATTR(P4_WC_BUFFER, WCB_EVICTS, 0),
++	P4_MAKE_EVENT_ATTR(P4_WC_BUFFER, WCB_FULL_EVICTS, 1),
++
++	P4_MAKE_EVENT_ATTR(P4_FRONT_END_EVENT, NBOGUS, 0),
++	P4_MAKE_EVENT_ATTR(P4_FRONT_END_EVENT, BOGUS, 1),
++
++	P4_MAKE_EVENT_ATTR(P4_EXECUTION_EVENT, NBOGUS0, 0),
++	P4_MAKE_EVENT_ATTR(P4_EXECUTION_EVENT, NBOGUS1, 1),
++	P4_MAKE_EVENT_ATTR(P4_EXECUTION_EVENT, NBOGUS2, 2),
++	P4_MAKE_EVENT_ATTR(P4_EXECUTION_EVENT, NBOGUS3, 3),
++	P4_MAKE_EVENT_ATTR(P4_EXECUTION_EVENT, BOGUS0, 4),
++	P4_MAKE_EVENT_ATTR(P4_EXECUTION_EVENT, BOGUS1, 5),
++	P4_MAKE_EVENT_ATTR(P4_EXECUTION_EVENT, BOGUS2, 6),
++	P4_MAKE_EVENT_ATTR(P4_EXECUTION_EVENT, BOGUS3, 7),
++
++	P4_MAKE_EVENT_ATTR(P4_REPLAY_EVENT, NBOGUS, 0),
++	P4_MAKE_EVENT_ATTR(P4_REPLAY_EVENT, BOGUS, 1),
++
++	P4_MAKE_EVENT_ATTR(P4_INSTR_RETIRED, NBOGUSNTAG, 0),
++	P4_MAKE_EVENT_ATTR(P4_INSTR_RETIRED, NBOGUSTAG, 1),
++	P4_MAKE_EVENT_ATTR(P4_INSTR_RETIRED, BOGUSNTAG, 2),
++	P4_MAKE_EVENT_ATTR(P4_INSTR_RETIRED, BOGUSTAG, 3),
++
++	P4_MAKE_EVENT_ATTR(P4_UOPS_RETIRED, NBOGUS, 0),
++	P4_MAKE_EVENT_ATTR(P4_UOPS_RETIRED, BOGUS, 1),
++
++	P4_MAKE_EVENT_ATTR(P4_UOP_TYPE, TAGLOADS, 1),
++	P4_MAKE_EVENT_ATTR(P4_UOP_TYPE, TAGSTORES, 2),
++
++	P4_MAKE_EVENT_ATTR(P4_BRANCH_RETIRED, MMNP, 0),
++	P4_MAKE_EVENT_ATTR(P4_BRANCH_RETIRED, MMNM, 1),
++	P4_MAKE_EVENT_ATTR(P4_BRANCH_RETIRED, MMTP, 2),
++	P4_MAKE_EVENT_ATTR(P4_BRANCH_RETIRED, MMTM, 3),
++
++	P4_MAKE_EVENT_ATTR(P4_MISPRED_BRANCH_RETIRED, NBOGUS, 0),
++
++	P4_MAKE_EVENT_ATTR(P4_X87_ASSIST, FPSU, 0),
++	P4_MAKE_EVENT_ATTR(P4_X87_ASSIST, FPSO, 1),
++	P4_MAKE_EVENT_ATTR(P4_X87_ASSIST, POAO, 2),
++	P4_MAKE_EVENT_ATTR(P4_X87_ASSIST, POAU, 3),
++	P4_MAKE_EVENT_ATTR(P4_X87_ASSIST, PREA, 4),
++
++	P4_MAKE_EVENT_ATTR(P4_MACHINE_CLEAR, CLEAR, 0),
++	P4_MAKE_EVENT_ATTR(P4_MACHINE_CLEAR, MOCLEAR, 1),
++	P4_MAKE_EVENT_ATTR(P4_MACHINE_CLEAR, SMCLEAR, 2),
++
++	P4_MAKE_EVENT_ATTR(P4_INSTR_COMPLETED, NBOGUS, 0),
++	P4_MAKE_EVENT_ATTR(P4_INSTR_COMPLETED, BOGUS, 1),
++};
++
++#endif /* PERF_EVENT_P4_H */
+diff --git a/arch/x86/kernel/cpu/perf_event.c b/arch/x86/kernel/cpu/perf_event.c
+index d08c768..33aefd8 100644
+--- a/arch/x86/kernel/cpu/perf_event.c
++++ b/arch/x86/kernel/cpu/perf_event.c
+@@ -125,6 +125,8 @@ struct x86_pmu {
+ 	void		(*enable_all)(void);
+ 	void		(*enable)(struct perf_event *);
+ 	void		(*disable)(struct perf_event *);
++	int		(*hw_config)(struct perf_event_attr *attr, struct hw_perf_event *hwc);
++	int		(*schedule_events)(struct cpu_hw_events *cpuc, int n, int *assign);
+ 	unsigned	eventsel;
+ 	unsigned	perfctr;
+ 	u64		(*event_map)(int);
+@@ -342,6 +344,25 @@ set_ext_hw_attr(struct hw_perf_event *hwc, struct perf_event_attr *attr)
+ 	return 0;
+ }
+ 
++static int x86_hw_config(struct perf_event_attr *attr, struct hw_perf_event *hwc)
++{
++	/*
++	 * Generate PMC IRQs:
++	 * (keep 'enabled' bit clear for now)
++	 */
++	hwc->config = ARCH_PERFMON_EVENTSEL_INT;
++
++	/*
++	 * Count user and OS events unless requested not to
++	 */
++	if (!attr->exclude_user)
++		hwc->config |= ARCH_PERFMON_EVENTSEL_USR;
++	if (!attr->exclude_kernel)
++		hwc->config |= ARCH_PERFMON_EVENTSEL_OS;
++
++	return 0;
++}
++
+ /*
+  * Setup the hardware configuration for a given attr_type
+  */
+@@ -376,23 +397,13 @@ static int __hw_perf_event_init(struct perf_event *event)
+ 
+ 	event->destroy = hw_perf_event_destroy;
+ 
+-	/*
+-	 * Generate PMC IRQs:
+-	 * (keep 'enabled' bit clear for now)
+-	 */
+-	hwc->config = ARCH_PERFMON_EVENTSEL_INT;
+-
+ 	hwc->idx = -1;
+ 	hwc->last_cpu = -1;
+ 	hwc->last_tag = ~0ULL;
+ 
+-	/*
+-	 * Count user and OS events unless requested not to.
+-	 */
+-	if (!attr->exclude_user)
+-		hwc->config |= ARCH_PERFMON_EVENTSEL_USR;
+-	if (!attr->exclude_kernel)
+-		hwc->config |= ARCH_PERFMON_EVENTSEL_OS;
++	/* Processor specifics */
++	if (x86_pmu.hw_config(attr, hwc))
++		return -EOPNOTSUPP;
+ 
+ 	if (!hwc->sample_period) {
+ 		hwc->sample_period = x86_pmu.max_period;
+@@ -447,7 +458,7 @@ static int __hw_perf_event_init(struct perf_event *event)
+ 			return -EOPNOTSUPP;
+ 
+ 		/* BTS is currently only allowed for user-mode. */
+-		if (hwc->config & ARCH_PERFMON_EVENTSEL_OS)
++		if (!attr->exclude_kernel)
+ 			return -EOPNOTSUPP;
+ 	}
+ 
+@@ -854,7 +865,7 @@ static int x86_pmu_enable(struct perf_event *event)
+ 	if (n < 0)
+ 		return n;
+ 
+-	ret = x86_schedule_events(cpuc, n, assign);
++	ret = x86_pmu.schedule_events(cpuc, n, assign);
+ 	if (ret)
+ 		return ret;
+ 	/*
+@@ -1186,7 +1197,7 @@ int hw_perf_group_sched_in(struct perf_event *leader,
+ 	if (n0 < 0)
+ 		return n0;
+ 
+-	ret = x86_schedule_events(cpuc, n0, assign);
++	ret = x86_pmu.schedule_events(cpuc, n0, assign);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1236,6 +1247,7 @@ undo:
+ 
+ #include "perf_event_amd.c"
+ #include "perf_event_p6.c"
++#include "perf_event_p4.c"
+ #include "perf_event_intel_ds.c"
+ #include "perf_event_intel.c"
+ 
+@@ -1436,7 +1448,7 @@ static int validate_group(struct perf_event *event)
+ 
+ 	fake_cpuc->n_events = n;
+ 
+-	ret = x86_schedule_events(fake_cpuc, n, NULL);
++	ret = x86_pmu.schedule_events(fake_cpuc, n, NULL);
+ 
+ out_free:
+ 	kfree(fake_cpuc);
+diff --git a/arch/x86/kernel/cpu/perf_event_amd.c b/arch/x86/kernel/cpu/perf_event_amd.c
+index 44addd3..6eb6564 100644
+--- a/arch/x86/kernel/cpu/perf_event_amd.c
++++ b/arch/x86/kernel/cpu/perf_event_amd.c
+@@ -378,6 +378,8 @@ static __initconst struct x86_pmu amd_pmu = {
+ 	.enable_all		= x86_pmu_enable_all,
+ 	.enable			= x86_pmu_enable_event,
+ 	.disable		= x86_pmu_disable_event,
++	.hw_config		= x86_hw_config,
++	.schedule_events	= x86_schedule_events,
+ 	.eventsel		= MSR_K7_EVNTSEL0,
+ 	.perfctr		= MSR_K7_PERFCTR0,
+ 	.event_map		= amd_pmu_event_map,
+diff --git a/arch/x86/kernel/cpu/perf_event_intel.c b/arch/x86/kernel/cpu/perf_event_intel.c
+index 27c8ba9..eb58fd4 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel.c
++++ b/arch/x86/kernel/cpu/perf_event_intel.c
+@@ -748,6 +748,8 @@ static __initconst struct x86_pmu core_pmu = {
+ 	.enable_all		= x86_pmu_enable_all,
+ 	.enable			= x86_pmu_enable_event,
+ 	.disable		= x86_pmu_disable_event,
++	.hw_config		= x86_hw_config,
++	.schedule_events	= x86_schedule_events,
+ 	.eventsel		= MSR_ARCH_PERFMON_EVENTSEL0,
+ 	.perfctr		= MSR_ARCH_PERFMON_PERFCTR0,
+ 	.event_map		= intel_pmu_event_map,
+@@ -771,6 +773,8 @@ static __initconst struct x86_pmu intel_pmu = {
+ 	.enable_all		= intel_pmu_enable_all,
+ 	.enable			= intel_pmu_enable_event,
+ 	.disable		= intel_pmu_disable_event,
++	.hw_config		= x86_hw_config,
++	.schedule_events	= x86_schedule_events,
+ 	.eventsel		= MSR_ARCH_PERFMON_EVENTSEL0,
+ 	.perfctr		= MSR_ARCH_PERFMON_PERFCTR0,
+ 	.event_map		= intel_pmu_event_map,
+@@ -798,12 +802,13 @@ static __init int intel_pmu_init(void)
+ 	int version;
+ 
+ 	if (!cpu_has(&boot_cpu_data, X86_FEATURE_ARCH_PERFMON)) {
+-		/* check for P6 processor family */
+-	   if (boot_cpu_data.x86 == 6) {
+-		return p6_pmu_init();
+-	   } else {
++		switch (boot_cpu_data.x86) {
++		case 0x6:
++			return p6_pmu_init();
++		case 0xf:
++			return p4_pmu_init();
++		}
+ 		return -ENODEV;
+-	   }
+ 	}
+ 
+ 	/*
+diff --git a/arch/x86/kernel/cpu/perf_event_p4.c b/arch/x86/kernel/cpu/perf_event_p4.c
+new file mode 100644
+index 0000000..381f593
+--- /dev/null
++++ b/arch/x86/kernel/cpu/perf_event_p4.c
+@@ -0,0 +1,607 @@
++/*
++ * Netburst Perfomance Events (P4, old Xeon)
++ *
++ *  Copyright (C) 2010 Parallels, Inc., Cyrill Gorcunov <gorcunov@openvz.org>
++ *  Copyright (C) 2010 Intel Corporation, Lin Ming <ming.m.lin@intel.com>
++ *
++ *  For licencing details see kernel-base/COPYING
++ */
++
++#ifdef CONFIG_CPU_SUP_INTEL
++
++#include <asm/perf_event_p4.h>
++
++/*
++ * array indices: 0,1 - HT threads, used with HT enabled cpu
++ */
++struct p4_event_template {
++	u32 opcode;			/* ESCR event + CCCR selector */
++	u64 config;			/* packed predefined bits */
++	int dep;			/* upstream dependency event index */
++	unsigned int emask;		/* ESCR EventMask */
++	unsigned int escr_msr[2];	/* ESCR MSR for this event */
++	unsigned int cntr[2];		/* counter index (offset) */
++};
++
++struct p4_pmu_res {
++	/* maps hw_conf::idx into template for ESCR sake */
++	struct p4_event_template *tpl[ARCH_P4_MAX_CCCR];
++};
++
++static DEFINE_PER_CPU(struct p4_pmu_res, p4_pmu_config);
++
++/*
++ * WARN: CCCR1 doesn't have a working enable bit so try to not
++ * use it if possible
++ *
++ * Also as only we start to support raw events we will need to
++ * append _all_ P4_EVENT_PACK'ed events here
++ */
++struct p4_event_template p4_templates[] = {
++	[0] = {
++		.opcode	= P4_UOP_TYPE,
++		.config	= 0,
++		.dep	= -1,
++		.emask	=
++			P4_EVENT_ATTR(P4_UOP_TYPE, TAGLOADS)	|
++			P4_EVENT_ATTR(P4_UOP_TYPE, TAGSTORES),
++		.escr_msr	= { MSR_P4_RAT_ESCR0, MSR_P4_RAT_ESCR1 },
++		.cntr		= { 16, 17 },
++	},
++	[1] = {
++		.opcode	= P4_GLOBAL_POWER_EVENTS,
++		.config	= 0,
++		.dep	= -1,
++		.emask	=
++			P4_EVENT_ATTR(P4_GLOBAL_POWER_EVENTS, RUNNING),
++		.escr_msr	= { MSR_P4_FSB_ESCR0, MSR_P4_FSB_ESCR1 },
++		.cntr		= { 0, 2 },
++	},
++	[2] = {
++		.opcode	= P4_INSTR_RETIRED,
++		.config	= 0,
++		.dep	= 0, /* needs front-end tagging */
++		.emask	=
++			P4_EVENT_ATTR(P4_INSTR_RETIRED, NBOGUSNTAG)	|
++			P4_EVENT_ATTR(P4_INSTR_RETIRED, NBOGUSTAG)	|
++			P4_EVENT_ATTR(P4_INSTR_RETIRED, BOGUSNTAG)	|
++			P4_EVENT_ATTR(P4_INSTR_RETIRED, BOGUSTAG),
++		.escr_msr	= { MSR_P4_CRU_ESCR2, MSR_P4_CRU_ESCR3 },
++		.cntr		= { 12, 14 },
++	},
++	[3] = {
++		.opcode	= P4_BSQ_CACHE_REFERENCE,
++		.config	= 0,
++		.dep	= -1,
++		.emask	=
++			P4_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_2ndL_HITS)	|
++			P4_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_2ndL_HITE)	|
++			P4_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_2ndL_HITM)	|
++			P4_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_3rdL_HITS)	|
++			P4_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_3rdL_HITE)	|
++			P4_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_3rdL_HITM),
++		.escr_msr	= { MSR_P4_BSU_ESCR0, MSR_P4_BSU_ESCR1 },
++		.cntr		= { 0, 2 },
++	},
++	[4] = {
++		.opcode	= P4_BSQ_CACHE_REFERENCE,
++		.config	= 0,
++		.dep	= -1,
++		.emask	=
++			P4_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_2ndL_MISS)	|
++			P4_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, RD_3rdL_MISS)	|
++			P4_EVENT_ATTR(P4_BSQ_CACHE_REFERENCE, WR_2ndL_MISS),
++		.escr_msr	= { MSR_P4_BSU_ESCR0, MSR_P4_BSU_ESCR1 },
++		.cntr		= { 0, 3 },
++	},
++	[5] = {
++		.opcode	= P4_RETIRED_BRANCH_TYPE,
++		.config	= 0,
++		.dep	= -1,
++		.emask	=
++			P4_EVENT_ATTR(P4_RETIRED_BRANCH_TYPE, CONDITIONAL)	|
++			P4_EVENT_ATTR(P4_RETIRED_BRANCH_TYPE, CALL)		|
++			P4_EVENT_ATTR(P4_RETIRED_BRANCH_TYPE, RETURN)		|
++			P4_EVENT_ATTR(P4_RETIRED_BRANCH_TYPE, INDIRECT),
++		.escr_msr	= { MSR_P4_TBPU_ESCR0, MSR_P4_TBPU_ESCR1 },
++		.cntr		= { 4, 6 },
++	},
++	[6] = {
++		.opcode	= P4_MISPRED_BRANCH_RETIRED,
++		.config	= 0,
++		.dep	= -1,
++		.emask	=
++			P4_EVENT_ATTR(P4_MISPRED_BRANCH_RETIRED, NBOGUS),
++		.escr_msr	= { MSR_P4_CRU_ESCR0, MSR_P4_CRU_ESCR1 },
++		.cntr		= { 12, 14 },
++	},
++	[7] = {
++		.opcode	= P4_FSB_DATA_ACTIVITY,
++		.config	= p4_config_pack_cccr(P4_CCCR_EDGE | P4_CCCR_COMPARE),
++		.dep	= -1,
++		.emask	=
++			P4_EVENT_ATTR(P4_FSB_DATA_ACTIVITY, DRDY_DRV)	|
++			P4_EVENT_ATTR(P4_FSB_DATA_ACTIVITY, DRDY_OWN),
++		.escr_msr	= { MSR_P4_FSB_ESCR0, MSR_P4_FSB_ESCR1 },
++		.cntr		= { 0, 2 },
++	},
++};
++
++static struct p4_event_template *p4_event_map[PERF_COUNT_HW_MAX] = {
++	/* non-halted CPU clocks */
++	[PERF_COUNT_HW_CPU_CYCLES]		= &p4_templates[1],
++
++	/* retired instructions: dep on tagging the FSB */
++	[PERF_COUNT_HW_INSTRUCTIONS]		= &p4_templates[2],
++
++	/* cache hits */
++	[PERF_COUNT_HW_CACHE_REFERENCES]	= &p4_templates[3],
++
++	/* cache misses */
++	[PERF_COUNT_HW_CACHE_MISSES]		= &p4_templates[4],
++
++	/* branch instructions retired */
++	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS]	= &p4_templates[5],
++
++	/* mispredicted branches retired */
++	[PERF_COUNT_HW_BRANCH_MISSES]		= &p4_templates[6],
++
++	/* bus ready clocks (cpu is driving #DRDY_DRV\#DRDY_OWN):  */
++	[PERF_COUNT_HW_BUS_CYCLES]		= &p4_templates[7],
++};
++
++static u64 p4_pmu_event_map(int hw_event)
++{
++	struct p4_event_template *tpl;
++	u64 config;
++
++	if (hw_event > ARRAY_SIZE(p4_event_map)) {
++		printk_once(KERN_ERR "PMU: Incorrect event index\n");
++		return 0;
++	}
++	tpl = p4_event_map[hw_event];
++
++	/*
++	 * fill config up according to
++	 * a predefined event template
++	 */
++	config  = tpl->config;
++	config |= p4_config_pack_escr(P4_EVENT_UNPACK_EVENT(tpl->opcode) << P4_EVNTSEL_EVENT_SHIFT);
++	config |= p4_config_pack_escr(tpl->emask << P4_EVNTSEL_EVENTMASK_SHIFT);
++	config |= p4_config_pack_cccr(P4_EVENT_UNPACK_SELECTOR(tpl->opcode) << P4_CCCR_ESCR_SELECT_SHIFT);
++
++	/* on HT machine we need a special bit */
++	if (p4_ht_active() && p4_ht_thread(raw_smp_processor_id()))
++		config = p4_set_ht_bit(config);
++
++	return config;
++}
++
++/*
++ * Note that we still have 5 events (from global events SDM list)
++ * intersected in opcode+emask bits so we will need another
++ * scheme there do distinguish templates.
++ */
++static inline int p4_pmu_emask_match(unsigned int dst, unsigned int src)
++{
++	return dst & src;
++}
++
++static struct p4_event_template *p4_pmu_template_lookup(u64 config)
++{
++	u32 opcode = p4_config_unpack_opcode(config);
++	unsigned int emask = p4_config_unpack_emask(config);
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(p4_templates); i++) {
++		if (opcode == p4_templates[i].opcode &&
++			p4_pmu_emask_match(emask, p4_templates[i].emask))
++			return &p4_templates[i];
++	}
++
++	return NULL;
++}
++
++/*
++ * We don't control raw events so it's up to the caller
++ * to pass sane values (and we don't count the thread number
++ * on HT machine but allow HT-compatible specifics to be
++ * passed on)
++ */
++static u64 p4_pmu_raw_event(u64 hw_event)
++{
++	return hw_event &
++		(p4_config_pack_escr(P4_EVNTSEL_MASK_HT) |
++		 p4_config_pack_cccr(P4_CCCR_MASK_HT));
++}
++
++static int p4_hw_config(struct perf_event_attr *attr, struct hw_perf_event *hwc)
++{
++	int cpu = raw_smp_processor_id();
++
++	/*
++	 * the reason we use cpu that early is that: if we get scheduled
++	 * first time on the same cpu -- we will not need swap thread
++	 * specific flags in config (and will save some cpu cycles)
++	 */
++
++	/* CCCR by default */
++	hwc->config = p4_config_pack_cccr(p4_default_cccr_conf(cpu));
++
++	/* Count user and OS events unless not requested to */
++	hwc->config |= p4_config_pack_escr(p4_default_escr_conf(cpu, attr->exclude_kernel,
++								attr->exclude_user));
++	return 0;
++}
++
++static inline void p4_pmu_clear_cccr_ovf(struct hw_perf_event *hwc)
++{
++	unsigned long dummy;
++
++	rdmsrl(hwc->config_base + hwc->idx, dummy);
++	if (dummy & P4_CCCR_OVF) {
++		(void)checking_wrmsrl(hwc->config_base + hwc->idx,
++			((u64)dummy) & ~P4_CCCR_OVF);
++	}
++}
++
++static inline void p4_pmu_disable_event(struct perf_event *event)
++{
++	struct hw_perf_event *hwc = &event->hw;
++
++	/*
++	 * If event gets disabled while counter is in overflowed
++	 * state we need to clear P4_CCCR_OVF, otherwise interrupt get
++	 * asserted again and again
++	 */
++	(void)checking_wrmsrl(hwc->config_base + hwc->idx,
++		(u64)(p4_config_unpack_cccr(hwc->config)) &
++			~P4_CCCR_ENABLE & ~P4_CCCR_OVF);
++}
++
++static void p4_pmu_disable_all(void)
++{
++	struct cpu_hw_events *cpuc = &__get_cpu_var(cpu_hw_events);
++	int idx;
++
++	for (idx = 0; idx < x86_pmu.num_events; idx++) {
++		struct perf_event *event = cpuc->events[idx];
++		if (!test_bit(idx, cpuc->active_mask))
++			continue;
++		p4_pmu_disable_event(event);
++	}
++}
++
++static void p4_pmu_enable_event(struct perf_event *event)
++{
++	struct hw_perf_event *hwc = &event->hw;
++	int thread = p4_ht_config_thread(hwc->config);
++	u64 escr_conf = p4_config_unpack_escr(p4_clear_ht_bit(hwc->config));
++	u64 escr_base;
++	struct p4_event_template *tpl;
++	struct p4_pmu_res *c;
++
++	/*
++	 * some preparation work from per-cpu private fields
++	 * since we need to find out which ESCR to use
++	 */
++	c = &__get_cpu_var(p4_pmu_config);
++	tpl = c->tpl[hwc->idx];
++	if (!tpl) {
++		pr_crit("%s: Wrong index: %d\n", __func__, hwc->idx);
++		return;
++	}
++	escr_base = (u64)tpl->escr_msr[thread];
++
++	/*
++	 * - we dont support cascaded counters yet
++	 * - and counter 1 is broken (erratum)
++	 */
++	WARN_ON_ONCE(p4_is_event_cascaded(hwc->config));
++	WARN_ON_ONCE(hwc->idx == 1);
++
++	(void)checking_wrmsrl(escr_base, escr_conf);
++	(void)checking_wrmsrl(hwc->config_base + hwc->idx,
++		(u64)(p4_config_unpack_cccr(hwc->config)) | P4_CCCR_ENABLE);
++}
++
++static void p4_pmu_enable_all(void)
++{
++	struct cpu_hw_events *cpuc = &__get_cpu_var(cpu_hw_events);
++	int idx;
++
++	for (idx = 0; idx < x86_pmu.num_events; idx++) {
++		struct perf_event *event = cpuc->events[idx];
++		if (!test_bit(idx, cpuc->active_mask))
++			continue;
++		p4_pmu_enable_event(event);
++	}
++}
++
++static int p4_pmu_handle_irq(struct pt_regs *regs)
++{
++	struct perf_sample_data data;
++	struct cpu_hw_events *cpuc;
++	struct perf_event *event;
++	struct hw_perf_event *hwc;
++	int idx, handled = 0;
++	u64 val;
++
++	data.addr = 0;
++	data.raw = NULL;
++
++	cpuc = &__get_cpu_var(cpu_hw_events);
++
++	for (idx = 0; idx < x86_pmu.num_events; idx++) {
++
++		if (!test_bit(idx, cpuc->active_mask))
++			continue;
++
++		event = cpuc->events[idx];
++		hwc = &event->hw;
++
++		WARN_ON_ONCE(hwc->idx != idx);
++
++		/*
++		 * FIXME: Redundant call, actually not needed
++		 * but just to check if we're screwed
++		 */
++		p4_pmu_clear_cccr_ovf(hwc);
++
++		val = x86_perf_event_update(event);
++		if (val & (1ULL << (x86_pmu.event_bits - 1)))
++			continue;
++
++		/*
++		 * event overflow
++		 */
++		handled		= 1;
++		data.period	= event->hw.last_period;
++
++		if (!x86_perf_event_set_period(event))
++			continue;
++		if (perf_event_overflow(event, 1, &data, regs))
++			p4_pmu_disable_event(event);
++	}
++
++	if (handled) {
++		/* p4 quirk: unmask it again */
++		apic_write(APIC_LVTPC, apic_read(APIC_LVTPC) & ~APIC_LVT_MASKED);
++		inc_irq_stat(apic_perf_irqs);
++	}
++
++	return handled;
++}
++
++/*
++ * swap thread specific fields according to a thread
++ * we are going to run on
++ */
++static void p4_pmu_swap_config_ts(struct hw_perf_event *hwc, int cpu)
++{
++	u32 escr, cccr;
++
++	/*
++	 * we either lucky and continue on same cpu or no HT support
++	 */
++	if (!p4_should_swap_ts(hwc->config, cpu))
++		return;
++
++	/*
++	 * the event is migrated from an another logical
++	 * cpu, so we need to swap thread specific flags
++	 */
++
++	escr = p4_config_unpack_escr(hwc->config);
++	cccr = p4_config_unpack_cccr(hwc->config);
++
++	if (p4_ht_thread(cpu)) {
++		cccr &= ~P4_CCCR_OVF_PMI_T0;
++		cccr |= P4_CCCR_OVF_PMI_T1;
++		if (escr & P4_EVNTSEL_T0_OS) {
++			escr &= ~P4_EVNTSEL_T0_OS;
++			escr |= P4_EVNTSEL_T1_OS;
++		}
++		if (escr & P4_EVNTSEL_T0_USR) {
++			escr &= ~P4_EVNTSEL_T0_USR;
++			escr |= P4_EVNTSEL_T1_USR;
++		}
++		hwc->config  = p4_config_pack_escr(escr);
++		hwc->config |= p4_config_pack_cccr(cccr);
++		hwc->config |= P4_CONFIG_HT;
++	} else {
++		cccr &= ~P4_CCCR_OVF_PMI_T1;
++		cccr |= P4_CCCR_OVF_PMI_T0;
++		if (escr & P4_EVNTSEL_T1_OS) {
++			escr &= ~P4_EVNTSEL_T1_OS;
++			escr |= P4_EVNTSEL_T0_OS;
++		}
++		if (escr & P4_EVNTSEL_T1_USR) {
++			escr &= ~P4_EVNTSEL_T1_USR;
++			escr |= P4_EVNTSEL_T0_USR;
++		}
++		hwc->config  = p4_config_pack_escr(escr);
++		hwc->config |= p4_config_pack_cccr(cccr);
++		hwc->config &= ~P4_CONFIG_HT;
++	}
++}
++
++/* ESCRs are not sequential in memory so we need a map */
++static unsigned int p4_escr_map[ARCH_P4_TOTAL_ESCR] = {
++	MSR_P4_ALF_ESCR0,	/*  0 */
++	MSR_P4_ALF_ESCR1,	/*  1 */
++	MSR_P4_BPU_ESCR0,	/*  2 */
++	MSR_P4_BPU_ESCR1,	/*  3 */
++	MSR_P4_BSU_ESCR0,	/*  4 */
++	MSR_P4_BSU_ESCR1,	/*  5 */
++	MSR_P4_CRU_ESCR0,	/*  6 */
++	MSR_P4_CRU_ESCR1,	/*  7 */
++	MSR_P4_CRU_ESCR2,	/*  8 */
++	MSR_P4_CRU_ESCR3,	/*  9 */
++	MSR_P4_CRU_ESCR4,	/* 10 */
++	MSR_P4_CRU_ESCR5,	/* 11 */
++	MSR_P4_DAC_ESCR0,	/* 12 */
++	MSR_P4_DAC_ESCR1,	/* 13 */
++	MSR_P4_FIRM_ESCR0,	/* 14 */
++	MSR_P4_FIRM_ESCR1,	/* 15 */
++	MSR_P4_FLAME_ESCR0,	/* 16 */
++	MSR_P4_FLAME_ESCR1,	/* 17 */
++	MSR_P4_FSB_ESCR0,	/* 18 */
++	MSR_P4_FSB_ESCR1,	/* 19 */
++	MSR_P4_IQ_ESCR0,	/* 20 */
++	MSR_P4_IQ_ESCR1,	/* 21 */
++	MSR_P4_IS_ESCR0,	/* 22 */
++	MSR_P4_IS_ESCR1,	/* 23 */
++	MSR_P4_ITLB_ESCR0,	/* 24 */
++	MSR_P4_ITLB_ESCR1,	/* 25 */
++	MSR_P4_IX_ESCR0,	/* 26 */
++	MSR_P4_IX_ESCR1,	/* 27 */
++	MSR_P4_MOB_ESCR0,	/* 28 */
++	MSR_P4_MOB_ESCR1,	/* 29 */
++	MSR_P4_MS_ESCR0,	/* 30 */
++	MSR_P4_MS_ESCR1,	/* 31 */
++	MSR_P4_PMH_ESCR0,	/* 32 */
++	MSR_P4_PMH_ESCR1,	/* 33 */
++	MSR_P4_RAT_ESCR0,	/* 34 */
++	MSR_P4_RAT_ESCR1,	/* 35 */
++	MSR_P4_SAAT_ESCR0,	/* 36 */
++	MSR_P4_SAAT_ESCR1,	/* 37 */
++	MSR_P4_SSU_ESCR0,	/* 38 */
++	MSR_P4_SSU_ESCR1,	/* 39 */
++	MSR_P4_TBPU_ESCR0,	/* 40 */
++	MSR_P4_TBPU_ESCR1,	/* 41 */
++	MSR_P4_TC_ESCR0,	/* 42 */
++	MSR_P4_TC_ESCR1,	/* 43 */
++	MSR_P4_U2L_ESCR0,	/* 44 */
++	MSR_P4_U2L_ESCR1,	/* 45 */
++};
++
++static int p4_get_escr_idx(unsigned int addr)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(p4_escr_map); i++) {
++		if (addr == p4_escr_map[i])
++			return i;
++	}
++
++	return -1;
++}
++
++static int p4_pmu_schedule_events(struct cpu_hw_events *cpuc, int n, int *assign)
++{
++	unsigned long used_mask[BITS_TO_LONGS(X86_PMC_IDX_MAX)];
++	unsigned long escr_mask[BITS_TO_LONGS(ARCH_P4_TOTAL_ESCR)];
++
++	struct hw_perf_event *hwc;
++	struct p4_event_template *tpl;
++	struct p4_pmu_res *c;
++	int cpu = raw_smp_processor_id();
++	int escr_idx, thread, i, num;
++
++	bitmap_zero(used_mask, X86_PMC_IDX_MAX);
++	bitmap_zero(escr_mask, ARCH_P4_TOTAL_ESCR);
++
++	c = &__get_cpu_var(p4_pmu_config);
++	/*
++	 * Firstly find out which resource events are going
++	 * to use, if ESCR+CCCR tuple is already borrowed
++	 * then get out of here
++	 */
++	for (i = 0, num = n; i < n; i++, num--) {
++		hwc = &cpuc->event_list[i]->hw;
++		tpl = p4_pmu_template_lookup(hwc->config);
++		if (!tpl)
++			goto done;
++		thread = p4_ht_thread(cpu);
++		escr_idx = p4_get_escr_idx(tpl->escr_msr[thread]);
++		if (escr_idx == -1)
++			goto done;
++
++		/* already allocated and remains on the same cpu */
++		if (hwc->idx != -1 && !p4_should_swap_ts(hwc->config, cpu)) {
++			if (assign)
++				assign[i] = hwc->idx;
++			/* upstream dependent event */
++			if (unlikely(tpl->dep != -1))
++				printk_once(KERN_WARNING "PMU: Dep events are "
++					"not implemented yet\n");
++			goto reserve;
++		}
++
++		/* it may be already borrowed */
++		if (test_bit(tpl->cntr[thread], used_mask) ||
++			test_bit(escr_idx, escr_mask))
++			goto done;
++
++		/*
++		 * ESCR+CCCR+COUNTERs are available to use lets swap
++		 * thread specific bits, push assigned bits
++		 * back and save template into per-cpu
++		 * area (which will allow us to find out the ESCR
++		 * to be used at moment of "enable event via real MSR")
++		 */
++		p4_pmu_swap_config_ts(hwc, cpu);
++		if (assign) {
++			assign[i] = tpl->cntr[thread];
++			c->tpl[assign[i]] = tpl;
++		}
++reserve:
++		set_bit(tpl->cntr[thread], used_mask);
++		set_bit(escr_idx, escr_mask);
++	}
++
++done:
++	return num ? -ENOSPC : 0;
++}
++
++static __initconst struct x86_pmu p4_pmu = {
++	.name			= "Netburst P4/Xeon",
++	.handle_irq		= p4_pmu_handle_irq,
++	.disable_all		= p4_pmu_disable_all,
++	.enable_all		= p4_pmu_enable_all,
++	.enable			= p4_pmu_enable_event,
++	.disable		= p4_pmu_disable_event,
++	.eventsel		= MSR_P4_BPU_CCCR0,
++	.perfctr		= MSR_P4_BPU_PERFCTR0,
++	.event_map		= p4_pmu_event_map,
++	.raw_event		= p4_pmu_raw_event,
++	.max_events		= ARRAY_SIZE(p4_event_map),
++	.get_event_constraints	= x86_get_event_constraints,
++	/*
++	 * IF HT disabled we may need to use all
++	 * ARCH_P4_MAX_CCCR counters simulaneously
++	 * though leave it restricted at moment assuming
++	 * HT is on
++	 */
++	.num_events		= ARCH_P4_MAX_CCCR,
++	.apic			= 1,
++	.event_bits		= 40,
++	.event_mask		= (1ULL << 40) - 1,
++	.max_period		= (1ULL << 39) - 1,
++	.hw_config		= p4_hw_config,
++	.schedule_events	= p4_pmu_schedule_events,
++};
++
++static __init int p4_pmu_init(void)
++{
++	unsigned int low, high;
++
++	/* If we get stripped -- indexig fails */
++	BUILD_BUG_ON(ARCH_P4_MAX_CCCR > X86_PMC_MAX_GENERIC);
++
++	rdmsr(MSR_IA32_MISC_ENABLE, low, high);
++	if (!(low & (1 << 7))) {
++		pr_cont("unsupported Netburst CPU model %d ",
++			boot_cpu_data.x86_model);
++		return -ENODEV;
++	}
++
++	pr_cont("Netburst events, ");
++
++	x86_pmu = p4_pmu;
++
++	return 0;
++}
++
++#endif /* CONFIG_CPU_SUP_INTEL */
+diff --git a/arch/x86/kernel/cpu/perf_event_p6.c b/arch/x86/kernel/cpu/perf_event_p6.c
+index a330485..6ff4d01 100644
+--- a/arch/x86/kernel/cpu/perf_event_p6.c
++++ b/arch/x86/kernel/cpu/perf_event_p6.c
+@@ -109,6 +109,8 @@ static __initconst struct x86_pmu p6_pmu = {
+ 	.enable_all		= p6_pmu_enable_all,
+ 	.enable			= p6_pmu_enable_event,
+ 	.disable		= p6_pmu_disable_event,
++	.hw_config		= x86_hw_config,
++	.schedule_events	= x86_schedule_events,
+ 	.eventsel		= MSR_P6_EVNTSEL0,
+ 	.perfctr		= MSR_P6_PERFCTR0,
+ 	.event_map		= p6_pmu_event_map,
+-- 
+1.7.0
+
