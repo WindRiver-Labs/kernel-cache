@@ -1,0 +1,351 @@
+From b9651965a031eb7306d160560ca7c7c9b44040a3 Mon Sep 17 00:00:00 2001
+From: Chen Gong <gong.chen@linux.intel.com>
+Date: Thu, 9 Aug 2012 11:44:51 -0700
+Subject: [PATCH] x86/mce: Add CMCI poll mode
+
+upstream: 55babd8f41f122f5f4c7c
+The upstream commit is not able to be applied on standard/preempt-rt/intel-xeon-core
+as this branch has merged some rt related commits from
+git://git.kernel.org/pub/scm/linux/kernel/git/rt/linux-stable-rt.git.
+This patch fixed some context conflict due to those rt related merge.
+
+On Intel systems corrected machine check interrupts (CMCI) may be sent to
+multiple logical processors; possibly to all processors on the affected
+socket (SDM Volume 3B "15.5.1 CMCI Local APIC Interface").  This means
+that a persistent error (such as a stuck bit in ECC memory) may cause
+a storm of interrupts that greatly hinders or prevents forward progress
+(probably on many processors).
+
+To solve this we keep track of the rate at which each processor sees
+CMCI. If we exceed a threshold, we disable CMCI delivery and switch to
+polling the machine check banks. If the storm subsides (none of the
+affected processors see any more errors for a complete poll interval) we
+re-enable CMCI.
+
+[Tony: Added console messages when storm begins/ends and increased storm
+threshold from 5 to 15 so we have a few more logged entries before we
+disable interrupts and start dropping reports]
+
+Signed-off-by: Chen Gong <gong.chen@linux.intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Chen Gong <gong.chen@linux.intel.com>
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Yunguo Wei <yunguo.wei@windriver.com>
+---
+ arch/x86/kernel/cpu/mcheck/mce-internal.h |   12 +++
+ arch/x86/kernel/cpu/mcheck/mce.c          |   69 +++++++++++++-----
+ arch/x86/kernel/cpu/mcheck/mce_intel.c    |  108 ++++++++++++++++++++++++++++-
+ 3 files changed, 168 insertions(+), 21 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mcheck/mce-internal.h b/arch/x86/kernel/cpu/mcheck/mce-internal.h
+index ed44c8a..6a05c1d 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce-internal.h
++++ b/arch/x86/kernel/cpu/mcheck/mce-internal.h
+@@ -28,6 +28,18 @@ extern int mce_ser;
+ 
+ extern struct mce_bank *mce_banks;
+ 
++#ifdef CONFIG_X86_MCE_INTEL
++unsigned long mce_intel_adjust_timer(unsigned long interval);
++void mce_intel_cmci_poll(void);
++void mce_intel_hcpu_update(unsigned long cpu);
++#else
++# define mce_intel_adjust_timer mce_adjust_timer_default
++static inline void mce_intel_cmci_poll(void) { }
++static inline void mce_intel_hcpu_update(unsigned long cpu) { }
++#endif
++
++void mce_timer_kick(unsigned long interval);
++
+ #ifdef CONFIG_ACPI_APEI
+ int apei_write_mce(struct mce *m);
+ ssize_t apei_read_mce(struct mce *m, u64 *record_id);
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index 10e7c58..42ff7ca 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -38,7 +38,6 @@
+ #include <linux/debugfs.h>
+ #include <linux/irq_work.h>
+ #include <linux/export.h>
+-#include <linux/jiffies.h>
+ 
+ #include <asm/processor.h>
+ #include <asm/mce.h>
+@@ -1266,31 +1265,60 @@ static unsigned long check_interval = 5 * 60; /* 5 minutes */
+ static DEFINE_PER_CPU(unsigned long, mce_next_interval); /* in jiffies */
+ static DEFINE_PER_CPU(struct hrtimer, mce_timer);
+ 
++static unsigned long mce_adjust_timer_default(unsigned long interval)
++{
++	return interval;
++}
++
++static unsigned long (*mce_adjust_timer)(unsigned long interval) =
++	mce_adjust_timer_default;
++
+ static enum hrtimer_restart mce_timer_fn(struct hrtimer *timer)
+ {
+-	unsigned long *n;
++	unsigned long iv;
+ 
+ 	if (mce_available(__this_cpu_ptr(&cpu_info))) {
+ 		machine_check_poll(MCP_TIMESTAMP,
+ 				&__get_cpu_var(mce_poll_banks));
++		mce_intel_cmci_poll();
+ 	}
+ 
+ 	/*
+ 	 * Alert userspace if needed.  If we logged an MCE, reduce the
+ 	 * polling interval, otherwise increase the polling interval.
+ 	 */
+-	n = &__get_cpu_var(mce_next_interval);
+-	if (mce_notify_irq())
+-		*n = max(*n/2, HZ/100UL);
+-	else
+-		*n = min(*n*2, round_jiffies_relative(check_interval*HZ));
++	iv = __this_cpu_read(mce_next_interval);
++	if (mce_notify_irq()) {
++		iv = max(iv / 2, (unsigned long) HZ/100);
++	} else {
++		iv = min(iv * 2, round_jiffies_relative(check_interval * HZ));
++		iv = mce_adjust_timer(iv);
++	}
++	__this_cpu_write(mce_next_interval, iv);
++	/* Might have become 0 after CMCI storm subsided */
++	if (iv) {
++		hrtimer_forward(timer, timer->base->get_time(),
++				ns_to_ktime(jiffies_to_usecs(iv)));
++		return HRTIMER_RESTART;
++	}
++}
+ 
+-	hrtimer_forward(timer, timer->base->get_time(),
+-			ns_to_ktime(jiffies_to_usecs(*n) * 1000));
+-	return HRTIMER_RESTART;
++/*
++ * Ensure that the timer is firing in @interval from now.
++ */
++void mce_timer_kick(unsigned long interval)
++{
++	struct hrtimer *t = &__get_cpu_var(mce_timer);
++	unsigned long iv = __this_cpu_read(mce_next_interval);
++
++	hrtimer_forward(t, t->base->get_time(),
++			ns_to_ktime(jiffies_to_usecs(iv)));
++
++	if (interval < iv)
++		__this_cpu_write(mce_next_interval, interval);
+ }
+ 
+-/* Must not be called in IRQ context where hrtimer_cancel() can deadlock */
++/* Must not be called in IRQ context where del_timer_sync() can deadlock */
+ static void mce_timer_delete_all(void)
+ {
+ 	int cpu;
+@@ -1583,6 +1611,7 @@ static void __mcheck_cpu_init_vendor(struct cpuinfo_x86 *c)
+ 	switch (c->x86_vendor) {
+ 	case X86_VENDOR_INTEL:
+ 		mce_intel_feature_init(c);
++		mce_adjust_timer = mce_intel_adjust_timer;
+ 		break;
+ 	case X86_VENDOR_AMD:
+ 		mce_amd_feature_init(c);
+@@ -1594,15 +1623,14 @@ static void __mcheck_cpu_init_vendor(struct cpuinfo_x86 *c)
+ 
+ static void mce_start_timer(unsigned int cpu, struct hrtimer *t)
+ {
+-	unsigned long *n = &__get_cpu_var(mce_next_interval);
+-
+-	if (mce_ignore_ce || !*n)
+-		return;
++	unsigned long iv = mce_adjust_timer(check_interval * HZ);
+ 
+-	*n = check_interval * HZ;
++	__this_cpu_write(mce_next_interval, iv);
+ 
+-	hrtimer_start_range_ns(t, ns_to_ktime(jiffies_to_usecs(*n) * 1000),
+-			       0 , HRTIMER_MODE_REL_PINNED);
++	if (mce_ignore_ce || !iv)
++		return;
++	hrtimer_start_range_ns(t, ns_to_ktime(jiffies_to_usecs(iv) * 1000),
++				0, HRTIMER_MODE_REL_PINNED);
+ }
+ 
+ static void __mcheck_cpu_init_timer(void)
+@@ -2277,6 +2305,7 @@ static void __cpuinit mce_disable_cpu(void *h)
+ 		if (b->init)
+ 			wrmsrl(MSR_IA32_MCx_CTL(i), 0);
+ 	}
++	__mcheck_cpu_init_timer();
+ }
+ 
+ static void __cpuinit mce_reenable_cpu(void *h)
+@@ -2295,7 +2324,6 @@ static void __cpuinit mce_reenable_cpu(void *h)
+ 		if (b->init)
+ 			wrmsrl(MSR_IA32_MCx_CTL(i), b->ctl);
+ 	}
+-	__mcheck_cpu_init_timer();
+ }
+ 
+ /* Get notified when a cpu comes on/off. Be hotplug friendly. */
+@@ -2303,7 +2331,7 @@ static int __cpuinit
+ mce_cpu_callback(struct notifier_block *nfb, unsigned long action, void *hcpu)
+ {
+ 	unsigned int cpu = (unsigned long)hcpu;
+-	struct hrtimer *t = &per_cpu(mce_timer, cpu);
++	struct hrtimer *t = &__get_cpu_var(mce_timer);
+ 
+ 	switch (action & ~CPU_TASKS_FROZEN) {
+ 	case CPU_ONLINE:
+@@ -2315,6 +2343,7 @@ mce_cpu_callback(struct notifier_block *nfb, unsigned long action, void *hcpu)
+ 		if (threshold_cpu_callback)
+ 			threshold_cpu_callback(action, cpu);
+ 		mce_device_remove(cpu);
++		mce_intel_hcpu_update(cpu);
+ 		break;
+ 	case CPU_DOWN_PREPARE:
+ 		smp_call_function_single(cpu, mce_disable_cpu, &action, 1);
+diff --git a/arch/x86/kernel/cpu/mcheck/mce_intel.c b/arch/x86/kernel/cpu/mcheck/mce_intel.c
+index cd08793..0e23620 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce_intel.c
++++ b/arch/x86/kernel/cpu/mcheck/mce_intel.c
+@@ -15,6 +15,8 @@
+ #include <asm/msr.h>
+ #include <asm/mce.h>
+ 
++#include "mce-internal.h"
++
+ /*
+  * Support for Intel Correct Machine Check Interrupts. This allows
+  * the CPU to raise an interrupt when a corrected machine check happened.
+@@ -30,7 +32,22 @@ static DEFINE_PER_CPU(mce_banks_t, mce_banks_owned);
+  */
+ static DEFINE_RAW_SPINLOCK(cmci_discover_lock);
+ 
+-#define CMCI_THRESHOLD 1
++#define CMCI_THRESHOLD		1
++#define CMCI_POLL_INTERVAL	(30 * HZ)
++#define CMCI_STORM_INTERVAL	(1 * HZ)
++#define CMCI_STORM_THRESHOLD	15
++
++static DEFINE_PER_CPU(unsigned long, cmci_time_stamp);
++static DEFINE_PER_CPU(unsigned int, cmci_storm_cnt);
++static DEFINE_PER_CPU(unsigned int, cmci_storm_state);
++
++enum {
++	CMCI_STORM_NONE,
++	CMCI_STORM_ACTIVE,
++	CMCI_STORM_SUBSIDED,
++};
++
++static atomic_t cmci_storm_on_cpus;
+ 
+ static int cmci_supported(int *banks)
+ {
+@@ -53,6 +70,93 @@ static int cmci_supported(int *banks)
+ 	return !!(cap & MCG_CMCI_P);
+ }
+ 
++void mce_intel_cmci_poll(void)
++{
++	if (__this_cpu_read(cmci_storm_state) == CMCI_STORM_NONE)
++		return;
++	machine_check_poll(MCP_TIMESTAMP, &__get_cpu_var(mce_banks_owned));
++}
++
++void mce_intel_hcpu_update(unsigned long cpu)
++{
++	if (per_cpu(cmci_storm_state, cpu) == CMCI_STORM_ACTIVE)
++		atomic_dec(&cmci_storm_on_cpus);
++
++	per_cpu(cmci_storm_state, cpu) = CMCI_STORM_NONE;
++}
++
++unsigned long mce_intel_adjust_timer(unsigned long interval)
++{
++	int r;
++
++	if (interval < CMCI_POLL_INTERVAL)
++		return interval;
++
++	switch (__this_cpu_read(cmci_storm_state)) {
++	case CMCI_STORM_ACTIVE:
++		/*
++		 * We switch back to interrupt mode once the poll timer has
++		 * silenced itself. That means no events recorded and the
++		 * timer interval is back to our poll interval.
++		 */
++		__this_cpu_write(cmci_storm_state, CMCI_STORM_SUBSIDED);
++		r = atomic_sub_return(1, &cmci_storm_on_cpus);
++		if (r == 0)
++			pr_notice("CMCI storm subsided: switching to interrupt mode\n");
++		/* FALLTHROUGH */
++
++	case CMCI_STORM_SUBSIDED:
++		/*
++		 * We wait for all cpus to go back to SUBSIDED
++		 * state. When that happens we switch back to
++		 * interrupt mode.
++		 */
++		if (!atomic_read(&cmci_storm_on_cpus)) {
++			__this_cpu_write(cmci_storm_state, CMCI_STORM_NONE);
++			cmci_reenable();
++			cmci_recheck();
++		}
++		return CMCI_POLL_INTERVAL;
++	default:
++		/*
++		 * We have shiny weather. Let the poll do whatever it
++		 * thinks.
++		 */
++		return interval;
++	}
++}
++
++static bool cmci_storm_detect(void)
++{
++	unsigned int cnt = __this_cpu_read(cmci_storm_cnt);
++	unsigned long ts = __this_cpu_read(cmci_time_stamp);
++	unsigned long now = jiffies;
++	int r;
++
++	if (__this_cpu_read(cmci_storm_state) != CMCI_STORM_NONE)
++		return true;
++
++	if (time_before_eq(now, ts + CMCI_STORM_INTERVAL)) {
++		cnt++;
++	} else {
++		cnt = 1;
++		__this_cpu_write(cmci_time_stamp, now);
++	}
++	__this_cpu_write(cmci_storm_cnt, cnt);
++
++	if (cnt <= CMCI_STORM_THRESHOLD)
++		return false;
++
++	cmci_clear();
++	__this_cpu_write(cmci_storm_state, CMCI_STORM_ACTIVE);
++	r = atomic_add_return(1, &cmci_storm_on_cpus);
++	mce_timer_kick(CMCI_POLL_INTERVAL);
++
++	if (r == 1)
++		pr_notice("CMCI storm detected: switching to poll mode\n");
++	return true;
++}
++
+ /*
+  * The interrupt handler. This is called on every event.
+  * Just call the poller directly to log any events.
+@@ -61,6 +165,8 @@ static int cmci_supported(int *banks)
+  */
+ static void intel_threshold_interrupt(void)
+ {
++	if (cmci_storm_detect())
++		return;
+ 	machine_check_poll(MCP_TIMESTAMP, &__get_cpu_var(mce_banks_owned));
+ 	mce_notify_irq();
+ }
+-- 
+1.7.6
+
