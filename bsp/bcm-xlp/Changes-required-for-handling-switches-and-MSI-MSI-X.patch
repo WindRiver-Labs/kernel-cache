@@ -1,0 +1,534 @@
+From d6614ae3ac5fd32c477e9f843544c411ec72d543 Mon Sep 17 00:00:00 2001
+From: Om Narasimhan <onarasimhan@netlogicmicro.com>
+Date: Tue, 25 Oct 2011 15:26:51 -0700
+Subject: [PATCH 478/761] Changes required for handling switches and MSI/MSI-X
+ over switches.
+
+This commit implements changes required for implementing MSI/MSI-X
+correctly over PCIe switches. The three dimentional array of interrupts
+used to allocate IRQ for MSI is changed to a single array of structures.
+MSI/MSI-X allocations are re-engineered and number of MSI per controller
+function is increased to 32, thus incrementing the total number to 128.
+Subsequently, NR_IRQS are increased to 384
+
+New IRQ vector range is as follows.
+0-7 : Reserved
+8 - 167 : Native
+160-191 : Reserved
+192 - 223 : MSI-X
+224-256 : Reserved
+256-384	: MSI
+
+Bug fix : Previously irq_map[] was wrongly declared to have only 168 elements.
+Corrected to have NR_IRQS elements.
+MSI on sky2 works fine now.  MSI on e1000e (multiport) works fine as well over
+a PLX switch
+
+The port driver core has a patch specific to XLP. This may be removed in
+future once VCs are supported.
+
+Based on Broadcom SDK 2.3.
+
+Signed-off-by: Om Narasimhan <onarasimhan@netlogicmicro.com>
+Signed-off-by: Yanjiang Jin <yanjiang.jin@windriver.com>
+---
+ arch/mips/include/asm/netlogic/xlp_irq.h |   28 ++--
+ arch/mips/pci/pci-xlp.c                  |  253 ++++++++++++++++++++++++------
+ 2 files changed, 219 insertions(+), 62 deletions(-)
+
+diff --git a/arch/mips/include/asm/netlogic/xlp_irq.h b/arch/mips/include/asm/netlogic/xlp_irq.h
+index d759b9b..70b5742 100644
+--- a/arch/mips/include/asm/netlogic/xlp_irq.h
++++ b/arch/mips/include/asm/netlogic/xlp_irq.h
+@@ -34,6 +34,8 @@ THE POSSIBILITY OF SUCH DAMAGE.
+ #define NR_IRQS			384
+ /* Maximum IRQ vector numbers supported by MIPS */
+ #define XLP_EIRR_SIZE		64
++#define XLP_IRT_NUM	160
++#define XLP_IRQ_MAX	168	/* 0-7 are reserved + 160 IRT entries */
+ 
+ /* The following interrupt assignments (0-7) are special.
+  * I need to find out what governs these assignments
+@@ -84,6 +86,10 @@ THE POSSIBILITY OF SUCH DAMAGE.
+ /*
+  *    IRT Map
+  */
++
++#define arch_setup_msi_irqs	arch_setup_msi_irqs /* defines arch. specific msi setup function */
++#define xlp_irq_to_irt(x)	((x) - XLP_IRQ_RESERVED_MAX)
++#define xlp_irt_to_irq(x)	((x) + XLP_IRQ_RESERVED_MAX)
+ #define XLP_PIC_NUM_IRTS	160
+ 
+ #define XLP_WD_BASE			(0 + XLP_IRQ_RESERVED_MAX)
+@@ -137,6 +143,9 @@ THE POSSIBILITY OF SUCH DAMAGE.
+ #define	XLP_KBP_IRT_OFFSET			(132 + XLP_IRQ_RESERVED_MAX)
+ #define XLP_KBP_IRQ(x)	(XLP_KBP_IRT_OFFSET + (x))
+ 
++#define XLP_UART_IRT_OFFSET			(133 + XLP_IRQ_RESERVED_MAX)
++#define XLP_UART_IRQ(x)	(XLP_UART_IRT_OFFSET + (x))
++
+ #define XLP_PIC_IRT_UART_0		133
+ #define XLP_PIC_IRT_UART_1		134
+ #define XLP_PIC_IRT_UART(x)		((x) + XLP_PIC_IRT_UART_0)
+@@ -189,22 +198,13 @@ THE POSSIBILITY OF SUCH DAMAGE.
+  * This is a kludge to keep NR_IRQS == 256 and can be expanded later
+  * We are using IRQ 192 - 255 for MSI/MSI-X
+  * */
+-#if 1
+-/* XLP_MERGE_TODO: to reenable MSI support
+- * after resolving irq namespace conflict caused by upstream changes */
+-#undef CONFIG_PCI_MSI_XLP
+-#undef CONFIG_PCI_MSIX_XLP
+-#else
+-#define CONFIG_PCI_MSI_XLP	1
+-#define CONFIG_PCI_MSIX_XLP	1
+-#endif
+ 
+ #define XLP_PIC_IRTREG_START 0xB4
+ #define XLP_ITE_ENTRIES		8
+ #ifdef CONFIG_XLP_MSI_ADDRESSES
+ #define XLP_MSI_ADDR		0xFEE00000
+ #endif
+-
++#define XLP_INTX_TO_CTRL_FN(irq) ((irq - XLP_PCIE_LINK_IRQ(0)) & 0x3)
+ #define XLP_MSI_ADDR_SIZE	0x00002000
+ #define XLP_MSIX_ADDR_SIZE	0x00008000
+ #define XLP_BDF_BASE(b,d,f)	(0x18000000 + ((b) << 20) + ((d) << 15) + ((f) << 12))
+@@ -228,6 +228,14 @@ THE POSSIBILITY OF SUCH DAMAGE.
+ #define XLP_MSIX_INDEX_END	(XLP_MSIX_IRQ_START(XLP_MAX_SLOTS) - 1)// 31 vectors
+ 
+ #endif
++
++#define	XLP_INTMODE_NONE  0
++#define	XLP_INTMODE_INTX  1
++#define	XLP_INTMODE_MSI  2
++#define	XLP_INTMODE_MSIX  4
++
++#define xlp_incr_ctrl_intmode(fn, mode) xlp_ctrl_intmode_add(fn, mode, 1)
++#define xlp_decr_ctrl_intmode(fn, mode) xlp_ctrl_intmode_add(fn, mode, -1)
+ /*
+  *     Register Offsets
+  */
+diff --git a/arch/mips/pci/pci-xlp.c b/arch/mips/pci/pci-xlp.c
+index 384ee14..3b1fa0c 100644
+--- a/arch/mips/pci/pci-xlp.c
++++ b/arch/mips/pci/pci-xlp.c
+@@ -47,12 +47,13 @@ extern int pci_probe_only;
+ static void *pci_config_base;
+ static const volatile void *pci_io_base;
+ 
+-void xlp_intx_enable(int fn);
+-void xlp_intx_disable(int fn);
+-int xlp_msi_enable(struct pci_dev *dev, u32 bitmap);
+-int xlp_msix_enable(struct pci_dev *dev);
+-void xlp_msi_disable(int fn, u32 bitmap);
+-void xlp_msix_disable(int fn);
++int xlp_intx_enable(int);
++int xlp_intx_disable(int);
++int xlp_msi_enable(int, u32);
++int xlp_msix_enable(int);
++int xlp_msi_disable(int, u32);
++int xlp_msix_disable(int);
++u32 xlp_msi_set_mask(int, int, int);
+ 
+ /*
+  * Possible values are no more hard coded.
+@@ -93,6 +94,29 @@ void xlp_msix_disable(int fn);
+  * numbers would be different. Based on this fact, we can figure out from
+  * pci_dev structure the slot where a card is placed at run time.
+  */
++struct xlp_link_struct {
++	int intno;
++	int sec;
++	int sub;
++};
++
++struct xlp_plc_fn_struct {
++	int plc;
++	struct xlp_link_struct farray[4];
++};
++
++static struct xlp_plc_fn_struct xlp_irqmap[4] = {
++	{0, {{XLP_PCIE_LINK_IRQ(0), 0, 0}, {0, 0, 0},
++		{XLP_PCIE_LINK_IRQ(2), 0, 0}, {0, 0, 0}}},
++	{1, {{XLP_PCIE_LINK_IRQ(0), 0, 0}, {XLP_PCIE_LINK_IRQ(1), 0, 0},
++		{XLP_PCIE_LINK_IRQ(2), 0, 0}, {0, 0, 0}}},
++	{2, {{XLP_PCIE_LINK_IRQ(0), 0, 0}, {0, 0, 0},
++		{XLP_PCIE_LINK_IRQ(2), 0, 0}, {XLP_PCIE_LINK_IRQ(3), 0, 0}}},
++	{3, {{XLP_PCIE_LINK_IRQ(0), 0, 0}, {XLP_PCIE_LINK_IRQ(1), 0, 0},
++		{XLP_PCIE_LINK_IRQ(2), 0, 0}, {XLP_PCIE_LINK_IRQ(3), 0, 0}}},
++};
++
++/*
+ static int xlp_irq_map[4][4][3] = {
+ 	{{XLP_PCIE_LINK_IRQ(0), 0, 0}, {0, 0, 0},
+ 		{XLP_PCIE_LINK_IRQ(2), 0, 0}, {0, 0, 0}},
+@@ -103,6 +127,55 @@ static int xlp_irq_map[4][4][3] = {
+ 	{{XLP_PCIE_LINK_IRQ(0), 0, 0}, {XLP_PCIE_LINK_IRQ(1), 0, 0},
+ 		{XLP_PCIE_LINK_IRQ(2), 0, 0}, {XLP_PCIE_LINK_IRQ(3), 0, 0}},
+ };
++*/
++/* The following is the table describing current interrupt modes of
++ * XLP controllers. When an external switch is present, different devices
++ * can request different interrupt mode on the same controller which might lead
++ * to controller changing previous interrupt mode. If this happens, interrupt
++ * delivery will not work correctly. So, we need a way to prevent different
++ * devices requesting different interrupt modes. This is kind of impossible
++ * because we can't control all device drivers, but we can
++ *	1. fail pci_enable_msi{x} if intX is set and at least one interrupt
++ *	is allocated
++ *	2. fail request_irq() for any interrupt outside current interrupt
++ *	distribution range
++ */
++struct xlp_intmode_struct {
++	u32 mode;
++	int usage;
++};
++static struct xlp_intmode_struct intmode[4];
++
++int xlp_ctrl_intmode_add(int fn, int mode, int i)
++{
++	if (intmode[fn].mode != mode) {
++		return -EBUSY;
++	}
++	intmode[fn].usage += i;
++	if ((intmode[fn].usage < 0) || (intmode[fn].usage == 0)) {
++		intmode[fn].usage = 0;
++	}
++	return intmode[fn].usage;
++}
++
++
++int xlp_get_ctrl_intmode(int fn)
++{
++	return intmode[fn].mode;
++}
++
++int xlp_set_ctrl_intmode(int fn, int mode)
++{
++	int ret = 0;
++	if (intmode[fn].mode == mode) {
++		/* do nothing */
++	} else if (intmode[fn].usage == 0) {
++		intmode[fn].mode = mode;
++	} else {
++		ret = -EBUSY;
++	}
++	return ret;
++}
+ 
+ /* Just a helper function to fill up xlp_irq_map table's entries
+  * This function checks whether a PCIe slot is populated and if yes,
+@@ -122,8 +195,8 @@ static int xlp_map_helper(int row, int fn)
+ 		return -ENODEV;
+ 	}
+ 	reg6 = nlm_hal_read_32bit_reg(xlp_pci_base, 0x6);
+-	xlp_irq_map[row][fn][1] = (reg6 >> 8) & 0xff;
+-	xlp_irq_map[row][fn][2] = (reg6 >> 16) & 0xff;
++	xlp_irqmap[row].farray[fn].sec = (reg6 >> 8) & 0xff;
++	xlp_irqmap[row].farray[fn].sub = (reg6 >> 16) & 0xff;
+ 	return 0;
+ }
+ 
+@@ -138,8 +211,8 @@ int xlp_ctrl_fn_from_dev(const struct pci_dev *dev)
+ 	while (row < 4) {
+ 		fn = 0;
+ 		while (fn < 4) {
+-			if ((dev->bus->number >= xlp_irq_map[row][fn][1]) &&
+-				(dev->bus->number <= xlp_irq_map[row][fn][2])) {
++			if ((dev->bus->number >= xlp_irqmap[row].farray[fn].sec)
++			&&(dev->bus->number <= xlp_irqmap[row].farray[fn].sub)){
+ 				goto out; /* No `break', note two loops */;
+ 			}
+ 			fn++;
+@@ -218,8 +291,8 @@ static void xlp_msi_controller_init(int fn)
+ void xlp_pcie_controller_setup(int fn)
+ {
+ 	xlp_msi_controller_init(fn);
+-	xlp_msix_disable(fn);
+-	xlp_msi_disable(fn, 0xf);
++	//xlp_msix_disable(fn);
++	//xlp_msi_disable(fn, 0xf);
+ 	/* By default, leave INTX enabled */
+ 	xlp_intx_enable(fn);
+ }
+@@ -462,14 +535,14 @@ int __init pcibios_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
+ 	}
+ 	row = (xlp_get_power_on_reset_cfg(0) >> 23) & 0x3;
+ 	fn = xlp_ctrl_fn_from_dev(dev);
+-	dev_printk(KERN_DEBUG, &dev->dev, "Assigning interrupt %#x\n", xlp_irq_map[row][fn][0]);
+-	return xlp_irq_map[row][fn][0];
++	dev_printk(KERN_DEBUG, &dev->dev, "Assigning interrupt %#x\n", xlp_irqmap[row].farray[fn].intno);
++	return xlp_irqmap[row].farray[fn].intno;
+ }
+ 
+ /*
+  * Enables INTx on a controller
+  */
+-void xlp_intx_enable(int fn)
++static int __xlp_intx_enable(int fn)
+ {
+ 	u64 xlp_pci_base;
+ 	u32 pci;
+@@ -481,13 +554,25 @@ void xlp_intx_enable(int fn)
+ 	pci = nlm_hal_read_32bit_reg(xlp_pci_base, 0x261);
+ 	pci |= 0xf;	/* Enable INT A,B,C,D */
+ 	nlm_hal_write_32bit_reg(xlp_pci_base, 0x261, pci);
+-	return;
++	return 0;
++}
++
++int xlp_intx_enable(int fn)
++{
++	int mode = xlp_get_ctrl_intmode(fn);
++
++	if ((mode & XLP_INTMODE_MSI) || (mode & XLP_INTMODE_MSIX)) {
++		return -EBUSY;
++	}
++	__xlp_intx_enable(fn);
++	xlp_incr_ctrl_intmode(fn, XLP_INTMODE_INTX);
++	return 0;
+ }
+ 
+ /*
+  * Disables INTx on a controller
+  */
+-void xlp_intx_disable(int fn)
++static int __xlp_intx_disable(int fn)
+ {
+ 	u64 xlp_pci_base;
+ 	u32 pci;
+@@ -499,7 +584,19 @@ void xlp_intx_disable(int fn)
+ 	pci = nlm_hal_read_32bit_reg(xlp_pci_base, 0x261);
+ 	pci &= ~(0xf);
+ 	nlm_hal_write_32bit_reg(xlp_pci_base, 0x261, pci);
+-	return;
++	return 0;
++}
++
++int xlp_intx_disable(int fn)
++{
++	int mode = xlp_get_ctrl_intmode(fn);
++
++	if (!(mode & XLP_INTMODE_INTX)) {
++		return -EBUSY;
++	}
++	__xlp_intx_disable(fn);
++	xlp_decr_ctrl_intmode(fn, XLP_INTMODE_INTX);
++	return 0;
+ }
+ 
+ /*
+@@ -507,48 +604,55 @@ void xlp_intx_disable(int fn)
+  * MSI enable register on the _controller_ if not already enabled
+  * @dev : pci device corresponding to this device
+  */
+-int xlp_msi_enable(struct pci_dev *dev, u32 bitmap)
++static int __xlp_msi_enable(int fn, u32 bit)
+ {
+-	int fn = 0;
+ 	u64 xlp_pci_base;
+ 	u32 msi_en;
+ 
+-	fn = xlp_ctrl_fn_from_dev(dev);
+ 	xlp_pci_base = XLP_BDF_BASE(0,1,fn);
+-	/* First, set PCIe Int Enable register. __KEEP_THIS_ORDER__ */
++
++	/* First, set PCIe MSI Enable register. __KEEP_THIS_ORDER__ */
+ 	msi_en = nlm_hal_read_32bit_reg(xlp_pci_base, 0x261);
+-	if (!(msi_en & (1 << 9))) {
+-		xlp_intx_disable(fn);
+-		xlp_msix_disable(fn);
+-		msi_en &= ~(0xf);
++	msi_en &= ~(0xf);
++	if ((msi_en & (1 << 9)) == 0) {
+ 		msi_en |= (1 << 9);	/* controls ONLY MSI, Not MSI-X */
+-		/* Then, individually enable MSI bits */
+ 		nlm_hal_write_32bit_reg(xlp_pci_base, 0x261, msi_en);
+-		msi_en = nlm_hal_read_32bit_reg(xlp_pci_base, 0x25B);
+-		msi_en |= bitmap;
+-		nlm_hal_write_32bit_reg(xlp_pci_base, 0x25B, msi_en);
+ 	}
++	/* Now, set the individual bit */
++	xlp_msi_set_mask(fn, bit, 1);
++	return 0;
++}
++
++int xlp_msi_enable(int fn, u32 bit)
++{
++	int tmp = xlp_get_ctrl_intmode(fn);
++
++	if ((tmp & XLP_INTMODE_INTX) || (tmp & XLP_INTMODE_MSIX)) {
++		return -EBUSY;
++	}
++
++	/* Enable MSI bis
++	 * Multiple MSI can get enabled at different point of time (especially
++	 * with a switch present. So, setting the bitmap should not depend on
++	 * present value of reg 0x25b or 0x261
++	 */
++	__xlp_msi_enable(fn, bit);
++	xlp_incr_ctrl_intmode(fn, XLP_INTMODE_MSI);
+ 	return 0;
+ }
+ 
+ /*
+  * Finds the slot on which this device is placed and enables corresponding
+  * MSI-X enable register on the controller
+- * @dev : pci device corresponding to this device
+  */
+-int xlp_msix_enable(struct pci_dev *dev)
++static int __xlp_msix_enable(int fn)
+ {
+-	int fn = 0;
+ 	u64 xlp_pci_base;
+ 	u32 msix_ctrl;
+ 
+-	fn = xlp_ctrl_fn_from_dev(dev);
+ 	xlp_pci_base = XLP_BDF_BASE(0,1,fn);
+ 	msix_ctrl = nlm_hal_read_32bit_reg(xlp_pci_base, 0x2C);
+ 	if (!(msix_ctrl & 0x80000000)) {
+-		/* disable MSI and intx first */
+-		xlp_intx_disable(fn);
+-		xlp_msi_disable(fn, 0xf);
+ 		msix_ctrl |= 0x80000000;	/* MSI-X enable */
+ 		nlm_hal_write_32bit_reg(xlp_pci_base, 0x2C, msix_ctrl);
+ 	}
+@@ -556,28 +660,59 @@ int xlp_msix_enable(struct pci_dev *dev)
+ 	return 0;
+ }
+ 
++int xlp_msix_enable(int fn)
++{
++	int mode = xlp_get_ctrl_intmode(fn);
++
++	if ((mode & XLP_INTMODE_MSI) || (mode & XLP_INTMODE_INTX)) {
++		return -EBUSY;
++	}
++	__xlp_msix_enable(fn);
++	xlp_incr_ctrl_intmode(fn, XLP_INTMODE_MSIX);
++	return 0;
++}
++
+ /*
+  * Disables MSI on controller function
+  */
+-void xlp_msi_disable(int fn, u32 bitmap)
++static int __xlp_msi_disable(int fn)
+ {
+ 	u64 xlp_pci_base;
+ 	u32 msi_en;
+ 
++	/* We dont call xlp_decr_ctrl.... here because it has already been 
++	 * called before xlp_msi_disable is called */
+ 	xlp_pci_base = XLP_BDF_BASE(0,1,fn);
+ 	/*set PCIe Int Enable register */
+ 	msi_en = nlm_hal_read_32bit_reg(xlp_pci_base, 0x261);
+-	if (msi_en & (1 << 9)) {
++	if ((msi_en & (1 << 9)) != 0) {
+ 		msi_en &= ~(1 << 9);
+-		msi_en |= (bitmap & 0xf);
++		msi_en |= 0xf;
+ 		nlm_hal_write_32bit_reg(xlp_pci_base, 0x261, msi_en);
+ 	}
++	return 0;
++}
++
++int xlp_msi_disable(int fn, u32 bit)
++{
++	int tmp = xlp_get_ctrl_intmode(fn);
++	u32 r25b;
++
++	if (!(tmp & XLP_INTMODE_MSI)) {
++		return -EBUSY;
++	}
++	r25b = xlp_msi_set_mask(fn, bit, 0);
++	if (r25b == 0) {
++		__xlp_msi_disable(fn);
++	}
++	xlp_decr_ctrl_intmode(fn, XLP_INTMODE_MSI);
++	return 0;
+ }
+ 
+ /*
+  * Disables MSI-X on a controller function
+  */
+-void xlp_msix_disable(int fn)
++static int __xlp_msix_disable(int fn)
+ {
+ 	u64 xlp_pci_base;
+ 	u32 msix_ctrl;
+@@ -587,7 +722,20 @@ void xlp_msix_disable(int fn)
+ 	msix_ctrl &= ~(0x80000000);	/* MSI-X disable */
+ 	nlm_hal_write_32bit_reg(xlp_pci_base, 0x2C, msix_ctrl);
+ 	//nlm_hal_write_32bit_reg(xlp_pci_base, 0xf, 0xFF);	/* TODO Get from dev */
+-	return;
++	return 0;
++}
++
++int xlp_msix_disable(int fn)
++{
++	int mode = xlp_get_ctrl_intmode(fn);
++
++	if (!(mode & XLP_INTMODE_MSIX)) {
++		return -EBUSY;
++	}
++	if (xlp_decr_ctrl_intmode(fn, XLP_INTMODE_MSIX) == 0) {
++		__xlp_msix_disable(fn);
++	}
++	return 0;
+ }
+ 
+ /*
+@@ -661,22 +809,22 @@ int xlp_msix_base_vector(struct pci_dev *dev)
+ #endif
+ 
+ /*
+- * Masks the bit corresponding to an MSI
++ * Masks the bit corresponding to an MSI and return the resulting bitmask
+  */
+ u32 xlp_msi_set_mask(int fn, int bit, int val)
+ {
+ 	u64 xlp_pci_base;
+-	u32 msi_en;
++	u32 bits;
+ 
+ 	xlp_pci_base = XLP_BDF_BASE(0,1,fn);
+-	msi_en = nlm_hal_read_32bit_reg(xlp_pci_base, 0x25B);
+-	if (val == 0) {	/* Make the bit 0 */
+-		msi_en &= ~( 1 << bit);
+-	} else {	/* Make the bit 1 */
+-		msi_en |= ( 1 << bit);
++	bits = nlm_hal_read_32bit_reg(xlp_pci_base, 0x25B);
++	if (val == 0) {	/* Clear bit `bit` */
++		bits &= ~( 1 << bit);
++	} else {	/* Set bit `bit` */
++		bits |= ( 1 << bit);
+ 	}
+-	nlm_hal_write_32bit_reg(xlp_pci_base, 0x25B, msi_en);
+-	return msi_en;
++	nlm_hal_write_32bit_reg(xlp_pci_base, 0x25B, bits);
++	return bits;
+ }
+ 
+ /*
+@@ -686,7 +834,7 @@ u32 xlp_msi_set_mask(int fn, int bit, int val)
+  */
+ int xlp_msi_status_clear(struct pci_dev *dev, int bit)
+ {
+-	int row = 0, fn = 0;
++	int fn = 0;
+ 	u64 xlp_pci_base;
+ 	u32 msi_en;
+ 
+@@ -757,6 +905,7 @@ static int __init pcibios_init(void)
+ 	ioport_resource.end   = ~0;
+ 
+ 	printk(KERN_DEBUG "Registering XLP PCIE Controller. \n");
++	/* Setting up controller specific data */
+ 	pcie_controller_init_done();
+ 	register_pci_controller(&xlp_controller);
+ 
+-- 
+1.7.10.4
+

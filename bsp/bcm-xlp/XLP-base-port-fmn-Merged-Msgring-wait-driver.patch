@@ -1,0 +1,511 @@
+From 85f7ca592a84cfeba01f4d754368b8c1c4dabdd1 Mon Sep 17 00:00:00 2001
+From: Jayanthi A <jayanthi.annadurai@broadcom.com>
+Date: Thu, 19 Jul 2012 23:25:10 +0530
+Subject: [PATCH 556/761] XLP base port: fmn - Merged Msgring wait driver
+
+    Helinux apps instead of looping on a VC for packets can
+    wait for a packet arrival. The thread sleeps by a read
+    on the msgring file, and it will be woken up when a packet
+    comes on the selected VC.
+
+Based on Broadcom SDK 2.3.
+
+Signed-off-by: Jayanthi A <jayanthi.annadurai@broadcom.com>
+Signed-off-by: Yanjiang Jin <yanjiang.jin@windriver.com>
+---
+ arch/mips/netlogic/xlp/on_chip.c |  161 +++++++++++++++++++++++++++-----
+ drivers/char/Makefile            |    2 +-
+ drivers/char/nlm_msgring.c       |  192 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 333 insertions(+), 22 deletions(-)
+ create mode 100644 drivers/char/nlm_msgring.c
+
+diff --git a/arch/mips/netlogic/xlp/on_chip.c b/arch/mips/netlogic/xlp/on_chip.c
+index d986784..acc3044 100644
+--- a/arch/mips/netlogic/xlp/on_chip.c
++++ b/arch/mips/netlogic/xlp/on_chip.c
+@@ -63,8 +63,12 @@ uint32_t nlm_cpu_vc_mask[NLM_MAX_CPU_NODE*NLM_MAX_CPU_PER_NODE] = {0};
+ uint32_t nlm_l1_lock[NR_CPUS/4] = {0};
+ 
+ #ifdef CONFIG_XLP_FMN_SUPPORT
+-typedef void (*vchandler)(int vc);
+-static vchandler xlp_vc_handlers[NLM_MAX_VC_PER_THREAD];
++typedef int (*vchandler)(int vc, int budget);
++static vchandler xlp_napi_vc_handlers[NLM_MAX_VC_PER_THREAD];
++
++typedef int (*intr_vchandler)(int vc);
++static intr_vchandler xlp_intr_vc_handler;
++unsigned int intr_vc_mask[NR_CPUS];
+ 
+ /* make this a read/write spinlock */
+ spinlock_t msgrng_lock;
+@@ -73,8 +77,11 @@ static nlm_common_atomic_t msgring_registered;
+ struct msgstn_handler {
+         void (*action)(uint32_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, void *);
+         void *dev_id;
++	void (*napi_final)(void *arg);
++	void *napi_final_arg;
+ };
+ 
++static int napi_final_needed[NR_CPUS][XLP_MSG_HANDLE_MAX];
+ struct net_device xlp_napi_fmn_dummy_dev;
+ DEFINE_PER_CPU(struct napi_struct, xlp_napi_fmn_poll_struct);
+ DEFINE_PER_CPU(unsigned long long, xlp_napi_fmn_rx_count);
+@@ -278,30 +285,89 @@ void dummy_handler(uint32_t vc, uint32_t src_id, uint32_t size, uint32_t code,
+  *
+  ******************************************************************************************/
+ struct msgstn_handler msg_handler_map[XLP_MSG_HANDLE_MAX] = {
+-	[0 ... (XLP_MSG_HANDLE_MAX-1)] = {dummy_handler, NULL},
++	[0 ... (XLP_MSG_HANDLE_MAX-1)] = {dummy_handler, NULL, NULL, NULL},
+ };
+ 
+ 
+-int nlm_xlp_register_vc_handler(int vc, void (*handler)(int vc))
++int nlm_xlp_register_napi_vc_handler(int vc, int (*handler)(int vc, int budget))
+ {
+-	int i, node = 0;
+ 	if(vc < 0 || vc >= NLM_MAX_VC_PER_THREAD) {
+-		printk("Invalid VC Passed %d\n", vc);
++		printk("%s, Error, invalid VC Passed %d\n", __FUNCTION__, vc);
+ 		return -1;
+ 	}
+-	xlp_vc_handlers[vc] = handler;
+ 
+-	for(i=0; i<NR_CPUS; i++){
+-		if(!cpu_isset(i, phys_cpu_present_map))
+-			continue;
+-		node = i / 32;
+-		nlm_hal_enable_vc_intr(node, (i*NLM_MAX_VC_PER_THREAD + vc) & 0x7f);
++	if(!((1 << vc) & xlp_napi_vc_mask)) {
++		printk("%s , Error, VC is not specified in napi vc mask\n", __FUNCTION__);
++		return -1;
+ 	}
+ 
++	if(!xlp_fmn_init_done)
++		xlp_fmn_init_done = 1;
++	
++	xlp_napi_vc_handlers[vc] = handler;
++	return 0;
++}
++EXPORT_SYMBOL(nlm_xlp_register_napi_vc_handler);
++
++
++int nlm_xlp_unregister_napi_vc_handler(int vc)
++{
++	if(vc < 0 || vc >= NLM_MAX_VC_PER_THREAD) {
++		printk("%s, Error, invalid VC Passed %d\n", __FUNCTION__, vc);
++		return -1;
++	}
++	xlp_napi_vc_handlers[vc] = NULL;
++	return 0;
++}
++EXPORT_SYMBOL(nlm_xlp_unregister_napi_vc_handler);
++
++int nlm_xlp_register_intr_vc_handler(int (*handler)(int vc))
++{
++	xlp_intr_vc_handler = handler;
++	return 0;
++}
++EXPORT_SYMBOL(nlm_xlp_register_intr_vc_handler);
++
++int nlm_xlp_register_intr_vc(int cpu, int vc)
++{
++	int node;
++	unsigned long flags;
++
++	if(vc < 0 || vc >= NLM_MAX_VC_PER_THREAD) {
++		printk("%s, Error, invalid VC Passed %d\n", __FUNCTION__, vc);
++		return -1;
++	}
++
++	if(!xlp_fmn_init_done)
++		xlp_fmn_init_done = 1;
++	
++	node = cpu / 32;
++	nlm_hal_enable_vc_intr(node, (cpu*4 + vc) & 0x7f);
++
++	spin_lock_irqsave(&msgrng_lock, flags);
++	intr_vc_mask[cpu] |= (1 << vc);
++	spin_unlock_irqrestore(&msgrng_lock, flags);
++	
++	/*printk("%s in, cpu %d intr_vc_mask %x\n", __FUNCTION__, cpu, intr_vc_mask[cpu]);*/
+ 	return 0;
+ }
+-EXPORT_SYMBOL(nlm_xlp_register_vc_handler);
++EXPORT_SYMBOL(nlm_xlp_register_intr_vc);
+ 
++int nlm_xlp_unregister_intr_vc(int cpu, int vc)
++{
++	unsigned long flags;
++
++	if(vc < 0 || vc >= NLM_MAX_VC_PER_THREAD) {
++		printk("%s, Error, invalid VC Passed %d\n", __FUNCTION__, vc);
++		return -1;
++	}
++
++	spin_lock_irqsave(&msgrng_lock, flags);
++	intr_vc_mask[cpu] &= (~(1 << vc));
++	spin_unlock_irqrestore(&msgrng_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL(nlm_xlp_unregister_intr_vc);
+ 
+ /*********************************************************************
+  * nlm_xlp_msgring_int_handler 
+@@ -322,6 +388,8 @@ void nlm_xlp_msgring_int_handler(unsigned int irq, struct pt_regs *regs)
+ 	int cpu = hard_smp_processor_id();
+ 	int pop_vc_mask = nlm_cpu_vc_mask[cpu];
+ 	uint32_t napi_vc_mask = xlp_napi_vc_mask & pop_vc_mask;
++	unsigned int vcmask;
++
+ 	msg0 = msg1 = msg2 = msg3 = 0;
+ 	
+ 	if (irq == XLP_IRQ_MSGRING) {
+@@ -343,12 +411,15 @@ void nlm_xlp_msgring_int_handler(unsigned int irq, struct pt_regs *regs)
+ 		/* Read latest VC empty mask */
+ 		msg_status1 = xlp_read_status1();
+ 
+-#ifdef CONFIG_NLM_EXCL_VC_NAPI_HANDLER_SUPPORT
+-		for(vc = 0; vc < 4; vc++) {
+-			if(xlp_vc_handlers[vc])
+-				(xlp_vc_handlers)[vc](vc);
++		vcmask = (~(msg_status1>>24) & intr_vc_mask[cpu]);
++		if(vcmask && xlp_intr_vc_handler) {
++			for(vc = 0; vc < 4; vc++) {
++				if(!(vcmask & (1<<vc)))
++					continue;
++				xlp_intr_vc_handler(vc);
++			}
+ 		}
+-#else
++
+ 		if((~(msg_status1>>24) & napi_vc_mask) && xlp_fmn_init_done) {
+ 			struct napi_struct *napi;
+ 
+@@ -357,7 +428,6 @@ void nlm_xlp_msgring_int_handler(unsigned int irq, struct pt_regs *regs)
+ 		        napi_schedule(napi);
+ 			pop_vc_mask = pop_vc_mask & ~napi_vc_mask;
+ 		}
+-#endif
+ 
+ 		vc_empty_status = (msg_status1 >> 24) & pop_vc_mask;
+ 		if (vc_empty_status == pop_vc_mask) break;  
+@@ -529,6 +599,8 @@ int unregister_xlp_msgring_handler(int major, void *dev_id)
+ 	if(msg_handler_map[major].dev_id == dev_id){
+ 		msg_handler_map[major].action = dummy_handler;
+ 		msg_handler_map[major].dev_id = NULL;
++		msg_handler_map[major].napi_final = NULL;
++		msg_handler_map[major].napi_final_arg = NULL;
+ 	}
+ 	spin_unlock_irqrestore(&msgrng_lock, flags);
+ 	return 0;
+@@ -536,6 +608,22 @@ int unregister_xlp_msgring_handler(int major, void *dev_id)
+ 
+ EXPORT_SYMBOL(unregister_xlp_msgring_handler);
+ 
++int nlm_xlp_register_napi_final_handler(int major, void (*napi_final)(void *arg), void *arg)
++{
++      if(major >= XLP_MSG_HANDLE_MAX){
++              printk(KERN_ALERT "%s:%d  Invalid parameter: major=%d, "
++                    "XLP_MAX_TX_STN=%d", __FUNCTION__, __LINE__, major,
++                     XLP_MAX_TX_STNS);
++              return -1;
++      }
++      msg_handler_map[major].napi_final = napi_final;
++      msg_handler_map[major].napi_final_arg = arg;
++      return 0;
++}
++
++EXPORT_SYMBOL(nlm_xlp_register_napi_final_handler);
++
++
+ #include <asm/netlogic/cpumask.h>
+ 
+ /*********************************************************************
+@@ -578,6 +666,7 @@ void nlm_enable_vc_intr(void)
+ 	}
+ }
+ 
++
+ int xlp_fmn_poll(struct napi_struct *napi, int budget)
+ {
+ 	int vc = 0;
+@@ -592,12 +681,26 @@ int xlp_fmn_poll(struct napi_struct *napi, int budget)
+ #ifdef CONFIG_32BIT
+ 	unsigned long mflags;
+ #endif
++	unsigned long napi_final_hndlr[XLP_MSG_HANDLE_MAX];
++	int hndlr_cnt = 0, hndlr_id, i, rv;
+ 
+ 	while(count < budget){
+ 		for( no_msg = 0, vc = 0; vc < 4; vc++)
+ 		{
++			
+ 			if(!(napi_vc_mask & (1<<vc)))
+ 				continue;
++	
++			/* Explicit per vc napi handlers. Here the vc handler does the polling of
++			 all the packets */
++			if(xlp_napi_vc_handlers[vc]) {
++				rv = (xlp_napi_vc_handlers)[vc](vc, budget);
++				count += rv;
++				if(rv == 0)
++					no_msg++;
++				continue;
++			}
++			
+ #ifdef CONFIG_32BIT
+ 			msgrng_access_enable(mflags);
+ #endif
+@@ -611,20 +714,36 @@ int xlp_fmn_poll(struct napi_struct *napi, int budget)
+ 			}
+ 			count++;
+ 			if (is_nlm_xlp3xx()) {
+-				handler = &msg_handler_map[xlp3xx_vc_to_handle_map[src_id]];
++				hndlr_id = xlp3xx_vc_to_handle_map[src_id];
+ 			}
+ 			else {
+-				handler = &msg_handler_map[vc_to_handle_map[src_id]];
++				hndlr_id = vc_to_handle_map[src_id];
+ 			}
+ 
++			handler = &msg_handler_map[hndlr_id];
++
+ 			/* Execute device driver fmn handler */
+ 			(handler->action)(vc, src_id, size, code,
+ 				  msg0, msg1, msg2, msg3, handler->dev_id);
++
++			if(handler->napi_final && (napi_final_needed[cpu][hndlr_id] == 0)) {
++				napi_final_needed[cpu][hndlr_id] = 1;
++				napi_final_hndlr[hndlr_cnt] = (unsigned long)handler;
++				hndlr_cnt++;
++			}
+ 		}
+ 		if(no_msg == xlp_napi_vc_count)
+ 			break;
+ 	}
+ 
++	for(i = 0; i < hndlr_cnt; i++) {
++		handler = (struct msgstn_handler *)napi_final_hndlr[i];
++		handler->napi_final(handler->napi_final_arg);
++		hndlr_id = handler - &msg_handler_map[0];
++		napi_final_needed[cpu][hndlr_id] = 0;
++	}
++	
++
+ 	/*Ack fmn interrupts.*/
+ 	if(count < budget) {
+ 		uint32_t val;
+diff --git a/drivers/char/Makefile b/drivers/char/Makefile
+index b8a6204..561ee0f 100644
+--- a/drivers/char/Makefile
++++ b/drivers/char/Makefile
+@@ -57,7 +57,7 @@ obj-$(CONFIG_AGP)		+= agp/
+ obj-$(CONFIG_PCMCIA)		+= pcmcia/
+ obj-$(CONFIG_IPMI_HANDLER)	+= ipmi/
+ 
+-obj-$(CONFIG_NLM_XLP)		+= nlm_vuart.o
++obj-$(CONFIG_NLM_XLP)		+= nlm_vuart.o nlm_msgring.o
+ obj-$(CONFIG_XEN)		+= nlm_sharedmem.o
+ obj-$(CONFIG_NLM_XLP_DMA)	+= nlm_xlp_dma.o
+ 
+diff --git a/drivers/char/nlm_msgring.c b/drivers/char/nlm_msgring.c
+new file mode 100644
+index 0000000..e58e6e2
+--- /dev/null
++++ b/drivers/char/nlm_msgring.c
+@@ -0,0 +1,192 @@
++/***********************************************************************
++Copyright 2003-2010 Netlogic Microsystems ( Netlogic ). All rights
++reserved.
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are
++met:
++1. Redistributions of source code must retain the above copyright
++notice, this list of conditions and the following disclaimer.
++2. Redistributions in binary form must reproduce the above copyright
++notice, this list of conditions and the following disclaimer in
++the documentation and/or other materials provided with the
++distribution.
++THIS SOFTWARE IS PROVIDED BY Netlogic Microsystems ``AS IS'' AND
++ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NETLOGIC OR CONTRIBUTORS BE LIABLE
++FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++THE POSSIBILITY OF SUCH DAMAGE.
++*****************************#NETL_2#********************************/
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/version.h>
++#include <linux/errno.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/interrupt.h>
++#include <linux/sched.h>
++#include <asm/uaccess.h>
++#include <asm/io.h>
++#include <linux/vmalloc.h>
++#include <linux/mman.h>
++#include <linux/slab.h>
++#include <linux/device.h>
++#include <asm/netlogic/hal/nlm_hal_macros.h>
++#include <asm/netlogic/hal/nlm_hal_xlp_dev.h>
++
++#define MSGRING_WAIT_CHRDEV_NAME "nlm_msgring"
++static int msgring_major;
++static wait_queue_head_t msgring_wq[NR_CPUS];
++static int msgring_status[NR_CPUS];
++static DEFINE_MUTEX(msgrng_mutex);
++
++#define NLM_MSGRING_WAIT_IOC 'm'
++#define NLM_MSGRING_WAIT_VC   _IOWR(NLM_MSGRING_WAIT_IOC, 1, unsigned int *)
++extern unsigned int intr_vc_mask[];
++
++
++extern int nlm_xlp_register_intr_vc_handler(int (*handler)(int vc));
++extern int nlm_xlp_register_intr_vc(int cpu, int vc);
++
++static int msgring_event(int vc)
++{
++	int cpu = hard_smp_processor_id();
++	if(msgring_status[cpu] != 1)
++		return 0;
++	msgring_status[cpu] = 0;
++	wake_up_interruptible(&msgring_wq[cpu]);
++	return 0;
++}
++
++static ssize_t msgring_read (struct file *filp, char __user *buf, size_t count, loff_t *offset)
++{
++	int cpu = hard_smp_processor_id();
++	unsigned int val;
++	unsigned long flags;
++
++#ifdef CONFIG_32BIT
++	unsigned long mflags;
++#endif
++
++	local_irq_save(flags);
++#ifdef CONFIG_32BIT
++	msgrng_access_enable(mflags);
++#endif
++	
++	msgring_status[cpu] = 1;
++
++	/* Enable intr on the vcs */
++	/* Need write vcmask into the register */
++	val =  _read_32bit_cp2_register(XLP_MSG_STATUS1_REG);
++	val |= (intr_vc_mask[cpu] << 16);
++	_write_32bit_cp2_register(XLP_MSG_STATUS1_REG, val);
++
++#ifdef CONFIG_32BIT
++	msgrng_access_disable(mflags);
++#endif
++	local_irq_restore(flags);
++	
++	wait_event_interruptible(msgring_wq[cpu], (msgring_status[cpu] == 0));
++	return 1;
++}
++
++static int msgring_open (struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++static int msgring_release (struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++static int msgring_ioctl(struct inode *inode, struct file *filp, unsigned int cmd,
++		   unsigned long arg)
++{
++	int err = 0, rv, vc = -1;
++	unsigned int  *ptr = (unsigned int *) arg;
++	int cpu;
++
++	switch (cmd) {
++		case NLM_MSGRING_WAIT_VC:
++			rv = copy_from_user(&vc, ptr, sizeof(*ptr));
++			if(vc < 0 || vc > 3) {
++				printk("Error in %s, Invald vc %d\n", __FUNCTION__, vc);
++				err = -EINVAL;
++				break;
++			}
++			preempt_disable();
++			cpu = hard_smp_processor_id();
++			nlm_xlp_register_intr_vc(cpu, vc);
++			preempt_enable();
++			break;
++		default:
++			printk("Invalid cmd in %s\n", __FUNCTION__);
++			err = -EINVAL;
++	}	
++	return err;
++}
++
++static long msgring_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	unsigned long ret = -1;
++	mutex_lock(&msgrng_mutex);
++	ret = msgring_ioctl(NULL,filp,cmd,arg);
++	mutex_unlock(&msgrng_mutex);
++
++	if(ret){
++		printk("msgring_ioctl returned with an error %lx", ret);
++		return -ENOIOCTLCMD;
++	}
++	return ret;
++}
++
++static struct file_operations msgring_fops = {
++	owner:		THIS_MODULE,
++	read:		msgring_read,
++	open:  		msgring_open,
++	unlocked_ioctl:	msgring_ioctl,
++	compat_ioctl:   msgring_compat_ioctl,
++	release:        msgring_release,
++};
++
++static int msgring_init(void)
++{
++	int ret, i;
++
++	for(i = 0; i < NR_CPUS; i++) {
++		init_waitqueue_head(&msgring_wq[i]);
++	}
++
++	nlm_xlp_register_intr_vc_handler(msgring_event);
++
++	ret = register_chrdev (0, MSGRING_WAIT_CHRDEV_NAME, &msgring_fops);
++	if (ret < 0) {
++		printk("[%s] Failed to register msgring char device major=%d\n",
++				__FUNCTION__, 0);
++		return -EIO;
++	}
++	msgring_major = ret;
++	printk("[%s] Registered nlm_msgring char device major=%d\n",
++			__FUNCTION__, msgring_major);
++	return 0;
++}
++
++static void msgring_exit(void)
++{
++	unregister_chrdev (msgring_major, MSGRING_WAIT_CHRDEV_NAME);
++}
++
++	
++
++
++module_init(msgring_init);
++module_exit(msgring_exit);
++MODULE_AUTHOR("Netlogic");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Msgring driver");
+-- 
+1.7.10.4
+
