@@ -1,0 +1,464 @@
+From 5b5cdf49634e7d4de1ef3d14ffe1b768d9788e7d Mon Sep 17 00:00:00 2001
+From: Christopher Harvey <charvey@matrox.com>
+Date: Wed, 5 Jun 2013 15:24:26 -0400
+Subject: [PATCH 352/904] drm/mgag200: Hardware cursor support
+
+commit a080db9fdda77ffaa43679d21b4bd78ead0cf9e1 upstream
+
+G200 cards support, at best, 16 colour palleted images for the cursor
+so we do a conversion in the cursor_set function, and reject cursors
+with more than 16 colours, or cursors with partial transparency. Xorg
+falls back gracefully to software cursors in this case.
+
+We can't disable/enable the cursor hardware without causing momentary
+corruption around the cursor. Instead, once the cursor is on we leave
+it on, and simulate turning the cursor off by moving it
+offscreen. This works well.
+
+Since we can't disable -> update -> enable the cursors, we double
+buffer cursor icons, then just move the base address that points to
+the old cursor, to the new. This also works well, but uses an extra
+page of memory.
+
+The cursor buffers are lazily-allocated on first cursor_set. This is
+to make sure they don't take priority over any framebuffers in case of
+limited memory.
+
+Here is a representation of how the bitmap for the cursor is mapped in G200 memory :
+
+  Each line of color cursor use 6 Slices of 8 bytes. Slices 0 to 3
+  are used for the 4bpp bitmap, slice 4 for XOR mask and slice 5 for
+  AND mask. Each line has the following format:
+
+      //      Byte 0  Byte 1  Byte 2  Byte 3  Byte 4  Byte 5  Byte 6 Byte 7
+      //
+      // S0:  P00-01  P02-03  P04-05  P06-07  P08-09  P10-11  P12-13 P14-15
+      // S1:  P16-17  P18-19  P20-21  P22-23  P24-25  P26-27  P28-29 P30-31
+      // S2:  P32-33  P34-35  P36-37  P38-39  P40-41  P42-43  P44-45 P46-47
+      // S3:  P48-49  P50-51  P52-53  P54-55  P56-57  P58-59  P60-61 P62-63
+      // S4:  X63-56  X55-48  X47-40  X39-32  X31-24  X23-16  X15-08 X07-00
+      // S5:  A63-56  A55-48  A47-40  A39-32  A31-24  A23-16  A15-08 A07-00
+      //
+      //       S0 to S5      = Slices 0 to 5
+      //       P00 to P63    = Bitmap - pixels 0 to 63
+      //       X00 to X63    = always 0 - pixels 0 to 63
+      //       A00 to A63    = transparent markers - pixels 0 to 63
+      //                       1 means colour, 0 means transparent
+
+Signed-off-by: Christopher Harvey <charvey@matrox.com>
+Signed-off-by: Mathieu Larouche <mathieu.larouche@matrox.com>
+Acked-by: Julia Lemire <jlemire@matrox.com>
+Tested-by: Julia Lemire <jlemire@matrox.com>
+Signed-off-by: Dave Airlie <airlied@gmail.com>
+---
+ drivers/gpu/drm/mgag200/Makefile         |   2 +-
+ drivers/gpu/drm/mgag200/mgag200_cursor.c | 275 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/mgag200/mgag200_drv.h    |  21 +++
+ drivers/gpu/drm/mgag200/mgag200_main.c   |  21 ++-
+ drivers/gpu/drm/mgag200/mgag200_mode.c   |   2 +
+ drivers/gpu/drm/mgag200/mgag200_reg.h    |   6 +-
+ 6 files changed, 324 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/gpu/drm/mgag200/mgag200_cursor.c
+
+diff --git a/drivers/gpu/drm/mgag200/Makefile b/drivers/gpu/drm/mgag200/Makefile
+index 7db592e..a9a0300 100644
+--- a/drivers/gpu/drm/mgag200/Makefile
++++ b/drivers/gpu/drm/mgag200/Makefile
+@@ -1,5 +1,5 @@
+ ccflags-y := -Iinclude/drm
+-mgag200-y   := mgag200_main.o mgag200_mode.o \
++mgag200-y   := mgag200_main.o mgag200_mode.o mgag200_cursor.o \
+ 	mgag200_drv.o mgag200_fb.o mgag200_i2c.o mgag200_ttm.o
+ 
+ obj-$(CONFIG_DRM_MGAG200) += mgag200.o
+diff --git a/drivers/gpu/drm/mgag200/mgag200_cursor.c b/drivers/gpu/drm/mgag200/mgag200_cursor.c
+new file mode 100644
+index 0000000..801731a
+--- /dev/null
++++ b/drivers/gpu/drm/mgag200/mgag200_cursor.c
+@@ -0,0 +1,275 @@
++/*
++ * Copyright 2013 Matrox Graphics
++ *
++ * This file is subject to the terms and conditions of the GNU General
++ * Public License version 2. See the file COPYING in the main
++ * directory of this archive for more details.
++ *
++ * Author: Christopher Harvey <charvey@matrox.com>
++ */
++
++#include <drm/drmP.h>
++#include "mgag200_drv.h"
++
++static bool warn_transparent = true;
++static bool warn_palette = true;
++
++/*
++  Hide the cursor off screen. We can't disable the cursor hardware because it
++  takes too long to re-activate and causes momentary corruption
++*/
++static void mga_hide_cursor(struct mga_device *mdev)
++{
++	WREG8(MGA_CURPOSXL, 0);
++	WREG8(MGA_CURPOSXH, 0);
++	mgag200_bo_unpin(mdev->cursor.pixels_1);
++	mgag200_bo_unpin(mdev->cursor.pixels_2);
++}
++
++int mga_crtc_cursor_set(struct drm_crtc *crtc,
++			struct drm_file *file_priv,
++			uint32_t handle,
++			uint32_t width,
++			uint32_t height)
++{
++	struct drm_device *dev = (struct drm_device *)file_priv->minor->dev;
++	struct mga_device *mdev = (struct mga_device *)dev->dev_private;
++	struct mgag200_bo *pixels_1 = mdev->cursor.pixels_1;
++	struct mgag200_bo *pixels_2 = mdev->cursor.pixels_2;
++	struct mgag200_bo *pixels_current = mdev->cursor.pixels_current;
++	struct mgag200_bo *pixels_prev = mdev->cursor.pixels_prev;
++	struct drm_gem_object *obj;
++	struct mgag200_bo *bo = NULL;
++	int ret = 0;
++	unsigned int i, row, col;
++	uint32_t colour_set[16];
++	uint32_t *next_space = &colour_set[0];
++	uint32_t *palette_iter;
++	uint32_t this_colour;
++	bool found = false;
++	int colour_count = 0;
++	u64 gpu_addr;
++	u8 reg_index;
++	u8 this_row[48];
++
++	if (!pixels_1 || !pixels_2) {
++		WREG8(MGA_CURPOSXL, 0);
++		WREG8(MGA_CURPOSXH, 0);
++		return -ENOTSUPP; /* Didn't allocate space for cursors */
++	}
++
++	if ((width != 64 || height != 64) && handle) {
++		WREG8(MGA_CURPOSXL, 0);
++		WREG8(MGA_CURPOSXH, 0);
++		return -EINVAL;
++	}
++
++	BUG_ON(pixels_1 != pixels_current && pixels_1 != pixels_prev);
++	BUG_ON(pixels_2 != pixels_current && pixels_2 != pixels_prev);
++	BUG_ON(pixels_current == pixels_prev);
++
++	ret = mgag200_bo_reserve(pixels_1, true);
++	if (ret) {
++		WREG8(MGA_CURPOSXL, 0);
++		WREG8(MGA_CURPOSXH, 0);
++		return ret;
++	}
++	ret = mgag200_bo_reserve(pixels_2, true);
++	if (ret) {
++		WREG8(MGA_CURPOSXL, 0);
++		WREG8(MGA_CURPOSXH, 0);
++		mgag200_bo_unreserve(pixels_1);
++		return ret;
++	}
++
++	if (!handle) {
++		mga_hide_cursor(mdev);
++		ret = 0;
++		goto out1;
++	}
++
++	/* Move cursor buffers into VRAM if they aren't already */
++	if (!pixels_1->pin_count) {
++		ret = mgag200_bo_pin(pixels_1, TTM_PL_FLAG_VRAM,
++				     &mdev->cursor.pixels_1_gpu_addr);
++		if (ret)
++			goto out1;
++	}
++	if (!pixels_2->pin_count) {
++		ret = mgag200_bo_pin(pixels_2, TTM_PL_FLAG_VRAM,
++				     &mdev->cursor.pixels_2_gpu_addr);
++		if (ret) {
++			mgag200_bo_unpin(pixels_1);
++			goto out1;
++		}
++	}
++
++	mutex_lock(&dev->struct_mutex);
++	obj = drm_gem_object_lookup(dev, file_priv, handle);
++	if (!obj) {
++		mutex_unlock(&dev->struct_mutex);
++		ret = -ENOENT;
++		goto out1;
++	}
++	drm_gem_object_unreference(obj);
++	mutex_unlock(&dev->struct_mutex);
++
++	bo = gem_to_mga_bo(obj);
++	ret = mgag200_bo_reserve(bo, true);
++	if (ret) {
++		dev_err(&dev->pdev->dev, "failed to reserve user bo\n");
++		goto out1;
++	}
++	if (!bo->kmap.virtual) {
++		ret = ttm_bo_kmap(&bo->bo, 0, bo->bo.num_pages, &bo->kmap);
++		if (ret) {
++			dev_err(&dev->pdev->dev, "failed to kmap user buffer updates\n");
++			goto out2;
++		}
++	}
++
++	memset(&colour_set[0], 0, sizeof(uint32_t)*16);
++	/* width*height*4 = 16384 */
++	for (i = 0; i < 16384; i += 4) {
++		this_colour = ioread32(bo->kmap.virtual + i);
++		/* No transparency */
++		if (this_colour>>24 != 0xff &&
++			this_colour>>24 != 0x0) {
++			if (warn_transparent) {
++				dev_info(&dev->pdev->dev, "Video card doesn't support cursors with partial transparency.\n");
++				dev_info(&dev->pdev->dev, "Not enabling hardware cursor.\n");
++				warn_transparent = false; /* Only tell the user once. */
++			}
++			ret = -EINVAL;
++			goto out3;
++		}
++		/* Don't need to store transparent pixels as colours */
++		if (this_colour>>24 == 0x0)
++			continue;
++		found = false;
++		for (palette_iter = &colour_set[0]; palette_iter != next_space; palette_iter++) {
++			if (*palette_iter == this_colour) {
++				found = true;
++				break;
++			}
++		}
++		if (found)
++			continue;
++		/* We only support 4bit paletted cursors */
++		if (colour_count >= 16) {
++			if (warn_palette) {
++				dev_info(&dev->pdev->dev, "Video card only supports cursors with up to 16 colours.\n");
++				dev_info(&dev->pdev->dev, "Not enabling hardware cursor.\n");
++				warn_palette = false; /* Only tell the user once. */
++			}
++			ret = -EINVAL;
++			goto out3;
++		}
++		*next_space = this_colour;
++		next_space++;
++		colour_count++;
++	}
++
++	/* Program colours from cursor icon into palette */
++	for (i = 0; i < colour_count; i++) {
++		if (i <= 2)
++			reg_index = 0x8 + i*0x4;
++		else
++			reg_index = 0x60 + i*0x3;
++		WREG_DAC(reg_index, colour_set[i] & 0xff);
++		WREG_DAC(reg_index+1, colour_set[i]>>8 & 0xff);
++		WREG_DAC(reg_index+2, colour_set[i]>>16 & 0xff);
++		BUG_ON((colour_set[i]>>24 & 0xff) != 0xff);
++	}
++
++	/* Map up-coming buffer to write colour indices */
++	if (!pixels_prev->kmap.virtual) {
++		ret = ttm_bo_kmap(&pixels_prev->bo, 0,
++				  pixels_prev->bo.num_pages,
++				  &pixels_prev->kmap);
++		if (ret) {
++			dev_err(&dev->pdev->dev, "failed to kmap cursor updates\n");
++			goto out3;
++		}
++	}
++
++	/* now write colour indices into hardware cursor buffer */
++	for (row = 0; row < 64; row++) {
++		memset(&this_row[0], 0, 48);
++		for (col = 0; col < 64; col++) {
++			this_colour = ioread32(bo->kmap.virtual + 4*(col + 64*row));
++			/* write transparent pixels */
++			if (this_colour>>24 == 0x0) {
++				this_row[47 - col/8] |= 0x80>>(col%8);
++				continue;
++			}
++
++			/* write colour index here */
++			for (i = 0; i < colour_count; i++) {
++				if (colour_set[i] == this_colour) {
++					if (col % 2)
++						this_row[col/2] |= i<<4;
++					else
++						this_row[col/2] |= i;
++					break;
++				}
++			}
++		}
++		memcpy_toio(pixels_prev->kmap.virtual + row*48, &this_row[0], 48);
++	}
++
++	/* Program gpu address of cursor buffer */
++	if (pixels_prev == pixels_1)
++		gpu_addr = mdev->cursor.pixels_1_gpu_addr;
++	else
++		gpu_addr = mdev->cursor.pixels_2_gpu_addr;
++	WREG_DAC(MGA1064_CURSOR_BASE_ADR_LOW, (u8)((gpu_addr>>10) & 0xff));
++	WREG_DAC(MGA1064_CURSOR_BASE_ADR_HI, (u8)((gpu_addr>>18) & 0x3f));
++
++	/* Adjust cursor control register to turn on the cursor */
++	WREG_DAC(MGA1064_CURSOR_CTL, 4); /* 16-colour palletized cursor mode */
++
++	/* Now swap internal buffer pointers */
++	if (mdev->cursor.pixels_1 == mdev->cursor.pixels_prev) {
++		mdev->cursor.pixels_prev = mdev->cursor.pixels_2;
++		mdev->cursor.pixels_current = mdev->cursor.pixels_1;
++	} else if (mdev->cursor.pixels_1 == mdev->cursor.pixels_current) {
++		mdev->cursor.pixels_prev = mdev->cursor.pixels_1;
++		mdev->cursor.pixels_current = mdev->cursor.pixels_2;
++	} else {
++		BUG();
++	}
++	ret = 0;
++
++	ttm_bo_kunmap(&pixels_prev->kmap);
++ out3:
++	ttm_bo_kunmap(&bo->kmap);
++ out2:
++	mgag200_bo_unreserve(bo);
++ out1:
++	if (ret)
++		mga_hide_cursor(mdev);
++	mgag200_bo_unreserve(pixels_1);
++	mgag200_bo_unreserve(pixels_2);
++	return ret;
++}
++
++int mga_crtc_cursor_move(struct drm_crtc *crtc, int x, int y)
++{
++	struct mga_device *mdev = (struct mga_device *)crtc->dev->dev_private;
++	/* Our origin is at (64,64) */
++	x += 64;
++	y += 64;
++
++	BUG_ON(x <= 0);
++	BUG_ON(y <= 0);
++	BUG_ON(x & ~0xffff);
++	BUG_ON(y & ~0xffff);
++
++	WREG8(MGA_CURPOSXL, x & 0xff);
++	WREG8(MGA_CURPOSXH, (x>>8) & 0xff);
++
++	WREG8(MGA_CURPOSYL, y & 0xff);
++	WREG8(MGA_CURPOSYH, (y>>8) & 0xff);
++	return 0;
++}
+diff --git a/drivers/gpu/drm/mgag200/mgag200_drv.h b/drivers/gpu/drm/mgag200/mgag200_drv.h
+index 988911a..d9737ef 100644
+--- a/drivers/gpu/drm/mgag200/mgag200_drv.h
++++ b/drivers/gpu/drm/mgag200/mgag200_drv.h
+@@ -149,6 +149,21 @@ struct mga_connector {
+ 	struct mga_i2c_chan *i2c;
+ };
+ 
++struct mga_cursor {
++	/*
++	   We have to have 2 buffers for the cursor to avoid occasional
++	   corruption while switching cursor icons.
++	   If either of these is NULL, then don't do hardware cursors, and
++	   fall back to software.
++	*/
++	struct mgag200_bo *pixels_1;
++	struct mgag200_bo *pixels_2;
++	u64 pixels_1_gpu_addr, pixels_2_gpu_addr;
++	/* The currently displayed icon, this points to one of pixels_1, or pixels_2 */
++	struct mgag200_bo *pixels_current;
++	/* The previously displayed icon */
++	struct mgag200_bo *pixels_prev;
++};
+ 
+ struct mga_mc {
+ 	resource_size_t			vram_size;
+@@ -181,6 +196,7 @@ struct mga_device {
+ 	struct mga_mode_info		mode_info;
+ 
+ 	struct mga_fbdev *mfbdev;
++	struct mga_cursor cursor;
+ 
+ 	bool				suspended;
+ 	int				num_crtc;
+@@ -274,4 +290,9 @@ int mgag200_mmap(struct file *filp, struct vm_area_struct *vma);
+ int mgag200_bo_pin(struct mgag200_bo *bo, u32 pl_flag, u64 *gpu_addr);
+ int mgag200_bo_unpin(struct mgag200_bo *bo);
+ int mgag200_bo_push_sysram(struct mgag200_bo *bo);
++			   /* mgag200_cursor.c */
++int mga_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
++						uint32_t handle, uint32_t width, uint32_t height);
++int mga_crtc_cursor_move(struct drm_crtc *crtc, int x, int y);
++
+ #endif				/* __MGAG200_DRV_H__ */
+diff --git a/drivers/gpu/drm/mgag200/mgag200_main.c b/drivers/gpu/drm/mgag200/mgag200_main.c
+index dafe049..0479caf 100644
+--- a/drivers/gpu/drm/mgag200/mgag200_main.c
++++ b/drivers/gpu/drm/mgag200/mgag200_main.c
+@@ -221,8 +221,27 @@ int mgag200_driver_load(struct drm_device *dev, unsigned long flags)
+ 	dev->mode_config.prefer_shadow = 1;
+ 
+ 	r = mgag200_modeset_init(mdev);
+-	if (r)
++	if (r) {
+ 		dev_err(&dev->pdev->dev, "Fatal error during modeset init: %d\n", r);
++		goto out;
++	}
++
++	/* Make small buffers to store a hardware cursor (double buffered icon updates) */
++	mgag200_bo_create(dev, roundup(48*64, PAGE_SIZE), 0, 0,
++					  &mdev->cursor.pixels_1);
++	mgag200_bo_create(dev, roundup(48*64, PAGE_SIZE), 0, 0,
++					  &mdev->cursor.pixels_2);
++	if (!mdev->cursor.pixels_2 || !mdev->cursor.pixels_1)
++		goto cursor_nospace;
++	mdev->cursor.pixels_current = mdev->cursor.pixels_1;
++	mdev->cursor.pixels_prev = mdev->cursor.pixels_2;
++	goto cursor_done;
++ cursor_nospace:
++	mdev->cursor.pixels_1 = NULL;
++	mdev->cursor.pixels_2 = NULL;
++	dev_warn(&dev->pdev->dev, "Could not allocate space for cursors. Not doing hardware cursors.\n");
++ cursor_done:
++
+ out:
+ 	if (r)
+ 		mgag200_driver_unload(dev);
+diff --git a/drivers/gpu/drm/mgag200/mgag200_mode.c b/drivers/gpu/drm/mgag200/mgag200_mode.c
+index 99e07b6..251784a 100644
+--- a/drivers/gpu/drm/mgag200/mgag200_mode.c
++++ b/drivers/gpu/drm/mgag200/mgag200_mode.c
+@@ -1253,6 +1253,8 @@ static void mga_crtc_destroy(struct drm_crtc *crtc)
+ 
+ /* These provide the minimum set of functions required to handle a CRTC */
+ static const struct drm_crtc_funcs mga_crtc_funcs = {
++	.cursor_set = mga_crtc_cursor_set,
++	.cursor_move = mga_crtc_cursor_move,
+ 	.gamma_set = mga_crtc_gamma_set,
+ 	.set_config = drm_crtc_helper_set_config,
+ 	.destroy = mga_crtc_destroy,
+diff --git a/drivers/gpu/drm/mgag200/mgag200_reg.h b/drivers/gpu/drm/mgag200/mgag200_reg.h
+index fb24d86..3ae442a6 100644
+--- a/drivers/gpu/drm/mgag200/mgag200_reg.h
++++ b/drivers/gpu/drm/mgag200/mgag200_reg.h
+@@ -235,7 +235,11 @@
+ #define MGAREG_CRTCEXT_INDEX	0x1fde
+ #define MGAREG_CRTCEXT_DATA	0x1fdf
+ 
+-
++/* Cursor X and Y position */
++#define MGA_CURPOSXL 0x3c0c
++#define MGA_CURPOSXH 0x3c0d
++#define MGA_CURPOSYL 0x3c0e
++#define MGA_CURPOSYH 0x3c0f
+ 
+ /* MGA bits for registers PCI_OPTION_REG */
+ #define MGA1064_OPT_SYS_CLK_PCI   		( 0x00 << 0 )
+-- 
+1.8.4.93.g57e4c17
+

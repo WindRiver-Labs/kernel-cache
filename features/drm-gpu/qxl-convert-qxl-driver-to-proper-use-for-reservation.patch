@@ -1,0 +1,1935 @@
+From f49020237b21b35e3c8f6da573fbc7c1d393b619 Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Tue, 23 Jul 2013 14:16:42 +1000
+Subject: [PATCH 830/904] qxl: convert qxl driver to proper use for
+ reservations
+
+commit 8002db6336dd361fc13214e9515fe5d52ff294ee upstream
+
+The recent addition of lockdep support to reservations and their subsequent
+use by TTM showed up a number of potential problems with the way qxl was using
+TTM objects.
+
+a) it was allocating objects, and reserving them later without validating
+underneath the reservation, which meant in extreme conditions the objects could
+be evicted before the reservation ever used them.
+
+b) it was reserving objects straight after allocating them, but with no
+ability to back off should the reservations fail. It now allocates the necessary
+objects then does a complete reservation pass on them to avoid deadlocks.
+
+c) it had two lists per release tracking objects, unnecessary complicating
+the reservation process.
+
+This patch removes the dual object tracking, adds reservations ticket support
+to the release and fence object handling. It then ports the internal fb
+drawing code and the userspace facing ioctl to use the new interfaces properly,
+along with cleanup up the error path handling in some codepaths.
+
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+---
+ drivers/gpu/drm/qxl/qxl_cmd.c     |  40 ++---
+ drivers/gpu/drm/qxl/qxl_display.c |  70 ++++++---
+ drivers/gpu/drm/qxl/qxl_draw.c    | 263 +++++++++++++++++++++----------
+ drivers/gpu/drm/qxl/qxl_drv.h     |  75 ++++-----
+ drivers/gpu/drm/qxl/qxl_fence.c   |  10 +-
+ drivers/gpu/drm/qxl/qxl_image.c   | 111 ++++++++++---
+ drivers/gpu/drm/qxl/qxl_ioctl.c   | 317 +++++++++++++++++++++-----------------
+ drivers/gpu/drm/qxl/qxl_object.c  |  49 +-----
+ drivers/gpu/drm/qxl/qxl_object.h  |   2 -
+ drivers/gpu/drm/qxl/qxl_release.c | 203 +++++++++++++++---------
+ 10 files changed, 676 insertions(+), 464 deletions(-)
+
+diff --git a/drivers/gpu/drm/qxl/qxl_cmd.c b/drivers/gpu/drm/qxl/qxl_cmd.c
+index 4e6a627..eb89653 100644
+--- a/drivers/gpu/drm/qxl/qxl_cmd.c
++++ b/drivers/gpu/drm/qxl/qxl_cmd.c
+@@ -179,9 +179,10 @@ qxl_push_command_ring_release(struct qxl_device *qdev, struct qxl_release *relea
+ 			      uint32_t type, bool interruptible)
+ {
+ 	struct qxl_command cmd;
++	struct qxl_bo_list *entry = list_first_entry(&release->bos, struct qxl_bo_list, tv.head);
+ 
+ 	cmd.type = type;
+-	cmd.data = qxl_bo_physical_address(qdev, release->bos[0], release->release_offset);
++	cmd.data = qxl_bo_physical_address(qdev, to_qxl_bo(entry->tv.bo), release->release_offset);
+ 
+ 	return qxl_ring_push(qdev->command_ring, &cmd, interruptible);
+ }
+@@ -191,9 +192,10 @@ qxl_push_cursor_ring_release(struct qxl_device *qdev, struct qxl_release *releas
+ 			     uint32_t type, bool interruptible)
+ {
+ 	struct qxl_command cmd;
++	struct qxl_bo_list *entry = list_first_entry(&release->bos, struct qxl_bo_list, tv.head);
+ 
+ 	cmd.type = type;
+-	cmd.data = qxl_bo_physical_address(qdev, release->bos[0], release->release_offset);
++	cmd.data = qxl_bo_physical_address(qdev, to_qxl_bo(entry->tv.bo), release->release_offset);
+ 
+ 	return qxl_ring_push(qdev->cursor_ring, &cmd, interruptible);
+ }
+@@ -214,7 +216,6 @@ int qxl_garbage_collect(struct qxl_device *qdev)
+ 	struct qxl_release *release;
+ 	uint64_t id, next_id;
+ 	int i = 0;
+-	int ret;
+ 	union qxl_release_info *info;
+ 
+ 	while (qxl_ring_pop(qdev->release_ring, &id)) {
+@@ -224,17 +225,10 @@ int qxl_garbage_collect(struct qxl_device *qdev)
+ 			if (release == NULL)
+ 				break;
+ 
+-			ret = qxl_release_reserve(qdev, release, false);
+-			if (ret) {
+-				qxl_io_log(qdev, "failed to reserve release on garbage collect %lld\n", id);
+-				DRM_ERROR("failed to reserve release %lld\n", id);
+-			}
+-
+ 			info = qxl_release_map(qdev, release);
+ 			next_id = info->next;
+ 			qxl_release_unmap(qdev, release, info);
+ 
+-			qxl_release_unreserve(qdev, release);
+ 			QXL_INFO(qdev, "popped %lld, next %lld\n", id,
+ 				next_id);
+ 
+@@ -259,7 +253,9 @@ int qxl_garbage_collect(struct qxl_device *qdev)
+ 	return i;
+ }
+ 
+-int qxl_alloc_bo_reserved(struct qxl_device *qdev, unsigned long size,
++int qxl_alloc_bo_reserved(struct qxl_device *qdev,
++			  struct qxl_release *release,
++			  unsigned long size,
+ 			  struct qxl_bo **_bo)
+ {
+ 	struct qxl_bo *bo;
+@@ -271,15 +267,15 @@ int qxl_alloc_bo_reserved(struct qxl_device *qdev, unsigned long size,
+ 		DRM_ERROR("failed to allocate VRAM BO\n");
+ 		return ret;
+ 	}
+-	ret = qxl_bo_reserve(bo, false);
+-	if (unlikely(ret != 0))
++	ret = qxl_release_list_add(release, bo);
++	if (ret)
+ 		goto out_unref;
+ 
+ 	*_bo = bo;
+ 	return 0;
+ out_unref:
+ 	qxl_bo_unref(&bo);
+-	return 0;
++	return ret;
+ }
+ 
+ static int wait_for_io_cmd_user(struct qxl_device *qdev, uint8_t val, long port, bool intr)
+@@ -503,6 +499,10 @@ int qxl_hw_surface_alloc(struct qxl_device *qdev,
+ 	if (ret)
+ 		return ret;
+ 
++	ret = qxl_release_reserve_list(release, true);
++	if (ret)
++		return ret;
++
+ 	cmd = (struct qxl_surface_cmd *)qxl_release_map(qdev, release);
+ 	cmd->type = QXL_SURFACE_CMD_CREATE;
+ 	cmd->u.surface_create.format = surf->surf.format;
+@@ -524,14 +524,11 @@ int qxl_hw_surface_alloc(struct qxl_device *qdev,
+ 
+ 	surf->surf_create = release;
+ 
+-	/* no need to add a release to the fence for this bo,
++	/* no need to add a release to the fence for this surface bo,
+ 	   since it is only released when we ask to destroy the surface
+ 	   and it would never signal otherwise */
+-	qxl_fence_releaseable(qdev, release);
+-
+ 	qxl_push_command_ring_release(qdev, release, QXL_CMD_SURFACE, false);
+-
+-	qxl_release_unreserve(qdev, release);
++	qxl_release_fence_buffer_objects(release);
+ 
+ 	surf->hw_surf_alloc = true;
+ 	spin_lock(&qdev->surf_id_idr_lock);
+@@ -573,12 +570,9 @@ int qxl_hw_surface_dealloc(struct qxl_device *qdev,
+ 	cmd->surface_id = id;
+ 	qxl_release_unmap(qdev, release, &cmd->release_info);
+ 
+-	qxl_fence_releaseable(qdev, release);
+-
+ 	qxl_push_command_ring_release(qdev, release, QXL_CMD_SURFACE, false);
+ 
+-	qxl_release_unreserve(qdev, release);
+-
++	qxl_release_fence_buffer_objects(release);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/qxl/qxl_display.c b/drivers/gpu/drm/qxl/qxl_display.c
+index f76f5dd..835caba 100644
+--- a/drivers/gpu/drm/qxl/qxl_display.c
++++ b/drivers/gpu/drm/qxl/qxl_display.c
+@@ -179,7 +179,7 @@ static void qxl_crtc_destroy(struct drm_crtc *crtc)
+ 	kfree(qxl_crtc);
+ }
+ 
+-static void
++static int
+ qxl_hide_cursor(struct qxl_device *qdev)
+ {
+ 	struct qxl_release *release;
+@@ -188,14 +188,22 @@ qxl_hide_cursor(struct qxl_device *qdev)
+ 
+ 	ret = qxl_alloc_release_reserved(qdev, sizeof(*cmd), QXL_RELEASE_CURSOR_CMD,
+ 					 &release, NULL);
++	if (ret)
++		return ret;
++
++	ret = qxl_release_reserve_list(release, true);
++	if (ret) {
++		qxl_release_free(qdev, release);
++		return ret;
++	}
+ 
+ 	cmd = (struct qxl_cursor_cmd *)qxl_release_map(qdev, release);
+ 	cmd->type = QXL_CURSOR_HIDE;
+ 	qxl_release_unmap(qdev, release, &cmd->release_info);
+ 
+-	qxl_fence_releaseable(qdev, release);
+ 	qxl_push_cursor_ring_release(qdev, release, QXL_CMD_CURSOR, false);
+-	qxl_release_unreserve(qdev, release);
++	qxl_release_fence_buffer_objects(release);
++	return 0;
+ }
+ 
+ static int qxl_crtc_cursor_set2(struct drm_crtc *crtc,
+@@ -216,10 +224,8 @@ static int qxl_crtc_cursor_set2(struct drm_crtc *crtc,
+ 
+ 	int size = 64*64*4;
+ 	int ret = 0;
+-	if (!handle) {
+-		qxl_hide_cursor(qdev);
+-		return 0;
+-	}
++	if (!handle)
++		return qxl_hide_cursor(qdev);
+ 
+ 	obj = drm_gem_object_lookup(crtc->dev, file_priv, handle);
+ 	if (!obj) {
+@@ -234,8 +240,9 @@ static int qxl_crtc_cursor_set2(struct drm_crtc *crtc,
+ 		goto out_unref;
+ 
+ 	ret = qxl_bo_pin(user_bo, QXL_GEM_DOMAIN_CPU, NULL);
++	qxl_bo_unreserve(user_bo);
+ 	if (ret)
+-		goto out_unreserve;
++		goto out_unref;
+ 
+ 	ret = qxl_bo_kmap(user_bo, &user_ptr);
+ 	if (ret)
+@@ -246,14 +253,20 @@ static int qxl_crtc_cursor_set2(struct drm_crtc *crtc,
+ 					 &release, NULL);
+ 	if (ret)
+ 		goto out_kunmap;
+-	ret = qxl_alloc_bo_reserved(qdev, sizeof(struct qxl_cursor) + size,
+-				    &cursor_bo);
++
++	ret = qxl_alloc_bo_reserved(qdev, release, sizeof(struct qxl_cursor) + size,
++			   &cursor_bo);
+ 	if (ret)
+ 		goto out_free_release;
+-	ret = qxl_bo_kmap(cursor_bo, (void **)&cursor);
++
++	ret = qxl_release_reserve_list(release, false);
+ 	if (ret)
+ 		goto out_free_bo;
+ 
++	ret = qxl_bo_kmap(cursor_bo, (void **)&cursor);
++	if (ret)
++		goto out_backoff;
++
+ 	cursor->header.unique = 0;
+ 	cursor->header.type = SPICE_CURSOR_TYPE_ALPHA;
+ 	cursor->header.width = 64;
+@@ -269,11 +282,7 @@ static int qxl_crtc_cursor_set2(struct drm_crtc *crtc,
+ 
+ 	qxl_bo_kunmap(cursor_bo);
+ 
+-	/* finish with the userspace bo */
+ 	qxl_bo_kunmap(user_bo);
+-	qxl_bo_unpin(user_bo);
+-	qxl_bo_unreserve(user_bo);
+-	drm_gem_object_unreference_unlocked(obj);
+ 
+ 	cmd = (struct qxl_cursor_cmd *)qxl_release_map(qdev, release);
+ 	cmd->type = QXL_CURSOR_SET;
+@@ -281,30 +290,35 @@ static int qxl_crtc_cursor_set2(struct drm_crtc *crtc,
+ 	cmd->u.set.position.y = qcrtc->cur_y;
+ 
+ 	cmd->u.set.shape = qxl_bo_physical_address(qdev, cursor_bo, 0);
+-	qxl_release_add_res(qdev, release, cursor_bo);
+ 
+ 	cmd->u.set.visible = 1;
+ 	qxl_release_unmap(qdev, release, &cmd->release_info);
+ 
+-	qxl_fence_releaseable(qdev, release);
+ 	qxl_push_cursor_ring_release(qdev, release, QXL_CMD_CURSOR, false);
+-	qxl_release_unreserve(qdev, release);
++	qxl_release_fence_buffer_objects(release);
++
++	/* finish with the userspace bo */
++	ret = qxl_bo_reserve(user_bo, false);
++	if (!ret) {
++		qxl_bo_unpin(user_bo);
++		qxl_bo_unreserve(user_bo);
++	}
++	drm_gem_object_unreference_unlocked(obj);
+ 
+-	qxl_bo_unreserve(cursor_bo);
+ 	qxl_bo_unref(&cursor_bo);
+ 
+ 	return ret;
++
++out_backoff:
++	qxl_release_backoff_reserve_list(release);
+ out_free_bo:
+ 	qxl_bo_unref(&cursor_bo);
+ out_free_release:
+-	qxl_release_unreserve(qdev, release);
+ 	qxl_release_free(qdev, release);
+ out_kunmap:
+ 	qxl_bo_kunmap(user_bo);
+ out_unpin:
+ 	qxl_bo_unpin(user_bo);
+-out_unreserve:
+-	qxl_bo_unreserve(user_bo);
+ out_unref:
+ 	drm_gem_object_unreference_unlocked(obj);
+ 	return ret;
+@@ -322,6 +336,14 @@ static int qxl_crtc_cursor_move(struct drm_crtc *crtc,
+ 
+ 	ret = qxl_alloc_release_reserved(qdev, sizeof(*cmd), QXL_RELEASE_CURSOR_CMD,
+ 				   &release, NULL);
++	if (ret)
++		return ret;
++
++	ret = qxl_release_reserve_list(release, true);
++	if (ret) {
++		qxl_release_free(qdev, release);
++		return ret;
++	}
+ 
+ 	qcrtc->cur_x = x;
+ 	qcrtc->cur_y = y;
+@@ -332,9 +354,9 @@ static int qxl_crtc_cursor_move(struct drm_crtc *crtc,
+ 	cmd->u.position.y = qcrtc->cur_y;
+ 	qxl_release_unmap(qdev, release, &cmd->release_info);
+ 
+-	qxl_fence_releaseable(qdev, release);
+ 	qxl_push_cursor_ring_release(qdev, release, QXL_CMD_CURSOR, false);
+-	qxl_release_unreserve(qdev, release);
++	qxl_release_fence_buffer_objects(release);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/qxl/qxl_draw.c b/drivers/gpu/drm/qxl/qxl_draw.c
+index 3c8c3db..56e1d63 100644
+--- a/drivers/gpu/drm/qxl/qxl_draw.c
++++ b/drivers/gpu/drm/qxl/qxl_draw.c
+@@ -23,25 +23,29 @@
+ #include "qxl_drv.h"
+ #include "qxl_object.h"
+ 
++static int alloc_clips(struct qxl_device *qdev,
++		       struct qxl_release *release,
++		       unsigned num_clips,
++		       struct qxl_bo **clips_bo)
++{
++	int size = sizeof(struct qxl_clip_rects) + sizeof(struct qxl_rect) * num_clips;
++
++	return qxl_alloc_bo_reserved(qdev, release, size, clips_bo);
++}
++
+ /* returns a pointer to the already allocated qxl_rect array inside
+  * the qxl_clip_rects. This is *not* the same as the memory allocated
+  * on the device, it is offset to qxl_clip_rects.chunk.data */
+ static struct qxl_rect *drawable_set_clipping(struct qxl_device *qdev,
+ 					      struct qxl_drawable *drawable,
+ 					      unsigned num_clips,
+-					      struct qxl_bo **clips_bo,
+-					      struct qxl_release *release)
++					      struct qxl_bo *clips_bo)
+ {
+ 	struct qxl_clip_rects *dev_clips;
+ 	int ret;
+-	int size = sizeof(*dev_clips) + sizeof(struct qxl_rect) * num_clips;
+-	ret = qxl_alloc_bo_reserved(qdev, size, clips_bo);
+-	if (ret)
+-		return NULL;
+ 
+-	ret = qxl_bo_kmap(*clips_bo, (void **)&dev_clips);
++	ret = qxl_bo_kmap(clips_bo, (void **)&dev_clips);
+ 	if (ret) {
+-		qxl_bo_unref(clips_bo);
+ 		return NULL;
+ 	}
+ 	dev_clips->num_rects = num_clips;
+@@ -52,20 +56,34 @@ static struct qxl_rect *drawable_set_clipping(struct qxl_device *qdev,
+ }
+ 
+ static int
++alloc_drawable(struct qxl_device *qdev, struct qxl_release **release)
++{
++	int ret;
++	ret = qxl_alloc_release_reserved(qdev, sizeof(struct qxl_drawable),
++					 QXL_RELEASE_DRAWABLE, release,
++					 NULL);
++	return ret;
++}
++
++static void
++free_drawable(struct qxl_device *qdev, struct qxl_release *release)
++{
++	qxl_release_free(qdev, release);
++}
++
++/* release needs to be reserved at this point */
++static int
+ make_drawable(struct qxl_device *qdev, int surface, uint8_t type,
+ 	      const struct qxl_rect *rect,
+-	      struct qxl_release **release)
++	      struct qxl_release *release)
+ {
+ 	struct qxl_drawable *drawable;
+-	int i, ret;
++	int i;
+ 
+-	ret = qxl_alloc_release_reserved(qdev, sizeof(*drawable),
+-					 QXL_RELEASE_DRAWABLE, release,
+-					 NULL);
+-	if (ret)
+-		return ret;
++	drawable = (struct qxl_drawable *)qxl_release_map(qdev, release);
++	if (!drawable)
++		return -ENOMEM;
+ 
+-	drawable = (struct qxl_drawable *)qxl_release_map(qdev, *release);
+ 	drawable->type = type;
+ 
+ 	drawable->surface_id = surface;		/* Only primary for now */
+@@ -91,14 +109,23 @@ make_drawable(struct qxl_device *qdev, int surface, uint8_t type,
+ 		drawable->bbox = *rect;
+ 
+ 	drawable->mm_time = qdev->rom->mm_clock;
+-	qxl_release_unmap(qdev, *release, &drawable->release_info);
++	qxl_release_unmap(qdev, release, &drawable->release_info);
+ 	return 0;
+ }
+ 
+-static int qxl_palette_create_1bit(struct qxl_bo **palette_bo,
++static int alloc_palette_object(struct qxl_device *qdev,
++				struct qxl_release *release,
++				struct qxl_bo **palette_bo)
++{
++	return qxl_alloc_bo_reserved(qdev, release,
++				     sizeof(struct qxl_palette) + sizeof(uint32_t) * 2,
++				     palette_bo);
++}
++
++static int qxl_palette_create_1bit(struct qxl_bo *palette_bo,
++				   struct qxl_release *release,
+ 				   const struct qxl_fb_image *qxl_fb_image)
+ {
+-	struct qxl_device *qdev = qxl_fb_image->qdev;
+ 	const struct fb_image *fb_image = &qxl_fb_image->fb_image;
+ 	uint32_t visual = qxl_fb_image->visual;
+ 	const uint32_t *pseudo_palette = qxl_fb_image->pseudo_palette;
+@@ -108,12 +135,7 @@ static int qxl_palette_create_1bit(struct qxl_bo **palette_bo,
+ 	static uint64_t unique; /* we make no attempt to actually set this
+ 				 * correctly globaly, since that would require
+ 				 * tracking all of our palettes. */
+-
+-	ret = qxl_alloc_bo_reserved(qdev,
+-				    sizeof(struct qxl_palette) + sizeof(uint32_t) * 2,
+-				    palette_bo);
+-
+-	ret = qxl_bo_kmap(*palette_bo, (void **)&pal);
++	ret = qxl_bo_kmap(palette_bo, (void **)&pal);
+ 	pal->num_ents = 2;
+ 	pal->unique = unique++;
+ 	if (visual == FB_VISUAL_TRUECOLOR || visual == FB_VISUAL_DIRECTCOLOR) {
+@@ -126,7 +148,7 @@ static int qxl_palette_create_1bit(struct qxl_bo **palette_bo,
+ 	}
+ 	pal->ents[0] = bgcolor;
+ 	pal->ents[1] = fgcolor;
+-	qxl_bo_kunmap(*palette_bo);
++	qxl_bo_kunmap(palette_bo);
+ 	return 0;
+ }
+ 
+@@ -144,44 +166,63 @@ void qxl_draw_opaque_fb(const struct qxl_fb_image *qxl_fb_image,
+ 	const char *src = fb_image->data;
+ 	int depth = fb_image->depth;
+ 	struct qxl_release *release;
+-	struct qxl_bo *image_bo;
+ 	struct qxl_image *image;
+ 	int ret;
+-
++	struct qxl_drm_image *dimage;
++	struct qxl_bo *palette_bo = NULL;
+ 	if (stride == 0)
+ 		stride = depth * width / 8;
+ 
++	ret = alloc_drawable(qdev, &release);
++	if (ret)
++		return;
++
++	ret = qxl_image_alloc_objects(qdev, release,
++				      &dimage,
++				      height, stride);
++	if (ret)
++		goto out_free_drawable;
++
++	if (depth == 1) {
++		ret = alloc_palette_object(qdev, release, &palette_bo);
++		if (ret)
++			goto out_free_image;
++	}
++
++	/* do a reservation run over all the objects we just allocated */
++	ret = qxl_release_reserve_list(release, true);
++	if (ret)
++		goto out_free_palette;
++
+ 	rect.left = x;
+ 	rect.right = x + width;
+ 	rect.top = y;
+ 	rect.bottom = y + height;
+ 
+-	ret = make_drawable(qdev, 0, QXL_DRAW_COPY, &rect, &release);
+-	if (ret)
+-		return;
++	ret = make_drawable(qdev, 0, QXL_DRAW_COPY, &rect, release);
++	if (ret) {
++		qxl_release_backoff_reserve_list(release);
++		goto out_free_palette;
++	}
+ 
+-	ret = qxl_image_create(qdev, release, &image_bo,
+-			       (const uint8_t *)src, 0, 0,
+-			       width, height, depth, stride);
++	ret = qxl_image_init(qdev, release, dimage,
++			     (const uint8_t *)src, 0, 0,
++			     width, height, depth, stride);
+ 	if (ret) {
+-		qxl_release_unreserve(qdev, release);
++		qxl_release_backoff_reserve_list(release);
+ 		qxl_release_free(qdev, release);
+ 		return;
+ 	}
+ 
+ 	if (depth == 1) {
+-		struct qxl_bo *palette_bo;
+ 		void *ptr;
+-		ret = qxl_palette_create_1bit(&palette_bo, qxl_fb_image);
+-		qxl_release_add_res(qdev, release, palette_bo);
++		ret = qxl_palette_create_1bit(palette_bo, release, qxl_fb_image);
+ 
+-		ptr = qxl_bo_kmap_atomic_page(qdev, image_bo, 0);
++		ptr = qxl_bo_kmap_atomic_page(qdev, dimage->bo, 0);
+ 		image = ptr;
+ 		image->u.bitmap.palette =
+ 			qxl_bo_physical_address(qdev, palette_bo, 0);
+-		qxl_bo_kunmap_atomic_page(qdev, image_bo, ptr);
+-		qxl_bo_unreserve(palette_bo);
+-		qxl_bo_unref(&palette_bo);
++		qxl_bo_kunmap_atomic_page(qdev, dimage->bo, ptr);
+ 	}
+ 
+ 	drawable = (struct qxl_drawable *)qxl_release_map(qdev, release);
+@@ -199,16 +240,20 @@ void qxl_draw_opaque_fb(const struct qxl_fb_image *qxl_fb_image,
+ 	drawable->u.copy.mask.bitmap = 0;
+ 
+ 	drawable->u.copy.src_bitmap =
+-		qxl_bo_physical_address(qdev, image_bo, 0);
++		qxl_bo_physical_address(qdev, dimage->bo, 0);
+ 	qxl_release_unmap(qdev, release, &drawable->release_info);
+ 
+-	qxl_release_add_res(qdev, release, image_bo);
+-	qxl_bo_unreserve(image_bo);
+-	qxl_bo_unref(&image_bo);
+-
+-	qxl_fence_releaseable(qdev, release);
+ 	qxl_push_command_ring_release(qdev, release, QXL_CMD_DRAW, false);
+-	qxl_release_unreserve(qdev, release);
++	qxl_release_fence_buffer_objects(release);
++
++out_free_palette:
++	if (palette_bo)
++		qxl_bo_unref(&palette_bo);
++out_free_image:
++	qxl_image_free_objects(qdev, dimage);
++out_free_drawable:
++	if (ret)
++		free_drawable(qdev, release);
+ }
+ 
+ /* push a draw command using the given clipping rectangles as
+@@ -243,10 +288,14 @@ void qxl_draw_dirty_fb(struct qxl_device *qdev,
+ 	int depth = qxl_fb->base.bits_per_pixel;
+ 	uint8_t *surface_base;
+ 	struct qxl_release *release;
+-	struct qxl_bo *image_bo;
+ 	struct qxl_bo *clips_bo;
++	struct qxl_drm_image *dimage;
+ 	int ret;
+ 
++	ret = alloc_drawable(qdev, &release);
++	if (ret)
++		return;
++
+ 	left = clips->x1;
+ 	right = clips->x2;
+ 	top = clips->y1;
+@@ -263,36 +312,52 @@ void qxl_draw_dirty_fb(struct qxl_device *qdev,
+ 
+ 	width = right - left;
+ 	height = bottom - top;
++
++	ret = alloc_clips(qdev, release, num_clips, &clips_bo);
++	if (ret)
++		goto out_free_drawable;
++
++	ret = qxl_image_alloc_objects(qdev, release,
++				      &dimage,
++				      height, stride);
++	if (ret)
++		goto out_free_clips;
++
++	/* do a reservation run over all the objects we just allocated */
++	ret = qxl_release_reserve_list(release, true);
++	if (ret)
++		goto out_free_image;
++
+ 	drawable_rect.left = left;
+ 	drawable_rect.right = right;
+ 	drawable_rect.top = top;
+ 	drawable_rect.bottom = bottom;
++
+ 	ret = make_drawable(qdev, 0, QXL_DRAW_COPY, &drawable_rect,
+-			    &release);
++			    release);
+ 	if (ret)
+-		return;
++		goto out_release_backoff;
+ 
+ 	ret = qxl_bo_kmap(bo, (void **)&surface_base);
+ 	if (ret)
+-		goto out_unref;
++		goto out_release_backoff;
+ 
+-	ret = qxl_image_create(qdev, release, &image_bo, surface_base,
+-			       left, top, width, height, depth, stride);
++
++	ret = qxl_image_init(qdev, release, dimage, surface_base,
++			     left, top, width, height, depth, stride);
+ 	qxl_bo_kunmap(bo);
+ 	if (ret)
+-		goto out_unref;
++		goto out_release_backoff;
++
++	rects = drawable_set_clipping(qdev, drawable, num_clips, clips_bo);
++	if (!rects)
++		goto out_release_backoff;
+ 
+-	rects = drawable_set_clipping(qdev, drawable, num_clips, &clips_bo, release);
+-	if (!rects) {
+-		qxl_bo_unref(&image_bo);
+-		goto out_unref;
+-	}
+ 	drawable = (struct qxl_drawable *)qxl_release_map(qdev, release);
+ 
+ 	drawable->clip.type = SPICE_CLIP_TYPE_RECTS;
+ 	drawable->clip.data = qxl_bo_physical_address(qdev,
+ 						      clips_bo, 0);
+-	qxl_release_add_res(qdev, release, clips_bo);
+ 
+ 	drawable->u.copy.src_area.top = 0;
+ 	drawable->u.copy.src_area.bottom = height;
+@@ -306,11 +371,9 @@ void qxl_draw_dirty_fb(struct qxl_device *qdev,
+ 	drawable->u.copy.mask.pos.y = 0;
+ 	drawable->u.copy.mask.bitmap = 0;
+ 
+-	drawable->u.copy.src_bitmap = qxl_bo_physical_address(qdev, image_bo, 0);
++	drawable->u.copy.src_bitmap = qxl_bo_physical_address(qdev, dimage->bo, 0);
+ 	qxl_release_unmap(qdev, release, &drawable->release_info);
+-	qxl_release_add_res(qdev, release, image_bo);
+-	qxl_bo_unreserve(image_bo);
+-	qxl_bo_unref(&image_bo);
++
+ 	clips_ptr = clips;
+ 	for (i = 0; i < num_clips; i++, clips_ptr += inc) {
+ 		rects[i].left   = clips_ptr->x1;
+@@ -319,17 +382,22 @@ void qxl_draw_dirty_fb(struct qxl_device *qdev,
+ 		rects[i].bottom = clips_ptr->y2;
+ 	}
+ 	qxl_bo_kunmap(clips_bo);
+-	qxl_bo_unreserve(clips_bo);
+-	qxl_bo_unref(&clips_bo);
+ 
+-	qxl_fence_releaseable(qdev, release);
+ 	qxl_push_command_ring_release(qdev, release, QXL_CMD_DRAW, false);
+-	qxl_release_unreserve(qdev, release);
+-	return;
++	qxl_release_fence_buffer_objects(release);
++
++out_release_backoff:
++	if (ret)
++		qxl_release_backoff_reserve_list(release);
++out_free_image:
++	qxl_image_free_objects(qdev, dimage);
++out_free_clips:
++	qxl_bo_unref(&clips_bo);
++out_free_drawable:
++	/* only free drawable on error */
++	if (ret)
++		free_drawable(qdev, release);
+ 
+-out_unref:
+-	qxl_release_unreserve(qdev, release);
+-	qxl_release_free(qdev, release);
+ }
+ 
+ void qxl_draw_copyarea(struct qxl_device *qdev,
+@@ -342,22 +410,36 @@ void qxl_draw_copyarea(struct qxl_device *qdev,
+ 	struct qxl_release *release;
+ 	int ret;
+ 
++	ret = alloc_drawable(qdev, &release);
++	if (ret)
++		return;
++
++	/* do a reservation run over all the objects we just allocated */
++	ret = qxl_release_reserve_list(release, true);
++	if (ret)
++		goto out_free_release;
++
+ 	rect.left = dx;
+ 	rect.top = dy;
+ 	rect.right = dx + width;
+ 	rect.bottom = dy + height;
+-	ret = make_drawable(qdev, 0, QXL_COPY_BITS, &rect, &release);
+-	if (ret)
+-		return;
++	ret = make_drawable(qdev, 0, QXL_COPY_BITS, &rect, release);
++	if (ret) {
++		qxl_release_backoff_reserve_list(release);
++		goto out_free_release;
++	}
+ 
+ 	drawable = (struct qxl_drawable *)qxl_release_map(qdev, release);
+ 	drawable->u.copy_bits.src_pos.x = sx;
+ 	drawable->u.copy_bits.src_pos.y = sy;
+-
+ 	qxl_release_unmap(qdev, release, &drawable->release_info);
+-	qxl_fence_releaseable(qdev, release);
++
+ 	qxl_push_command_ring_release(qdev, release, QXL_CMD_DRAW, false);
+-	qxl_release_unreserve(qdev, release);
++	qxl_release_fence_buffer_objects(release);
++
++out_free_release:
++	if (ret)
++		free_drawable(qdev, release);
+ }
+ 
+ void qxl_draw_fill(struct qxl_draw_fill *qxl_draw_fill_rec)
+@@ -370,10 +452,21 @@ void qxl_draw_fill(struct qxl_draw_fill *qxl_draw_fill_rec)
+ 	struct qxl_release *release;
+ 	int ret;
+ 
+-	ret = make_drawable(qdev, 0, QXL_DRAW_FILL, &rect, &release);
++	ret = alloc_drawable(qdev, &release);
+ 	if (ret)
+ 		return;
+ 
++	/* do a reservation run over all the objects we just allocated */
++	ret = qxl_release_reserve_list(release, true);
++	if (ret)
++		goto out_free_release;
++
++	ret = make_drawable(qdev, 0, QXL_DRAW_FILL, &rect, release);
++	if (ret) {
++		qxl_release_backoff_reserve_list(release);
++		goto out_free_release;
++	}
++
+ 	drawable = (struct qxl_drawable *)qxl_release_map(qdev, release);
+ 	drawable->u.fill.brush.type = SPICE_BRUSH_TYPE_SOLID;
+ 	drawable->u.fill.brush.u.color = color;
+@@ -384,7 +477,11 @@ void qxl_draw_fill(struct qxl_draw_fill *qxl_draw_fill_rec)
+ 	drawable->u.fill.mask.bitmap = 0;
+ 
+ 	qxl_release_unmap(qdev, release, &drawable->release_info);
+-	qxl_fence_releaseable(qdev, release);
++
+ 	qxl_push_command_ring_release(qdev, release, QXL_CMD_DRAW, false);
+-	qxl_release_unreserve(qdev, release);
++	qxl_release_fence_buffer_objects(release);
++
++out_free_release:
++	if (ret)
++		free_drawable(qdev, release);
+ }
+diff --git a/drivers/gpu/drm/qxl/qxl_drv.h b/drivers/gpu/drm/qxl/qxl_drv.h
+index 6a4106f..7e96f4f 100644
+--- a/drivers/gpu/drm/qxl/qxl_drv.h
++++ b/drivers/gpu/drm/qxl/qxl_drv.h
+@@ -42,6 +42,9 @@
+ #include <ttm/ttm_placement.h>
+ #include <ttm/ttm_module.h>
+ 
++/* just for ttm_validate_buffer */
++#include <ttm/ttm_execbuf_util.h>
++
+ #include <drm/qxl_drm.h>
+ #include "qxl_dev.h"
+ 
+@@ -118,9 +121,9 @@ struct qxl_bo {
+ 	uint32_t surface_id;
+ 	struct qxl_fence fence; /* per bo fence  - list of releases */
+ 	struct qxl_release *surf_create;
+-	atomic_t reserve_count;
+ };
+ #define gem_to_qxl_bo(gobj) container_of((gobj), struct qxl_bo, gem_base)
++#define to_qxl_bo(tobj) container_of((tobj), struct qxl_bo, tbo)
+ 
+ struct qxl_gem {
+ 	struct mutex		mutex;
+@@ -128,12 +131,7 @@ struct qxl_gem {
+ };
+ 
+ struct qxl_bo_list {
+-	struct list_head lhead;
+-	struct qxl_bo *bo;
+-};
+-
+-struct qxl_reloc_list {
+-	struct list_head bos;
++	struct ttm_validate_buffer tv;
+ };
+ 
+ struct qxl_crtc {
+@@ -195,10 +193,20 @@ enum {
+ struct qxl_release {
+ 	int id;
+ 	int type;
+-	int bo_count;
+ 	uint32_t release_offset;
+ 	uint32_t surface_release_id;
+-	struct qxl_bo *bos[QXL_MAX_RES];
++	struct ww_acquire_ctx ticket;
++	struct list_head bos;
++};
++
++struct qxl_drm_chunk {
++	struct list_head head;
++	struct qxl_bo *bo;
++};
++
++struct qxl_drm_image {
++	struct qxl_bo *bo;
++	struct list_head chunk_list;
+ };
+ 
+ struct qxl_fb_image {
+@@ -434,12 +442,19 @@ int qxl_mmap(struct file *filp, struct vm_area_struct *vma);
+ 
+ /* qxl image */
+ 
+-int qxl_image_create(struct qxl_device *qdev,
+-		     struct qxl_release *release,
+-		     struct qxl_bo **image_bo,
+-		     const uint8_t *data,
+-		     int x, int y, int width, int height,
+-		     int depth, int stride);
++int qxl_image_init(struct qxl_device *qdev,
++		   struct qxl_release *release,
++		   struct qxl_drm_image *dimage,
++		   const uint8_t *data,
++		   int x, int y, int width, int height,
++		   int depth, int stride);
++int
++qxl_image_alloc_objects(struct qxl_device *qdev,
++			struct qxl_release *release,
++			struct qxl_drm_image **image_ptr,
++			int height, int stride);
++void qxl_image_free_objects(struct qxl_device *qdev, struct qxl_drm_image *dimage);
++
+ void qxl_update_screen(struct qxl_device *qxl);
+ 
+ /* qxl io operations (qxl_cmd.c) */
+@@ -460,20 +475,15 @@ int qxl_ring_push(struct qxl_ring *ring, const void *new_elt, bool interruptible
+ void qxl_io_flush_release(struct qxl_device *qdev);
+ void qxl_io_flush_surfaces(struct qxl_device *qdev);
+ 
+-int qxl_release_reserve(struct qxl_device *qdev,
+-			struct qxl_release *release, bool no_wait);
+-void qxl_release_unreserve(struct qxl_device *qdev,
+-			   struct qxl_release *release);
+ union qxl_release_info *qxl_release_map(struct qxl_device *qdev,
+ 					struct qxl_release *release);
+ void qxl_release_unmap(struct qxl_device *qdev,
+ 		       struct qxl_release *release,
+ 		       union qxl_release_info *info);
+-/*
+- * qxl_bo_add_resource.
+- *
+- */
+-void qxl_bo_add_resource(struct qxl_bo *main_bo, struct qxl_bo *resource);
++int qxl_release_list_add(struct qxl_release *release, struct qxl_bo *bo);
++int qxl_release_reserve_list(struct qxl_release *release, bool no_intr);
++void qxl_release_backoff_reserve_list(struct qxl_release *release);
++void qxl_release_fence_buffer_objects(struct qxl_release *release);
+ 
+ int qxl_alloc_surface_release_reserved(struct qxl_device *qdev,
+ 				       enum qxl_surface_cmd_type surface_cmd_type,
+@@ -482,15 +492,16 @@ int qxl_alloc_surface_release_reserved(struct qxl_device *qdev,
+ int qxl_alloc_release_reserved(struct qxl_device *qdev, unsigned long size,
+ 			       int type, struct qxl_release **release,
+ 			       struct qxl_bo **rbo);
+-int qxl_fence_releaseable(struct qxl_device *qdev,
+-			  struct qxl_release *release);
++
+ int
+ qxl_push_command_ring_release(struct qxl_device *qdev, struct qxl_release *release,
+ 			      uint32_t type, bool interruptible);
+ int
+ qxl_push_cursor_ring_release(struct qxl_device *qdev, struct qxl_release *release,
+ 			     uint32_t type, bool interruptible);
+-int qxl_alloc_bo_reserved(struct qxl_device *qdev, unsigned long size,
++int qxl_alloc_bo_reserved(struct qxl_device *qdev,
++			  struct qxl_release *release,
++			  unsigned long size,
+ 			  struct qxl_bo **_bo);
+ /* qxl drawing commands */
+ 
+@@ -511,15 +522,9 @@ void qxl_draw_copyarea(struct qxl_device *qdev,
+ 		       u32 sx, u32 sy,
+ 		       u32 dx, u32 dy);
+ 
+-uint64_t
+-qxl_release_alloc(struct qxl_device *qdev, int type,
+-		  struct qxl_release **ret);
+-
+ void qxl_release_free(struct qxl_device *qdev,
+ 		      struct qxl_release *release);
+-void qxl_release_add_res(struct qxl_device *qdev,
+-			 struct qxl_release *release,
+-			 struct qxl_bo *bo);
++
+ /* used by qxl_debugfs_release */
+ struct qxl_release *qxl_release_from_id_locked(struct qxl_device *qdev,
+ 						   uint64_t id);
+@@ -562,7 +567,7 @@ void qxl_surface_evict(struct qxl_device *qdev, struct qxl_bo *surf, bool freein
+ int qxl_update_surface(struct qxl_device *qdev, struct qxl_bo *surf);
+ 
+ /* qxl_fence.c */
+-int qxl_fence_add_release(struct qxl_fence *qfence, uint32_t rel_id);
++void qxl_fence_add_release_locked(struct qxl_fence *qfence, uint32_t rel_id);
+ int qxl_fence_remove_release(struct qxl_fence *qfence, uint32_t rel_id);
+ int qxl_fence_init(struct qxl_device *qdev, struct qxl_fence *qfence);
+ void qxl_fence_fini(struct qxl_fence *qfence);
+diff --git a/drivers/gpu/drm/qxl/qxl_fence.c b/drivers/gpu/drm/qxl/qxl_fence.c
+index 63c6715..ae59e91 100644
+--- a/drivers/gpu/drm/qxl/qxl_fence.c
++++ b/drivers/gpu/drm/qxl/qxl_fence.c
+@@ -49,17 +49,11 @@
+ 
+    For some reason every so often qxl hw fails to release, things go wrong.
+ */
+-
+-
+-int qxl_fence_add_release(struct qxl_fence *qfence, uint32_t rel_id)
++/* must be called with the fence lock held */
++void qxl_fence_add_release_locked(struct qxl_fence *qfence, uint32_t rel_id)
+ {
+-	struct qxl_bo *bo = container_of(qfence, struct qxl_bo, fence);
+-
+-	spin_lock(&bo->tbo.bdev->fence_lock);
+ 	radix_tree_insert(&qfence->tree, rel_id, qfence);
+ 	qfence->num_active_releases++;
+-	spin_unlock(&bo->tbo.bdev->fence_lock);
+-	return 0;
+ }
+ 
+ int qxl_fence_remove_release(struct qxl_fence *qfence, uint32_t rel_id)
+diff --git a/drivers/gpu/drm/qxl/qxl_image.c b/drivers/gpu/drm/qxl/qxl_image.c
+index cf85620..7fbcc35 100644
+--- a/drivers/gpu/drm/qxl/qxl_image.c
++++ b/drivers/gpu/drm/qxl/qxl_image.c
+@@ -30,31 +30,100 @@
+ #include "qxl_object.h"
+ 
+ static int
+-qxl_image_create_helper(struct qxl_device *qdev,
++qxl_allocate_chunk(struct qxl_device *qdev,
++		   struct qxl_release *release,
++		   struct qxl_drm_image *image,
++		   unsigned int chunk_size)
++{
++	struct qxl_drm_chunk *chunk;
++	int ret;
++
++	chunk = kmalloc(sizeof(struct qxl_drm_chunk), GFP_KERNEL);
++	if (!chunk)
++		return -ENOMEM;
++
++	ret = qxl_alloc_bo_reserved(qdev, release, chunk_size, &chunk->bo);
++	if (ret) {
++		kfree(chunk);
++		return ret;
++	}
++
++	list_add_tail(&chunk->head, &image->chunk_list);
++	return 0;
++}
++
++int
++qxl_image_alloc_objects(struct qxl_device *qdev,
+ 			struct qxl_release *release,
+-			struct qxl_bo **image_bo,
+-			const uint8_t *data,
+-			int width, int height,
+-			int depth, unsigned int hash,
+-			int stride)
++			struct qxl_drm_image **image_ptr,
++			int height, int stride)
++{
++	struct qxl_drm_image *image;
++	int ret;
++
++	image = kmalloc(sizeof(struct qxl_drm_image), GFP_KERNEL);
++	if (!image)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&image->chunk_list);
++
++	ret = qxl_alloc_bo_reserved(qdev, release, sizeof(struct qxl_image), &image->bo);
++	if (ret) {
++		kfree(image);
++		return ret;
++	}
++
++	ret = qxl_allocate_chunk(qdev, release, image, sizeof(struct qxl_data_chunk) + stride * height);
++	if (ret) {
++		qxl_bo_unref(&image->bo);
++		kfree(image);
++		return ret;
++	}
++	*image_ptr = image;
++	return 0;
++}
++
++void qxl_image_free_objects(struct qxl_device *qdev, struct qxl_drm_image *dimage)
+ {
++	struct qxl_drm_chunk *chunk, *tmp;
++
++	list_for_each_entry_safe(chunk, tmp, &dimage->chunk_list, head) {
++		qxl_bo_unref(&chunk->bo);
++		kfree(chunk);
++	}
++
++	qxl_bo_unref(&dimage->bo);
++	kfree(dimage);
++}
++
++static int
++qxl_image_init_helper(struct qxl_device *qdev,
++		      struct qxl_release *release,
++		      struct qxl_drm_image *dimage,
++		      const uint8_t *data,
++		      int width, int height,
++		      int depth, unsigned int hash,
++		      int stride)
++{
++	struct qxl_drm_chunk *drv_chunk;
+ 	struct qxl_image *image;
+ 	struct qxl_data_chunk *chunk;
+ 	int i;
+ 	int chunk_stride;
+ 	int linesize = width * depth / 8;
+-	struct qxl_bo *chunk_bo;
+-	int ret;
++	struct qxl_bo *chunk_bo, *image_bo;
+ 	void *ptr;
+ 	/* Chunk */
+ 	/* FIXME: Check integer overflow */
+ 	/* TODO: variable number of chunks */
++
++	drv_chunk = list_first_entry(&dimage->chunk_list, struct qxl_drm_chunk, head);
++
++	chunk_bo = drv_chunk->bo;
+ 	chunk_stride = stride; /* TODO: should use linesize, but it renders
+ 				  wrong (check the bitmaps are sent correctly
+ 				  first) */
+-	ret = qxl_alloc_bo_reserved(qdev, sizeof(*chunk) + height * chunk_stride,
+-				    &chunk_bo);
+-	
++
+ 	ptr = qxl_bo_kmap_atomic_page(qdev, chunk_bo, 0);
+ 	chunk = ptr;
+ 	chunk->data_size = height * chunk_stride;
+@@ -102,7 +171,6 @@ qxl_image_create_helper(struct qxl_device *qdev,
+ 				while (remain > 0) {
+ 					page_base = out_offset & PAGE_MASK;
+ 					page_offset = offset_in_page(out_offset);
+-					
+ 					size = min((int)(PAGE_SIZE - page_offset), remain);
+ 
+ 					ptr = qxl_bo_kmap_atomic_page(qdev, chunk_bo, page_base);
+@@ -116,14 +184,10 @@ qxl_image_create_helper(struct qxl_device *qdev,
+ 			}
+ 		}
+ 	}
+-
+-
+ 	qxl_bo_kunmap(chunk_bo);
+ 
+-	/* Image */
+-	ret = qxl_alloc_bo_reserved(qdev, sizeof(*image), image_bo);
+-
+-	ptr = qxl_bo_kmap_atomic_page(qdev, *image_bo, 0);
++	image_bo = dimage->bo;
++	ptr = qxl_bo_kmap_atomic_page(qdev, image_bo, 0);
+ 	image = ptr;
+ 
+ 	image->descriptor.id = 0;
+@@ -154,23 +218,20 @@ qxl_image_create_helper(struct qxl_device *qdev,
+ 	image->u.bitmap.stride = chunk_stride;
+ 	image->u.bitmap.palette = 0;
+ 	image->u.bitmap.data = qxl_bo_physical_address(qdev, chunk_bo, 0);
+-	qxl_release_add_res(qdev, release, chunk_bo);
+-	qxl_bo_unreserve(chunk_bo);
+-	qxl_bo_unref(&chunk_bo);
+ 
+-	qxl_bo_kunmap_atomic_page(qdev, *image_bo, ptr);
++	qxl_bo_kunmap_atomic_page(qdev, image_bo, ptr);
+ 
+ 	return 0;
+ }
+ 
+-int qxl_image_create(struct qxl_device *qdev,
++int qxl_image_init(struct qxl_device *qdev,
+ 		     struct qxl_release *release,
+-		     struct qxl_bo **image_bo,
++		     struct qxl_drm_image *dimage,
+ 		     const uint8_t *data,
+ 		     int x, int y, int width, int height,
+ 		     int depth, int stride)
+ {
+ 	data += y * stride + x * (depth / 8);
+-	return qxl_image_create_helper(qdev, release, image_bo, data,
++	return qxl_image_init_helper(qdev, release, dimage, data,
+ 				       width, height, depth, 0, stride);
+ }
+diff --git a/drivers/gpu/drm/qxl/qxl_ioctl.c b/drivers/gpu/drm/qxl/qxl_ioctl.c
+index 7448c5e..6de3356 100644
+--- a/drivers/gpu/drm/qxl/qxl_ioctl.c
++++ b/drivers/gpu/drm/qxl/qxl_ioctl.c
+@@ -68,55 +68,60 @@ static int qxl_map_ioctl(struct drm_device *dev, void *data,
+ 				  &qxl_map->offset);
+ }
+ 
++struct qxl_reloc_info {
++	int type;
++	struct qxl_bo *dst_bo;
++	uint32_t dst_offset;
++	struct qxl_bo *src_bo;
++	int src_offset;
++};
++
+ /*
+  * dst must be validated, i.e. whole bo on vram/surfacesram (right now all bo's
+  * are on vram).
+  * *(dst + dst_off) = qxl_bo_physical_address(src, src_off)
+  */
+ static void
+-apply_reloc(struct qxl_device *qdev, struct qxl_bo *dst, uint64_t dst_off,
+-	    struct qxl_bo *src, uint64_t src_off)
++apply_reloc(struct qxl_device *qdev, struct qxl_reloc_info *info)
+ {
+ 	void *reloc_page;
+-
+-	reloc_page = qxl_bo_kmap_atomic_page(qdev, dst, dst_off & PAGE_MASK);
+-	*(uint64_t *)(reloc_page + (dst_off & ~PAGE_MASK)) = qxl_bo_physical_address(qdev,
+-								     src, src_off);
+-	qxl_bo_kunmap_atomic_page(qdev, dst, reloc_page);
++	reloc_page = qxl_bo_kmap_atomic_page(qdev, info->dst_bo, info->dst_offset & PAGE_MASK);
++	*(uint64_t *)(reloc_page + (info->dst_offset & ~PAGE_MASK)) = qxl_bo_physical_address(qdev,
++											      info->src_bo,
++											      info->src_offset);
++	qxl_bo_kunmap_atomic_page(qdev, info->dst_bo, reloc_page);
+ }
+ 
+ static void
+-apply_surf_reloc(struct qxl_device *qdev, struct qxl_bo *dst, uint64_t dst_off,
+-		 struct qxl_bo *src)
++apply_surf_reloc(struct qxl_device *qdev, struct qxl_reloc_info *info)
+ {
+ 	uint32_t id = 0;
+ 	void *reloc_page;
+ 
+-	if (src && !src->is_primary)
+-		id = src->surface_id;
++	if (info->src_bo && !info->src_bo->is_primary)
++		id = info->src_bo->surface_id;
+ 
+-	reloc_page = qxl_bo_kmap_atomic_page(qdev, dst, dst_off & PAGE_MASK);
+-	*(uint32_t *)(reloc_page + (dst_off & ~PAGE_MASK)) = id;
+-	qxl_bo_kunmap_atomic_page(qdev, dst, reloc_page);
++	reloc_page = qxl_bo_kmap_atomic_page(qdev, info->dst_bo, info->dst_offset & PAGE_MASK);
++	*(uint32_t *)(reloc_page + (info->dst_offset & ~PAGE_MASK)) = id;
++	qxl_bo_kunmap_atomic_page(qdev, info->dst_bo, reloc_page);
+ }
+ 
+ /* return holding the reference to this object */
+ static struct qxl_bo *qxlhw_handle_to_bo(struct qxl_device *qdev,
+ 					 struct drm_file *file_priv, uint64_t handle,
+-					 struct qxl_reloc_list *reloc_list)
++					 struct qxl_release *release)
+ {
+ 	struct drm_gem_object *gobj;
+ 	struct qxl_bo *qobj;
+ 	int ret;
+ 
+ 	gobj = drm_gem_object_lookup(qdev->ddev, file_priv, handle);
+-	if (!gobj) {
+-		DRM_ERROR("bad bo handle %lld\n", handle);
++	if (!gobj)
+ 		return NULL;
+-	}
++
+ 	qobj = gem_to_qxl_bo(gobj);
+ 
+-	ret = qxl_bo_list_add(reloc_list, qobj);
++	ret = qxl_release_list_add(release, qobj);
+ 	if (ret)
+ 		return NULL;
+ 
+@@ -129,151 +134,177 @@ static struct qxl_bo *qxlhw_handle_to_bo(struct qxl_device *qdev,
+  * However, the command as passed from user space must *not* contain the initial
+  * QXLReleaseInfo struct (first XXX bytes)
+  */
+-static int qxl_execbuffer_ioctl(struct drm_device *dev, void *data,
+-				struct drm_file *file_priv)
++static int qxl_process_single_command(struct qxl_device *qdev,
++				      struct drm_qxl_command *cmd,
++				      struct drm_file *file_priv)
+ {
+-	struct qxl_device *qdev = dev->dev_private;
+-	struct drm_qxl_execbuffer *execbuffer = data;
+-	struct drm_qxl_command user_cmd;
+-	int cmd_num;
+-	struct qxl_bo *reloc_src_bo;
+-	struct qxl_bo *reloc_dst_bo;
+-	struct drm_qxl_reloc reloc;
++	struct qxl_reloc_info *reloc_info;
++	int release_type;
++	struct qxl_release *release;
++	struct qxl_bo *cmd_bo;
+ 	void *fb_cmd;
+-	int i, ret;
+-	struct qxl_reloc_list reloc_list;
++	int i, j, ret, num_relocs;
+ 	int unwritten;
+-	uint32_t reloc_dst_offset;
+-	INIT_LIST_HEAD(&reloc_list.bos);
+ 
+-	for (cmd_num = 0; cmd_num < execbuffer->commands_num; ++cmd_num) {
+-		struct qxl_release *release;
+-		struct qxl_bo *cmd_bo;
+-		int release_type;
+-		struct drm_qxl_command *commands =
+-			(struct drm_qxl_command *)(uintptr_t)execbuffer->commands;
++	switch (cmd->type) {
++	case QXL_CMD_DRAW:
++		release_type = QXL_RELEASE_DRAWABLE;
++		break;
++	case QXL_CMD_SURFACE:
++	case QXL_CMD_CURSOR:
++	default:
++		DRM_DEBUG("Only draw commands in execbuffers\n");
++		return -EINVAL;
++		break;
++	}
+ 
+-		if (DRM_COPY_FROM_USER(&user_cmd, &commands[cmd_num],
+-				       sizeof(user_cmd)))
+-			return -EFAULT;
+-		switch (user_cmd.type) {
+-		case QXL_CMD_DRAW:
+-			release_type = QXL_RELEASE_DRAWABLE;
+-			break;
+-		case QXL_CMD_SURFACE:
+-		case QXL_CMD_CURSOR:
+-		default:
+-			DRM_DEBUG("Only draw commands in execbuffers\n");
+-			return -EINVAL;
+-			break;
+-		}
++	if (cmd->command_size > PAGE_SIZE - sizeof(union qxl_release_info))
++		return -EINVAL;
+ 
+-		if (user_cmd.command_size > PAGE_SIZE - sizeof(union qxl_release_info))
+-			return -EINVAL;
++	if (!access_ok(VERIFY_READ,
++		       (void *)(unsigned long)cmd->command,
++		       cmd->command_size))
++		return -EFAULT;
+ 
+-		if (!access_ok(VERIFY_READ,
+-			       (void *)(unsigned long)user_cmd.command,
+-			       user_cmd.command_size))
+-			return -EFAULT;
++	reloc_info = kmalloc(sizeof(struct qxl_reloc_info) * cmd->relocs_num, GFP_KERNEL);
++	if (!reloc_info)
++		return -ENOMEM;
+ 
+-		ret = qxl_alloc_release_reserved(qdev,
+-						 sizeof(union qxl_release_info) +
+-						 user_cmd.command_size,
+-						 release_type,
+-						 &release,
+-						 &cmd_bo);
+-		if (ret)
+-			return ret;
++	ret = qxl_alloc_release_reserved(qdev,
++					 sizeof(union qxl_release_info) +
++					 cmd->command_size,
++					 release_type,
++					 &release,
++					 &cmd_bo);
++	if (ret)
++		goto out_free_reloc;
+ 
+-		/* TODO copy slow path code from i915 */
+-		fb_cmd = qxl_bo_kmap_atomic_page(qdev, cmd_bo, (release->release_offset & PAGE_SIZE));
+-		unwritten = __copy_from_user_inatomic_nocache(fb_cmd + sizeof(union qxl_release_info) + (release->release_offset & ~PAGE_SIZE), (void *)(unsigned long)user_cmd.command, user_cmd.command_size);
++	/* TODO copy slow path code from i915 */
++	fb_cmd = qxl_bo_kmap_atomic_page(qdev, cmd_bo, (release->release_offset & PAGE_SIZE));
++	unwritten = __copy_from_user_inatomic_nocache(fb_cmd + sizeof(union qxl_release_info) + (release->release_offset & ~PAGE_SIZE), (void *)(unsigned long)cmd->command, cmd->command_size);
+ 
+-		{
+-			struct qxl_drawable *draw = fb_cmd;
++	{
++		struct qxl_drawable *draw = fb_cmd;
++		draw->mm_time = qdev->rom->mm_clock;
++	}
+ 
+-			draw->mm_time = qdev->rom->mm_clock;
+-		}
+-		qxl_bo_kunmap_atomic_page(qdev, cmd_bo, fb_cmd);
+-		if (unwritten) {
+-			DRM_ERROR("got unwritten %d\n", unwritten);
+-			qxl_release_unreserve(qdev, release);
+-			qxl_release_free(qdev, release);
+-			return -EFAULT;
++	qxl_bo_kunmap_atomic_page(qdev, cmd_bo, fb_cmd);
++	if (unwritten) {
++		DRM_ERROR("got unwritten %d\n", unwritten);
++		ret = -EFAULT;
++		goto out_free_release;
++	}
++
++	/* fill out reloc info structs */
++	num_relocs = 0;
++	for (i = 0; i < cmd->relocs_num; ++i) {
++		struct drm_qxl_reloc reloc;
++
++		if (DRM_COPY_FROM_USER(&reloc,
++				       &((struct drm_qxl_reloc *)(uintptr_t)cmd->relocs)[i],
++				       sizeof(reloc))) {
++			ret = -EFAULT;
++			goto out_free_bos;
+ 		}
+ 
+-		for (i = 0 ; i < user_cmd.relocs_num; ++i) {
+-			if (DRM_COPY_FROM_USER(&reloc,
+-					       &((struct drm_qxl_reloc *)(uintptr_t)user_cmd.relocs)[i],
+-					       sizeof(reloc))) {
+-				qxl_bo_list_unreserve(&reloc_list, true);
+-				qxl_release_unreserve(qdev, release);
+-				qxl_release_free(qdev, release);
+-				return -EFAULT;
+-			}
++		/* add the bos to the list of bos to validate -
++		   need to validate first then process relocs? */
++		if (reloc.reloc_type != QXL_RELOC_TYPE_BO && reloc.reloc_type != QXL_RELOC_TYPE_SURF) {
++			DRM_DEBUG("unknown reloc type %d\n", reloc_info[i].type);
+ 
+-			/* add the bos to the list of bos to validate -
+-			   need to validate first then process relocs? */
+-			if (reloc.dst_handle) {
+-				reloc_dst_bo = qxlhw_handle_to_bo(qdev, file_priv,
+-								  reloc.dst_handle, &reloc_list);
+-				if (!reloc_dst_bo) {
+-					qxl_bo_list_unreserve(&reloc_list, true);
+-					qxl_release_unreserve(qdev, release);
+-					qxl_release_free(qdev, release);
+-					return -EINVAL;
+-				}
+-				reloc_dst_offset = 0;
+-			} else {
+-				reloc_dst_bo = cmd_bo;
+-				reloc_dst_offset = release->release_offset;
++			ret = -EINVAL;
++			goto out_free_bos;
++		}
++		reloc_info[i].type = reloc.reloc_type;
++
++		if (reloc.dst_handle) {
++			reloc_info[i].dst_bo = qxlhw_handle_to_bo(qdev, file_priv,
++								  reloc.dst_handle, release);
++			if (!reloc_info[i].dst_bo) {
++				ret = -EINVAL;
++				reloc_info[i].src_bo = NULL;
++				goto out_free_bos;
+ 			}
+-
+-			/* reserve and validate the reloc dst bo */
+-			if (reloc.reloc_type == QXL_RELOC_TYPE_BO || reloc.src_handle > 0) {
+-				reloc_src_bo =
+-					qxlhw_handle_to_bo(qdev, file_priv,
+-							   reloc.src_handle, &reloc_list);
+-				if (!reloc_src_bo) {
+-					if (reloc_dst_bo != cmd_bo)
+-						drm_gem_object_unreference_unlocked(&reloc_dst_bo->gem_base);
+-					qxl_bo_list_unreserve(&reloc_list, true);
+-					qxl_release_unreserve(qdev, release);
+-					qxl_release_free(qdev, release);
+-					return -EINVAL;
+-				}
+-			} else
+-				reloc_src_bo = NULL;
+-			if (reloc.reloc_type == QXL_RELOC_TYPE_BO) {
+-				apply_reloc(qdev, reloc_dst_bo, reloc_dst_offset + reloc.dst_offset,
+-					    reloc_src_bo, reloc.src_offset);
+-			} else if (reloc.reloc_type == QXL_RELOC_TYPE_SURF) {
+-				apply_surf_reloc(qdev, reloc_dst_bo, reloc_dst_offset + reloc.dst_offset, reloc_src_bo);
+-			} else {
+-				DRM_ERROR("unknown reloc type %d\n", reloc.reloc_type);
+-				return -EINVAL;
++			reloc_info[i].dst_offset = reloc.dst_offset;
++		} else {
++			reloc_info[i].dst_bo = cmd_bo;
++			reloc_info[i].dst_offset = reloc.dst_offset + release->release_offset;
++		}
++		num_relocs++;
++
++		/* reserve and validate the reloc dst bo */
++		if (reloc.reloc_type == QXL_RELOC_TYPE_BO || reloc.src_handle > 0) {
++			reloc_info[i].src_bo =
++				qxlhw_handle_to_bo(qdev, file_priv,
++						   reloc.src_handle, release);
++			if (!reloc_info[i].src_bo) {
++				if (reloc_info[i].dst_bo != cmd_bo)
++					drm_gem_object_unreference_unlocked(&reloc_info[i].dst_bo->gem_base);
++				ret = -EINVAL;
++				goto out_free_bos;
+ 			}
++			reloc_info[i].src_offset = reloc.src_offset;
++		} else {
++			reloc_info[i].src_bo = NULL;
++			reloc_info[i].src_offset = 0;
++		}
++	}
+ 
+-			if (reloc_src_bo && reloc_src_bo != cmd_bo) {
+-				qxl_release_add_res(qdev, release, reloc_src_bo);
+-				drm_gem_object_unreference_unlocked(&reloc_src_bo->gem_base);
+-			}
++	/* validate all buffers */
++	ret = qxl_release_reserve_list(release, false);
++	if (ret)
++		goto out_free_bos;
+ 
+-			if (reloc_dst_bo != cmd_bo)
+-				drm_gem_object_unreference_unlocked(&reloc_dst_bo->gem_base);
+-		}
+-		qxl_fence_releaseable(qdev, release);
++	for (i = 0; i < cmd->relocs_num; ++i) {
++		if (reloc_info[i].type == QXL_RELOC_TYPE_BO)
++			apply_reloc(qdev, &reloc_info[i]);
++		else if (reloc_info[i].type == QXL_RELOC_TYPE_SURF)
++			apply_surf_reloc(qdev, &reloc_info[i]);
++	}
+ 
+-		ret = qxl_push_command_ring_release(qdev, release, user_cmd.type, true);
+-		if (ret == -ERESTARTSYS) {
+-			qxl_release_unreserve(qdev, release);
+-			qxl_release_free(qdev, release);
+-			qxl_bo_list_unreserve(&reloc_list, true);
++	ret = qxl_push_command_ring_release(qdev, release, cmd->type, true);
++	if (ret)
++		qxl_release_backoff_reserve_list(release);
++	else
++		qxl_release_fence_buffer_objects(release);
++
++out_free_bos:
++	for (j = 0; j < num_relocs; j++) {
++		if (reloc_info[j].dst_bo != cmd_bo)
++			drm_gem_object_unreference_unlocked(&reloc_info[j].dst_bo->gem_base);
++		if (reloc_info[j].src_bo && reloc_info[j].src_bo != cmd_bo)
++			drm_gem_object_unreference_unlocked(&reloc_info[j].src_bo->gem_base);
++	}
++out_free_release:
++	if (ret)
++		qxl_release_free(qdev, release);
++out_free_reloc:
++	kfree(reloc_info);
++	return ret;
++}
++
++static int qxl_execbuffer_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *file_priv)
++{
++	struct qxl_device *qdev = dev->dev_private;
++	struct drm_qxl_execbuffer *execbuffer = data;
++	struct drm_qxl_command user_cmd;
++	int cmd_num;
++	int ret;
++
++	for (cmd_num = 0; cmd_num < execbuffer->commands_num; ++cmd_num) {
++
++		struct drm_qxl_command *commands =
++			(struct drm_qxl_command *)(uintptr_t)execbuffer->commands;
++
++		if (DRM_COPY_FROM_USER(&user_cmd, &commands[cmd_num],
++				       sizeof(user_cmd)))
++			return -EFAULT;
++
++		ret = qxl_process_single_command(qdev, &user_cmd, file_priv);
++		if (ret)
+ 			return ret;
+-		}
+-		qxl_release_unreserve(qdev, release);
+ 	}
+-	qxl_bo_list_unreserve(&reloc_list, 0);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/qxl/qxl_object.c b/drivers/gpu/drm/qxl/qxl_object.c
+index 50e7a61..aa161cd 100644
+--- a/drivers/gpu/drm/qxl/qxl_object.c
++++ b/drivers/gpu/drm/qxl/qxl_object.c
+@@ -104,7 +104,7 @@ int qxl_bo_create(struct qxl_device *qdev,
+ 	bo->surface_id = 0;
+ 	qxl_fence_init(qdev, &bo->fence);
+ 	INIT_LIST_HEAD(&bo->list);
+-	atomic_set(&bo->reserve_count, 0);
++
+ 	if (surf)
+ 		bo->surf = *surf;
+ 
+@@ -316,53 +316,6 @@ int qxl_bo_check_id(struct qxl_device *qdev, struct qxl_bo *bo)
+ 	return 0;
+ }
+ 
+-void qxl_bo_list_unreserve(struct qxl_reloc_list *reloc_list, bool failed)
+-{
+-	struct qxl_bo_list *entry, *sf;
+-
+-	list_for_each_entry_safe(entry, sf, &reloc_list->bos, lhead) {
+-		qxl_bo_unreserve(entry->bo);
+-		list_del(&entry->lhead);
+-		kfree(entry);
+-	}
+-}
+-
+-int qxl_bo_list_add(struct qxl_reloc_list *reloc_list, struct qxl_bo *bo)
+-{
+-	struct qxl_bo_list *entry;
+-	int ret;
+-
+-	list_for_each_entry(entry, &reloc_list->bos, lhead) {
+-		if (entry->bo == bo)
+-			return 0;
+-	}
+-
+-	entry = kmalloc(sizeof(struct qxl_bo_list), GFP_KERNEL);
+-	if (!entry)
+-		return -ENOMEM;
+-
+-	entry->bo = bo;
+-	list_add(&entry->lhead, &reloc_list->bos);
+-
+-	ret = qxl_bo_reserve(bo, false);
+-	if (ret)
+-		return ret;
+-
+-	if (!bo->pin_count) {
+-		qxl_ttm_placement_from_domain(bo, bo->type, false);
+-		ret = ttm_bo_validate(&bo->tbo, &bo->placement,
+-				      true, false);
+-		if (ret)
+-			return ret;
+-	}
+-
+-	/* allocate a surface for reserved + validated buffers */
+-	ret = qxl_bo_check_id(bo->gem_base.dev->dev_private, bo);
+-	if (ret)
+-		return ret;
+-	return 0;
+-}
+-
+ int qxl_surf_evict(struct qxl_device *qdev)
+ {
+ 	return ttm_bo_evict_mm(&qdev->mman.bdev, TTM_PL_PRIV0);
+diff --git a/drivers/gpu/drm/qxl/qxl_object.h b/drivers/gpu/drm/qxl/qxl_object.h
+index 116637f..8cb6167 100644
+--- a/drivers/gpu/drm/qxl/qxl_object.h
++++ b/drivers/gpu/drm/qxl/qxl_object.h
+@@ -102,6 +102,4 @@ extern int qxl_bo_unpin(struct qxl_bo *bo);
+ extern void qxl_ttm_placement_from_domain(struct qxl_bo *qbo, u32 domain, bool pinned);
+ extern bool qxl_ttm_bo_is_qxl_bo(struct ttm_buffer_object *bo);
+ 
+-extern int qxl_bo_list_add(struct qxl_reloc_list *reloc_list, struct qxl_bo *bo);
+-extern void qxl_bo_list_unreserve(struct qxl_reloc_list *reloc_list, bool failed);
+ #endif
+diff --git a/drivers/gpu/drm/qxl/qxl_release.c b/drivers/gpu/drm/qxl/qxl_release.c
+index b7f1271..b61449e 100644
+--- a/drivers/gpu/drm/qxl/qxl_release.c
++++ b/drivers/gpu/drm/qxl/qxl_release.c
+@@ -38,7 +38,8 @@
+ 
+ static const int release_size_per_bo[] = { RELEASE_SIZE, SURFACE_RELEASE_SIZE, RELEASE_SIZE };
+ static const int releases_per_bo[] = { RELEASES_PER_BO, SURFACE_RELEASES_PER_BO, RELEASES_PER_BO };
+-uint64_t
++
++static uint64_t
+ qxl_release_alloc(struct qxl_device *qdev, int type,
+ 		  struct qxl_release **ret)
+ {
+@@ -53,9 +54,9 @@ qxl_release_alloc(struct qxl_device *qdev, int type,
+ 		return 0;
+ 	}
+ 	release->type = type;
+-	release->bo_count = 0;
+ 	release->release_offset = 0;
+ 	release->surface_release_id = 0;
++	INIT_LIST_HEAD(&release->bos);
+ 
+ 	idr_preload(GFP_KERNEL);
+ 	spin_lock(&qdev->release_idr_lock);
+@@ -77,20 +78,20 @@ void
+ qxl_release_free(struct qxl_device *qdev,
+ 		 struct qxl_release *release)
+ {
+-	int i;
+-
+-	QXL_INFO(qdev, "release %d, type %d, %d bos\n", release->id,
+-		 release->type, release->bo_count);
++	struct qxl_bo_list *entry, *tmp;
++	QXL_INFO(qdev, "release %d, type %d\n", release->id,
++		 release->type);
+ 
+ 	if (release->surface_release_id)
+ 		qxl_surface_id_dealloc(qdev, release->surface_release_id);
+ 
+-	for (i = 0 ; i < release->bo_count; ++i) {
++	list_for_each_entry_safe(entry, tmp, &release->bos, tv.head) {
++		struct qxl_bo *bo = to_qxl_bo(entry->tv.bo);
+ 		QXL_INFO(qdev, "release %llx\n",
+-			release->bos[i]->tbo.addr_space_offset
++			entry->tv.bo->addr_space_offset
+ 						- DRM_FILE_OFFSET);
+-		qxl_fence_remove_release(&release->bos[i]->fence, release->id);
+-		qxl_bo_unref(&release->bos[i]);
++		qxl_fence_remove_release(&bo->fence, release->id);
++		qxl_bo_unref(&bo);
+ 	}
+ 	spin_lock(&qdev->release_idr_lock);
+ 	idr_remove(&qdev->release_idr, release->id);
+@@ -98,22 +99,6 @@ qxl_release_free(struct qxl_device *qdev,
+ 	kfree(release);
+ }
+ 
+-void
+-qxl_release_add_res(struct qxl_device *qdev, struct qxl_release *release,
+-		    struct qxl_bo *bo)
+-{
+-	int i;
+-	for (i = 0; i < release->bo_count; i++)
+-		if (release->bos[i] == bo)
+-			return;
+-
+-	if (release->bo_count >= QXL_MAX_RES) {
+-		DRM_ERROR("exceeded max resource on a qxl_release item\n");
+-		return;
+-	}
+-	release->bos[release->bo_count++] = qxl_bo_ref(bo);
+-}
+-
+ static int qxl_release_bo_alloc(struct qxl_device *qdev,
+ 				struct qxl_bo **bo)
+ {
+@@ -125,58 +110,106 @@ static int qxl_release_bo_alloc(struct qxl_device *qdev,
+ 	return ret;
+ }
+ 
+-int qxl_release_reserve(struct qxl_device *qdev,
+-			struct qxl_release *release, bool no_wait)
++int qxl_release_list_add(struct qxl_release *release, struct qxl_bo *bo)
++{
++	struct qxl_bo_list *entry;
++
++	list_for_each_entry(entry, &release->bos, tv.head) {
++		if (entry->tv.bo == &bo->tbo)
++			return 0;
++	}
++
++	entry = kmalloc(sizeof(struct qxl_bo_list), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++
++	qxl_bo_ref(bo);
++	entry->tv.bo = &bo->tbo;
++	list_add_tail(&entry->tv.head, &release->bos);
++	return 0;
++}
++
++static int qxl_release_validate_bo(struct qxl_bo *bo)
+ {
+ 	int ret;
+-	if (atomic_inc_return(&release->bos[0]->reserve_count) == 1) {
+-		ret = qxl_bo_reserve(release->bos[0], no_wait);
++
++	if (!bo->pin_count) {
++		qxl_ttm_placement_from_domain(bo, bo->type, false);
++		ret = ttm_bo_validate(&bo->tbo, &bo->placement,
++				      true, false);
+ 		if (ret)
+ 			return ret;
+ 	}
++
++	/* allocate a surface for reserved + validated buffers */
++	ret = qxl_bo_check_id(bo->gem_base.dev->dev_private, bo);
++	if (ret)
++		return ret;
+ 	return 0;
+ }
+ 
+-void qxl_release_unreserve(struct qxl_device *qdev,
+-			  struct qxl_release *release)
++int qxl_release_reserve_list(struct qxl_release *release, bool no_intr)
+ {
+-	if (atomic_dec_and_test(&release->bos[0]->reserve_count))
+-		qxl_bo_unreserve(release->bos[0]);
++	int ret;
++	struct qxl_bo_list *entry;
++
++	/* if only one object on the release its the release itself
++	   since these objects are pinned no need to reserve */
++	if (list_is_singular(&release->bos))
++		return 0;
++
++	ret = ttm_eu_reserve_buffers(&release->ticket, &release->bos);
++	if (ret)
++		return ret;
++
++	list_for_each_entry(entry, &release->bos, tv.head) {
++		struct qxl_bo *bo = to_qxl_bo(entry->tv.bo);
++
++		ret = qxl_release_validate_bo(bo);
++		if (ret) {
++			ttm_eu_backoff_reservation(&release->ticket, &release->bos);
++			return ret;
++		}
++	}
++	return 0;
+ }
+ 
++void qxl_release_backoff_reserve_list(struct qxl_release *release)
++{
++	/* if only one object on the release its the release itself
++	   since these objects are pinned no need to reserve */
++	if (list_is_singular(&release->bos))
++		return;
++
++	ttm_eu_backoff_reservation(&release->ticket, &release->bos);
++}
++
++
+ int qxl_alloc_surface_release_reserved(struct qxl_device *qdev,
+ 				       enum qxl_surface_cmd_type surface_cmd_type,
+ 				       struct qxl_release *create_rel,
+ 				       struct qxl_release **release)
+ {
+-	int ret;
+-
+ 	if (surface_cmd_type == QXL_SURFACE_CMD_DESTROY && create_rel) {
+ 		int idr_ret;
++		struct qxl_bo_list *entry = list_first_entry(&create_rel->bos, struct qxl_bo_list, tv.head);
+ 		struct qxl_bo *bo;
+ 		union qxl_release_info *info;
+ 
+ 		/* stash the release after the create command */
+ 		idr_ret = qxl_release_alloc(qdev, QXL_RELEASE_SURFACE_CMD, release);
+-		bo = qxl_bo_ref(create_rel->bos[0]);
++		bo = qxl_bo_ref(to_qxl_bo(entry->tv.bo));
+ 
+ 		(*release)->release_offset = create_rel->release_offset + 64;
+ 
+-		qxl_release_add_res(qdev, *release, bo);
++		qxl_release_list_add(*release, bo);
+ 
+-		ret = qxl_release_reserve(qdev, *release, false);
+-		if (ret) {
+-			DRM_ERROR("release reserve failed\n");
+-			goto out_unref;
+-		}
+ 		info = qxl_release_map(qdev, *release);
+ 		info->id = idr_ret;
+ 		qxl_release_unmap(qdev, *release, info);
+ 
+-
+-out_unref:
+ 		qxl_bo_unref(&bo);
+-		return ret;
++		return 0;
+ 	}
+ 
+ 	return qxl_alloc_release_reserved(qdev, sizeof(struct qxl_surface_cmd),
+@@ -189,7 +222,7 @@ int qxl_alloc_release_reserved(struct qxl_device *qdev, unsigned long size,
+ {
+ 	struct qxl_bo *bo;
+ 	int idr_ret;
+-	int ret;
++	int ret = 0;
+ 	union qxl_release_info *info;
+ 	int cur_idx;
+ 
+@@ -228,36 +261,18 @@ int qxl_alloc_release_reserved(struct qxl_device *qdev, unsigned long size,
+ 	if (rbo)
+ 		*rbo = bo;
+ 
+-	qxl_release_add_res(qdev, *release, bo);
+-
+-	ret = qxl_release_reserve(qdev, *release, false);
+ 	mutex_unlock(&qdev->release_mutex);
+-	if (ret)
+-		goto out_unref;
++
++	qxl_release_list_add(*release, bo);
+ 
+ 	info = qxl_release_map(qdev, *release);
+ 	info->id = idr_ret;
+ 	qxl_release_unmap(qdev, *release, info);
+ 
+-out_unref:
+ 	qxl_bo_unref(&bo);
+ 	return ret;
+ }
+ 
+-int qxl_fence_releaseable(struct qxl_device *qdev,
+-			  struct qxl_release *release)
+-{
+-	int i, ret;
+-	for (i = 0; i < release->bo_count; i++) {
+-		if (!release->bos[i]->tbo.sync_obj)
+-			release->bos[i]->tbo.sync_obj = &release->bos[i]->fence;
+-		ret = qxl_fence_add_release(&release->bos[i]->fence, release->id);
+-		if (ret)
+-			return ret;
+-	}
+-	return 0;
+-}
+-
+ struct qxl_release *qxl_release_from_id_locked(struct qxl_device *qdev,
+ 						   uint64_t id)
+ {
+@@ -270,10 +285,7 @@ struct qxl_release *qxl_release_from_id_locked(struct qxl_device *qdev,
+ 		DRM_ERROR("failed to find id in release_idr\n");
+ 		return NULL;
+ 	}
+-	if (release->bo_count < 1) {
+-		DRM_ERROR("read a released resource with 0 bos\n");
+-		return NULL;
+-	}
++
+ 	return release;
+ }
+ 
+@@ -282,9 +294,12 @@ union qxl_release_info *qxl_release_map(struct qxl_device *qdev,
+ {
+ 	void *ptr;
+ 	union qxl_release_info *info;
+-	struct qxl_bo *bo = release->bos[0];
++	struct qxl_bo_list *entry = list_first_entry(&release->bos, struct qxl_bo_list, tv.head);
++	struct qxl_bo *bo = to_qxl_bo(entry->tv.bo);
+ 
+ 	ptr = qxl_bo_kmap_atomic_page(qdev, bo, release->release_offset & PAGE_SIZE);
++	if (!ptr)
++		return NULL;
+ 	info = ptr + (release->release_offset & ~PAGE_SIZE);
+ 	return info;
+ }
+@@ -293,9 +308,51 @@ void qxl_release_unmap(struct qxl_device *qdev,
+ 		       struct qxl_release *release,
+ 		       union qxl_release_info *info)
+ {
+-	struct qxl_bo *bo = release->bos[0];
++	struct qxl_bo_list *entry = list_first_entry(&release->bos, struct qxl_bo_list, tv.head);
++	struct qxl_bo *bo = to_qxl_bo(entry->tv.bo);
+ 	void *ptr;
+ 
+ 	ptr = ((void *)info) - (release->release_offset & ~PAGE_SIZE);
+ 	qxl_bo_kunmap_atomic_page(qdev, bo, ptr);
+ }
++
++void qxl_release_fence_buffer_objects(struct qxl_release *release)
++{
++	struct ttm_validate_buffer *entry;
++	struct ttm_buffer_object *bo;
++	struct ttm_bo_global *glob;
++	struct ttm_bo_device *bdev;
++	struct ttm_bo_driver *driver;
++	struct qxl_bo *qbo;
++
++	/* if only one object on the release its the release itself
++	   since these objects are pinned no need to reserve */
++	if (list_is_singular(&release->bos))
++		return;
++
++	bo = list_first_entry(&release->bos, struct ttm_validate_buffer, head)->bo;
++	bdev = bo->bdev;
++	driver = bdev->driver;
++	glob = bo->glob;
++
++	spin_lock(&glob->lru_lock);
++	spin_lock(&bdev->fence_lock);
++
++	list_for_each_entry(entry, &release->bos, head) {
++		bo = entry->bo;
++		qbo = to_qxl_bo(bo);
++
++		if (!entry->bo->sync_obj)
++			entry->bo->sync_obj = &qbo->fence;
++
++		qxl_fence_add_release_locked(&qbo->fence, release->id);
++
++		ttm_bo_add_to_lru(bo);
++		ww_mutex_unlock(&bo->resv->lock);
++		entry->reserved = false;
++	}
++	spin_unlock(&bdev->fence_lock);
++	spin_unlock(&glob->lru_lock);
++	ww_acquire_fini(&release->ticket);
++}
++
+-- 
+1.8.4.93.g57e4c17
+

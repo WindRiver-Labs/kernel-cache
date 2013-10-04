@@ -1,0 +1,231 @@
+From fa9de2c452314295af469de5ce4ca29c7a75b5f5 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Tue, 7 May 2013 09:48:30 +1000
+Subject: [PATCH 642/904] drm/nouveau: delay busy bo vma removal until fence
+ signals
+
+commit c4c7044ffc1ba973e2ec0f0dc94980b49101d877 upstream
+
+As opposed to an explicit wait.  Allows userspace to not stall waiting
+on buffer deletion.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+---
+ drivers/gpu/drm/nouveau/nouveau_bo.c    |  7 +---
+ drivers/gpu/drm/nouveau/nouveau_fence.c | 73 ++++++++++++++++++++++++++++++---
+ drivers/gpu/drm/nouveau/nouveau_fence.h |  2 +
+ drivers/gpu/drm/nouveau/nouveau_gem.c   | 41 ++++++++++++++++--
+ 4 files changed, 108 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index 86eef68..a1cf825 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -1550,13 +1550,8 @@ void
+ nouveau_bo_vma_del(struct nouveau_bo *nvbo, struct nouveau_vma *vma)
+ {
+ 	if (vma->node) {
+-		if (nvbo->bo.mem.mem_type != TTM_PL_SYSTEM) {
+-			spin_lock(&nvbo->bo.bdev->fence_lock);
+-			ttm_bo_wait(&nvbo->bo, false, false, false);
+-			spin_unlock(&nvbo->bo.bdev->fence_lock);
++		if (nvbo->bo.mem.mem_type != TTM_PL_SYSTEM)
+ 			nouveau_vm_unmap(vma);
+-		}
+-
+ 		nouveau_vm_put(vma);
+ 		list_del(&vma->head);
+ 	}
+diff --git a/drivers/gpu/drm/nouveau/nouveau_fence.c b/drivers/gpu/drm/nouveau/nouveau_fence.c
+index 6c94683..1680d91 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_fence.c
++++ b/drivers/gpu/drm/nouveau/nouveau_fence.c
+@@ -35,15 +35,34 @@
+ 
+ #include <engine/fifo.h>
+ 
++struct fence_work {
++	struct work_struct base;
++	struct list_head head;
++	void (*func)(void *);
++	void *data;
++};
++
++static void
++nouveau_fence_signal(struct nouveau_fence *fence)
++{
++	struct fence_work *work, *temp;
++
++	list_for_each_entry_safe(work, temp, &fence->work, head) {
++		schedule_work(&work->base);
++		list_del(&work->head);
++	}
++
++	fence->channel = NULL;
++	list_del(&fence->head);
++}
++
+ void
+ nouveau_fence_context_del(struct nouveau_fence_chan *fctx)
+ {
+ 	struct nouveau_fence *fence, *fnext;
+ 	spin_lock(&fctx->lock);
+ 	list_for_each_entry_safe(fence, fnext, &fctx->pending, head) {
+-		fence->channel = NULL;
+-		list_del(&fence->head);
+-		nouveau_fence_unref(&fence);
++		nouveau_fence_signal(fence);
+ 	}
+ 	spin_unlock(&fctx->lock);
+ }
+@@ -57,6 +76,50 @@ nouveau_fence_context_new(struct nouveau_fence_chan *fctx)
+ }
+ 
+ static void
++nouveau_fence_work_handler(struct work_struct *kwork)
++{
++	struct fence_work *work = container_of(kwork, typeof(*work), base);
++	work->func(work->data);
++	kfree(work);
++}
++
++void
++nouveau_fence_work(struct nouveau_fence *fence,
++		   void (*func)(void *), void *data)
++{
++	struct nouveau_channel *chan = fence->channel;
++	struct nouveau_fence_chan *fctx;
++	struct fence_work *work = NULL;
++
++	if (nouveau_fence_done(fence)) {
++		func(data);
++		return;
++	}
++
++	fctx = chan->fence;
++	work = kmalloc(sizeof(*work), GFP_KERNEL);
++	if (!work) {
++		WARN_ON(nouveau_fence_wait(fence, false, false));
++		func(data);
++		return;
++	}
++
++	spin_lock(&fctx->lock);
++	if (!fence->channel) {
++		spin_unlock(&fctx->lock);
++		kfree(work);
++		func(data);
++		return;
++	}
++
++	INIT_WORK(&work->base, nouveau_fence_work_handler);
++	work->func = func;
++	work->data = data;
++	list_add(&work->head, &fence->work);
++	spin_unlock(&fctx->lock);
++}
++
++static void
+ nouveau_fence_update(struct nouveau_channel *chan)
+ {
+ 	struct nouveau_fence_chan *fctx = chan->fence;
+@@ -67,8 +130,7 @@ nouveau_fence_update(struct nouveau_channel *chan)
+ 		if (fctx->read(chan) < fence->sequence)
+ 			break;
+ 
+-		fence->channel = NULL;
+-		list_del(&fence->head);
++		nouveau_fence_signal(fence);
+ 		nouveau_fence_unref(&fence);
+ 	}
+ 	spin_unlock(&fctx->lock);
+@@ -265,6 +327,7 @@ nouveau_fence_new(struct nouveau_channel *chan, bool sysmem,
+ 	if (!fence)
+ 		return -ENOMEM;
+ 
++	INIT_LIST_HEAD(&fence->work);
+ 	fence->sysmem = sysmem;
+ 	kref_init(&fence->kref);
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_fence.h b/drivers/gpu/drm/nouveau/nouveau_fence.h
+index c899434..c57bb61 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_fence.h
++++ b/drivers/gpu/drm/nouveau/nouveau_fence.h
+@@ -5,6 +5,7 @@ struct nouveau_drm;
+ 
+ struct nouveau_fence {
+ 	struct list_head head;
++	struct list_head work;
+ 	struct kref kref;
+ 
+ 	bool sysmem;
+@@ -22,6 +23,7 @@ void nouveau_fence_unref(struct nouveau_fence **);
+ 
+ int  nouveau_fence_emit(struct nouveau_fence *, struct nouveau_channel *);
+ bool nouveau_fence_done(struct nouveau_fence *);
++void nouveau_fence_work(struct nouveau_fence *, void (*)(void *), void *);
+ int  nouveau_fence_wait(struct nouveau_fence *, bool lazy, bool intr);
+ int  nouveau_fence_sync(struct nouveau_fence *, struct nouveau_channel *);
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_gem.c b/drivers/gpu/drm/nouveau/nouveau_gem.c
+index 2b2077d..e72d09c 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_gem.c
++++ b/drivers/gpu/drm/nouveau/nouveau_gem.c
+@@ -102,6 +102,41 @@ out:
+ 	return ret;
+ }
+ 
++static void
++nouveau_gem_object_delete(void *data)
++{
++	struct nouveau_vma *vma = data;
++	nouveau_vm_unmap(vma);
++	nouveau_vm_put(vma);
++	kfree(vma);
++}
++
++static void
++nouveau_gem_object_unmap(struct nouveau_bo *nvbo, struct nouveau_vma *vma)
++{
++	const bool mapped = nvbo->bo.mem.mem_type != TTM_PL_SYSTEM;
++	struct nouveau_fence *fence = NULL;
++
++	list_del(&vma->head);
++
++	if (mapped) {
++		spin_lock(&nvbo->bo.bdev->fence_lock);
++		if (nvbo->bo.sync_obj)
++			fence = nouveau_fence_ref(nvbo->bo.sync_obj);
++		spin_unlock(&nvbo->bo.bdev->fence_lock);
++	}
++
++	if (fence) {
++		nouveau_fence_work(fence, nouveau_gem_object_delete, vma);
++	} else {
++		if (mapped)
++			nouveau_vm_unmap(vma);
++		nouveau_vm_put(vma);
++		kfree(vma);
++	}
++	nouveau_fence_unref(&fence);
++}
++
+ void
+ nouveau_gem_object_close(struct drm_gem_object *gem, struct drm_file *file_priv)
+ {
+@@ -119,10 +154,8 @@ nouveau_gem_object_close(struct drm_gem_object *gem, struct drm_file *file_priv)
+ 
+ 	vma = nouveau_bo_vma_find(nvbo, cli->base.vm);
+ 	if (vma) {
+-		if (--vma->refcount == 0) {
+-			nouveau_bo_vma_del(nvbo, vma);
+-			kfree(vma);
+-		}
++		if (--vma->refcount == 0)
++			nouveau_gem_object_unmap(nvbo, vma);
+ 	}
+ 	ttm_bo_unreserve(&nvbo->bo);
+ }
+-- 
+1.8.4.93.g57e4c17
+
