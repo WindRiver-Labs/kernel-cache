@@ -1,0 +1,250 @@
+From 4af5fd3a69294a07bce360a75ad2de02791bdf68 Mon Sep 17 00:00:00 2001
+From: David Mercado <david.mercado@windriver.com>
+Date: Wed, 12 Jun 2013 15:53:03 -0400
+Subject: [PATCH 71/75] arch/powerpc: Fix PMU interrupts
+
+The PMU interrupts were previously initialized at too early in the
+board init process, so IRQ affinity wasn't working. Moved PMU IRQ
+setup/teardown to PMU enable/disable routines instead. With this
+change, PMU interrupts correctly work across all cores.
+
+Signed-off-by: David Mercado <david.mercado@windriver.com>
+---
+ arch/powerpc/perf/core-lsi-acp.c |  115 +++++++++++++++++++++++++++++++++++++-
+ arch/powerpc/perf/ppc476-pmu.c   |   59 -------------------
+ 2 files changed, 113 insertions(+), 61 deletions(-)
+
+diff --git a/arch/powerpc/perf/core-lsi-acp.c b/arch/powerpc/perf/core-lsi-acp.c
+index 9e8986d..28437b5 100644
+--- a/arch/powerpc/perf/core-lsi-acp.c
++++ b/arch/powerpc/perf/core-lsi-acp.c
+@@ -12,6 +12,8 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/cpumask.h>
++#include <linux/interrupt.h>
+ #include <linux/sched.h>
+ #include <linux/perf_event.h>
+ #include <linux/percpu.h>
+@@ -53,6 +55,115 @@ static inline int perf_intr_is_nmi(struct pt_regs *regs)
+ 
+ static void perf_event_interrupt(struct pt_regs *regs);
+ 
++static int cpu_to_pmu_irq(int cpu)
++{
++	int hwirq;
++
++	/*
++	 * NOTE: On the LSI ACP platform, the PMU interrupts are
++	 * hard-wired as inputs to the MPIC. The irq numbers are
++	 * fixed as follows:
++	 *
++	 *   Core 0 PMU: IRQ 95
++	 *   Core 1 PMU: IRQ 94
++	 *   Core 2 PMU: IRQ 93
++	 *   Core 3 PMU: IRQ 92
++	 *
++	 * The IRQ assignment should probably be done in the DTB,
++	 * like ARM does, but no other PowerPC platform does this.
++	 * So for now, we hard-code the numbers here.
++	 */
++	if (cpu == 0)
++		hwirq = 95;
++	else if (cpu == 1)
++		hwirq = 94;
++	else if (cpu == 2)
++		hwirq = 93;
++	else if (cpu == 3)
++		hwirq = 92;
++	else
++		hwirq = 0;
++
++	return hwirq;
++}
++
++static cpumask_t active_irqs;
++
++/* PMU IRQ handler */
++static irqreturn_t acp_pmu_isr(int irq, void *dev_id)
++{
++	__get_cpu_var(irq_stat).pmu_irqs++;
++	perf_irq(get_irq_regs());
++	return IRQ_HANDLED;
++}
++
++static void acp_pmu_release_hardware(void)
++{
++	int i, irq, virq;
++
++	for (i = 0; i < num_possible_cpus(); ++i) {
++		if (!cpumask_test_and_clear_cpu(i, &active_irqs))
++			continue;
++		irq = cpu_to_pmu_irq(i);
++		if (irq) {
++			free_irq(irq, NULL);
++			virq = irq_find_mapping(NULL, irq);
++			if (virq)
++				irq_dispose_mapping(virq);
++		}
++	}
++
++	release_pmc_hardware();
++}
++
++static int acp_pmu_reserve_hardware(void)
++{
++	int err = 0;
++	int i, irq, hwirq;
++
++	err = reserve_pmc_hardware(perf_event_interrupt);
++
++	if (err) {
++		pr_warning("unable to reserve pmu\n");
++		return err;
++	}
++
++	for (i = 0; i < num_possible_cpus(); ++i) {
++		err = 0;
++
++		hwirq = cpu_to_pmu_irq(i);
++		if (!hwirq)
++			continue;
++
++		irq = irq_create_mapping(NULL, hwirq);
++		if (irq == NO_IRQ) {
++			pr_err("PMU irq_create_mapping() failed\n");
++			continue;
++		}
++
++		irq = cpu_to_pmu_irq(i);
++		if (irq < 0)
++			continue;
++
++		if (irq_set_affinity(irq, cpumask_of(i))) {
++			pr_warning("PMU IRQ affinity failed (irq=%d, cpu=%d)\n",
++				   irq, i);
++			continue;
++		}
++		err = request_irq(irq, acp_pmu_isr,
++				  IRQF_DISABLED | IRQF_NOBALANCING,
++				  "pmu", NULL);
++		if (err) {
++			pr_err("PMU reqeust for IRQ%d failed\n", irq);
++			acp_pmu_release_hardware();
++			return err;
++		}
++		cpumask_set_cpu(i, &active_irqs);
++	}
++
++	return 0;
++}
++
+ 
+ static void acp_pmu_read(struct perf_event *event)
+ {
+@@ -339,7 +450,7 @@ static void hw_perf_event_destroy(struct perf_event *event)
+ 	if (!atomic_add_unless(&num_events, -1, 1)) {
+ 		mutex_lock(&pmc_reserve_mutex);
+ 		if (atomic_dec_return(&num_events) == 0)
+-			release_pmc_hardware();
++			acp_pmu_release_hardware();
+ 		mutex_unlock(&pmc_reserve_mutex);
+ 	}
+ }
+@@ -445,7 +556,7 @@ static int acp_pmu_event_init(struct perf_event *event)
+ 
+ 		mutex_lock(&pmc_reserve_mutex);
+ 		if (atomic_read(&num_events) == 0 &&
+-		    reserve_pmc_hardware(perf_event_interrupt))
++		    acp_pmu_reserve_hardware())
+ 			err = -EBUSY;
+ 		else
+ 			atomic_inc(&num_events);
+diff --git a/arch/powerpc/perf/ppc476-pmu.c b/arch/powerpc/perf/ppc476-pmu.c
+index 9bd9060..30c05d9 100644
+--- a/arch/powerpc/perf/ppc476-pmu.c
++++ b/arch/powerpc/perf/ppc476-pmu.c
+@@ -19,14 +19,6 @@
+ #include <asm/perf_event_acp.h>
+ #include <asm/reg_acp_pmu.h>
+ 
+-/* PMU IRQ handler */
+-static irqreturn_t acp_pmu_isr(int irq, void *dev_id)
+-{
+-	__get_cpu_var(irq_stat).pmu_irqs++;
+-	perf_irq(get_irq_regs());
+-	return IRQ_HANDLED;
+-}
+-
+ /*
+  * Map of generic hardware event types to hardware events
+  * Zero if unsupported
+@@ -129,13 +121,6 @@ static struct acp_pmu ppc476_pmu = {
+ 
+ static int init_ppc476_pmu(void)
+ {
+-	unsigned int irq;
+-	int intNum, core;
+-	static const char * const irqname[] = { "pmu-core0",
+-						"pmu-core1",
+-						"pmu-core2",
+-						"pmu-core3" };
+-
+ 	if (!cur_cpu_spec->oprofile_cpu_type)
+ 		return -ENODEV;
+ 
+@@ -144,50 +129,6 @@ static int init_ppc476_pmu(void)
+ 	else
+ 		return -ENODEV;
+ 
+-	/*
+-	 * Install the PMU interrupt handlers:
+-	 *
+-	 * NOTE: On the LSI ACP platform, the PMU interrupts are
+-	 * hard-wired as inputs to the MPIC. The irq numbers are
+-	 * fixed as follows:
+-	 *
+-	 *   Core 0 PMU: IRQ 95
+-	 *   Core 1 PMU: IRQ 94
+-	 *   Core 2 PMU: IRQ 93
+-	 *   Core 3 PMU: IRQ 92
+-	 *
+-	 * The IRQ assignment should probably be done in the DTB,
+-	 * like ARM does, but no other PowerPC platform does this.
+-	 * So for now, we hard-code the numbers here.
+-	 */
+-	for_each_possible_cpu(core) {
+-		if (core == 0)
+-			intNum = 95;
+-		else if (core == 1)
+-			intNum = 94;
+-		else if (core == 2)
+-			intNum = 93;
+-		else if (core == 3)
+-			intNum = 92;
+-		else
+-			break;
+-
+-		irq = irq_create_mapping(NULL, intNum);
+-		if (irq == NO_IRQ) {
+-			pr_err("PMU irq_create_mapping() failed\n");
+-			break;
+-		}
+-		if (irq_set_affinity(irq, get_cpu_mask(core))) {
+-			pr_warning("PMU IRQ affinity failed (irq=%d, cpu=%d)\n",
+-				   irq, core);
+-			continue;
+-		}
+-		if (request_irq(irq, acp_pmu_isr,
+-				IRQF_DISABLED | IRQF_NOBALANCING,
+-				irqname[core], NULL))
+-			pr_err("PMU reqeust for IRQ%d failed\n", irq);
+-	}
+-
+ 	return register_acp_pmu(&ppc476_pmu);
+ }
+ 
+-- 
+1.7.5.4
+
