@@ -1,0 +1,276 @@
+From 73c24b75cdedde5a4259e17dd9cd7602dd8d9f67 Mon Sep 17 00:00:00 2001
+From: Nam Ninh <nam.ninh@windriver.com>
+Date: Mon, 21 Oct 2013 13:37:24 -0400
+Subject: [PATCH] KVM-host: Inject vIRQ to guest for IRQ latency test
+
+When inject_virq=1 is specified with kvm module loading, vIRQ injecting
+to guest is enabled. The injecting period is 1 second by default.
+
+Signed-off-by: Nam Ninh <nam.ninh@windriver.com>
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 5492521..dc27628 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -498,6 +498,12 @@ struct kvm_vcpu_arch {
+ 		u64 msr_val;
+ 		struct gfn_to_hva_cache data;
+ 	} pv_eoi;
++
++	/* Guest tsc counter before virq is injected into the guest */
++	struct {
++		u64 tsc;
++		struct gfn_to_hva_cache data;
++	} guest_tsc;
+ };
+ 
+ struct kvm_lpage_info {
+diff --git a/arch/x86/include/asm/kvm_para.h b/arch/x86/include/asm/kvm_para.h
+index 2f7712e..dcd7095 100644
+--- a/arch/x86/include/asm/kvm_para.h
++++ b/arch/x86/include/asm/kvm_para.h
+@@ -39,6 +39,7 @@
+ #define MSR_KVM_ASYNC_PF_EN 0x4b564d02
+ #define MSR_KVM_STEAL_TIME  0x4b564d03
+ #define MSR_KVM_PV_EOI_EN      0x4b564d04
++#define MSR_KVM_GUEST_TSC      0x4b564d05
+ 
+ struct kvm_steal_time {
+ 	__u64 steal;
+diff --git a/arch/x86/kvm/Kconfig b/arch/x86/kvm/Kconfig
+index a28f338..1494fd7 100644
+--- a/arch/x86/kvm/Kconfig
++++ b/arch/x86/kvm/Kconfig
+@@ -80,6 +80,19 @@ config KVM_MMU_AUDIT
+ 	 This option adds a R/W kVM module parameter 'mmu_audit', which allows
+ 	 audit  KVM MMU at runtime.
+ 
++config VIRT_INT_LAT_HOST
++	bool "Inject vIRQ to KVM guest"
++	depends on KVM
++	default n
++	---help---
++	 Enable this option to inject vIRQ to KVM guest for vIRQ latency
++	 measurement on the guest
++
++config VIRT_INT_INJECT_PERIOD
++	int "Frequency to inject vIRQ from host to guest in msec"
++	depends on VIRT_INT_LAT_HOST
++	default 1000
++
+ # OK, it's a little counter-intuitive to do this, but it puts it neatly under
+ # the virtualization menu.
+ source drivers/vhost/Kconfig
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index c009aaa..d938be0 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -46,8 +46,6 @@
+ #include "trace.h"
+ 
+ #define __ex(x) __kvm_handle_fault_on_reboot(x)
+-#define __ex_clear(x, reg) \
+-	____kvm_handle_fault_on_reboot(x, "xor " reg " , " reg)
+ 
+ MODULE_AUTHOR("Qumranet");
+ MODULE_LICENSE("GPL");
+@@ -1128,15 +1126,6 @@ static inline void ept_sync_individual_addr(u64 eptp, gpa_t gpa)
+ 	}
+ }
+ 
+-static __always_inline unsigned long vmcs_readl(unsigned long field)
+-{
+-	unsigned long value;
+-
+-	asm volatile (__ex_clear(ASM_VMX_VMREAD_RDX_RAX, "%0")
+-		      : "=a"(value) : "d"(field) : "cc");
+-	return value;
+-}
+-
+ static __always_inline u16 vmcs_read16(unsigned long field)
+ {
+ 	return vmcs_readl(field);
+@@ -1147,15 +1136,6 @@ static __always_inline u32 vmcs_read32(unsigned long field)
+ 	return vmcs_readl(field);
+ }
+ 
+-static __always_inline u64 vmcs_read64(unsigned long field)
+-{
+-#ifdef CONFIG_X86_64
+-	return vmcs_readl(field);
+-#else
+-	return vmcs_readl(field) | ((u64)vmcs_readl(field+1) << 32);
+-#endif
+-}
+-
+ static noinline void vmwrite_error(unsigned long field, unsigned long value)
+ {
+ 	printk(KERN_ERR "vmwrite error: reg %lx value %lx (err %d)\n",
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index ed53290..e680905 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -101,6 +101,13 @@ EXPORT_SYMBOL_GPL(kvm_max_guest_tsc_khz);
+ static u32 tsc_tolerance_ppm = 250;
+ module_param(tsc_tolerance_ppm, uint, S_IRUGO | S_IWUSR);
+ 
++#ifdef CONFIG_VIRT_INT_LAT_HOST
++static bool inject_enabled;
++static int auto_inject_virq;
++static unsigned long auto_inject_jiffies;
++module_param(inject_enabled, bool, S_IRUGO | S_IWUSR);
++#endif
++
+ #define KVM_NR_SHARED_MSRS 16
+ 
+ struct kvm_shared_msrs_global {
+@@ -1696,7 +1703,15 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		if (kvm_lapic_enable_pv_eoi(vcpu, data))
+ 			return 1;
+ 		break;
+-
++#ifdef CONFIG_VIRT_INT_LAT_HOST
++	case MSR_KVM_GUEST_TSC:
++		if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++						&vcpu->arch.guest_tsc.data,
++						data,
++						sizeof(u64)))
++			return 1;
++		break;
++#endif
+ 	case MSR_IA32_MCG_CTL:
+ 	case MSR_IA32_MCG_STATUS:
+ 	case MSR_IA32_MC0_CTL ... MSR_IA32_MC0_CTL + 4 * KVM_MAX_MCE_BANKS - 1:
+@@ -1947,6 +1962,7 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
+ 	case MSR_K8_INT_PENDING_MSG:
+ 	case MSR_AMD64_NB_CFG:
+ 	case MSR_FAM10H_MMIO_CONF_BASE:
++	case MSR_KVM_GUEST_TSC:
+ 		data = 0;
+ 		break;
+ 	case MSR_P6_PERFCTR0:
+@@ -2727,6 +2743,20 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 		break;
+ 	}
+ 	case KVM_NMI: {
++#ifdef CONFIG_VIRT_INT_LAT_HOST
++		if (inject_enabled) {
++			/* nmi command in qemu monitor enables this parameter */
++			if (auto_inject_virq == 0) {
++				pr_debug("## Enable auto_inject_virq\n");
++				auto_inject_virq = 1;
++			} else {
++				pr_debug("## Disable auto_inject_virq\n");
++				auto_inject_virq = 0;
++			}
++			r = 0;
++			break;
++		}
++#endif
+ 		r = kvm_vcpu_ioctl_nmi(vcpu);
+ 		if (r)
+ 			goto out;
+@@ -5467,6 +5497,30 @@ out:
+ 	return r;
+ }
+ 
++#ifdef CONFIG_VIRT_INT_LAT_HOST
++
++/*
++ * Reads and returns guest's timestamp counter "register"
++ * guest_tsc = host_tsc + tsc_offset
++ */
++static u64 guest_read_tsc(void)
++{
++	u64 host_tsc, tsc_offset;
++
++	rdtscll(host_tsc);
++	tsc_offset = vmcs_read64(TSC_OFFSET);
++	return host_tsc + tsc_offset;
++}
++
++static void virq_inject_time(struct kvm_vcpu *vcpu)
++{
++	vcpu->arch.guest_tsc.tsc = guest_read_tsc();
++
++	kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.guest_tsc.data,
++		&vcpu->arch.guest_tsc.tsc, sizeof(u64));
++}
++
++#endif  /* CONFIG_VIRT_INT_LAT_HOST */
+ 
+ static int __vcpu_run(struct kvm_vcpu *vcpu)
+ {
+@@ -5528,7 +5582,29 @@ static int __vcpu_run(struct kvm_vcpu *vcpu)
+ 			vcpu->run->exit_reason = KVM_EXIT_INTR;
+ 			++vcpu->stat.request_irq_exits;
+ 		}
+-
++#ifdef CONFIG_VIRT_INT_LAT_HOST
++		/*
++		 * After entering the nmi command in qemu monitor and exiting
++		 * the monitor, the host will automatically inject nmi virq
++		 * every second.
++		 */
++		if (auto_inject_virq) {
++			if ((auto_inject_jiffies == 0) ||
++			    time_after(jiffies, auto_inject_jiffies)) {
++				unsigned int virq_period;
++				/*
++				 * Let the guest know the timestamp when the
++				 * virq was injected from host
++				 */
++				virq_inject_time(vcpu);
++				/* Inject the virq now */
++				kvm_vcpu_ioctl_nmi(vcpu);
++				virq_period = CONFIG_VIRT_INT_INJECT_PERIOD;
++				auto_inject_jiffies =
++					jiffies + msecs_to_jiffies(virq_period);
++			}
++		}
++#endif
+ 		kvm_check_async_pf_completion(vcpu);
+ 
+ 		if (signal_pending(current)) {
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index e224f7a..62d46c8 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -2,8 +2,34 @@
+ #define ARCH_X86_KVM_X86_H
+ 
+ #include <linux/kvm_host.h>
++#include <asm/vmx.h>
+ #include "kvm_cache_regs.h"
+ 
++#define __ex_clear(x, reg) \
++	____kvm_handle_fault_on_reboot(x, "xor " reg " , " reg)
++
++/*
++ * vmcs_readl and vmcs_read64 are moved here from vmx.c so that
++ * kvm/x86.c can use.
++ */
++static __always_inline unsigned long vmcs_readl(unsigned long field)
++{
++	unsigned long value;
++
++	asm volatile (__ex_clear(ASM_VMX_VMREAD_RDX_RAX, "%0")
++		      : "=a"(value) : "d"(field) : "cc");
++	return value;
++}
++
++static __always_inline u64 vmcs_read64(unsigned long field)
++{
++#ifdef CONFIG_X86_64
++	return vmcs_readl(field);
++#else
++	return vmcs_readl(field) | ((u64)vmcs_readl(field+1) << 32);
++#endif
++}
++
+ static inline void kvm_clear_exception_queue(struct kvm_vcpu *vcpu)
+ {
+ 	vcpu->arch.exception.pending = false;
+-- 
+1.8.4
+

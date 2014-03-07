@@ -1,0 +1,170 @@
+From 09082ec4b6a5045a44de195fc7b5073adf69000d Mon Sep 17 00:00:00 2001
+From: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Date: Fri, 21 Jun 2013 13:00:57 -0700
+Subject: [PATCH] nohz_full: Add per-CPU idle-state tracking
+
+commit eb348b898290da242e46df75ab0b9772003e08b8 upstream.
+
+This commit adds the code that updates the rcu_dyntick structure's
+new fields to track the per-CPU idle state based on interrupts and
+transitions into and out of the idle loop (NMIs are ignored because NMI
+handlers cannot cleanly read out the time anyway).  This code is similar
+to the code that maintains RCU's idea of per-CPU idleness, but differs
+in that RCU treats CPUs running in user mode as idle, where this new
+code does not.
+
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Acked-by: Frederic Weisbecker <fweisbec@gmail.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+
+diff --git a/kernel/rcutree.c b/kernel/rcutree.c
+index eb2fbc4..50cf85c 100644
+--- a/kernel/rcutree.c
++++ b/kernel/rcutree.c
+@@ -443,6 +443,7 @@ void rcu_idle_enter(void)
+ 
+ 	local_irq_save(flags);
+ 	rcu_eqs_enter(false);
++	rcu_sysidle_enter(&__get_cpu_var(rcu_dynticks), 0);
+ 	local_irq_restore(flags);
+ }
+ EXPORT_SYMBOL_GPL(rcu_idle_enter);
+@@ -493,6 +494,7 @@ void rcu_irq_exit(void)
+ 		trace_rcu_dyntick(TPS("--="), oldval, rdtp->dynticks_nesting);
+ 	else
+ 		rcu_eqs_enter_common(rdtp, oldval, true);
++	rcu_sysidle_enter(rdtp, 1);
+ 	local_irq_restore(flags);
+ }
+ 
+@@ -561,6 +563,7 @@ void rcu_idle_exit(void)
+ 
+ 	local_irq_save(flags);
+ 	rcu_eqs_exit(false);
++	rcu_sysidle_exit(&__get_cpu_var(rcu_dynticks), 0);
+ 	local_irq_restore(flags);
+ }
+ EXPORT_SYMBOL_GPL(rcu_idle_exit);
+@@ -612,6 +615,7 @@ void rcu_irq_enter(void)
+ 		trace_rcu_dyntick(TPS("++="), oldval, rdtp->dynticks_nesting);
+ 	else
+ 		rcu_eqs_exit_common(rdtp, oldval, true);
++	rcu_sysidle_exit(rdtp, 1);
+ 	local_irq_restore(flags);
+ }
+ 
+diff --git a/kernel/rcutree.h b/kernel/rcutree.h
+index 2139826..0322809 100644
+--- a/kernel/rcutree.h
++++ b/kernel/rcutree.h
+@@ -557,6 +557,8 @@ static void rcu_boot_init_nocb_percpu_data(struct rcu_data *rdp);
+ static void rcu_spawn_nocb_kthreads(struct rcu_state *rsp);
+ static bool init_nocb_callback_list(struct rcu_data *rdp);
+ static void rcu_kick_nohz_cpu(int cpu);
++static void rcu_sysidle_enter(struct rcu_dynticks *rdtp, int irq);
++static void rcu_sysidle_exit(struct rcu_dynticks *rdtp, int irq);
+ static void rcu_sysidle_init_percpu_data(struct rcu_dynticks *rdtp);
+ 
+ #endif /* #ifndef RCU_TREE_NONCORE */
+diff --git a/kernel/rcutree_plugin.h b/kernel/rcutree_plugin.h
+index 27147d0..dad3fab 100644
+--- a/kernel/rcutree_plugin.h
++++ b/kernel/rcutree_plugin.h
+@@ -2387,6 +2387,77 @@ static void rcu_kick_nohz_cpu(int cpu)
+ #ifdef CONFIG_NO_HZ_FULL_SYSIDLE
+ 
+ /*
++ * Invoked to note exit from irq or task transition to idle.  Note that
++ * usermode execution does -not- count as idle here!  After all, we want
++ * to detect full-system idle states, not RCU quiescent states and grace
++ * periods.  The caller must have disabled interrupts.
++ */
++static void rcu_sysidle_enter(struct rcu_dynticks *rdtp, int irq)
++{
++	unsigned long j;
++
++	/* Adjust nesting, check for fully idle. */
++	if (irq) {
++		rdtp->dynticks_idle_nesting--;
++		WARN_ON_ONCE(rdtp->dynticks_idle_nesting < 0);
++		if (rdtp->dynticks_idle_nesting != 0)
++			return;  /* Still not fully idle. */
++	} else {
++		if ((rdtp->dynticks_idle_nesting & DYNTICK_TASK_NEST_MASK) ==
++		    DYNTICK_TASK_NEST_VALUE) {
++			rdtp->dynticks_idle_nesting = 0;
++		} else {
++			rdtp->dynticks_idle_nesting -= DYNTICK_TASK_NEST_VALUE;
++			WARN_ON_ONCE(rdtp->dynticks_idle_nesting < 0);
++			return;  /* Still not fully idle. */
++		}
++	}
++
++	/* Record start of fully idle period. */
++	j = jiffies;
++	ACCESS_ONCE(rdtp->dynticks_idle_jiffies) = j;
++	smp_mb__before_atomic_inc();
++	atomic_inc(&rdtp->dynticks_idle);
++	smp_mb__after_atomic_inc();
++	WARN_ON_ONCE(atomic_read(&rdtp->dynticks_idle) & 0x1);
++}
++
++/*
++ * Invoked to note entry to irq or task transition from idle.  Note that
++ * usermode execution does -not- count as idle here!  The caller must
++ * have disabled interrupts.
++ */
++static void rcu_sysidle_exit(struct rcu_dynticks *rdtp, int irq)
++{
++	/* Adjust nesting, check for already non-idle. */
++	if (irq) {
++		rdtp->dynticks_idle_nesting++;
++		WARN_ON_ONCE(rdtp->dynticks_idle_nesting <= 0);
++		if (rdtp->dynticks_idle_nesting != 1)
++			return; /* Already non-idle. */
++	} else {
++		/*
++		 * Allow for irq misnesting.  Yes, it really is possible
++		 * to enter an irq handler then never leave it, and maybe
++		 * also vice versa.  Handle both possibilities.
++		 */
++		if (rdtp->dynticks_idle_nesting & DYNTICK_TASK_NEST_MASK) {
++			rdtp->dynticks_idle_nesting += DYNTICK_TASK_NEST_VALUE;
++			WARN_ON_ONCE(rdtp->dynticks_idle_nesting <= 0);
++			return; /* Already non-idle. */
++		} else {
++			rdtp->dynticks_idle_nesting = DYNTICK_TASK_EXIT_IDLE;
++		}
++	}
++
++	/* Record end of idle period. */
++	smp_mb__before_atomic_inc();
++	atomic_inc(&rdtp->dynticks_idle);
++	smp_mb__after_atomic_inc();
++	WARN_ON_ONCE(!(atomic_read(&rdtp->dynticks_idle) & 0x1));
++}
++
++/*
+  * Initialize dynticks sysidle state for CPUs coming online.
+  */
+ static void rcu_sysidle_init_percpu_data(struct rcu_dynticks *rdtp)
+@@ -2396,6 +2467,14 @@ static void rcu_sysidle_init_percpu_data(struct rcu_dynticks *rdtp)
+ 
+ #else /* #ifdef CONFIG_NO_HZ_FULL_SYSIDLE */
+ 
++static void rcu_sysidle_enter(struct rcu_dynticks *rdtp, int irq)
++{
++}
++
++static void rcu_sysidle_exit(struct rcu_dynticks *rdtp, int irq)
++{
++}
++
+ static void rcu_sysidle_init_percpu_data(struct rcu_dynticks *rdtp)
+ {
+ }
+-- 
+1.8.4.1
+
