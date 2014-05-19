@@ -1,0 +1,127 @@
+From b0c59314cfd745c54a448c0268f9008d3985e63c Mon Sep 17 00:00:00 2001
+From: Jian Liu <jian.liu@windriver.com>
+Date: Wed, 7 May 2014 16:05:59 +0800
+Subject: [PATCH] Fix AP powersave TX vs. wakeup race
+
+commit 1d147bfa64293b2723c4fec50922168658e613ba upstream
+
+There is a race between the TX path and the STA wakeup:
+while a station is sleeping, mac80211 buffers frames
+until it wakes up, then the frames are transmitted.
+However, the RX and TX path are concurrent, so the
+packet indicating wakeup can be processed while a
+packet is being transmitted.
+This can lead to a situation where the buffered frames
+list is emptied on the one side, while a frame is
+being added on the other side, as the station is still
+seen as sleeping in the TX path.
+As a result, the newly added frame will not be send
+anytime soon. It might be sent much later
+(and out of order) when the station goes to sleep
+and wakes up the next time.
+Additionally, it can lead to the crash below.
+Fix all this by synchronising both paths with a new
+lock. Both path are not fastpath since they handle
+PS situations.
+
+Reported-by: Yaara Rozenblum <yaara.rozenblum@intel.com>
+Reviewed-by: Stanislaw Gruszka <sgruszka@redhat.com>
+Signed-off-by: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+Signed-off-by: Jian Liu <jian.liu@windriver.com>
+---
+ net/mac80211/sta_info.c |    5 ++++-
+ net/mac80211/sta_info.h |    7 +++----
+ net/mac80211/tx.c       |   15 +++++++++++++++
+ 3 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/net/mac80211/sta_info.c b/net/mac80211/sta_info.c
+index e2e0e0b..43096c3 100644
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -242,6 +242,7 @@ struct sta_info *sta_info_alloc(struct ieee80211_sub_if_data *sdata,
+ 		return NULL;
+ 
+ 	spin_lock_init(&sta->lock);
++	spin_lock_init(&sta->ps_lock);
+ 	INIT_WORK(&sta->drv_unblock_wk, sta_unblock);
+ 	INIT_WORK(&sta->ampdu_mlme.work, ieee80211_ba_session_work);
+ 	mutex_init(&sta->ampdu_mlme.mtx);
+@@ -970,7 +971,8 @@ void ieee80211_sta_ps_deliver_wakeup(struct sta_info *sta)
+ 		drv_sta_notify(local, sdata, STA_NOTIFY_AWAKE, &sta->sta);
+ 
+ 	skb_queue_head_init(&pending);
+-
++	/* sync with ieee80211_tx_h_unicast_ps_buf */
++	spin_lock(&sta->ps_lock);
+ 	/* Send all buffered frames to the station */
+ 	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+ 		int count = skb_queue_len(&pending), tmp;
+@@ -990,6 +992,7 @@ void ieee80211_sta_ps_deliver_wakeup(struct sta_info *sta)
+ 	}
+ 
+ 	ieee80211_add_pending_skbs_fn(local, &pending, clear_sta_ps_flags, sta);
++	spin_unlock(&sta->ps_lock);
+ 
+ 	local->total_ps_buffered -= buffered;
+ 
+diff --git a/net/mac80211/sta_info.h b/net/mac80211/sta_info.h
+index ab05768..249f4d0 100644
+--- a/net/mac80211/sta_info.h
++++ b/net/mac80211/sta_info.h
+@@ -227,6 +227,7 @@ struct sta_ampdu_mlme {
+  * @drv_unblock_wk: used for driver PS unblocking
+  * @listen_interval: listen interval of this station, when we're acting as AP
+  * @_flags: STA flags, see &enum ieee80211_sta_info_flags, do not use directly
++ * @ps_lock: used for powersave (when mac80211 is the AP) related locking
+  * @ps_tx_buf: buffers (per AC) of frames to transmit to this station
+  *	when it leaves power saving state or polls
+  * @tx_filtered: buffers (per AC) of frames we already tried to
+@@ -297,10 +298,8 @@ struct sta_info {
+ 	/* use the accessors defined below */
+ 	unsigned long _flags;
+ 
+-	/*
+-	 * STA powersave frame queues, no more than the internal
+-	 * locking required.
+-	 */
++	/* STA powersave lock and frame queues */
++	spinlock_t ps_lock;
+ 	struct sk_buff_head ps_tx_buf[IEEE80211_NUM_ACS];
+ 	struct sk_buff_head tx_filtered[IEEE80211_NUM_ACS];
+ 	unsigned long driver_buffered_tids;
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index eace766..8c89bf7 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -471,6 +471,20 @@ ieee80211_tx_h_unicast_ps_buf(struct ieee80211_tx_data *tx)
+ #endif /* CONFIG_MAC80211_VERBOSE_PS_DEBUG */
+ 		if (tx->local->total_ps_buffered >= TOTAL_MAX_TX_BUFFER)
+ 			purge_old_ps_buffers(tx->local);
++
++		/* sync with ieee80211_sta_ps_deliver_wakeup */
++		spin_lock(&sta->ps_lock);
++		/*
++		* STA woke up the meantime and all the frames on ps_tx_buf have
++		* been queued to pending queue. No reordering can happen, go
++		* ahead and Tx the packet.
++		*/
++		if (!test_sta_flag(sta, WLAN_STA_PS_STA) &&
++		    !test_sta_flag(sta, WLAN_STA_PS_DRIVER)) {
++			spin_unlock(&sta->ps_lock);
++			return TX_CONTINUE;
++		}
++
+ 		if (skb_queue_len(&sta->ps_tx_buf[ac]) >= STA_MAX_TX_BUFFER) {
+ 			struct sk_buff *old = skb_dequeue(&sta->ps_tx_buf[ac]);
+ #ifdef CONFIG_MAC80211_VERBOSE_PS_DEBUG
+@@ -487,6 +501,7 @@ ieee80211_tx_h_unicast_ps_buf(struct ieee80211_tx_data *tx)
+ 		info->control.vif = &tx->sdata->vif;
+ 		info->flags |= IEEE80211_TX_INTFL_NEED_TXPROCESSING;
+ 		skb_queue_tail(&sta->ps_tx_buf[ac], tx->skb);
++		spin_unlock(&sta->ps_lock);
+ 
+ 		if (!timer_pending(&local->sta_cleanup))
+ 			mod_timer(&local->sta_cleanup,
+-- 
+1.7.5.4
+
