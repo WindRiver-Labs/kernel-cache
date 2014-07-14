@@ -1,0 +1,659 @@
+From 91d40c00a99207412240900aa0bccd8a800d374c Mon Sep 17 00:00:00 2001
+From: Matt Gates <matthew.gates@hp.com>
+Date: Tue, 18 Feb 2014 13:55:17 -0600
+Subject: [PATCH 25/89] hpsa: add support for 'fastpath' i/o
+
+commit e1f7de0cdd68d246d7008241cd9e443a54f880a8 upstream
+
+For certain i/o's to certain devices (unmasked physical disks) we
+can bypass the RAID stack firmware and do the i/o to the device
+directly and it will be faster.
+
+Signed-off-by: Matt Gates <matthew.gates@hp.com>
+Signed-off-by: Stephen M. Cameron <scameron@beardog.cce.hp.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+Signed-off-by: Yunguo Wei <yunguo.wei@windriver.com>
+---
+ drivers/scsi/hpsa.c     |  296 ++++++++++++++++++++++++++++++++++++++++++++---
+ drivers/scsi/hpsa.h     |   51 ++++++++
+ drivers/scsi/hpsa_cmd.h |   60 ++++++++++
+ 3 files changed, 388 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/scsi/hpsa.c b/drivers/scsi/hpsa.c
+index 11d9d00..fabb438 100644
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@ -204,7 +204,7 @@ static void check_ioctl_unit_attention(struct ctlr_info *h,
+ 	struct CommandList *c);
+ /* performant mode helper functions */
+ static void calc_bucket_map(int *bucket, int num_buckets,
+-	int nsgs, int *bucket_map);
++	int nsgs, int min_blocks, int *bucket_map);
+ static void hpsa_put_ctlr_into_performant_mode(struct ctlr_info *h);
+ static inline u32 next_command(struct ctlr_info *h, u8 q);
+ static int hpsa_find_cfg_addrs(struct pci_dev *pdev, void __iomem *vaddr,
+@@ -570,6 +570,9 @@ static inline u32 next_command(struct ctlr_info *h, u8 q)
+ 	struct reply_pool *rq = &h->reply_queue[q];
+ 	unsigned long flags;
+ 
++	if (h->transMethod & CFGTBL_Trans_io_accel1)
++		return h->access.command_completed(h, q);
++
+ 	if (unlikely(!(h->transMethod & CFGTBL_Trans_Performant)))
+ 		return h->access.command_completed(h, q);
+ 
+@@ -1203,7 +1206,8 @@ static void complete_scsi_command(struct CommandList *cp)
+ 	h = cp->h;
+ 
+ 	scsi_dma_unmap(cmd); /* undo the DMA mappings */
+-	if (cp->Header.SGTotal > h->max_cmd_sg_entries)
++	if ((cp->cmd_type == CMD_SCSI) &&
++		(cp->Header.SGTotal > h->max_cmd_sg_entries))
+ 		hpsa_unmap_sg_chain_block(h, cp);
+ 
+ 	cmd->result = (DID_OK << 16); 		/* host byte */
+@@ -1227,6 +1231,19 @@ static void complete_scsi_command(struct CommandList *cp)
+ 		return;
+ 	}
+ 
++	/* For I/O accelerator commands, copy over some fields to the normal
++	 * CISS header used below for error handling.
++	 */
++	if (cp->cmd_type == CMD_IOACCEL1) {
++		struct io_accel1_cmd *c = &h->ioaccel_cmd_pool[cp->cmdindex];
++		cp->Header.SGList = cp->Header.SGTotal = scsi_sg_count(cmd);
++		cp->Request.CDBLen = c->io_flags & IOACCEL1_IOFLAGS_CDBLEN_MASK;
++		cp->Header.Tag.lower = c->Tag.lower;
++		cp->Header.Tag.upper = c->Tag.upper;
++		memcpy(cp->Header.LUN.LunAddrBytes, c->CISS_LUN, 8);
++		memcpy(cp->Request.CDB, c->CDB, cp->Request.CDBLen);
++	}
++
+ 	/* an error has occurred */
+ 	switch (ei->CommandStatus) {
+ 
+@@ -2070,6 +2087,9 @@ static void hpsa_update_scsi_devices(struct ctlr_info *h, int hostno)
+ 		case TYPE_DISK:
+ 			if (i < nphysicals)
+ 				break;
++			memcpy(&this_device->ioaccel_handle,
++				&lunaddrbytes[20],
++				sizeof(this_device->ioaccel_handle));
+ 			ncurrent++;
+ 			break;
+ 		case TYPE_TAPE:
+@@ -2164,6 +2184,104 @@ sglist_finished:
+ 	return 0;
+ }
+ 
++/*
++ * Queue a command to the I/O accelerator path.
++ * This method does not currently support S/G chaining.
++ */
++static int hpsa_scsi_ioaccel_queue_command(struct ctlr_info *h,
++					struct CommandList *c)
++{
++	struct scsi_cmnd *cmd = c->scsi_cmd;
++	struct hpsa_scsi_dev_t *dev = cmd->device->hostdata;
++	struct io_accel1_cmd *cp = &h->ioaccel_cmd_pool[c->cmdindex];
++	unsigned int len;
++	unsigned int total_len = 0;
++	struct scatterlist *sg;
++	u64 addr64;
++	int use_sg, i;
++	struct SGDescriptor *curr_sg;
++	u32 control = IOACCEL1_CONTROL_SIMPLEQUEUE;
++
++	BUG_ON(cmd->cmd_len > IOACCEL1_IOFLAGS_CDBLEN_MAX);
++
++	c->cmd_type = CMD_IOACCEL1;
++
++	/* Adjust the DMA address to point to the accelerated command buffer */
++	c->busaddr = (u32) h->ioaccel_cmd_pool_dhandle +
++				(c->cmdindex * sizeof(*cp));
++	BUG_ON(c->busaddr & 0x0000007F);
++
++	use_sg = scsi_dma_map(cmd);
++	if (use_sg < 0)
++		return use_sg;
++
++	if (use_sg) {
++		curr_sg = cp->SG;
++		scsi_for_each_sg(cmd, sg, use_sg, i) {
++			addr64 = (u64) sg_dma_address(sg);
++			len  = sg_dma_len(sg);
++			total_len += len;
++			curr_sg->Addr.lower = (u32) (addr64 & 0x0FFFFFFFFULL);
++			curr_sg->Addr.upper =
++				(u32) ((addr64 >> 32) & 0x0FFFFFFFFULL);
++			curr_sg->Len = len;
++
++			if (i == (scsi_sg_count(cmd) - 1))
++				curr_sg->Ext = HPSA_SG_LAST;
++			else
++				curr_sg->Ext = 0;  /* we are not chaining */
++			curr_sg++;
++		}
++
++		switch (cmd->sc_data_direction) {
++		case DMA_TO_DEVICE:
++			control |= IOACCEL1_CONTROL_DATA_OUT;
++			break;
++		case DMA_FROM_DEVICE:
++			control |= IOACCEL1_CONTROL_DATA_IN;
++			break;
++		case DMA_NONE:
++			control |= IOACCEL1_CONTROL_NODATAXFER;
++			break;
++		default:
++			dev_err(&h->pdev->dev, "unknown data direction: %d\n",
++			cmd->sc_data_direction);
++			BUG();
++			break;
++		}
++	} else {
++		control |= IOACCEL1_CONTROL_NODATAXFER;
++	}
++
++	/* Fill out the command structure to submit */
++	cp->dev_handle = dev->ioaccel_handle;
++	cp->transfer_len = total_len;
++	cp->io_flags = IOACCEL1_IOFLAGS_IO_REQ |
++			(cmd->cmd_len & IOACCEL1_IOFLAGS_CDBLEN_MASK);
++	cp->control = control;
++	memcpy(cp->CDB, cmd->cmnd, cmd->cmd_len);
++	memcpy(cp->CISS_LUN, dev->scsi3addr, 8);
++
++	/* Tell the controller to post the reply to the queue for this
++	 * processor.  This seems to give the best I/O throughput.
++	 */
++	cp->ReplyQueue = smp_processor_id() % h->nreply_queues;
++
++	/* Set the bits in the address sent down to include:
++	 *  - performant mode bit (bit 0)
++	 *  - pull count (bits 1-3)
++	 *  - command type (bits 4-6)
++	 */
++	c->busaddr |= 1 | (h->ioaccel1_blockFetchTable[use_sg] << 1) |
++					IOACCEL1_BUSADDR_CMDTYPE;
++
++	/* execute command (bypassing cmd queue if possible) */
++	if (unlikely(h->access.fifo_full(h)))
++		enqueue_cmd_and_start_io(h, c);
++	else
++		h->access.submit_command(h, c);
++	return 0;
++}
+ 
+ static int hpsa_scsi_queue_command_lck(struct scsi_cmnd *cmd,
+ 	void (*done)(struct scsi_cmnd *))
+@@ -2207,6 +2325,14 @@ static int hpsa_scsi_queue_command_lck(struct scsi_cmnd *cmd,
+ 
+ 	c->cmd_type = CMD_SCSI;
+ 	c->scsi_cmd = cmd;
++
++	/* Call alternate submit routine for I/O accelerated commands */
++	if ((likely(h->transMethod & CFGTBL_Trans_io_accel1)) &&
++		(dev->ioaccel_handle) &&
++		((cmd->cmnd[0] == READ_10) || (cmd->cmnd[0] == WRITE_10)) &&
++		(scsi_sg_count(cmd) <= IOACCEL1_MAXSGENTRIES))
++		return hpsa_scsi_ioaccel_queue_command(h, c);
++
+ 	c->Header.ReplyQueue = 0;  /* unused in simple mode */
+ 	memcpy(&c->Header.LUN.LunAddrBytes[0], &scsi3addr[0], 8);
+ 	c->Header.Tag.lower = (c->cmdindex << DIRECT_LOOKUP_SHIFT);
+@@ -2780,6 +2906,7 @@ static struct CommandList *cmd_special_alloc(struct ctlr_info *h)
+ 		return NULL;
+ 	memset(c, 0, sizeof(*c));
+ 
++	c->cmd_type = CMD_SCSI;
+ 	c->cmdindex = -1;
+ 
+ 	c->err_info = pci_alloc_consistent(h->pdev, sizeof(*c->err_info),
+@@ -3565,7 +3692,7 @@ static inline void finish_cmd(struct CommandList *c)
+ 	spin_unlock_irqrestore(&h->lock, flags);
+ 
+ 	dial_up_lockup_detection_on_fw_flash_complete(c->h, c);
+-	if (likely(c->cmd_type == CMD_SCSI))
++	if (likely(c->cmd_type == CMD_IOACCEL1 || c->cmd_type == CMD_SCSI))
+ 		complete_scsi_command(c);
+ 	else if (c->cmd_type == CMD_IOCTL_PEND)
+ 		complete(c->waiting);
+@@ -4588,6 +4715,10 @@ static void hpsa_free_cmd_pool(struct ctlr_info *h)
+ 			    h->nr_cmds * sizeof(struct ErrorInfo),
+ 			    h->errinfo_pool,
+ 			    h->errinfo_pool_dhandle);
++	if (h->ioaccel_cmd_pool)
++		pci_free_consistent(h->pdev,
++			h->nr_cmds * sizeof(struct io_accel1_cmd),
++			h->ioaccel_cmd_pool, h->ioaccel_cmd_pool_dhandle);
+ }
+ 
+ static int hpsa_request_irq(struct ctlr_info *h,
+@@ -4687,6 +4818,7 @@ static void hpsa_undo_allocations_after_kdump_soft_reset(struct ctlr_info *h)
+ 	hpsa_free_irqs_and_disable_msix(h);
+ 	hpsa_free_sg_chain_blocks(h);
+ 	hpsa_free_cmd_pool(h);
++	kfree(h->ioaccel1_blockFetchTable);
+ 	kfree(h->blockFetchTable);
+ 	pci_free_consistent(h->pdev, h->reply_pool_size,
+ 		h->reply_pool, h->reply_pool_dhandle);
+@@ -5040,6 +5172,7 @@ static void hpsa_remove_one(struct pci_dev *pdev)
+ 		h->reply_pool, h->reply_pool_dhandle);
+ 	kfree(h->cmd_pool_bits);
+ 	kfree(h->blockFetchTable);
++	kfree(h->ioaccel1_blockFetchTable);
+ 	kfree(h->hba_inquiry_data);
+ 	pci_disable_device(pdev);
+ 	pci_release_regions(pdev);
+@@ -5081,20 +5214,17 @@ static struct pci_driver hpsa_pci_driver = {
+  * bits of the command address.
+  */
+ static void  calc_bucket_map(int bucket[], int num_buckets,
+-	int nsgs, int *bucket_map)
++	int nsgs, int min_blocks, int *bucket_map)
+ {
+ 	int i, j, b, size;
+ 
+-	/* even a command with 0 SGs requires 4 blocks */
+-#define MINIMUM_TRANSFER_BLOCKS 4
+-#define NUM_BUCKETS 8
+ 	/* Note, bucket_map must have nsgs+1 entries. */
+ 	for (i = 0; i <= nsgs; i++) {
+ 		/* Compute size of a command with i SG entries */
+-		size = i + MINIMUM_TRANSFER_BLOCKS;
++		size = i + min_blocks;
+ 		b = num_buckets; /* Assume the biggest bucket */
+ 		/* Find the bucket that is just big enough */
+-		for (j = 0; j < 8; j++) {
++		for (j = 0; j < num_buckets; j++) {
+ 			if (bucket[j] >= size) {
+ 				b = j;
+ 				break;
+@@ -5105,10 +5235,16 @@ static void  calc_bucket_map(int bucket[], int num_buckets,
+ 	}
+ }
+ 
+-static void hpsa_enter_performant_mode(struct ctlr_info *h, u32 use_short_tags)
++static void hpsa_enter_performant_mode(struct ctlr_info *h, u32 trans_support)
+ {
+ 	int i;
+ 	unsigned long register_value;
++	unsigned long transMethod = CFGTBL_Trans_Performant |
++			(trans_support & CFGTBL_Trans_use_short_tags) |
++			CFGTBL_Trans_enable_directed_msix |
++			(trans_support & CFGTBL_Trans_io_accel1);
++
++	struct access_method access = SA5_performant_access;
+ 
+ 	/* This is a bit complicated.  There are 8 registers on
+ 	 * the controller which we write to to tell it 8 different
+@@ -5140,7 +5276,7 @@ static void hpsa_enter_performant_mode(struct ctlr_info *h, u32 use_short_tags)
+ 
+ 	bft[7] = SG_ENTRIES_IN_CMD + 4;
+ 	calc_bucket_map(bft, ARRAY_SIZE(bft),
+-				SG_ENTRIES_IN_CMD, h->blockFetchTable);
++				SG_ENTRIES_IN_CMD, 4, h->blockFetchTable);
+ 	for (i = 0; i < 8; i++)
+ 		writel(bft[i], &h->transtable->BlockFetch[i]);
+ 
+@@ -5157,9 +5293,15 @@ static void hpsa_enter_performant_mode(struct ctlr_info *h, u32 use_short_tags)
+ 			&h->transtable->RepQAddr[i].lower);
+ 	}
+ 
+-	writel(CFGTBL_Trans_Performant | use_short_tags |
+-		CFGTBL_Trans_enable_directed_msix,
+-		&(h->cfgtable->HostWrite.TransportRequest));
++	writel(transMethod, &(h->cfgtable->HostWrite.TransportRequest));
++	/*
++	 * enable outbound interrupt coalescing in accelerator mode;
++	 */
++	if (trans_support & CFGTBL_Trans_io_accel1) {
++		access = SA5_ioaccel_mode1_access;
++		writel(10, &h->cfgtable->HostWrite.CoalIntDelay);
++		writel(4, &h->cfgtable->HostWrite.CoalIntCount);
++	}
+ 	writel(CFGTBL_ChangeReq, h->vaddr + SA5_DOORBELL);
+ 	hpsa_wait_for_mode_change_ack(h);
+ 	register_value = readl(&(h->cfgtable->TransportActive));
+@@ -5169,18 +5311,102 @@ static void hpsa_enter_performant_mode(struct ctlr_info *h, u32 use_short_tags)
+ 		return;
+ 	}
+ 	/* Change the access methods to the performant access methods */
+-	h->access = SA5_performant_access;
+-	h->transMethod = CFGTBL_Trans_Performant;
++	h->access = access;
++	h->transMethod = transMethod;
++
++	if (!(trans_support & CFGTBL_Trans_io_accel1))
++		return;
++
++	/* Set up I/O accelerator mode */
++	for (i = 0; i < h->nreply_queues; i++) {
++		writel(i, h->vaddr + IOACCEL_MODE1_REPLY_QUEUE_INDEX);
++		h->reply_queue[i].current_entry =
++			readl(h->vaddr + IOACCEL_MODE1_PRODUCER_INDEX);
++	}
++	bft[7] = IOACCEL1_MAXSGENTRIES + 8;
++	calc_bucket_map(bft, ARRAY_SIZE(bft), IOACCEL1_MAXSGENTRIES, 8,
++			h->ioaccel1_blockFetchTable);
++
++	/* initialize all reply queue entries to unused */
++	memset(h->reply_pool, (u8) IOACCEL_MODE1_REPLY_UNUSED,
++			h->reply_pool_size);
++
++	/* set all the constant fields in the accelerator command
++	 * frames once at init time to save CPU cycles later.
++	 */
++	for (i = 0; i < h->nr_cmds; i++) {
++		struct io_accel1_cmd *cp = &h->ioaccel_cmd_pool[i];
++
++		cp->function = IOACCEL1_FUNCTION_SCSIIO;
++		cp->err_info = (u32) (h->errinfo_pool_dhandle +
++				(i * sizeof(struct ErrorInfo)));
++		cp->err_info_len = sizeof(struct ErrorInfo);
++		cp->sgl_offset = IOACCEL1_SGLOFFSET;
++		cp->host_context_flags = IOACCEL1_HCFLAGS_CISS_FORMAT;
++		cp->timeout_sec = 0;
++		cp->ReplyQueue = 0;
++		cp->Tag.lower = (i << DIRECT_LOOKUP_SHIFT) | DIRECT_LOOKUP_BIT;
++		cp->Tag.upper = 0;
++		cp->host_addr.lower = (u32) (h->ioaccel_cmd_pool_dhandle +
++				(i * sizeof(struct io_accel1_cmd)));
++		cp->host_addr.upper = 0;
++	}
++}
++
++static int hpsa_alloc_ioaccel_cmd_and_bft(struct ctlr_info *h)
++{
++	/* Command structures must be aligned on a 128-byte boundary
++	 * because the 7 lower bits of the address are used by the
++	 * hardware.
++	 */
++#define IOACCEL1_COMMANDLIST_ALIGNMENT 128
++	BUILD_BUG_ON(sizeof(struct io_accel1_cmd) %
++			IOACCEL1_COMMANDLIST_ALIGNMENT);
++	h->ioaccel_cmd_pool =
++		pci_alloc_consistent(h->pdev,
++			h->nr_cmds * sizeof(*h->ioaccel_cmd_pool),
++			&(h->ioaccel_cmd_pool_dhandle));
++
++	h->ioaccel1_blockFetchTable =
++		kmalloc(((IOACCEL1_MAXSGENTRIES + 1) *
++				sizeof(u32)), GFP_KERNEL);
++
++	if ((h->ioaccel_cmd_pool == NULL) ||
++		(h->ioaccel1_blockFetchTable == NULL))
++		goto clean_up;
++
++	memset(h->ioaccel_cmd_pool, 0,
++		h->nr_cmds * sizeof(*h->ioaccel_cmd_pool));
++	return 0;
++
++clean_up:
++	if (h->ioaccel_cmd_pool)
++		pci_free_consistent(h->pdev,
++			h->nr_cmds * sizeof(*h->ioaccel_cmd_pool),
++			h->ioaccel_cmd_pool, h->ioaccel_cmd_pool_dhandle);
++	kfree(h->ioaccel1_blockFetchTable);
++	return 1;
+ }
+ 
+ static void hpsa_put_ctlr_into_performant_mode(struct ctlr_info *h)
+ {
+ 	u32 trans_support;
++	unsigned long transMethod = CFGTBL_Trans_Performant |
++					CFGTBL_Trans_use_short_tags;
+ 	int i;
+ 
+ 	if (hpsa_simple_mode)
+ 		return;
+ 
++	/* Check for I/O accelerator mode support */
++	if (trans_support & CFGTBL_Trans_io_accel1) {
++		transMethod |= CFGTBL_Trans_io_accel1 |
++				CFGTBL_Trans_enable_directed_msix;
++		if (hpsa_alloc_ioaccel_cmd_and_bft(h))
++			goto clean_up;
++	}
++
++	/* TODO, check that this next line h->nreply_queues is correct */
+ 	trans_support = readl(&(h->cfgtable->TransportSupport));
+ 	if (!(trans_support & PERFORMANT_MODE))
+ 		return;
+@@ -5207,9 +5433,7 @@ static void hpsa_put_ctlr_into_performant_mode(struct ctlr_info *h)
+ 		|| (h->blockFetchTable == NULL))
+ 		goto clean_up;
+ 
+-	hpsa_enter_performant_mode(h,
+-		trans_support & CFGTBL_Trans_use_short_tags);
+-
++	hpsa_enter_performant_mode(h, trans_support);
+ 	return;
+ 
+ clean_up:
+@@ -5233,5 +5457,39 @@ static void __exit hpsa_cleanup(void)
+ 	pci_unregister_driver(&hpsa_pci_driver);
+ }
+ 
++static void __attribute__((unused)) verify_offsets(void)
++{
++#define VERIFY_OFFSET(member, offset) \
++	BUILD_BUG_ON(offsetof(struct io_accel1_cmd, member) != offset)
++
++	VERIFY_OFFSET(dev_handle, 0x00);
++	VERIFY_OFFSET(reserved1, 0x02);
++	VERIFY_OFFSET(function, 0x03);
++	VERIFY_OFFSET(reserved2, 0x04);
++	VERIFY_OFFSET(err_info, 0x0C);
++	VERIFY_OFFSET(reserved3, 0x10);
++	VERIFY_OFFSET(err_info_len, 0x12);
++	VERIFY_OFFSET(reserved4, 0x13);
++	VERIFY_OFFSET(sgl_offset, 0x14);
++	VERIFY_OFFSET(reserved5, 0x15);
++	VERIFY_OFFSET(transfer_len, 0x1C);
++	VERIFY_OFFSET(reserved6, 0x20);
++	VERIFY_OFFSET(io_flags, 0x24);
++	VERIFY_OFFSET(reserved7, 0x26);
++	VERIFY_OFFSET(LUN, 0x34);
++	VERIFY_OFFSET(control, 0x3C);
++	VERIFY_OFFSET(CDB, 0x40);
++	VERIFY_OFFSET(reserved8, 0x50);
++	VERIFY_OFFSET(host_context_flags, 0x60);
++	VERIFY_OFFSET(timeout_sec, 0x62);
++	VERIFY_OFFSET(ReplyQueue, 0x64);
++	VERIFY_OFFSET(reserved9, 0x65);
++	VERIFY_OFFSET(Tag, 0x68);
++	VERIFY_OFFSET(host_addr, 0x70);
++	VERIFY_OFFSET(CISS_LUN, 0x78);
++	VERIFY_OFFSET(SG, 0x78 + 8);
++#undef VERIFY_OFFSET
++}
++
+ module_init(hpsa_init);
+ module_exit(hpsa_cleanup);
+diff --git a/drivers/scsi/hpsa.h b/drivers/scsi/hpsa.h
+index 01c3283..c7865f3 100644
+--- a/drivers/scsi/hpsa.h
++++ b/drivers/scsi/hpsa.h
+@@ -46,6 +46,7 @@ struct hpsa_scsi_dev_t {
+ 	unsigned char vendor[8];        /* bytes 8-15 of inquiry data */
+ 	unsigned char model[16];        /* bytes 16-31 of inquiry data */
+ 	unsigned char raid_level;	/* from inquiry page 0xC1 */
++	u32 ioaccel_handle;
+ };
+ 
+ struct reply_pool {
+@@ -95,6 +96,8 @@ struct ctlr_info {
+ 	/* pointers to command and error info pool */
+ 	struct CommandList 	*cmd_pool;
+ 	dma_addr_t		cmd_pool_dhandle;
++	struct io_accel1_cmd	*ioaccel_cmd_pool;
++	dma_addr_t		ioaccel_cmd_pool_dhandle;
+ 	struct ErrorInfo 	*errinfo_pool;
+ 	dma_addr_t		errinfo_pool_dhandle;
+ 	unsigned long  		*cmd_pool_bits;
+@@ -128,6 +131,7 @@ struct ctlr_info {
+ 	u8 nreply_queues;
+ 	dma_addr_t reply_pool_dhandle;
+ 	u32 *blockFetchTable;
++	u32 *ioaccel1_blockFetchTable;
+ 	unsigned char *hba_inquiry_data;
+ 	u64 last_intr_timestamp;
+ 	u32 last_heartbeat;
+@@ -387,6 +391,45 @@ static bool SA5_performant_intr_pending(struct ctlr_info *h)
+ 	return register_value & SA5_OUTDB_STATUS_PERF_BIT;
+ }
+ 
++#define SA5_IOACCEL_MODE1_INTR_STATUS_CMP_BIT    0x100
++
++static bool SA5_ioaccel_mode1_intr_pending(struct ctlr_info *h)
++{
++	unsigned long register_value = readl(h->vaddr + SA5_INTR_STATUS);
++
++	return (register_value & SA5_IOACCEL_MODE1_INTR_STATUS_CMP_BIT) ?
++		true : false;
++}
++
++#define IOACCEL_MODE1_REPLY_QUEUE_INDEX  0x1A0
++#define IOACCEL_MODE1_PRODUCER_INDEX     0x1B8
++#define IOACCEL_MODE1_CONSUMER_INDEX     0x1BC
++#define IOACCEL_MODE1_REPLY_UNUSED       0xFFFFFFFFFFFFFFFFULL
++
++static unsigned long SA5_ioaccel_mode1_completed(struct ctlr_info *h,
++							u8 q)
++{
++	u64 register_value;
++	struct reply_pool *rq = &h->reply_queue[q];
++	unsigned long flags;
++
++	BUG_ON(q >= h->nreply_queues);
++
++	register_value = rq->head[rq->current_entry];
++	if (register_value != IOACCEL_MODE1_REPLY_UNUSED) {
++		rq->head[rq->current_entry] = IOACCEL_MODE1_REPLY_UNUSED;
++		if (++rq->current_entry == rq->size)
++			rq->current_entry = 0;
++		spin_lock_irqsave(&h->lock, flags);
++		h->commands_outstanding--;
++		spin_unlock_irqrestore(&h->lock, flags);
++	} else {
++		writel((q << 24) | rq->current_entry,
++			h->vaddr + IOACCEL_MODE1_CONSUMER_INDEX);
++	}
++	return (unsigned long) register_value;
++}
++
+ static struct access_method SA5_access = {
+ 	SA5_submit_command,
+ 	SA5_intr_mask,
+@@ -395,6 +438,14 @@ static struct access_method SA5_access = {
+ 	SA5_completed,
+ };
+ 
++static struct access_method SA5_ioaccel_mode1_access = {
++	SA5_submit_command,
++	SA5_performant_intr_mask,
++	SA5_fifo_full,
++	SA5_ioaccel_mode1_intr_pending,
++	SA5_ioaccel_mode1_completed,
++};
++
+ static struct access_method SA5_performant_access = {
+ 	SA5_submit_command,
+ 	SA5_performant_intr_mask,
+diff --git a/drivers/scsi/hpsa_cmd.h b/drivers/scsi/hpsa_cmd.h
+index 22cf799..e682d2e 100644
+--- a/drivers/scsi/hpsa_cmd.h
++++ b/drivers/scsi/hpsa_cmd.h
+@@ -129,6 +129,7 @@
+ 
+ #define CFGTBL_Trans_Simple     0x00000002l
+ #define CFGTBL_Trans_Performant 0x00000004l
++#define CFGTBL_Trans_io_accel1	0x00000080l
+ #define CFGTBL_Trans_use_short_tags 0x20000000l
+ #define CFGTBL_Trans_enable_directed_msix (1 << 30)
+ 
+@@ -285,6 +286,7 @@ struct ErrorInfo {
+ /* Command types */
+ #define CMD_IOCTL_PEND  0x01
+ #define CMD_SCSI	0x03
++#define CMD_IOACCEL1	0x04
+ 
+ #define DIRECT_LOOKUP_SHIFT 5
+ #define DIRECT_LOOKUP_BIT 0x10
+@@ -335,6 +337,63 @@ struct CommandList {
+ 	u8 pad[COMMANDLIST_PAD];
+ };
+ 
++/* Max S/G elements in I/O accelerator command */
++#define IOACCEL1_MAXSGENTRIES           24
++
++/*
++ * Structure for I/O accelerator (mode 1) commands.
++ * Note that this structure must be 128-byte aligned in size.
++ */
++struct io_accel1_cmd {
++	u16 dev_handle;			/* 0x00 - 0x01 */
++	u8  reserved1;			/* 0x02 */
++	u8  function;			/* 0x03 */
++	u8  reserved2[8];		/* 0x04 - 0x0B */
++	u32 err_info;			/* 0x0C - 0x0F */
++	u8  reserved3[2];		/* 0x10 - 0x11 */
++	u8  err_info_len;		/* 0x12 */
++	u8  reserved4;			/* 0x13 */
++	u8  sgl_offset;			/* 0x14 */
++	u8  reserved5[7];		/* 0x15 - 0x1B */
++	u32 transfer_len;		/* 0x1C - 0x1F */
++	u8  reserved6[4];		/* 0x20 - 0x23 */
++	u16 io_flags;			/* 0x24 - 0x25 */
++	u8  reserved7[14];		/* 0x26 - 0x33 */
++	u8  LUN[8];			/* 0x34 - 0x3B */
++	u32 control;			/* 0x3C - 0x3F */
++	u8  CDB[16];			/* 0x40 - 0x4F */
++	u8  reserved8[16];		/* 0x50 - 0x5F */
++	u16 host_context_flags;		/* 0x60 - 0x61 */
++	u16 timeout_sec;		/* 0x62 - 0x63 */
++	u8  ReplyQueue;			/* 0x64 */
++	u8  reserved9[3];		/* 0x65 - 0x67 */
++	struct vals32 Tag;		/* 0x68 - 0x6F */
++	struct vals32 host_addr;	/* 0x70 - 0x77 */
++	u8  CISS_LUN[8];		/* 0x78 - 0x7F */
++	struct SGDescriptor SG[IOACCEL1_MAXSGENTRIES];
++};
++
++#define IOACCEL1_FUNCTION_SCSIIO        0x00
++#define IOACCEL1_SGLOFFSET              32
++
++#define IOACCEL1_IOFLAGS_IO_REQ         0x4000
++#define IOACCEL1_IOFLAGS_CDBLEN_MASK    0x001F
++#define IOACCEL1_IOFLAGS_CDBLEN_MAX     16
++
++#define IOACCEL1_CONTROL_NODATAXFER     0x00000000
++#define IOACCEL1_CONTROL_DATA_OUT       0x01000000
++#define IOACCEL1_CONTROL_DATA_IN        0x02000000
++#define IOACCEL1_CONTROL_TASKPRIO_MASK  0x00007800
++#define IOACCEL1_CONTROL_TASKPRIO_SHIFT 11
++#define IOACCEL1_CONTROL_SIMPLEQUEUE    0x00000000
++#define IOACCEL1_CONTROL_HEADOFQUEUE    0x00000100
++#define IOACCEL1_CONTROL_ORDEREDQUEUE   0x00000200
++#define IOACCEL1_CONTROL_ACA            0x00000400
++
++#define IOACCEL1_HCFLAGS_CISS_FORMAT    0x0013
++
++#define IOACCEL1_BUSADDR_CMDTYPE        0x00000060
++
+ /* Configuration Table Structure */
+ struct HostWrite {
+ 	u32 TransportRequest;
+@@ -346,6 +405,7 @@ struct HostWrite {
+ #define SIMPLE_MODE     0x02
+ #define PERFORMANT_MODE 0x04
+ #define MEMQ_MODE       0x08
++#define IOACCEL_MODE_1  0x80
+ 
+ struct CfgTable {
+ 	u8            Signature[4];
+-- 
+1.7.5.4
+
