@@ -1,0 +1,323 @@
+From 3906e61f60c6826bd9efa39a3ea5f302f93d6731 Mon Sep 17 00:00:00 2001
+From: David Herrmann <dh.herrmann@gmail.com>
+Date: Sun, 25 Aug 2013 18:28:57 +0200
+Subject: [PATCH 028/263] drm/vma: add access management helpers
+
+This commit comes from branch ti-linux-3.12.y:
+  git://git.ti.com/ti-linux-kernel/ti-linux-kernel.git
+
+The VMA offset manager uses a device-global address-space. Hence, any
+user can currently map any offset-node they want. They only need to guess
+the right offset. If we wanted per open-file offset spaces, we'd either
+need VM_NONLINEAR mappings or multiple "struct address_space" trees. As
+both doesn't really scale, we implement access management in the VMA
+manager itself.
+
+We use an rb-tree to store open-files for each VMA node. On each mmap
+call, GEM, TTM or the drivers must check whether the current user is
+allowed to map this file.
+
+We add a separate lock for each node as there is no generic lock available
+for the caller to protect the node easily.
+
+As we currently don't know whether an object may be used for mmap(), we
+have to do access management for all objects. If it turns out to slow down
+handle creation/deletion significantly, we can optimize it in several
+ways:
+ - Most times only a single filp is added per bo so we could use a static
+   "struct file *main_filp" which is checked/added/removed first before we
+   fall back to the rbtree+drm_vma_offset_file.
+   This could be even done lockless with rcu.
+ - Let user-space pass a hint whether mmap() should be supported on the
+   bo and avoid access-management if not.
+ - .. there are probably more ideas once we have benchmarks ..
+
+v2: add drm_vma_node_verify_access() helper
+
+Signed-off-by: David Herrmann <dh.herrmann@gmail.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit 88d7ebe59341dc3b82e662b80809694e3c6b3766)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/gpu/drm/drm_gem.c         |    1 +
+ drivers/gpu/drm/drm_vma_manager.c |  155 +++++++++++++++++++++++++++++++++++++
+ include/drm/drm_vma_manager.h     |   39 +++++++++-
+ 3 files changed, 192 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index 312307d..2a15c8b 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -156,6 +156,7 @@ void drm_gem_private_object_init(struct drm_device *dev,
+ 	kref_init(&obj->refcount);
+ 	obj->handle_count = 0;
+ 	obj->size = size;
++	drm_vma_node_reset(&obj->vma_node);
+ }
+ EXPORT_SYMBOL(drm_gem_private_object_init);
+ 
+diff --git a/drivers/gpu/drm/drm_vma_manager.c b/drivers/gpu/drm/drm_vma_manager.c
+index 3837481..63b4712 100644
+--- a/drivers/gpu/drm/drm_vma_manager.c
++++ b/drivers/gpu/drm/drm_vma_manager.c
+@@ -25,6 +25,7 @@
+ #include <drm/drmP.h>
+ #include <drm/drm_mm.h>
+ #include <drm/drm_vma_manager.h>
++#include <linux/fs.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/rbtree.h>
+@@ -58,6 +59,13 @@
+  * must always be page-aligned (as usual).
+  * If you want to get a valid byte-based user-space address for a given offset,
+  * please see drm_vma_node_offset_addr().
++ *
++ * Additionally to offset management, the vma offset manager also handles access
++ * management. For every open-file context that is allowed to access a given
++ * node, you must call drm_vma_node_allow(). Otherwise, an mmap() call on this
++ * open-file with the offset of the node will fail with -EACCES. To revoke
++ * access again, use drm_vma_node_revoke(). However, the caller is responsible
++ * for destroying already existing mappings, if required.
+  */
+ 
+ /**
+@@ -279,3 +287,150 @@ void drm_vma_offset_remove(struct drm_vma_offset_manager *mgr,
+ 	write_unlock(&mgr->vm_lock);
+ }
+ EXPORT_SYMBOL(drm_vma_offset_remove);
++
++/**
++ * drm_vma_node_allow - Add open-file to list of allowed users
++ * @node: Node to modify
++ * @filp: Open file to add
++ *
++ * Add @filp to the list of allowed open-files for this node. If @filp is
++ * already on this list, the ref-count is incremented.
++ *
++ * The list of allowed-users is preserved across drm_vma_offset_add() and
++ * drm_vma_offset_remove() calls. You may even call it if the node is currently
++ * not added to any offset-manager.
++ *
++ * You must remove all open-files the same number of times as you added them
++ * before destroying the node. Otherwise, you will leak memory.
++ *
++ * This is locked against concurrent access internally.
++ *
++ * RETURNS:
++ * 0 on success, negative error code on internal failure (out-of-mem)
++ */
++int drm_vma_node_allow(struct drm_vma_offset_node *node, struct file *filp)
++{
++	struct rb_node **iter;
++	struct rb_node *parent = NULL;
++	struct drm_vma_offset_file *new, *entry;
++	int ret = 0;
++
++	/* Preallocate entry to avoid atomic allocations below. It is quite
++	 * unlikely that an open-file is added twice to a single node so we
++	 * don't optimize for this case. OOM is checked below only if the entry
++	 * is actually used. */
++	new = kmalloc(sizeof(*entry), GFP_KERNEL);
++
++	write_lock(&node->vm_lock);
++
++	iter = &node->vm_files.rb_node;
++
++	while (likely(*iter)) {
++		parent = *iter;
++		entry = rb_entry(*iter, struct drm_vma_offset_file, vm_rb);
++
++		if (filp == entry->vm_filp) {
++			entry->vm_count++;
++			goto unlock;
++		} else if (filp > entry->vm_filp) {
++			iter = &(*iter)->rb_right;
++		} else {
++			iter = &(*iter)->rb_left;
++		}
++	}
++
++	if (!new) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++
++	new->vm_filp = filp;
++	new->vm_count = 1;
++	rb_link_node(&new->vm_rb, parent, iter);
++	rb_insert_color(&new->vm_rb, &node->vm_files);
++	new = NULL;
++
++unlock:
++	write_unlock(&node->vm_lock);
++	kfree(new);
++	return ret;
++}
++EXPORT_SYMBOL(drm_vma_node_allow);
++
++/**
++ * drm_vma_node_revoke - Remove open-file from list of allowed users
++ * @node: Node to modify
++ * @filp: Open file to remove
++ *
++ * Decrement the ref-count of @filp in the list of allowed open-files on @node.
++ * If the ref-count drops to zero, remove @filp from the list. You must call
++ * this once for every drm_vma_node_allow() on @filp.
++ *
++ * This is locked against concurrent access internally.
++ *
++ * If @filp is not on the list, nothing is done.
++ */
++void drm_vma_node_revoke(struct drm_vma_offset_node *node, struct file *filp)
++{
++	struct drm_vma_offset_file *entry;
++	struct rb_node *iter;
++
++	write_lock(&node->vm_lock);
++
++	iter = node->vm_files.rb_node;
++	while (likely(iter)) {
++		entry = rb_entry(iter, struct drm_vma_offset_file, vm_rb);
++		if (filp == entry->vm_filp) {
++			if (!--entry->vm_count) {
++				rb_erase(&entry->vm_rb, &node->vm_files);
++				kfree(entry);
++			}
++			break;
++		} else if (filp > entry->vm_filp) {
++			iter = iter->rb_right;
++		} else {
++			iter = iter->rb_left;
++		}
++	}
++
++	write_unlock(&node->vm_lock);
++}
++EXPORT_SYMBOL(drm_vma_node_revoke);
++
++/**
++ * drm_vma_node_is_allowed - Check whether an open-file is granted access
++ * @node: Node to check
++ * @filp: Open-file to check for
++ *
++ * Search the list in @node whether @filp is currently on the list of allowed
++ * open-files (see drm_vma_node_allow()).
++ *
++ * This is locked against concurrent access internally.
++ *
++ * RETURNS:
++ * true iff @filp is on the list
++ */
++bool drm_vma_node_is_allowed(struct drm_vma_offset_node *node,
++			     struct file *filp)
++{
++	struct drm_vma_offset_file *entry;
++	struct rb_node *iter;
++
++	read_lock(&node->vm_lock);
++
++	iter = node->vm_files.rb_node;
++	while (likely(iter)) {
++		entry = rb_entry(iter, struct drm_vma_offset_file, vm_rb);
++		if (filp == entry->vm_filp)
++			break;
++		else if (filp > entry->vm_filp)
++			iter = iter->rb_right;
++		else
++			iter = iter->rb_left;
++	}
++
++	read_unlock(&node->vm_lock);
++
++	return iter;
++}
++EXPORT_SYMBOL(drm_vma_node_is_allowed);
+diff --git a/include/drm/drm_vma_manager.h b/include/drm/drm_vma_manager.h
+index 22eedac..c18a593 100644
+--- a/include/drm/drm_vma_manager.h
++++ b/include/drm/drm_vma_manager.h
+@@ -24,15 +24,24 @@
+  */
+ 
+ #include <drm/drm_mm.h>
++#include <linux/fs.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/rbtree.h>
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
+ 
++struct drm_vma_offset_file {
++	struct rb_node vm_rb;
++	struct file *vm_filp;
++	unsigned long vm_count;
++};
++
+ struct drm_vma_offset_node {
++	rwlock_t vm_lock;
+ 	struct drm_mm_node vm_node;
+ 	struct rb_node vm_rb;
++	struct rb_root vm_files;
+ };
+ 
+ struct drm_vma_offset_manager {
+@@ -56,6 +65,11 @@ int drm_vma_offset_add(struct drm_vma_offset_manager *mgr,
+ void drm_vma_offset_remove(struct drm_vma_offset_manager *mgr,
+ 			   struct drm_vma_offset_node *node);
+ 
++int drm_vma_node_allow(struct drm_vma_offset_node *node, struct file *filp);
++void drm_vma_node_revoke(struct drm_vma_offset_node *node, struct file *filp);
++bool drm_vma_node_is_allowed(struct drm_vma_offset_node *node,
++			     struct file *filp);
++
+ /**
+  * drm_vma_offset_exact_lookup() - Look up node by exact address
+  * @mgr: Manager object
+@@ -122,9 +136,8 @@ static inline void drm_vma_offset_unlock_lookup(struct drm_vma_offset_manager *m
+  * drm_vma_node_reset() - Initialize or reset node object
+  * @node: Node to initialize or reset
+  *
+- * Reset a node to its initial state. This must be called if @node isn't
+- * already cleared (eg., via kzalloc) before using it with any VMA offset
+- * manager.
++ * Reset a node to its initial state. This must be called before using it with
++ * any VMA offset manager.
+  *
+  * This must not be called on an already allocated node, or you will leak
+  * memory.
+@@ -132,6 +145,8 @@ static inline void drm_vma_offset_unlock_lookup(struct drm_vma_offset_manager *m
+ static inline void drm_vma_node_reset(struct drm_vma_offset_node *node)
+ {
+ 	memset(node, 0, sizeof(*node));
++	node->vm_files = RB_ROOT;
++	rwlock_init(&node->vm_lock);
+ }
+ 
+ /**
+@@ -221,4 +236,22 @@ static inline void drm_vma_node_unmap(struct drm_vma_offset_node *node,
+ 				    drm_vma_node_size(node) << PAGE_SHIFT, 1);
+ }
+ 
++/**
++ * drm_vma_node_verify_access() - Access verification helper for TTM
++ * @node: Offset node
++ * @filp: Open-file
++ *
++ * This checks whether @filp is granted access to @node. It is the same as
++ * drm_vma_node_is_allowed() but suitable as drop-in helper for TTM
++ * verify_access() callbacks.
++ *
++ * RETURNS:
++ * 0 if access is granted, -EACCES otherwise.
++ */
++static inline int drm_vma_node_verify_access(struct drm_vma_offset_node *node,
++					     struct file *filp)
++{
++	return drm_vma_node_is_allowed(node, filp) ? 0 : -EACCES;
++}
++
+ #endif /* __DRM_VMA_MANAGER_H__ */
+-- 
+1.7.5.4
+
