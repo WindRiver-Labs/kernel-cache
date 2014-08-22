@@ -1,0 +1,389 @@
+From 8b70125106ee4d3b2a9584b5e9cbd64c3d4f157c Mon Sep 17 00:00:00 2001
+From: Jarno Rajahalme <jrajahalme@nicira.com>
+Date: Thu, 21 Aug 2014 13:50:49 +0800
+Subject: [PATCH 09/29] openvswitch: Per NUMA node flow stats.
+
+commit 63e7959c4b9bd6f791061c460a22d9ee32ae2240 upstream
+
+Keep kernel flow stats for each NUMA node rather than each (logical)
+CPU.  This avoids using the per-CPU allocator and removes most of the
+kernel-side OVS locking overhead otherwise on the top of perf reports
+and allows OVS to scale better with higher number of threads.
+
+With 9 handlers and 4 revalidators netperf TCP_CRR test flow setup
+rate doubles on a server with two hyper-threaded physical CPUs (16
+logical cores each) compared to the current OVS master.  Tested with
+non-trivial flow table with a TCP port match rule forcing all new
+connections with unique port numbers to OVS userspace.  The IP
+addresses are still wildcarded, so the kernel flows are not considered
+as exact match 5-tuple flows.  This type of flows can be expected to
+appear in large numbers as the result of more effective wildcarding
+made possible by improvements in OVS userspace flow classifier.
+
+Perf results for this test (master):
+
+Events: 305K cycles
++   8.43%     ovs-vswitchd  [kernel.kallsyms]   [k] mutex_spin_on_owner
++   5.64%     ovs-vswitchd  [kernel.kallsyms]   [k] __ticket_spin_lock
++   4.75%     ovs-vswitchd  ovs-vswitchd        [.] find_match_wc
++   3.32%     ovs-vswitchd  libpthread-2.15.so  [.] pthread_mutex_lock
++   2.61%     ovs-vswitchd  [kernel.kallsyms]   [k] pcpu_alloc_area
++   2.19%     ovs-vswitchd  ovs-vswitchd        [.] flow_hash_in_minimask_range
++   2.03%          swapper  [kernel.kallsyms]   [k] intel_idle
++   1.84%     ovs-vswitchd  libpthread-2.15.so  [.] pthread_mutex_unlock
++   1.64%     ovs-vswitchd  ovs-vswitchd        [.] classifier_lookup
++   1.58%     ovs-vswitchd  libc-2.15.so        [.] 0x7f4e6
++   1.07%     ovs-vswitchd  [kernel.kallsyms]   [k] memset
++   1.03%          netperf  [kernel.kallsyms]   [k] __ticket_spin_lock
++   0.92%          swapper  [kernel.kallsyms]   [k] __ticket_spin_lock
+...
+
+And after this patch:
+
+Events: 356K cycles
++   6.85%     ovs-vswitchd  ovs-vswitchd        [.] find_match_wc
++   4.63%     ovs-vswitchd  libpthread-2.15.so  [.] pthread_mutex_lock
++   3.06%     ovs-vswitchd  [kernel.kallsyms]   [k] __ticket_spin_lock
++   2.81%     ovs-vswitchd  ovs-vswitchd        [.] flow_hash_in_minimask_range
++   2.51%     ovs-vswitchd  libpthread-2.15.so  [.] pthread_mutex_unlock
++   2.27%     ovs-vswitchd  ovs-vswitchd        [.] classifier_lookup
++   1.84%     ovs-vswitchd  libc-2.15.so        [.] 0x15d30f
++   1.74%     ovs-vswitchd  [kernel.kallsyms]   [k] mutex_spin_on_owner
++   1.47%          swapper  [kernel.kallsyms]   [k] intel_idle
++   1.34%     ovs-vswitchd  ovs-vswitchd        [.] flow_hash_in_minimask
++   1.33%     ovs-vswitchd  ovs-vswitchd        [.] rule_actions_unref
++   1.16%     ovs-vswitchd  ovs-vswitchd        [.] hindex_node_with_hash
++   1.16%     ovs-vswitchd  ovs-vswitchd        [.] do_xlate_actions
++   1.09%     ovs-vswitchd  ovs-vswitchd        [.] ofproto_rule_ref
++   1.01%          netperf  [kernel.kallsyms]   [k] __ticket_spin_lock
+...
+
+There is a small increase in kernel spinlock overhead due to the same
+spinlock being shared between multiple cores of the same physical CPU,
+but that is barely visible in the netperf TCP_CRR test performance
+(maybe ~1% performance drop, hard to tell exactly due to variance in
+the test results), when testing for kernel module throughput (with no
+userspace activity, handful of kernel flows).
+
+On flow setup, a single stats instance is allocated (for the NUMA node
+0).  As CPUs from multiple NUMA nodes start updating stats, new
+NUMA-node specific stats instances are allocated.  This allocation on
+the packet processing code path is made to never block or look for
+emergency memory pools, minimizing the allocation latency.  If the
+allocation fails, the existing preallocated stats instance is used.
+Also, if only CPUs from one NUMA-node are updating the preallocated
+stats instance, no additional stats instances are allocated.  This
+eliminates the need to pre-allocate stats instances that will not be
+used, also relieving the stats reader from the burden of reading stats
+that are never used.
+
+Signed-off-by: Jarno Rajahalme <jrajahalme@nicira.com>
+Acked-by: Pravin B Shelar <pshelar@nicira.com>
+Signed-off-by: Jesse Gross <jesse@nicira.com>
+Signed-off-by: He Zhe <zhe.he@windriver.com>
+Signed-off-by: Bruce Ashfield <bruce.ashfield@windriver.com>
+---
+ net/openvswitch/flow.c       | 119 ++++++++++++++++++++++++++++---------------
+ net/openvswitch/flow.h       |  10 +++-
+ net/openvswitch/flow_table.c |  46 +++++++++++++----
+ net/openvswitch/flow_table.h |   2 +
+ 4 files changed, 122 insertions(+), 55 deletions(-)
+
+diff --git a/net/openvswitch/flow.c b/net/openvswitch/flow.c
+index aad7a8da70b1..432f04d5c896 100644
+--- a/net/openvswitch/flow.c
++++ b/net/openvswitch/flow.c
+@@ -65,8 +65,9 @@ void ovs_flow_stats_update(struct sw_flow *flow, struct sk_buff *skb)
+ {
+ 	struct flow_stats *stats;
+ 	__be16 tcp_flags = 0;
++	int node = numa_node_id();
+ 
+-	stats = this_cpu_ptr(flow->stats);
++	stats = rcu_dereference(flow->stats[node]);
+ 
+ 	if ((flow->key.eth.type == htons(ETH_P_IP) ||
+ 	     flow->key.eth.type == htons(ETH_P_IPV6)) &&
+@@ -76,68 +77,102 @@ void ovs_flow_stats_update(struct sw_flow *flow, struct sk_buff *skb)
+ 		tcp_flags = TCP_FLAGS_BE16(tcp_hdr(skb));
+ 	}
+ 
+-	spin_lock(&stats->lock);
++	/* Check if already have node-specific stats. */
++	if (likely(stats)) {
++		spin_lock(&stats->lock);
++		/* Mark if we write on the pre-allocated stats. */
++		if (node == 0 && unlikely(flow->stats_last_writer != node))
++			flow->stats_last_writer = node;
++	} else {
++		stats = rcu_dereference(flow->stats[0]); /* Pre-allocated. */
++		spin_lock(&stats->lock);
++
++		/* If the current NUMA-node is the only writer on the
++		 * pre-allocated stats keep using them.
++		 */
++		if (unlikely(flow->stats_last_writer != node)) {
++			/* A previous locker may have already allocated the
++			 * stats, so we need to check again.  If node-specific
++			 * stats were already allocated, we update the pre-
++			 * allocated stats as we have already locked them.
++			 */
++			if (likely(flow->stats_last_writer != NUMA_NO_NODE)
++			    && likely(!rcu_dereference(flow->stats[node]))) {
++				/* Try to allocate node-specific stats. */
++				struct flow_stats *new_stats;
++
++				new_stats =
++					kmem_cache_alloc_node(flow_stats_cache,
++							      GFP_THISNODE |
++							      __GFP_NOMEMALLOC,
++							      node);
++				if (likely(new_stats)) {
++					new_stats->used = jiffies;
++					new_stats->packet_count = 1;
++					new_stats->byte_count = skb->len;
++					new_stats->tcp_flags = tcp_flags;
++					spin_lock_init(&new_stats->lock);
++
++					rcu_assign_pointer(flow->stats[node],
++							   new_stats);
++					goto unlock;
++				}
++			}
++			flow->stats_last_writer = node;
++		}
++	}
++
+ 	stats->used = jiffies;
+ 	stats->packet_count++;
+ 	stats->byte_count += skb->len;
+ 	stats->tcp_flags |= tcp_flags;
+-	spin_unlock(&stats->lock);
+-}
+-
+-static void stats_read(struct flow_stats *stats,
+-		       struct ovs_flow_stats *ovs_stats,
+-		       unsigned long *used, __be16 *tcp_flags)
+-{
+-	spin_lock(&stats->lock);
+-	if (!*used || time_after(stats->used, *used))
+-		*used = stats->used;
+-	*tcp_flags |= stats->tcp_flags;
+-	ovs_stats->n_packets += stats->packet_count;
+-	ovs_stats->n_bytes += stats->byte_count;
++unlock:
+ 	spin_unlock(&stats->lock);
+ }
+ 
+ void ovs_flow_stats_get(struct sw_flow *flow, struct ovs_flow_stats *ovs_stats,
+ 			unsigned long *used, __be16 *tcp_flags)
+ {
+-	int cpu;
++	int node;
+ 
+ 	*used = 0;
+ 	*tcp_flags = 0;
+ 	memset(ovs_stats, 0, sizeof(*ovs_stats));
+ 
+-	local_bh_disable();
+-
+-	for_each_possible_cpu(cpu) {
+-		struct flow_stats *stats;
++	for_each_node(node) {
++		struct flow_stats *stats = rcu_dereference(flow->stats[node]);
+ 
+-		stats = per_cpu_ptr(flow->stats.cpu_stats, cpu);
+-		stats_read(stats, ovs_stats, used, tcp_flags);
++		if (stats) {
++			/* Local CPU may write on non-local stats, so we must
++			 * block bottom-halves here.
++			 */
++			spin_lock_bh(&stats->lock);
++			if (!*used || time_after(stats->used, *used))
++				*used = stats->used;
++			*tcp_flags |= stats->tcp_flags;
++			ovs_stats->n_packets += stats->packet_count;
++			ovs_stats->n_bytes += stats->byte_count;
++			spin_unlock_bh(&stats->lock);
++		}
+ 	}
+-
+-	local_bh_enable();
+-}
+-
+-static void stats_reset(struct flow_stats *stats)
+-{
+-	spin_lock(&stats->lock);
+-	stats->used = 0;
+-	stats->packet_count = 0;
+-	stats->byte_count = 0;
+-	stats->tcp_flags = 0;
+-	spin_unlock(&stats->lock);
+ }
+ 
+ void ovs_flow_stats_clear(struct sw_flow *flow)
+ {
+-	int cpu;
+-
+-	local_bh_disable();
+-
+-	for_each_possible_cpu(cpu)
+-		stats_reset(per_cpu_ptr(flow->stats, cpu));
+-
+-	local_bh_enable();
++	int node;
++
++	for_each_node(node) {
++		struct flow_stats *stats = rcu_dereference(flow->stats[node]);
++
++		if (stats) {
++			spin_lock_bh(&stats->lock);
++			stats->used = 0;
++			stats->packet_count = 0;
++			stats->byte_count = 0;
++			stats->tcp_flags = 0;
++			spin_unlock_bh(&stats->lock);
++		}
++	}
+ }
+ 
+ static int check_header(struct sk_buff *skb, int len)
+diff --git a/net/openvswitch/flow.h b/net/openvswitch/flow.h
+index 9c0dd8aa3117..ddcebc53224f 100644
+--- a/net/openvswitch/flow.h
++++ b/net/openvswitch/flow.h
+@@ -159,12 +159,18 @@ struct sw_flow {
+ 	struct rcu_head rcu;
+ 	struct hlist_node hash_node[2];
+ 	u32 hash;
+-
++	int stats_last_writer;		/* NUMA-node id of the last writer on
++					 * 'stats[0]'.
++					 */
+ 	struct sw_flow_key key;
+ 	struct sw_flow_key unmasked_key;
+ 	struct sw_flow_mask *mask;
+ 	struct sw_flow_actions __rcu *sf_acts;
+-	struct flow_stats __percpu *stats;
++	struct flow_stats __rcu *stats[]; /* One for each NUMA node.  First one
++					   * is allocated at flow creation time,
++					   * the rest are allocated on demand
++					   * while holding the 'stats[0].lock'.
++					   */
+ };
+ 
+ struct arp_eth_header {
+diff --git a/net/openvswitch/flow_table.c b/net/openvswitch/flow_table.c
+index aa92da23053d..d8ef37b937bd 100644
+--- a/net/openvswitch/flow_table.c
++++ b/net/openvswitch/flow_table.c
+@@ -48,6 +48,7 @@
+ #define REHASH_INTERVAL		(10 * 60 * HZ)
+ 
+ static struct kmem_cache *flow_cache;
++struct kmem_cache *flow_stats_cache __read_mostly;
+ 
+ static u16 range_n_bytes(const struct sw_flow_key_range *range)
+ {
+@@ -75,7 +76,8 @@ void ovs_flow_mask_key(struct sw_flow_key *dst, const struct sw_flow_key *src,
+ struct sw_flow *ovs_flow_alloc(void)
+ {
+ 	struct sw_flow *flow;
+-	int cpu;
++	struct flow_stats *stats;
++	int node;
+ 
+ 	flow = kmem_cache_alloc(flow_cache, GFP_KERNEL);
+ 	if (!flow)
+@@ -83,17 +85,22 @@ struct sw_flow *ovs_flow_alloc(void)
+ 
+ 	flow->sf_acts = NULL;
+ 	flow->mask = NULL;
++	flow->stats_last_writer = NUMA_NO_NODE;
+ 
+-	flow->stats = alloc_percpu(struct flow_stats);
+-	if (!flow->stats)
++	/* Initialize the default stat node. */
++	stats = kmem_cache_alloc_node(flow_stats_cache,
++				      GFP_KERNEL | __GFP_ZERO, 0);
++	if (!stats)
+ 		goto err;
+ 
+-	for_each_possible_cpu(cpu) {
+-		struct flow_stats *cpu_stats;
++	spin_lock_init(&stats->lock);
++
++	RCU_INIT_POINTER(flow->stats[0], stats);
++
++	for_each_node(node)
++		if (node != 0)
++			RCU_INIT_POINTER(flow->stats[node], NULL);
+ 
+-		cpu_stats = per_cpu_ptr(flow->stats, cpu);
+-		spin_lock_init(&cpu_stats->lock);
+-	}
+ 	return flow;
+ err:
+ 	kmem_cache_free(flow_cache, flow);
+@@ -130,8 +137,13 @@ static struct flex_array *alloc_buckets(unsigned int n_buckets)
+ 
+ static void flow_free(struct sw_flow *flow)
+ {
++	int node;
++
+ 	kfree((struct sf_flow_acts __force *)flow->sf_acts);
+-	free_percpu(flow->stats);
++	for_each_node(node)
++		if (flow->stats[node])
++			kmem_cache_free(flow_stats_cache,
++					(struct flow_stats __force *)flow->stats[node]);
+ 	kmem_cache_free(flow_cache, flow);
+ }
+ 
+@@ -586,16 +598,28 @@ int ovs_flow_init(void)
+ 	BUILD_BUG_ON(__alignof__(struct sw_flow_key) % __alignof__(long));
+ 	BUILD_BUG_ON(sizeof(struct sw_flow_key) % sizeof(long));
+ 
+-	flow_cache = kmem_cache_create("sw_flow", sizeof(struct sw_flow), 0,
+-					0, NULL);
++	flow_cache = kmem_cache_create("sw_flow", sizeof(struct sw_flow)
++				       + (num_possible_nodes()
++					  * sizeof(struct flow_stats *)),
++				       0, 0, NULL);
+ 	if (flow_cache == NULL)
+ 		return -ENOMEM;
+ 
++	flow_stats_cache
++		= kmem_cache_create("sw_flow_stats", sizeof(struct flow_stats),
++				    0, SLAB_HWCACHE_ALIGN, NULL);
++	if (flow_stats_cache == NULL) {
++		kmem_cache_destroy(flow_cache);
++		flow_cache = NULL;
++		return -ENOMEM;
++	}
++
+ 	return 0;
+ }
+ 
+ /* Uninitializes the flow module. */
+ void ovs_flow_exit(void)
+ {
++	kmem_cache_destroy(flow_stats_cache);
+ 	kmem_cache_destroy(flow_cache);
+ }
+diff --git a/net/openvswitch/flow_table.h b/net/openvswitch/flow_table.h
+index c26c59a7ab57..ca8a5820f615 100644
+--- a/net/openvswitch/flow_table.h
++++ b/net/openvswitch/flow_table.h
+@@ -52,6 +52,8 @@ struct flow_table {
+ 	unsigned int count;
+ };
+ 
++extern struct kmem_cache *flow_stats_cache;
++
+ int ovs_flow_init(void);
+ void ovs_flow_exit(void);
+ 
+-- 
+1.8.1.2
+
