@@ -1,0 +1,542 @@
+From ad68feecea8994948ddfa261ca930bf12c8beb85 Mon Sep 17 00:00:00 2001
+From: yanjun.zhu <yanjun.zhu@windriver.com>
+Date: Mon, 25 Aug 2014 13:49:01 +0800
+Subject: [PATCH 1/2] sctp: Implement quick failover draft from tsvwg
+
+commit 5aa93bcf66f4af094d6f11096e81d5501a0b4ba5 upstream
+
+I've seen several attempts recently made to do quick failover of sctp transports
+by reducing various retransmit timers and counters.  While its possible to
+implement a faster failover on multihomed sctp associations, its not
+particularly robust, in that it can lead to unneeded retransmits, as well as
+false connection failures due to intermittent latency on a network.
+
+Instead, lets implement the new ietf quick failover draft found here:
+http://tools.ietf.org/html/draft-nishida-tsvwg-sctp-failover-05
+
+This will let the sctp stack identify transports that have had a small number of
+errors, and avoid using them quickly until their reliability can be
+re-established.  I've tested this out on two virt guests connected via multiple
+isolated virt networks and believe its in compliance with the above draft and
+works well.
+
+Signed-off-by: Neil Horman <nhorman@tuxdriver.com>
+CC: Vlad Yasevich <vyasevich@gmail.com>
+CC: Sridhar Samudrala <sri@us.ibm.com>
+CC: "David S. Miller" <davem@davemloft.net>
+CC: linux-sctp@vger.kernel.org
+CC: joe@perches.com
+Acked-by: Vlad Yasevich <vyasevich@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: yanjun.zhu <yanjun.zhu@windriver.com>
+---
+ Documentation/networking/ip-sysctl.txt |   14 +++++
+ include/net/sctp/constants.h           |    1 +
+ include/net/sctp/structs.h             |   21 ++++++-
+ include/net/sctp/user.h                |   11 ++++
+ net/sctp/associola.c                   |   37 +++++++++--
+ net/sctp/outqueue.c                    |    6 +-
+ net/sctp/sm_sideeffect.c               |   33 +++++++++-
+ net/sctp/socket.c                      |  101 ++++++++++++++++++++++++++++++++
+ net/sctp/sysctl.c                      |    9 +++
+ net/sctp/transport.c                   |    4 +-
+ 10 files changed, 222 insertions(+), 15 deletions(-)
+
+diff --git a/Documentation/networking/ip-sysctl.txt b/Documentation/networking/ip-sysctl.txt
+index 8b72c88..a7fd0f2 100644
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -1291,6 +1291,20 @@ path_max_retrans - INTEGER
+ 
+ 	Default: 5
+ 
++pf_retrans - INTEGER
++	The number of retransmissions that will be attempted on a given path
++	before traffic is redirected to an alternate transport (should one
++	exist).  Note this is distinct from path_max_retrans, as a path that
++	passes the pf_retrans threshold can still be used.  Its only
++	deprioritized when a transmission path is selected by the stack.  This
++	setting is primarily used to enable fast failover mechanisms without
++	having to reduce path_max_retrans to a very low value.  See:
++	http://www.ietf.org/id/draft-nishida-tsvwg-sctp-failover-05.txt
++	for details.  Note also that a value of pf_retrans > path_max_retrans
++	disables this feature
++
++	Default: 0
++
+ rto_initial - INTEGER
+ 	The initial round trip timeout value in milliseconds that will be used
+ 	in calculating round trip times.  This is the initial time interval
+diff --git a/include/net/sctp/constants.h b/include/net/sctp/constants.h
+index 6390884..e08d239 100644
+--- a/include/net/sctp/constants.h
++++ b/include/net/sctp/constants.h
+@@ -350,6 +350,7 @@ typedef enum {
+ typedef enum {
+ 	SCTP_TRANSPORT_UP,
+ 	SCTP_TRANSPORT_DOWN,
++	SCTP_TRANSPORT_PF,
+ } sctp_transport_cmd_t;
+ 
+ /* These are the address scopes defined mainly for IPv4 addresses
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index c83bcce..03b17bd 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -161,6 +161,12 @@ extern struct sctp_globals {
+ 	int max_retrans_path;
+ 	int max_retrans_init;
+ 
++	/* Potentially-Failed.Max.Retrans sysctl value
++	 * taken from:
++	 * http://tools.ietf.org/html/draft-nishida-tsvwg-sctp-failover-05
++	 */
++	int pf_retrans;
++
+ 	/*
+ 	 * Policy for preforming sctp/socket accounting
+ 	 * 0   - do socket level accounting, all assocs share sk_sndbuf
+@@ -253,6 +259,7 @@ extern struct sctp_globals {
+ #define sctp_sndbuf_policy	 	(sctp_globals.sndbuf_policy)
+ #define sctp_rcvbuf_policy	 	(sctp_globals.rcvbuf_policy)
+ #define sctp_max_retrans_path		(sctp_globals.max_retrans_path)
++#define sctp_pf_retrans			(sctp_globals.pf_retrans)
+ #define sctp_max_retrans_init		(sctp_globals.max_retrans_init)
+ #define sctp_sack_timeout		(sctp_globals.sack_timeout)
+ #define sctp_hb_interval		(sctp_globals.hb_interval)
+@@ -975,10 +982,16 @@ struct sctp_transport {
+ 
+ 	/* This is the max_retrans value for the transport and will
+ 	 * be initialized from the assocs value.  This can be changed
+-	 * using SCTP_SET_PEER_ADDR_PARAMS socket option.
++	 * using the SCTP_SET_PEER_ADDR_PARAMS socket option.
+ 	 */
+ 	__u16 pathmaxrxt;
+ 
++	/* This is the partially failed retrans value for the transport
++ 	 * and will be initialized from the assocs value.  This can be changed
++ 	 * using the SCTP_PEER_ADDR_THLDS socket option
++ 	 */
++	int pf_retrans;
++
+ 	/* is the Path MTU update pending on this tranport */
+ 	__u8 pmtu_pending;
+ 
+@@ -1653,6 +1666,12 @@ struct sctp_association {
+ 	 */
+ 	int max_retrans;
+ 
++	/* This is the partially failed retrans value for the transport
++	 * and will be initialized from the assocs value.  This can be
++	 * changed using the SCTP_PEER_ADDR_THLDS socket option
++	 */
++	int pf_retrans;
++
+ 	/* Maximum number of times the endpoint will retransmit INIT  */
+ 	__u16 max_init_attempts;
+ 
+diff --git a/include/net/sctp/user.h b/include/net/sctp/user.h
+index 2b2769c..a8c4a02 100644
+--- a/include/net/sctp/user.h
++++ b/include/net/sctp/user.h
+@@ -90,6 +90,7 @@ typedef __s32 sctp_assoc_t;
+ #define SCTP_PEER_AUTH_CHUNKS	26	/* Read only */
+ #define SCTP_LOCAL_AUTH_CHUNKS	27	/* Read only */
+ #define SCTP_GET_ASSOC_NUMBER	28	/* Read only */
++#define SCTP_PEER_ADDR_THLDS	31
+ 
+ /* Internal Socket Options. Some of the sctp library functions are
+  * implemented using these socket options.
+@@ -628,6 +629,7 @@ struct sctp_paddrinfo {
+  */
+ enum sctp_spinfo_state {
+ 	SCTP_INACTIVE,
++	SCTP_PF,
+ 	SCTP_ACTIVE,
+ 	SCTP_UNCONFIRMED,
+ 	SCTP_UNKNOWN = 0xffff  /* Value used for transport state unknown */
+@@ -708,4 +710,13 @@ typedef struct {
+ 	int sd;
+ } sctp_peeloff_arg_t;
+ 
++/*
++ *  Peer Address Thresholds socket option
++ */
++struct sctp_paddrthlds {
++	sctp_assoc_t spt_assoc_id;
++	struct sockaddr_storage spt_address;
++	__u16 spt_pathmaxrxt;
++	__u16 spt_pathpfthld;
++};
+ #endif /* __net_sctp_user_h__ */
+diff --git a/net/sctp/associola.c b/net/sctp/associola.c
+index 1ee420e..1c4c711 100644
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@ -125,6 +125,8 @@ static struct sctp_association *sctp_association_init(struct sctp_association *a
+ 	 * socket values.
+ 	 */
+ 	asoc->max_retrans = sp->assocparams.sasoc_asocmaxrxt;
++	asoc->pf_retrans  = sctp_pf_retrans;
++
+ 	asoc->rto_initial = msecs_to_jiffies(sp->rtoinfo.srto_initial);
+ 	asoc->rto_max = msecs_to_jiffies(sp->rtoinfo.srto_max);
+ 	asoc->rto_min = msecs_to_jiffies(sp->rtoinfo.srto_min);
+@@ -677,6 +679,9 @@ struct sctp_transport *sctp_assoc_add_peer(struct sctp_association *asoc,
+ 	/* Set the path max_retrans.  */
+ 	peer->pathmaxrxt = asoc->pathmaxrxt;
+ 
++	/* And the partial failure retrnas threshold */
++	peer->pf_retrans = asoc->pf_retrans;
++
+ 	/* Initialize the peer's SACK delay timeout based on the
+ 	 * association configured value.
+ 	 */
+@@ -833,6 +838,7 @@ void sctp_assoc_control_transport(struct sctp_association *asoc,
+ 	struct sctp_ulpevent *event;
+ 	struct sockaddr_storage addr;
+ 	int spc_state = 0;
++	bool ulp_notify = true;
+ 
+ 	/* Record the transition on the transport.  */
+ 	switch (command) {
+@@ -846,6 +852,14 @@ void sctp_assoc_control_transport(struct sctp_association *asoc,
+ 			spc_state = SCTP_ADDR_CONFIRMED;
+ 		else
+ 			spc_state = SCTP_ADDR_AVAILABLE;
++		/* Don't inform ULP about transition from PF to
++		 * active state and set cwnd to 1, see SCTP
++		 * Quick failover draft section 5.1, point 5
++		 */
++		if (transport->state == SCTP_PF) {
++			ulp_notify = false;
++			transport->cwnd = 1;
++		}
+ 		transport->state = SCTP_ACTIVE;
+ 		break;
+ 
+@@ -864,6 +878,11 @@ void sctp_assoc_control_transport(struct sctp_association *asoc,
+ 		spc_state = SCTP_ADDR_UNREACHABLE;
+ 		break;
+ 
++	case SCTP_TRANSPORT_PF:
++		transport->state = SCTP_PF;
++		ulp_notify = false;
++		break;
++
+ 	default:
+ 		return;
+ 	}
+@@ -871,12 +890,15 @@ void sctp_assoc_control_transport(struct sctp_association *asoc,
+ 	/* Generate and send a SCTP_PEER_ADDR_CHANGE notification to the
+ 	 * user.
+ 	 */
+-	memset(&addr, 0, sizeof(struct sockaddr_storage));
+-	memcpy(&addr, &transport->ipaddr, transport->af_specific->sockaddr_len);
+-	event = sctp_ulpevent_make_peer_addr_change(asoc, &addr,
+-				0, spc_state, error, GFP_ATOMIC);
+-	if (event)
+-		sctp_ulpq_tail_event(&asoc->ulpq, event);
++	if (ulp_notify) {
++		memset(&addr, 0, sizeof(struct sockaddr_storage));
++		memcpy(&addr, &transport->ipaddr,
++		       transport->af_specific->sockaddr_len);
++		event = sctp_ulpevent_make_peer_addr_change(asoc, &addr,
++					0, spc_state, error, GFP_ATOMIC);
++		if (event)
++			sctp_ulpq_tail_event(&asoc->ulpq, event);
++	}
+ 
+ 	/* Select new active and retran paths. */
+ 
+@@ -892,7 +914,8 @@ void sctp_assoc_control_transport(struct sctp_association *asoc,
+ 			transports) {
+ 
+ 		if ((t->state == SCTP_INACTIVE) ||
+-		    (t->state == SCTP_UNCONFIRMED))
++		    (t->state == SCTP_UNCONFIRMED) ||
++		    (t->state == SCTP_PF))
+ 			continue;
+ 		if (!first || t->last_time_heard > first->last_time_heard) {
+ 			second = first;
+diff --git a/net/sctp/outqueue.c b/net/sctp/outqueue.c
+index c241dab..d3ebfb4 100644
+--- a/net/sctp/outqueue.c
++++ b/net/sctp/outqueue.c
+@@ -774,7 +774,8 @@ static int sctp_outq_flush(struct sctp_outq *q, int rtx_timeout)
+ 			if (!new_transport)
+ 				new_transport = asoc->peer.active_path;
+ 		} else if ((new_transport->state == SCTP_INACTIVE) ||
+-			   (new_transport->state == SCTP_UNCONFIRMED)) {
++			   (new_transport->state == SCTP_UNCONFIRMED) ||
++			   (new_transport->state == SCTP_PF)) {
+ 			/* If the chunk is Heartbeat or Heartbeat Ack,
+ 			 * send it to chunk->transport, even if it's
+ 			 * inactive.
+@@ -959,7 +960,8 @@ static int sctp_outq_flush(struct sctp_outq *q, int rtx_timeout)
+ 			new_transport = chunk->transport;
+ 			if (!new_transport ||
+ 			    ((new_transport->state == SCTP_INACTIVE) ||
+-			     (new_transport->state == SCTP_UNCONFIRMED)))
++			     (new_transport->state == SCTP_UNCONFIRMED) ||
++			     (new_transport->state == SCTP_PF)))
+ 				new_transport = asoc->peer.active_path;
+ 
+ 			/* Change packets if necessary.  */
+diff --git a/net/sctp/sm_sideeffect.c b/net/sctp/sm_sideeffect.c
+index de4e7a9..c6c66e0 100644
+--- a/net/sctp/sm_sideeffect.c
++++ b/net/sctp/sm_sideeffect.c
+@@ -74,6 +74,8 @@ static int sctp_side_effects(sctp_event_t event_type, sctp_subtype_t subtype,
+ 			     sctp_cmd_seq_t *commands,
+ 			     gfp_t gfp);
+ 
++static void sctp_cmd_hb_timer_update(sctp_cmd_seq_t *cmds,
++				     struct sctp_transport *t);
+ /********************************************************************
+  * Helper functions
+  ********************************************************************/
+@@ -468,7 +470,8 @@ sctp_timer_event_t *sctp_timer_events[SCTP_NUM_TIMEOUT_TYPES] = {
+  * notification SHOULD be sent to the upper layer.
+  *
+  */
+-static void sctp_do_8_2_transport_strike(struct sctp_association *asoc,
++static void sctp_do_8_2_transport_strike(sctp_cmd_seq_t *commands,
++					 struct sctp_association *asoc,
+ 					 struct sctp_transport *transport,
+ 					 int is_hb)
+ {
+@@ -493,6 +496,23 @@ static void sctp_do_8_2_transport_strike(struct sctp_association *asoc,
+ 			transport->error_count++;
+ 	}
+ 
++	/* If the transport error count is greater than the pf_retrans
++	 * threshold, and less than pathmaxrtx, then mark this transport
++	 * as Partially Failed, ee SCTP Quick Failover Draft, secon 5.1,
++	 * point 1
++	 */
++	if ((transport->state != SCTP_PF) &&
++	   (asoc->pf_retrans < transport->pathmaxrxt) &&
++	   (transport->error_count > asoc->pf_retrans)) {
++
++		sctp_assoc_control_transport(asoc, transport,
++					     SCTP_TRANSPORT_PF,
++					     0);
++
++		/* Update the hb timer to resend a heartbeat every rto */
++		sctp_cmd_hb_timer_update(commands, transport);
++	}
++
+ 	if (transport->state != SCTP_INACTIVE &&
+ 	    (transport->error_count > transport->pathmaxrxt)) {
+ 		SCTP_DEBUG_PRINTK_IPADDR("transport_strike:association %p",
+@@ -694,6 +714,10 @@ static void sctp_cmd_transport_on(sctp_cmd_seq_t *cmds,
+ 		sctp_assoc_control_transport(asoc, t, SCTP_TRANSPORT_UP,
+ 					     SCTP_HEARTBEAT_SUCCESS);
+ 
++	if (t->state == SCTP_PF)
++		sctp_assoc_control_transport(asoc, t, SCTP_TRANSPORT_UP,
++					     SCTP_HEARTBEAT_SUCCESS);
++
+ 	/* The receiver of the HEARTBEAT ACK should also perform an
+ 	 * RTT measurement for that destination transport address
+ 	 * using the time value carried in the HEARTBEAT ACK chunk.
+@@ -1567,8 +1591,8 @@ static int sctp_cmd_interpreter(sctp_event_t event_type,
+ 
+ 		case SCTP_CMD_STRIKE:
+ 			/* Mark one strike against a transport.  */
+-			sctp_do_8_2_transport_strike(asoc, cmd->obj.transport,
+-						    0);
++			sctp_do_8_2_transport_strike(commands, asoc,
++						    cmd->obj.transport, 0);
+ 			break;
+ 
+ 		case SCTP_CMD_TRANSPORT_IDLE:
+@@ -1578,7 +1602,8 @@ static int sctp_cmd_interpreter(sctp_event_t event_type,
+ 
+ 		case SCTP_CMD_TRANSPORT_HB_SENT:
+ 			t = cmd->obj.transport;
+-			sctp_do_8_2_transport_strike(asoc, t, 1);
++			sctp_do_8_2_transport_strike(commands, asoc,
++						     t, 1);
+ 			t->hb_sent = 1;
+ 			break;
+ 
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 597e26e..ea14dba 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -3339,6 +3339,56 @@ static int sctp_setsockopt_del_key(struct sock *sk,
+ }
+ 
+ 
++/*
++ * SCTP_PEER_ADDR_THLDS
++ *
++ * This option allows us to alter the partially failed threshold for one or all
++ * transports in an association.  See Section 6.1 of:
++ * http://www.ietf.org/id/draft-nishida-tsvwg-sctp-failover-05.txt
++ */
++static int sctp_setsockopt_paddr_thresholds(struct sock *sk,
++					    char __user *optval,
++					    unsigned int optlen)
++{
++	struct sctp_paddrthlds val;
++	struct sctp_transport *trans;
++	struct sctp_association *asoc;
++
++	if (optlen < sizeof(struct sctp_paddrthlds))
++		return -EINVAL;
++	if (copy_from_user(&val, (struct sctp_paddrthlds __user *)optval,
++			   sizeof(struct sctp_paddrthlds)))
++		return -EFAULT;
++
++
++	if (sctp_is_any(sk, (const union sctp_addr *)&val.spt_address)) {
++		asoc = sctp_id2assoc(sk, val.spt_assoc_id);
++		if (!asoc)
++			return -ENOENT;
++		list_for_each_entry(trans, &asoc->peer.transport_addr_list,
++				    transports) {
++			if (val.spt_pathmaxrxt)
++				trans->pathmaxrxt = val.spt_pathmaxrxt;
++			trans->pf_retrans = val.spt_pathpfthld;
++		}
++
++		if (val.spt_pathmaxrxt)
++			asoc->pathmaxrxt = val.spt_pathmaxrxt;
++		asoc->pf_retrans = val.spt_pathpfthld;
++	} else {
++		trans = sctp_addr_id2transport(sk, &val.spt_address,
++					       val.spt_assoc_id);
++		if (!trans)
++			return -ENOENT;
++
++		if (val.spt_pathmaxrxt)
++			trans->pathmaxrxt = val.spt_pathmaxrxt;
++		trans->pf_retrans = val.spt_pathpfthld;
++	}
++
++	return 0;
++}
++
+ /* API 6.2 setsockopt(), getsockopt()
+  *
+  * Applications use setsockopt() and getsockopt() to set or retrieve
+@@ -3485,6 +3535,9 @@ SCTP_STATIC int sctp_setsockopt(struct sock *sk, int level, int optname,
+ 	case SCTP_AUTH_DELETE_KEY:
+ 		retval = sctp_setsockopt_del_key(sk, optval, optlen);
+ 		break;
++	case SCTP_PEER_ADDR_THLDS:
++		retval = sctp_setsockopt_paddr_thresholds(sk, optval, optlen);
++		break;
+ 	default:
+ 		retval = -ENOPROTOOPT;
+ 		break;
+@@ -5253,6 +5306,51 @@ static int sctp_getsockopt_assoc_number(struct sock *sk, int len,
+ 	return 0;
+ }
+ 
++/*
++ * SCTP_PEER_ADDR_THLDS
++ *
++ * This option allows us to fetch the partially failed threshold for one or all
++ * transports in an association.  See Section 6.1 of:
++ * http://www.ietf.org/id/draft-nishida-tsvwg-sctp-failover-05.txt
++ */
++static int sctp_getsockopt_paddr_thresholds(struct sock *sk,
++					    char __user *optval,
++					    int len,
++					    int __user *optlen)
++{
++	struct sctp_paddrthlds val;
++	struct sctp_transport *trans;
++	struct sctp_association *asoc;
++
++	if (len < sizeof(struct sctp_paddrthlds))
++		return -EINVAL;
++	len = sizeof(struct sctp_paddrthlds);
++	if (copy_from_user(&val, (struct sctp_paddrthlds __user *)optval, len))
++		return -EFAULT;
++
++	if (sctp_is_any(sk, (const union sctp_addr *)&val.spt_address)) {
++		asoc = sctp_id2assoc(sk, val.spt_assoc_id);
++		if (!asoc)
++			return -ENOENT;
++
++		val.spt_pathpfthld = asoc->pf_retrans;
++		val.spt_pathmaxrxt = asoc->pathmaxrxt;
++	} else {
++		trans = sctp_addr_id2transport(sk, &val.spt_address,
++					       val.spt_assoc_id);
++		if (!trans)
++			return -ENOENT;
++
++		val.spt_pathmaxrxt = trans->pathmaxrxt;
++		val.spt_pathpfthld = trans->pf_retrans;
++	}
++
++	if (put_user(len, optlen) || copy_to_user(optval, &val, len))
++		return -EFAULT;
++
++	return 0;
++}
++
+ SCTP_STATIC int sctp_getsockopt(struct sock *sk, int level, int optname,
+ 				char __user *optval, int __user *optlen)
+ {
+@@ -5385,6 +5483,9 @@ SCTP_STATIC int sctp_getsockopt(struct sock *sk, int level, int optname,
+ 	case SCTP_GET_ASSOC_NUMBER:
+ 		retval = sctp_getsockopt_assoc_number(sk, len, optval, optlen);
+ 		break;
++	case SCTP_PEER_ADDR_THLDS:
++		retval = sctp_getsockopt_paddr_thresholds(sk, optval, len, optlen);
++		break;
+ 	default:
+ 		retval = -ENOPROTOOPT;
+ 		break;
+diff --git a/net/sctp/sysctl.c b/net/sctp/sysctl.c
+index cff0a28..c51404e 100644
+--- a/net/sctp/sysctl.c
++++ b/net/sctp/sysctl.c
+@@ -137,6 +137,15 @@ static ctl_table sctp_table[] = {
+ 		.extra2		= &int_max
+ 	},
+ 	{
++		.procname	= "pf_retrans",
++		.data		= &sctp_pf_retrans,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &zero,
++		.extra2		= &int_max
++	},
++	{
+ 		.procname	= "max_init_retransmits",
+ 		.data		= &sctp_max_retrans_init,
+ 		.maxlen		= sizeof(int),
+diff --git a/net/sctp/transport.c b/net/sctp/transport.c
+index 67a670c..60baa09 100644
+--- a/net/sctp/transport.c
++++ b/net/sctp/transport.c
+@@ -95,6 +95,7 @@ static struct sctp_transport *sctp_transport_init(struct sctp_transport *peer,
+ 
+ 	/* Initialize the default path max_retrans.  */
+ 	peer->pathmaxrxt  = sctp_max_retrans_path;
++	peer->pf_retrans  = sctp_pf_retrans;
+ 	peer->error_count = 0;
+ 
+ 	INIT_LIST_HEAD(&peer->transmitted);
+@@ -611,7 +612,8 @@ unsigned long sctp_transport_timeout(struct sctp_transport *t)
+ {
+ 	unsigned long timeout;
+ 	timeout = t->rto + sctp_jitter(t->rto);
+-	if (t->state != SCTP_UNCONFIRMED)
++	if ((t->state != SCTP_UNCONFIRMED) &&
++	    (t->state != SCTP_PF))
+ 		timeout += t->hbinterval;
+ 	timeout += jiffies;
+ 	return timeout;
+-- 
+1.7.0
+
