@@ -1,0 +1,188 @@
+From ef78f239724619c7e13f20beaf56a62cec4908b5 Mon Sep 17 00:00:00 2001
+From: Dave Lerner <dave.lerner@windriver.com>
+Date: Mon, 1 Sep 2014 10:32:25 +0800
+Subject: [PATCH 2/2] oprofile: fix RCU core stalled failures in backtrace logic
+
+In the MIPS oprofile backtrace logic, there are two causes of
+one core or the cavium target locking up while running the
+oprofile MIPS backtrace stack crawl:
+1. illegal address accesses, causing the target to be completely
+non-responsive
+2. an infinite loop in the backtrace logic, causing RCU failure
+reports.
+
+The first failure mode has been seen on other non-linux MIPS targets
+when an address is invalid, and is also a known failure mode according
+to WRS kernel engineers. The functions probe_kernel_address and
+probe_kernel_read are supposed to prevent those accesses, but since the
+oprofile MIPS backtrace hueristics probe stack-resident addresses more
+frequently than other kernel code, additional protection is provided by
+insuring all addresses are valid and in the segment maps as described in
+MIPS Architecture for Programmers Vol III.
+
+The second failure, an infinite loop in the MIPS backtrace logic, was
+reported during several tests with additonal printk's in
+op_frame_crawl(). The 'crawl' examines every instruction 'around' a
+sampled instruction pointer or return instruction pointer. The crawl
+tries to match a sequence of op-codes from the IP with a function
+epilogue signature, and when that fails, starts backwards trying to
+match an op-code sequence with a function prologue signature.
+Since the target function under inspection by the crawl could be
+arbitrarily long, with an arbitrarily large number of branches, any of
+which could lead to the epilogue or prologue, and since the op-code
+traversal occurs in a kernel interrupt, limits must be imposed on the
+traversal going forward, backward, and following branches.
+After instrumenting this code, it was discovered that sequences of
+branch instructions followed by the return instruction causes the
+backwards search to loop forever; that logic path resets the loop
+iterator i to 0 after setting flags to do the reverse search and then
+starts the forward search. Not all op-codes seqeunces and reverse
+searches caused this failure. To insure that no opcode-sequence can
+ever cause the crawl algorithm to loop forever, a separate loop
+traversal counter and test are introduced, to give up the return
+adderss search after 4K iterations.
+
+Signed-off-by: Dave Lerner <dave.lerner@windriver.com>
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ arch/mips/oprofile/context.c      |    6 +++-
+ arch/mips/oprofile/mem_validate.h |    7 ++++++
+ arch/mips/oprofile/mips_crawl.c   |   38 +++++++++++++++++++++++++++++++++++++
+ drivers/oprofile/cpu_buffer.c     |    9 ++++++++
+ 4 files changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/arch/mips/oprofile/context.c b/arch/mips/oprofile/context.c
+index d13ef33..553793f 100644
+--- a/arch/mips/oprofile/context.c
++++ b/arch/mips/oprofile/context.c
+@@ -108,7 +108,8 @@ bool apply_delta(const struct new_value_delta *const delta,
+ 			    (void *)((unsigned long)child->gpregs[delta->reg] +
+ 				     delta->offset);
+ 		}
+-		if (probe_kernel_read(result, target, sizeof(*result))) {
++		if (!octeon_addr_valid(target) ||
++			probe_kernel_read(result, target, sizeof(*result))) {
+ 			d1printf("Invalid address %p picked up from gpregs+%d\n",
+ 				target, delta->reg);
+ 			return false;
+@@ -219,7 +220,8 @@ bool apply_context_results(struct op_context *const child,
+ 			     target);
+ 			return false;
+ 		}
+-		if (probe_kernel_read(&parent->pc, target, sizeof(parent->pc)))
++		if (!octeon_addr_valid(target) ||
++			probe_kernel_read(&parent->pc, target, sizeof(parent->pc)))
+ 			return false;
+ 	}
+ #endif /* USES_SP */
+diff --git a/arch/mips/oprofile/mem_validate.h b/arch/mips/oprofile/mem_validate.h
+index 9cae3ba..85a87ff 100644
+--- a/arch/mips/oprofile/mem_validate.h
++++ b/arch/mips/oprofile/mem_validate.h
+@@ -77,6 +77,10 @@ struct memory_access_data {
+ 	tInst data;
+ };
+ 
++
++/* patch for cavium_oceton board ranges */
++bool octeon_addr_valid(const void *target);
++
+ /*
+  * PCOk - check for valid PC address
+  *
+@@ -89,6 +93,9 @@ struct memory_access_data {
+  */
+ static inline bool PCOk(const void const *pc, struct memory_access_data *membuf)
+ {
++	if (!octeon_addr_valid(pc))
++		return false;
++
+ 	if (__will_fault(pc, sizeof(tInst)))
+ 		return false;
+ 
+diff --git a/arch/mips/oprofile/mips_crawl.c b/arch/mips/oprofile/mips_crawl.c
+index 6b84b78..308a796 100644
+--- a/arch/mips/oprofile/mips_crawl.c
++++ b/arch/mips/oprofile/mips_crawl.c
+@@ -252,6 +252,38 @@ done:
+ 	return ret;
+ }
+ 
++/* patch for cavium_oceton board ranges */
++struct SEGRANGE {
++	char *name;
++	void *start;
++	void *last;
++};
++
++static const struct SEGRANGE const segranges[] = {
++	{"kseg3", (void *)0xffffffffe0000000, (void *)0xffffffffffffffff},
++	{"ksseg", (void *)0xffffffffc0000000, (void *)0xffffffffdfffffff},
++	{"kseg1", (void *)0xffffffffa0000000, (void *)0xffffffffbfffffff},
++	{"kseg0", (void *)0xffffffff80000000, (void *)0xffffffff9fffffff},
++	{"xkseg", (void *)0xc000000000000000, (void *)0xc000001fffffffff},
++	{"xsseg", (void *)0x4000000000000000, (void *)0x4000001fffffffff},
++	{"xuseg", (void *)0x0000000080000000, (void *)0x0000001fffffffff},
++	{"useg",  (void *)0x0000000000000000, (void *)0x000000007fffffff}
++};
++
++bool octeon_addr_valid(const void *target)
++{
++#if defined(CONFIG_64BIT)
++	int i;
++	for (i = 0; i < ARRAY_SIZE(segranges); i++) {
++		struct SEGRANGE const *seg = &segranges[i];
++		if (seg->start <= target && seg->last >= target)
++			return true;
++	}
++	return false;
++#else
++	return true;
++#endif
++}
+ 
+ /**
+  * op_frame_crawl - given a target pc value, locate the calling stack frame
+@@ -306,6 +338,9 @@ bool op_frame_crawl(void *startpc,
+ 	int branchCount = 0;
+ 	long offset;
+ 	bool fpBeingUsed = false;
++	int totalLoopPasses = 0;
++	/* limit scans to twice the max function length allowed */
++	const int MAX_LOOP_PASSES = 2*RTITOOLS_CONTEXT_MAX_FN_LENGTH;
+ 
+ 	/* most clauses don't use the frame pointer, so by default we mark it as
+ 	   untracked for the current frame. */
+@@ -320,6 +355,9 @@ bool op_frame_crawl(void *startpc,
+ 	 */
+ 	for (i = 0; i < RTITOOLS_CONTEXT_MAX_FN_LENGTH; ++i) {
+ resumeFwdSearch:
++		if (totalLoopPasses++ >= MAX_LOOP_PASSES)
++			return false;
++
+ 		pcCur = pcCurStart + i;
+ 		if (!PCOk(pcCur, client_arg)) {
+ 			d1printf(" %p: invalid PC!  Loop #%u; reversing...\n",
+diff --git a/drivers/oprofile/cpu_buffer.c b/drivers/oprofile/cpu_buffer.c
+index c1db97a..43249ea 100644
+--- a/drivers/oprofile/cpu_buffer.c
++++ b/drivers/oprofile/cpu_buffer.c
+@@ -294,6 +294,15 @@ __oprofile_add_ext_sample(unsigned long pc, struct pt_regs * const regs,
+ 	unsigned long backtrace = oprofile_backtrace_depth;
+ 
+ 	/*
++	 * Don't start a trace on this cpu if one is already running.
++	 * Note this in diag mode
++	 */
++	if (cpu_buf->tracing) {
++		printk(KERN_ERR "oprofile backtrace reentry detected\n");
++		return;
++	}
++
++	/*
+ 	 * if log_sample() fail we can't backtrace since we lost the
+ 	 * source of this event
+ 	 */
+-- 
+1.7.0
+
