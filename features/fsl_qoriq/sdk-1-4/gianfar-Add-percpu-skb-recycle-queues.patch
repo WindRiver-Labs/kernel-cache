@@ -1,0 +1,250 @@
+From 1d151f8ffc42809f6a69a45ab96d09b7332b69f5 Mon Sep 17 00:00:00 2001
+From: Claudiu Manoil <claudiu.manoil@freescale.com>
+Date: Thu, 11 Apr 2013 09:26:52 +0300
+Subject: [PATCH 390/547] gianfar: Add percpu skb recycle queues
+
+Improve skb recycling efficiency by adding per CPU recycle
+queues. This allows lockless access to the local recycle
+queues and improves cache locality for the recycled buffers.
+On the other hand it may increase memory usage as each device
+will have one local recycle queue for each CPU in addition
+to the "shared" recycle queue. The optimization targets
+packet forwarding scenarios where each flow is assigned to
+a single CPU.
+
+If the local percpu recycle queue cannot service the dequeue or
+enqueue requests (i.e. queue either empty or resp. full), then
+the request falls back to the shared recycle queue. Local per
+CPU queue accesses are lockless.
+The sysfs recycle stub has been augmented to print the percpu
+statistics as well.
+The gfar_init_recycle() has been updated to alloc the percpu
+local queue structures and moved after device registration,
+to be able to log warning messages should the allocation fail.
+MAX_RECYCLE is set to the default Tx ring size (which is now
+equal to the default Rx ring size).
+
+Signed-off-by: Claudiu Manoil <claudiu.manoil@freescale.com>
+Change-Id: Ibae54d6dcd83581ca7a5f2d409b3b2b412e52f0d
+Reviewed-on: http://git.am.freescale.net:8181/2550
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Reviewed-by: Fleming Andrew-AFLEMING <AFLEMING@freescale.com>
+Tested-by: Fleming Andrew-AFLEMING <AFLEMING@freescale.com>
+[Original patch taken from QorIQ-SDK-V1.4-SOURCE-20130625-yocto.iso]
+Signed-off-by: Bin Jiang <bin.jiang@windriver.com>
+---
+ drivers/net/ethernet/freescale/gianfar.c       | 84 +++++++++++++++++++++++---
+ drivers/net/ethernet/freescale/gianfar.h       | 11 +++-
+ drivers/net/ethernet/freescale/gianfar_sysfs.c | 11 +++-
+ 3 files changed, 94 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/gianfar.c b/drivers/net/ethernet/freescale/gianfar.c
+index aa8107e..b7f73a7 100644
+--- a/drivers/net/ethernet/freescale/gianfar.c
++++ b/drivers/net/ethernet/freescale/gianfar.c
+@@ -579,6 +579,7 @@ static void unmap_group_regs(struct gfar_private *priv)
+ 
+ static void free_gfar_dev(struct gfar_private *priv)
+ {
++	struct gfar_priv_recycle *rec = &priv->recycle;
+ 	int i, j;
+ 
+ 	for (i = 0; i < MAXGROUPS; i++) {
+@@ -595,6 +596,8 @@ static void free_gfar_dev(struct gfar_private *priv)
+ 		}
+ 	}
+ 
++	free_percpu(rec->local);
++
+ 	free_netdev(priv->ndev);
+ }
+ 
+@@ -1091,19 +1094,41 @@ static void gfar_detect_errata(struct gfar_private *priv)
+ static void gfar_init_recycle(struct gfar_private *priv)
+ {
+ 	struct gfar_priv_recycle *rec = &priv->recycle;
++	int cpu;
+ 
+ 	rec->buff_size = priv->rx_buffer_size + RXBUF_ALIGNMENT;
+ 	skb_queue_head_init(&rec->recycle_q);
++
++	if (!gfar_skb_recycling_en)
++		goto disable_rec;
++
+ 	/* recycle skbs to the own queue by default */
+-	if (gfar_skb_recycling_en) {
+-		priv->recycle_target = &priv->recycle;
+-		priv->recycle_ndev = priv->ndev;
+-	} else {
+-		priv->recycle_target = NULL;
+-		priv->recycle_ndev = NULL;
++	priv->recycle_target = &priv->recycle;
++	priv->recycle_ndev = priv->ndev;
++
++	rec->local = alloc_percpu(struct gfar_priv_recycle_local);
++	if (!rec->local) {
++		netdev_err(priv->ndev, "Recycle queues init failed!\n");
++		goto disable_rec;
++	}
++
++	for_each_possible_cpu(cpu) {
++		struct gfar_priv_recycle_local *local;
++		local = per_cpu_ptr(rec->local, cpu);
++		skb_queue_head_init(&local->recycle_q);
++		local->recycle_cnt = 0;
++		local->reuse_cnt = 0;
+ 	}
+ 
+ 	list_add(&priv->recycle_node, &gfar_recycle_queues);
++
++	return;
++
++disable_rec:
++	netdev_info(priv->ndev, "skb recycling disabled\n");
++	priv->recycle_target = NULL;
++	priv->recycle_ndev = NULL;
++	return;
+ }
+ 
+ /* Set up the ethernet device structure, private data,
+@@ -1299,9 +1324,6 @@ static int gfar_probe(struct platform_device *ofdev)
+ 
+ 	priv->rx_buffer_size = DEFAULT_RX_BUFFER_SIZE;
+ 
+-	/* init buffer recycling fields */
+-	gfar_init_recycle(priv);
+-
+ 	/* Initializing some of the rx/tx queue level parameters */
+ 	for (i = 0; i < priv->num_tx_queues; i++) {
+ 		priv->tx_queue[i]->tx_ring_size = DEFAULT_TX_RING_SIZE;
+@@ -1352,6 +1374,9 @@ static int gfar_probe(struct platform_device *ofdev)
+ 			strcpy(gfar_irq(grp, TX)->name, dev->name);
+ 	}
+ 
++	/* Init buffer recycling fields and queues */
++	gfar_init_recycle(priv);
++
+ 	/* Initialize the filer table */
+ 	gfar_init_filer_table(priv);
+ 
+@@ -2057,8 +2082,19 @@ static void free_skb_rx_queue(struct gfar_priv_rx_q *rx_queue)
+ static void free_skb_recycle_q(struct gfar_priv_recycle *rec)
+ {
+ 	struct sk_buff *skb;
++	int cpu;
++
+ 	while ((skb = skb_dequeue(&rec->recycle_q)) != NULL)
+ 		dev_kfree_skb_any(skb);
++
++	for_each_possible_cpu(cpu) {
++		struct gfar_priv_recycle_local *local;
++
++		local = per_cpu_ptr(rec->local, cpu);
++		while ((skb = __skb_dequeue(&local->recycle_q)) != NULL)
++			dev_kfree_skb_any(skb);
++	}
++
+ }
+ 
+ /* If there are any tx skbs or rx skbs still around, free them.
+@@ -2939,6 +2975,8 @@ static void gfar_recycle_skb(struct gfar_private *priv, struct sk_buff *skb)
+ {
+ 	struct gfar_priv_recycle *rec_target = priv->recycle_target;
+ 	struct sk_buff_head *recycle_q;
++	struct gfar_priv_recycle_local *local;
++	int cpu;
+ 
+ 	if (unlikely(!rec_target))
+ 		goto free;
+@@ -2946,6 +2984,22 @@ static void gfar_recycle_skb(struct gfar_private *priv, struct sk_buff *skb)
+ 	if (unlikely(!skb_is_recycleable(skb, rec_target->buff_size)))
+ 		goto free;
+ 
++	cpu = get_cpu();
++	local = per_cpu_ptr(rec_target->local, cpu);
++
++	if (likely(skb_queue_len(&local->recycle_q) < GFAR_RECYCLE_MAX)) {
++		local->recycle_cnt++;
++
++		skb_recycle(skb);
++
++		gfar_align_skb(skb);
++
++		__skb_queue_head(&local->recycle_q, skb);
++		put_cpu();
++		return;
++	}
++	put_cpu();
++
+ 	recycle_q = &rec_target->recycle_q;
+ 
+ 	if (unlikely(skb_queue_len(recycle_q) >= GFAR_RECYCLE_MAX))
+@@ -3183,7 +3237,19 @@ static struct sk_buff *gfar_new_skb(struct gfar_private *priv)
+ {
+ 	struct sk_buff *skb = NULL;
+ 	struct gfar_priv_recycle *rec = &priv->recycle;
++	struct gfar_priv_recycle_local *local;
+ 	struct sk_buff_head *recycle_q;
++	int cpu;
++
++	cpu = get_cpu();
++	local = per_cpu_ptr(rec->local, cpu);
++	skb = __skb_dequeue(&local->recycle_q);
++	if (likely(skb)) {
++		local->reuse_cnt++;
++		put_cpu();
++		return skb;
++	}
++	put_cpu();
+ 
+ 	recycle_q = &rec->recycle_q;
+ 
+diff --git a/drivers/net/ethernet/freescale/gianfar.h b/drivers/net/ethernet/freescale/gianfar.h
+index f293d88..f6734a1 100644
+--- a/drivers/net/ethernet/freescale/gianfar.h
++++ b/drivers/net/ethernet/freescale/gianfar.h
+@@ -1224,9 +1224,16 @@ enum gfar_errata {
+ 	GFAR_ERRATA_12		= 0x08, /* a.k.a errata eTSEC49 */
+ };
+ 
++struct gfar_priv_recycle_local {
++	struct sk_buff_head recycle_q; /* percpu queue */
++	unsigned int recycle_cnt;
++	unsigned int reuse_cnt;
++};
++
++#define GFAR_RECYCLE_MAX	DEFAULT_TX_RING_SIZE
+ struct gfar_priv_recycle {
+-#define GFAR_RECYCLE_MAX	DEFAULT_RX_RING_SIZE
+-	struct sk_buff_head recycle_q __aligned(SMP_CACHE_BYTES);
++	struct gfar_priv_recycle_local __percpu *local;
++	struct sk_buff_head recycle_q; /* shared queue */
+ 	unsigned int buff_size;
+ 	atomic_t recycle_cnt;
+ 	atomic_t reuse_cnt;
+diff --git a/drivers/net/ethernet/freescale/gianfar_sysfs.c b/drivers/net/ethernet/freescale/gianfar_sysfs.c
+index 4923fdc..7de46a4 100644
+--- a/drivers/net/ethernet/freescale/gianfar_sysfs.c
++++ b/drivers/net/ethernet/freescale/gianfar_sysfs.c
+@@ -325,8 +325,17 @@ static ssize_t gfar_show_recycle(struct device *dev,
+ {
+ 	struct gfar_private *priv = netdev_priv(to_net_dev(dev));
+ 	struct gfar_priv_recycle *rec = &priv->recycle;
++	int cpu;
+ 
+-	pr_info("recycled skbs: %d\nreused skbs: %d\n",
++	for_each_possible_cpu(cpu) {
++		struct gfar_priv_recycle_local *local;
++
++		local = per_cpu_ptr(rec->local, cpu);
++		pr_info("local: CPU#%d: recycled skbs %d, reused skbs %d\n",
++			cpu, local->recycle_cnt, local->reuse_cnt);
++	}
++
++	pr_info("shared: recycled skbs %d, reused skbs %d\n",
+ 		atomic_read(&rec->recycle_cnt),
+ 		atomic_read(&rec->reuse_cnt));
+ 
+-- 
+1.8.4.93.g57e4c17
+

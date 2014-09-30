@@ -1,0 +1,408 @@
+From 5d12aaf4af618660c3aa20b79762bda6256a53be Mon Sep 17 00:00:00 2001
+From: Rajan Gupta <rajan.gupta@freescale.com>
+Date: Sat, 20 Apr 2013 04:06:31 +0530
+Subject: [PATCH 387/547] gianfar: Optimization for routed packets by
+ exchanging rx/tx buffers
+
+Patch enhances the Gianfar driver performance for the packets that are
+received by the driver and transmitted by the driver in the same context.
+Performance is enhanced by exchanging the buffer between the Tx and Rx rings,
+rather than allocating buffer from kernel or taking it from recycle queue.
+
+Patch keeps the TX interupt masked by default and skb cleanup is done in the
+xmit function just before skb is recybled back to the RX ring.
+TX interupt is unmasked only when H/W transmit queue is full, in TX interupt
+handler stopped tx queues are started again when the H/W has cleaned the TX buffer rings.
+
+As TX interups are disabled by default, RFC1588 timestamping is not done and 1588 ptp
+protocol doesnot works with this optimization.
+
+Patch gives best performance with DEFAULT_RX_RING_SIZE 32, DEFAULT_TX_RING_SIZE 32,
+and GFAR_DEV_WEIGHT 32.
+
+Patch improves the forwarding performance of offload implementation like ASF by around 50%
+and linux forwarding performance by 20%.
+
+Change-Id: Ie28858fc9b9ea0434c1242843abd7479a31a0de3
+Signed-off-by: Rajan Gupta <rajan.gupta@freescale.com>
+Reviewed-on: http://git.am.freescale.net:8181/1619
+Reviewed-by: Manoil Claudiu-B08782 <claudiu.manoil@freescale.com>
+Reviewed-by: Fleming Andrew-AFLEMING <AFLEMING@freescale.com>
+Tested-by: Fleming Andrew-AFLEMING <AFLEMING@freescale.com>
+[Original patch taken from QorIQ-SDK-V1.4-SOURCE-20130625-yocto.iso
+ Remove AS_FASTPATH as the dependency of RX_TX_BUFF_XCHG]
+Signed-off-by: Bin Jiang <bin.jiang@windriver.com>
+---
+ drivers/net/ethernet/freescale/Kconfig   |   7 ++
+ drivers/net/ethernet/freescale/gianfar.c | 157 ++++++++++++++++++++++++++++++-
+ drivers/net/ethernet/freescale/gianfar.h |   9 ++
+ 3 files changed, 171 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/Kconfig b/drivers/net/ethernet/freescale/Kconfig
+index 05a3572..49623d1 100644
+--- a/drivers/net/ethernet/freescale/Kconfig
++++ b/drivers/net/ethernet/freescale/Kconfig
+@@ -92,6 +92,13 @@ config GIANFAR
+ 	---help---
+ 	  This driver supports the Gigabit TSEC on the MPC83xx, MPC85xx,
+ 	  and MPC86xx family of chips, and the FEC on the 8540.
++config RX_TX_BUFF_XCHG
++        default y
++	 bool "RX and TX ring buffer exchange for Routed packets"
++	 depends on GIANFAR && EXPERIMENTAL
++	 ---help---
++	 Enable this flag to get better throughput for the routing functionality.
++	 Enhances the performance for IPv4 Routing, NAT forwarding.
+ 
+ source "drivers/net/ethernet/freescale/fman/Kconfig"
+ source "drivers/net/ethernet/freescale/dpa/Kconfig"
+diff --git a/drivers/net/ethernet/freescale/gianfar.c b/drivers/net/ethernet/freescale/gianfar.c
+index 46a64e1..4ec4d8b 100644
+--- a/drivers/net/ethernet/freescale/gianfar.c
++++ b/drivers/net/ethernet/freescale/gianfar.c
+@@ -119,6 +119,9 @@ static int gfar_set_mac_address(struct net_device *dev);
+ static int gfar_change_mtu(struct net_device *dev, int new_mtu);
+ static irqreturn_t gfar_error(int irq, void *dev_id);
+ static irqreturn_t gfar_transmit(int irq, void *dev_id);
++#ifdef CONFIG_RX_TX_BUFF_XCHG
++static irqreturn_t gfar_enable_tx_queue(int irq, void *dev_id);
++#endif
+ static irqreturn_t gfar_interrupt(int irq, void *dev_id);
+ static void adjust_link(struct net_device *dev);
+ static void init_registers(struct net_device *dev);
+@@ -146,6 +149,7 @@ static void gfar_set_mac_for_addr(struct net_device *dev, int num,
+ 				  const u8 *addr);
+ static int gfar_ioctl(struct net_device *dev, struct ifreq *rq, int cmd);
+ static void gfar_schedule_rx_cleanup(struct gfar_priv_grp *grp);
++static void gfar_align_skb(struct sk_buff *skb);
+ 
+ #ifdef CONFIG_PM
+ static void gfar_halt_rx(struct net_device *dev);
+@@ -169,6 +173,11 @@ MODULE_AUTHOR("Freescale Semiconductor, Inc");
+ MODULE_DESCRIPTION("Gianfar Ethernet Driver");
+ MODULE_LICENSE("GPL");
+ 
++#ifdef CONFIG_RX_TX_BUFF_XCHG
++static DEFINE_PER_CPU(void*, curr_skb);
++static DEFINE_PER_CPU(void*, recycled_skb);
++static DEFINE_PER_CPU(void*, reserved_skb);
++#endif
+ static void gfar_init_rxbdp(struct gfar_priv_rx_q *rx_queue, struct rxbd8 *bdp,
+ 			    dma_addr_t buf)
+ {
+@@ -719,6 +728,10 @@ static int gfar_of_init(struct platform_device *ofdev, struct net_device **pdev)
+ 		return -EINVAL;
+ 	}
+ 
++#ifdef CONFIG_RX_TX_BUFF_XCHG
++	/* Creating multilple queues for avoiding lock in xmit function.*/
++	num_tx_qs = (num_tx_qs < 3) ? 3 : num_tx_qs;
++#endif
+ 	*pdev = alloc_etherdev_mq(sizeof(*priv), num_tx_qs);
+ 	dev = *pdev;
+ 	if (NULL == dev)
+@@ -2243,9 +2256,16 @@ static int register_grp_irqs(struct gfar_priv_grp *grp)
+ 
+ 			goto err_irq_fail;
+ 		}
++#ifndef CONFIG_RX_TX_BUFF_XCHG
+ 		err = request_irq(gfar_irq(grp, TX)->irq, gfar_transmit,
+ 				  IRQF_NO_SUSPEND,
+ 				  gfar_irq(grp, TX)->name, grp);
++
++#else
++		err = request_irq(gfar_irq(grp, TX)->irq,
++				  gfar_enable_tx_queue, IRQF_NO_SUSPEND,
++				  gfar_irq(grp, TX)->name, grp);
++#endif
+ 		if (err < 0) {
+ 			netif_err(priv, intr, dev, "Can't get IRQ %d\n",
+ 				  gfar_irq(grp, TX)->irq);
+@@ -2430,7 +2450,12 @@ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	u32 lstatus;
+ 	int i, rq = 0, do_tstamp = 0;
+ 	u32 bufaddr;
++#ifdef CONFIG_RX_TX_BUFF_XCHG
++	struct sk_buff *new_skb;
++	int skb_curtx = 0;
++#else
+ 	unsigned long flags;
++#endif
+ 	unsigned int nr_frags, nr_txbds, length, fcb_length = GMAC_FCB_LEN;
+ 
+ 	/* TOE=1 frames larger than 2500 bytes may see excess delays
+@@ -2446,7 +2471,11 @@ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 			return ret;
+ 	}
+ 
++#ifdef CONFIG_RX_TX_BUFF_XCHG
++	rq = smp_processor_id() + 1;
++#else
+ 	rq = skb->queue_mapping;
++#endif
+ 	tx_queue = priv->tx_queue[rq];
+ 	txq = netdev_get_tx_queue(dev, rq);
+ 	base = tx_queue->tx_bd_base;
+@@ -2488,6 +2517,7 @@ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	else
+ 		nr_txbds = nr_frags + 1;
+ 
++#ifndef CONFIG_RX_TX_BUFF_XCHG
+ 	/* check if there is space to queue this packet */
+ 	if (nr_txbds > tx_queue->num_txbdfree) {
+ 		/* no space, stop the queue */
+@@ -2495,7 +2525,48 @@ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		dev->stats.tx_fifo_errors++;
+ 		return NETDEV_TX_BUSY;
+ 	}
++#else
++	txbdp = tx_queue->cur_tx;
++	skb_curtx = tx_queue->skb_curtx;
++	do {
++		lstatus = txbdp->lstatus;
++		if ((lstatus & BD_LFLAG(TXBD_READY))) {
++			u32 imask;
++			/* BD not free for tx */
++			netif_tx_stop_queue(txq);
++			dev->stats.tx_fifo_errors++;
++			spin_lock_irq(&tx_queue->grp->grplock);
++			imask = gfar_read(&regs->imask);
++			imask |= IMASK_TX_DEFAULT;
++			gfar_write(&regs->imask, imask);
++			spin_unlock_irq(&tx_queue->grp->grplock);
++			return NETDEV_TX_BUSY;
++		}
++
++		/* BD is free to be used by s/w */
++		/* Free skb for this BD if not recycled */
++		if (tx_queue->tx_skbuff[skb_curtx]) {
++			if (skb_is_recycleable(tx_queue->tx_skbuff[skb_curtx],
++			    DEFAULT_RX_BUFFER_SIZE + RXBUF_ALIGNMENT)) {
++				skb_recycle(tx_queue->tx_skbuff[skb_curtx]);
++				gfar_align_skb(tx_queue->tx_skbuff[skb_curtx]);
++			} else {
++				dev_kfree_skb_any(tx_queue->tx_skbuff[skb_curtx]);
++				tx_queue->tx_skbuff[skb_curtx] = NULL;
++			}
++		}
++
++		txbdp->lstatus &= BD_LFLAG(TXBD_WRAP);
++		skb_curtx = (skb_curtx + 1)
++				& TX_RING_MOD_MASK(tx_queue->tx_ring_size);
++		nr_txbds--;
++
++		if (!nr_txbds)
++			break;
+ 
++		txbdp = next_txbd(txbdp, base, tx_queue->tx_ring_size);
++	} while (1);
++#endif
+ 	/* Update transmit stats */
+ 	tx_queue->stats.tx_bytes += skb->len;
+ 	tx_queue->stats.tx_packets++;
+@@ -2591,6 +2662,16 @@ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		gfar_write(&regs->dfvlan, vlan_ctrl);
+ 	}
+ 
++#ifdef CONFIG_RX_TX_BUFF_XCHG
++	new_skb = tx_queue->tx_skbuff[tx_queue->skb_curtx];
++	skb_curtx = tx_queue->skb_curtx;
++	if (new_skb && (__this_cpu_read(curr_skb) != skb)) {
++		/* Packet from Kernel free the skb to recycle poll */
++		new_skb->dev = dev;
++		dev_kfree_skb_any(new_skb);
++		new_skb = NULL;
++	}
++#endif
+ 	txbdp_start->bufPtr = dma_map_single(priv->dev, skb->data,
+ 					     skb_headlen(skb), DMA_TO_DEVICE);
+ 
+@@ -2608,6 +2689,7 @@ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		lstatus |= BD_LFLAG(TXBD_CRC | TXBD_READY) | skb_headlen(skb);
+ 	}
+ 
++#ifndef CONFIG_RX_TX_BUFF_XCHG
+ 	netdev_tx_sent_queue(txq, skb->len);
+ 
+ 	/* We can work in parallel with gfar_clean_tx_ring(), except
+@@ -2622,6 +2704,7 @@ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	 * to be transmitted BD.
+ 	 */
+ 	spin_lock_irqsave(&tx_queue->txlock, flags);
++#endif
+ 
+ 	/* The powerpc-specific eieio() is used, as wmb() has too strong
+ 	 * semantics (it requires synchronization between cacheable and
+@@ -2646,6 +2729,7 @@ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 
+ 	tx_queue->cur_tx = next_txbd(txbdp, base, tx_queue->tx_ring_size);
+ 
++#ifndef CONFIG_RX_TX_BUFF_XCHG
+ 	/* reduce TxBD free count */
+ 	tx_queue->num_txbdfree -= (nr_txbds);
+ 
+@@ -2657,13 +2741,18 @@ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 
+ 		dev->stats.tx_fifo_errors++;
+ 	}
++#endif
+ 
+ 	/* Tell the DMA to go go go */
+ 	gfar_write(&regs->tstat, TSTAT_CLEAR_THALT >> tx_queue->qindex);
+-
++#ifndef CONFIG_RX_TX_BUFF_XCHG
+ 	/* Unlock priv */
+ 	spin_unlock_irqrestore(&tx_queue->txlock, flags);
+-
++#endif
++#ifdef CONFIG_RX_TX_BUFF_XCHG
++	__this_cpu_write(recycled_skb, new_skb);
++	txq->trans_start = jiffies;
++#endif
+ 	return NETDEV_TX_OK;
+ }
+ 
+@@ -3039,6 +3128,42 @@ static irqreturn_t gfar_transmit(int irq, void *grp_id)
+ 	return IRQ_HANDLED;
+ }
+ 
++#ifdef CONFIG_RX_TX_BUFF_XCHG
++static irqreturn_t gfar_enable_tx_queue(int irq, void *grp_id)
++{
++	struct gfar_priv_grp *grp = (struct gfar_priv_grp *)grp_id;
++	struct gfar_private *priv = priv = grp->priv;
++	struct gfar_priv_tx_q *tx_queue = NULL;
++	u32 tstat, mask;
++	int i;
++	unsigned long flags;
++
++	struct net_device *dev = NULL;
++	tstat = gfar_read(&grp->regs->tstat);
++	tstat = tstat & TSTAT_TXF_MASK_ALL;
++
++	/* Clear IEVENT */
++	gfar_write(&grp->regs->ievent, IEVENT_TX_MASK);
++
++	for_each_set_bit(i, &grp->napi_tx->tx_bit_map, priv->num_tx_queues) {
++		mask = TSTAT_TXF0_MASK >> i;
++		if (tstat & mask) {
++			tx_queue = priv->tx_queue[i];
++			dev = tx_queue->dev;
++			if (__netif_subqueue_stopped(dev, tx_queue->qindex))
++				netif_wake_subqueue(dev, tx_queue->qindex);
++		}
++	}
++
++	spin_lock_irqsave(&grp->grplock, flags);
++	mask = gfar_read(&grp->regs->imask);
++	mask = mask & IMASK_TX_DISABLED;
++	gfar_write(&grp->regs->imask, mask);
++	spin_unlock_irqrestore(&grp->grplock, flags);
++
++	return IRQ_HANDLED;
++}
++#endif
+ static void gfar_new_rxbdp(struct gfar_priv_rx_q *rx_queue, struct rxbd8 *bdp,
+ 			   struct sk_buff *skb)
+ {
+@@ -3263,8 +3388,13 @@ int gfar_clean_rx_ring(struct gfar_priv_rx_q *rx_queue, int rx_work_limit)
+ 
+ 		rmb();
+ 
++#ifndef CONFIG_RX_TX_BUFF_XCHG
+ 		/* Add another skb for the future */
+ 		newskb = gfar_new_skb(priv);
++#else
++		if (__this_cpu_read(reserved_skb) == NULL)
++			__this_cpu_write(reserved_skb, gfar_new_skb(priv));
++#endif
+ 
+ 		skb = rx_queue->rx_skbuff[rx_queue->skb_currx];
+ 
+@@ -3275,6 +3405,7 @@ int gfar_clean_rx_ring(struct gfar_priv_rx_q *rx_queue, int rx_work_limit)
+ 			     bdp->length > priv->rx_buffer_size))
+ 			bdp->status = RXBD_LARGE;
+ 
++#ifndef CONFIG_RX_TX_BUFF_XCHG
+ 		/* We drop the frame if we failed to allocate a new buffer */
+ 		if (unlikely(!newskb || !(bdp->status & RXBD_LAST) ||
+ 			     bdp->status & RXBD_ERR)) {
+@@ -3284,6 +3415,13 @@ int gfar_clean_rx_ring(struct gfar_priv_rx_q *rx_queue, int rx_work_limit)
+ 				newskb = skb;
+ 			else if (skb)
+ 				dev_kfree_skb(skb);
++#else
++		if ((__this_cpu_read(reserved_skb) == NULL)
++			|| unlikely(!(bdp->status & RXBD_LAST)
++			|| bdp->status & RXBD_ERR)) {
++				count_errors(bdp->status, dev);
++				newskb = skb;
++#endif
+ 		} else {
+ 			/* Increment the number of packets */
+ 			rx_queue->stats.rx_packets++;
+@@ -3295,8 +3433,16 @@ int gfar_clean_rx_ring(struct gfar_priv_rx_q *rx_queue, int rx_work_limit)
+ 				skb_put(skb, pkt_len);
+ 				rx_queue->stats.rx_bytes += pkt_len;
+ 				skb_record_rx_queue(skb, rx_queue->qindex);
++#ifdef CONFIG_RX_TX_BUFF_XCHG
++				__this_cpu_write(curr_skb, skb);
++#endif
+ 				gfar_process_frame(dev, skb, amount_pull,
+ 						   &rx_queue->napi_rx->napi);
++#ifdef CONFIG_RX_TX_BUFF_XCHG
++				newskb =  __this_cpu_read(recycled_skb);
++				__this_cpu_write(curr_skb, NULL);
++				__this_cpu_write(recycled_skb, NULL);
++#endif
+ 
+ 			} else {
+ 				netif_warn(priv, rx_err, dev, "Missing skb!\n");
+@@ -3306,6 +3452,13 @@ int gfar_clean_rx_ring(struct gfar_priv_rx_q *rx_queue, int rx_work_limit)
+ 
+ 		}
+ 
++#ifdef CONFIG_RX_TX_BUFF_XCHG
++		if (!newskb) {
++			/* Allocate new skb for Rx ring */
++			newskb = __this_cpu_read(reserved_skb);
++			__this_cpu_write(reserved_skb, NULL);
++		}
++#endif
+ 		rx_queue->rx_skbuff[rx_queue->skb_currx] = newskb;
+ 
+ 		/* Setup the new bdp */
+diff --git a/drivers/net/ethernet/freescale/gianfar.h b/drivers/net/ethernet/freescale/gianfar.h
+index 7220d1e..1c9ccf2 100644
+--- a/drivers/net/ethernet/freescale/gianfar.h
++++ b/drivers/net/ethernet/freescale/gianfar.h
+@@ -294,6 +294,8 @@ extern const char gfar_driver_version[];
+ #define DMACTRL_INIT_SETTINGS   0x000000c3
+ #define DMACTRL_GRS             0x00000010
+ #define DMACTRL_GTS             0x00000008
++#define TSTAT_TXF_MASK_ALL	 0x0000FF00
++#define TSTAT_TXF0_MASK	 0x00008000
+ 
+ #define TSTAT_CLEAR_THALT_ALL	0xFF000000
+ #define TSTAT_CLEAR_THALT	0x80000000
+@@ -441,10 +443,17 @@ extern const char gfar_driver_version[];
+ #define IMASK_FIQ		0x00000004
+ #define IMASK_DPE		0x00000002
+ #define IMASK_PERR		0x00000001
++#ifndef CONFIG_RX_TX_BUFF_XCHG
+ #define IMASK_DEFAULT  (IMASK_TXEEN | IMASK_TXFEN | IMASK_TXBEN | \
+ 		IMASK_RXFEN0 | IMASK_BSY | IMASK_EBERR | IMASK_BABR | \
+ 		IMASK_XFUN | IMASK_RXC | IMASK_BABT | IMASK_DPE \
+ 		| IMASK_PERR)
++#else
++#define IMASK_DEFAULT  (IMASK_TXEEN | \
++		IMASK_RXFEN0 | IMASK_BSY | IMASK_EBERR | IMASK_BABR | \
++		IMASK_XFUN | IMASK_RXC | IMASK_BABT | IMASK_DPE \
++		| IMASK_PERR)
++#endif
+ #define IMASK_RX_DEFAULT	(IMASK_RXFEN0 | IMASK_BSY)
+ #define IMASK_TX_DEFAULT	(IMASK_TXFEN | IMASK_TXBEN)
+ 
+-- 
+1.8.4.93.g57e4c17
+

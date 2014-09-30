@@ -1,0 +1,361 @@
+From d1ed7bc29286b3342e18cdfd88a2d12749dee5bb Mon Sep 17 00:00:00 2001
+From: Bin Jiang <bin.jiang@windriver.com>
+Date: Wed, 25 Dec 2013 14:38:05 +0800
+Subject: [PATCH 352/383] fsl/pci: modify pci suspend/resume flow-path
+
+Change platform_driver->suspend/resume to syscore->suspend/resume.
+pci-driver will call back EP device, to save EP state in pci_pm_suspend_noirq,
+so we need to keep the link, until pci_pm_suspend_noirq finish.
+Add a PME handler, to response PME & message interrupt.
+
+P1022ds deep sleep:
+In suspend do nothing.
+In resume flow, we need reset pci slot to make e1000e re-link.
+
+T4240qds:
+In suspend flow, we should send a PME_Turn_Off_Message to e1000e.
+In resume flow, we need send a Exit signal to make e1000e re-work.
+
+Signed-off-by: Wang Dongsheng <dongsheng.wang@freescale.com>
+Change-Id: I5b0ef699d5eed1a305bc1013a75e8957e380055f
+Reviewed-on: http://git.am.freescale.net:8181/6993
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Reviewed-by: Tiefei Zang <roy.zang@freescale.com>
+Reviewed-by: Thomas Trefny <Tom.Trefny@freescale.com>
+[Original patch taken from QorIQ-SDK-V1.5-SOURCE-20131219-yocto.iso]
+Signed-off-by: Bin Jiang <bin.jiang@windriver.com>
+---
+ arch/powerpc/sysdev/fsl_pci.c |  265 ++++++++++++++++++++++++++++++++++++-----
+ arch/powerpc/sysdev/fsl_pci.h |    4 +
+ 2 files changed, 237 insertions(+), 32 deletions(-)
+
+diff --git a/arch/powerpc/sysdev/fsl_pci.c b/arch/powerpc/sysdev/fsl_pci.c
+index 46bb6b4..0bf96b4 100644
+--- a/arch/powerpc/sysdev/fsl_pci.c
++++ b/arch/powerpc/sysdev/fsl_pci.c
+@@ -22,11 +22,16 @@
+ #include <linux/delay.h>
+ #include <linux/string.h>
+ #include <linux/init.h>
++#include <linux/interrupt.h>
+ #include <linux/bootmem.h>
+ #include <linux/memblock.h>
+ #include <linux/log2.h>
+ #include <linux/slab.h>
++#include <linux/suspend.h>
++#include <linux/syscore_ops.h>
+ 
++#include <asm/fsl_guts.h>
++#include <asm/ppc-pci.h>
+ #include <asm/io.h>
+ #include <asm/prom.h>
+ #include <asm/pci-bridge.h>
+@@ -1006,6 +1011,227 @@ void fsl_pci_assign_primary(void)
+ 	}
+ }
+ 
++#ifdef CONFIG_PM
++static irqreturn_t fsl_pci_pme_handle(int irq, void *dev_id)
++{
++	struct pci_controller *hose = dev_id;
++	struct ccsr_pci __iomem *pci = hose->private_data;
++	u32 dr;
++
++	dr = in_be32(&pci->pex_pme_mes_dr);
++	if (dr)
++		out_be32(&pci->pex_pme_mes_dr, dr);
++	else
++		return IRQ_NONE;
++
++	return IRQ_HANDLED;
++}
++
++static int fsl_pci_pme_probe(struct platform_device *pdev)
++{
++	struct pci_controller *hose;
++	int pme_irq;
++	int res;
++
++	pme_irq = irq_of_parse_and_map(pdev->dev.of_node, 0);
++	if (!pme_irq) {
++		pr_warn("Failed to map PME interrupt.\n");
++
++		return -ENXIO;
++	}
++
++	hose = pci_find_hose_for_OF_device(pdev->dev.of_node);
++
++	res = devm_request_irq(&pdev->dev, pme_irq,
++			fsl_pci_pme_handle,
++			IRQF_DISABLED | IRQF_SHARED,
++			"[PCI] PME", hose);
++	if (res < 0) {
++		pr_warn("Unable to requiest irq %d for PME\n", pme_irq);
++		irq_dispose_mapping(pme_irq);
++
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
++static int pcie_slot_flag;
++
++#define PX_RST		0x4
++#define PX_RST_PCIE	0x8
++#define CCSR_GUTS_PMUXCR_PX_MASK	0x8fffffff
++static int reset_pcie_slot(void)
++{
++	struct device_node *pixis_node;
++	struct device_node *guts_node;
++
++	void __iomem *pixis = NULL;
++	struct ccsr_guts __iomem *guts;
++	u32 value, fpga_value;
++
++	/* Map the global utilities registers. */
++	guts_node = of_find_compatible_node(NULL, NULL, "fsl,p1022-guts");
++	if (!guts_node) {
++		pr_err("p1022ds: missing global utilities device node\n");
++		return -ENODEV;
++	}
++
++	guts = of_iomap(guts_node, 0);
++	of_node_put(guts_node);
++	if (!guts) {
++		pr_err("p1022ds: could not map global utilities device\n");
++		goto out;
++	}
++
++	/* Map the pixis registers. */
++	pixis_node =
++		of_find_compatible_node(NULL, NULL, "fsl,p1022ds-fpga");
++	if (!pixis_node) {
++		pr_err("p1022ds: missing pixis node\n");
++		goto out;
++	}
++
++	pixis = of_iomap(pixis_node, 0);
++	of_node_put(pixis_node);
++	if (!pixis) {
++		pr_err("p1022ds: could not map pixis registers\n");
++		goto out;
++	}
++
++	/* Set Signal to FPGA */
++	value = in_be32(&guts->pmuxcr);
++	fpga_value = value & CCSR_GUTS_PMUXCR_PX_MASK;
++	out_be32(&guts->pmuxcr, fpga_value);
++
++	/* Rset PCIE slot */
++	/* power down pcie slot */
++	clrbits8(pixis + PX_RST, PX_RST_PCIE);
++
++	/* power up pcie slot */
++	setbits8(pixis + PX_RST, PX_RST_PCIE);
++
++	/* Restore PMUXCR */
++	out_be32(&guts->pmuxcr, value);
++	value = in_be32(&guts->pmuxcr);
++
++out:
++	if (pixis)
++		iounmap(pixis);
++
++	if (guts)
++		iounmap(guts);
++
++	return 0;
++}
++
++static void send_pme_turnoff_message(struct pci_controller *hose)
++{
++	struct ccsr_pci __iomem *pci = hose->private_data;
++	u32 value;
++	int i;
++
++	/* Send PME_Turn_Off Message Request */
++	setbits32(&pci->pex_pmcr, PEX_PMCR_PTOMR);
++
++	for (i = 0; i < 100; i++) {
++		value = in_be32(&pci->pex_pme_mes_dr);
++		if (value & (1 << PEX_PME_MES_DR_ENL23_SHIFT)) {
++			out_be32(&pci->pex_pme_mes_dr, value);
++			break;
++		} else {
++			udelay(1000);
++		}
++	}
++}
++
++static void fsl_pci_syscore_do_suspend(struct pci_controller *hose)
++{
++	suspend_state_t pm_state;
++	u32 svr;
++
++	svr = mfspr(SPRN_SVR);
++	pm_state = pm_suspend_state();
++
++	switch (pm_state) {
++	case PM_SUSPEND_STANDBY:
++		if (SVR_SOC_VER(svr) != SVR_T4240 && SVR_REV(svr) != 0x20)
++			break;
++		send_pme_turnoff_message(hose);
++		break;
++	case PM_SUSPEND_MEM:
++		pcie_slot_flag = 0;
++		break;
++	default:
++		break;
++	}
++}
++
++static int fsl_pci_syscore_suspend(void)
++{
++	struct pci_controller *hose, *tmp;
++
++	list_for_each_entry_safe(hose, tmp, &hose_list, list_node)
++		fsl_pci_syscore_do_suspend(hose);
++
++	return 0;
++}
++
++#define PCIE_RESET_SLOT_WAITTIME	100000 /* wait 100 ms */
++static void fsl_pci_syscore_do_resume(struct pci_controller *hose)
++{
++	struct ccsr_pci __iomem *pci = hose->private_data;
++
++	u32 svr, pms;
++	suspend_state_t pm_state;
++
++	svr = mfspr(SPRN_SVR);
++	pm_state = pm_suspend_state();
++
++	switch (pm_state) {
++	case PM_SUSPEND_STANDBY:
++		if (SVR_SOC_VER(svr) != SVR_T4240 && SVR_REV(svr) != 0x20)
++			break;
++		/* Send Exit L2 State Message */
++		setbits32(&pci->pex_pmcr, 0x2);
++
++		/* PME Enable */
++		indirect_read_config(hose->bus, 0, PCI_FSL_PM_CTRL, 4, &pms);
++		pms |= 0x100;
++		indirect_write_config(hose->bus, 0, PCI_FSL_PM_CTRL, 4, pms);
++		break;
++	case PM_SUSPEND_MEM:
++		if (SVR_SOC_VER(svr) != SVR_P1022 || pcie_slot_flag)
++			break;
++
++		/* only reset slot, we can rework the EP device */
++		reset_pcie_slot();
++		pcie_slot_flag = 1;
++
++		spin_event_timeout(!fsl_pcie_check_link(hose),
++				PCIE_RESET_SLOT_WAITTIME, 0);
++		break;
++	default:
++		break;
++	}
++
++	setup_pci_atmu(hose);
++}
++
++static void fsl_pci_syscore_resume(void)
++{
++	struct pci_controller *hose, *tmp;
++
++	list_for_each_entry_safe(hose, tmp, &hose_list, list_node)
++		fsl_pci_syscore_do_resume(hose);
++}
++
++static struct syscore_ops pci_syscore_pm_ops = {
++	.suspend = fsl_pci_syscore_suspend,
++	.resume = fsl_pci_syscore_resume,
++};
++#endif
++
+ static int fsl_pci_probe(struct platform_device *pdev)
+ {
+ 	int ret;
+@@ -1032,48 +1258,20 @@ static int fsl_pci_probe(struct platform_device *pdev)
+ 	}
+ #endif
+ 
++#ifdef CONFIG_PM
++	fsl_pci_pme_probe(pdev);
++#endif
++
+ #ifdef CONFIG_EDAC_MPC85XX
+ 	mpc85xx_pci_err_probe(pdev);
+ #endif
+-	return 0;
+-}
+-
+-#ifdef CONFIG_PM
+-static int fsl_pci_resume(struct device *dev)
+-{
+-	struct pci_controller *hose;
+-	struct resource pci_rsrc;
+-
+-	hose = pci_find_hose_for_OF_device(dev->of_node);
+-	if (!hose)
+-		return -ENODEV;
+-
+-	if (of_address_to_resource(dev->of_node, 0, &pci_rsrc)) {
+-		dev_err(dev, "Get pci register base failed.");
+-		return -ENODEV;
+-	}
+-
+-	setup_pci_atmu(hose);
+ 
+ 	return 0;
+ }
+ 
+-static const struct dev_pm_ops pci_pm_ops = {
+-	.resume = fsl_pci_resume,
+-};
+-
+-#define PCI_PM_OPS (&pci_pm_ops)
+-
+-#else
+-
+-#define PCI_PM_OPS NULL
+-
+-#endif
+-
+ static struct platform_driver fsl_pci_driver = {
+ 	.driver = {
+ 		.name = "fsl-pci",
+-		.pm = PCI_PM_OPS,
+ 		.of_match_table = pci_ids,
+ 	},
+ 	.probe = fsl_pci_probe,
+@@ -1081,6 +1279,9 @@ static struct platform_driver fsl_pci_driver = {
+ 
+ static int __init fsl_pci_init(void)
+ {
++#ifdef CONFIG_PM
++	register_syscore_ops(&pci_syscore_pm_ops);
++#endif
+ 	return platform_driver_register(&fsl_pci_driver);
+ }
+ arch_initcall(fsl_pci_init);
+diff --git a/arch/powerpc/sysdev/fsl_pci.h b/arch/powerpc/sysdev/fsl_pci.h
+index 5eec4ae..6c0352cc 100644
+--- a/arch/powerpc/sysdev/fsl_pci.h
++++ b/arch/powerpc/sysdev/fsl_pci.h
+@@ -31,6 +31,10 @@ struct platform_device;
+ #define PIWAR_WRITE_SNOOP	0x00005000
+ #define PIWAR_SZ_MASK          0x0000003f
+ 
++#define PCI_FSL_PM_CTRL		0x48
++#define PEX_PMCR_PTOMR		0x1
++#define PEX_PME_MES_DR_ENL23_SHIFT	13
++
+ /* PCI/PCI Express outbound window reg */
+ struct pci_outbound_window_regs {
+ 	__be32	potar;	/* 0x.0 - Outbound translation address register */
+-- 
+1.7.5.4
+

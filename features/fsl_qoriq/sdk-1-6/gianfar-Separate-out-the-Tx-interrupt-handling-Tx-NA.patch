@@ -1,0 +1,469 @@
+From a6429208b6745db55a471a184c37b3e6b0e7aca3 Mon Sep 17 00:00:00 2001
+From: Claudiu Manoil <claudiu.manoil@freescale.com>
+Date: Fri, 7 Mar 2014 14:42:45 +0200
+Subject: [PATCH 27/50] gianfar: Separate out the Tx interrupt handling (Tx
+ NAPI)
+
+commit aeb12c5ef7cb08d879af22fc0a56cab9e70689ea upstream
+
+There are some concurrency issues on devices w/ 2 CPUs related
+to the handling of Rx and Tx interrupts.  eTSEC has separate
+interrupt lines for Rx and Tx but a single imask register
+to mask these interrupts and a single NAPI instance to handle
+both Rx and Tx work.  As a result, the Rx and Tx ISRs are
+identical, both are invoking gfar_schedule_cleanup(), however
+both handlers can be entered at the same time when the Rx and
+Tx interrupts are taken by different CPUs.  In this case
+spurrious interrupts (SPU) show up (in /proc/interrupts)
+indicating a concurrency issue.  Also, Tx overruns followed
+by Tx timeout have been observed under heavy Tx traffic load.
+
+To address these issues, the schedule cleanup ISR part has
+been changed to handle the Rx and Tx interrupts independently.
+The patch adds a separate NAPI poll routine for Tx cleanup to
+be triggerred independently by the Tx confirmation interrupts
+only.  Existing poll functions are modified to handle only
+the Rx path processing.  The Tx poll routine does not need a
+budget, since Tx processing doesn't consume NAPI budget, and
+hence it is registered with minimum NAPI weight.
+NAPI scheduling does not require locking since there are
+different NAPI instances between the Rx and Tx confirmation
+paths now.
+So, the patch fixes the occurence of spurrious Rx/Tx interrupts.
+Tx overruns also occur less frequently now.
+
+Signed-off-by: Claudiu Manoil <claudiu.manoil@freescale.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Change-Id: I6951e2a4b057519a966214e7d7e874cc9524123a
+Reviewed-on: http://git.am.freescale.net:8181/9704
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Reviewed-by: Madalin-Cristian Bucur <madalin.bucur@freescale.com>
+Signed-off-by: Yanjiang Jin <yanjiang.jin@windriver.com>
+---
+ drivers/net/ethernet/freescale/gianfar.c |  284 ++++++++++++++++--------------
+ drivers/net/ethernet/freescale/gianfar.h |    4 +-
+ 2 files changed, 157 insertions(+), 131 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/gianfar.c b/drivers/net/ethernet/freescale/gianfar.c
+index 780d08f..eb42ab5 100644
+--- a/drivers/net/ethernet/freescale/gianfar.c
++++ b/drivers/net/ethernet/freescale/gianfar.c
+@@ -141,6 +141,8 @@ static void gfar_set_hash_for_addr(struct net_device *dev, u8 *addr);
+ static void gfar_configure_serdes(struct net_device *dev);
+ static int gfar_poll_rx(struct napi_struct *napi, int budget);
+ static int gfar_poll_tx(struct napi_struct *napi, int budget);
++static int gfar_poll_rx_sq(struct napi_struct *napi, int budget);
++static int gfar_poll_tx_sq(struct napi_struct *napi, int budget);
+ static void gfar_recycle_skb(struct gfar_private *priv, struct sk_buff *skb);
+ 
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+@@ -659,10 +661,8 @@ static void disable_napi(struct gfar_private *priv)
+ 	int i;
+ 
+ 	for (i = 0; i < priv->num_grps; i++) {
+-		struct gfar_priv_grp *grp = &priv->gfargrp[i];
+-
+-		napi_disable(&grp->napi_rx->napi);
+-		napi_disable(&grp->napi_tx->napi);
++		napi_disable(&priv->gfargrp[i].napi_rx);
++		napi_disable(&priv->gfargrp[i].napi_tx);
+ 	}
+ }
+ 
+@@ -671,10 +671,8 @@ static void enable_napi(struct gfar_private *priv)
+ 	int i;
+ 
+ 	for (i = 0; i < priv->num_grps; i++) {
+-		struct gfar_priv_grp *grp = &priv->gfargrp[i];
+-
+-		napi_enable(&grp->napi_rx->napi);
+-		napi_enable(&grp->napi_tx->napi);
++		napi_enable(&priv->gfargrp[i].napi_rx);
++		napi_enable(&priv->gfargrp[i].napi_tx);
+ 	}
+ }
+ 
+@@ -1359,13 +1357,19 @@ static int gfar_probe(struct platform_device *ofdev)
+ 	dev->ethtool_ops = &gfar_ethtool_ops;
+ 
+ 	/* Register for napi ...We are registering NAPI for each grp */
+-	if (priv->mode == SQ_SG_MODE)
+-		netif_napi_add(dev, &priv->gfargrp[0].napi, gfar_poll_sq,
++	if (priv->mode == SQ_SG_MODE) {
++		netif_napi_add(dev, &priv->gfargrp[0].napi_rx, gfar_poll_rx_sq,
+ 			       GFAR_DEV_WEIGHT);
+-	else
+-		for (i = 0; i < priv->num_grps; i++)
+-			netif_napi_add(dev, &priv->gfargrp[i].napi, gfar_poll,
+-				       GFAR_DEV_WEIGHT);
++		netif_napi_add(dev, &priv->gfargrp[0].napi_tx, gfar_poll_tx_sq,
++			       2);
++	} else {
++		for (i = 0; i < priv->num_grps; i++) {
++			netif_napi_add(dev, &priv->gfargrp[i].napi_rx,
++				       gfar_poll_rx, GFAR_DEV_WEIGHT);
++			netif_napi_add(dev, &priv->gfargrp[i].napi_tx,
++				       gfar_poll_tx, 2);
++		}
++	}
+ 
+ 	if (priv->device_flags & FSL_GIANFAR_DEV_HAS_CSUM) {
+ 		dev->hw_features = NETIF_F_IP_CSUM | NETIF_F_SG |
+@@ -3034,34 +3038,6 @@ static void gfar_clean_tx_ring(struct gfar_priv_tx_q *tx_queue)
+ 	tx_queue->dirty_tx = bdp;
+ }
+ 
+-static void gfar_schedule_tx_cleanup(struct gfar_priv_grp *grp)
+-{
+-	unsigned long flags;
+-
+-	if (napi_schedule_prep(&grp->napi_tx->napi)) {
+-		u32 imask;
+-		spin_lock_irqsave(&grp->grplock, flags);
+-		imask = gfar_read(&grp->regs->imask);
+-		imask &= IMASK_TX_DISABLED;
+-		gfar_write(&grp->regs->imask, imask);
+-		spin_unlock_irqrestore(&grp->grplock, flags);
+-		__napi_schedule(&grp->napi_tx->napi);
+-	} else {
+-		/* Clear IEVENT, so interrupts aren't called again
+-		 * because of the packets that have already arrived.
+-		 */
+-		gfar_write(&grp->regs->ievent, IEVENT_TX_MASK);
+-	}
+-
+-}
+-
+-/* Interrupt Handler for Transmit complete */
+-static irqreturn_t gfar_transmit(int irq, void *grp_id)
+-{
+-	gfar_schedule_tx_cleanup((struct gfar_priv_grp *)grp_id);
+-	return IRQ_HANDLED;
+-}
+-
+ #ifdef CONFIG_RX_TX_BUFF_XCHG
+ static irqreturn_t gfar_enable_tx_queue(int irq, void *grp_id)
+ {
+@@ -3199,40 +3175,50 @@ static inline void count_errors(unsigned short status, struct net_device *dev)
+ 	}
+ }
+ 
+-static void gfar_schedule_rx_cleanup(struct gfar_priv_grp *grp)
++irqreturn_t gfar_receive(int irq, void *grp_id)
+ {
++	struct gfar_priv_grp *grp = (struct gfar_priv_grp *)grp_id;
+ 	unsigned long flags;
++	u32 imask;
+ 
+-	if (napi_schedule_prep(&grp->napi_rx->napi)) {
+-		u32 imask;
++	if (likely(napi_schedule_prep(&grp->napi_rx))) {
+ 		spin_lock_irqsave(&grp->grplock, flags);
+ 		imask = gfar_read(&grp->regs->imask);
+ 		imask &= IMASK_RX_DISABLED;
+ 		gfar_write(&grp->regs->imask, imask);
+ 		spin_unlock_irqrestore(&grp->grplock, flags);
+-		__napi_schedule(&grp->napi_rx->napi);
++		__napi_schedule(&grp->napi_rx);
+ 	} else {
+ 		/* Clear IEVENT, so interrupts aren't called again
+ 		 * because of the packets that have already arrived.
+ 		 */
+ 		gfar_write(&grp->regs->ievent, IEVENT_RX_MASK);
+ 	}
++
++	return IRQ_HANDLED;
+ }
+ 
+-irqreturn_t gfar_receive(int irq, void *grp_id)
++/* Interrupt Handler for Transmit complete */
++static irqreturn_t gfar_transmit(int irq, void *grp_id)
+ {
+-	struct gfar_priv_grp *gfargrp = grp_id;
+-	struct gfar __iomem *regs = gfargrp->regs;
+-	u32 ievent;
+-
+-	ievent = gfar_read(&regs->ievent);
++	struct gfar_priv_grp *grp = (struct gfar_priv_grp *)grp_id;
++	unsigned long flags;
++	u32 imask;
+ 
+-	if (unlikely((ievent & IEVENT_FGPI) == IEVENT_FGPI)) {
+-		gfar_write(&regs->ievent, ievent & IEVENT_RX_MASK);
+-		return IRQ_HANDLED;
++	if (likely(napi_schedule_prep(&grp->napi_tx))) {
++		spin_lock_irqsave(&grp->grplock, flags);
++		imask = gfar_read(&grp->regs->imask);
++		imask &= IMASK_TX_DISABLED;
++		gfar_write(&grp->regs->imask, imask);
++		spin_unlock_irqrestore(&grp->grplock, flags);
++		__napi_schedule(&grp->napi_tx);
++	} else {
++		/* Clear IEVENT, so interrupts aren't called again
++		 * because of the packets that have already arrived.
++		 */
++		gfar_write(&grp->regs->ievent, IEVENT_TX_MASK);
+ 	}
+ 
+-	gfar_schedule_rx_cleanup((struct gfar_priv_grp *)grp_id);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -3368,7 +3354,7 @@ int gfar_clean_rx_ring(struct gfar_priv_rx_q *rx_queue, int rx_work_limit)
+ 				skb->owner = RT_PKT_ID;
+ #endif
+ 				gfar_process_frame(dev, skb, amount_pull,
+-						   &rx_queue->napi_rx->napi);
++						   &rx_queue->grp->napi_rx);
+ #ifdef CONFIG_RX_TX_BUFF_XCHG
+ 				newskb = skb->new_skb;
+ 				skb->owner = 0;
+@@ -3411,53 +3397,71 @@ int gfar_clean_rx_ring(struct gfar_priv_rx_q *rx_queue, int rx_work_limit)
+ 	return howmany;
+ }
+ 
+-static int gfar_poll_tx(struct napi_struct *napi, int budget)
++static int gfar_poll_rx_sq(struct napi_struct *napi, int budget)
+ {
+-	struct gfar_priv_napi_tx *napi_tx =
+-		container_of(napi, struct gfar_priv_napi_tx, napi);
+-	struct gfar_private *priv = napi_tx->grp->priv;
+-	struct gfar __iomem *regs = napi_tx->grp->regs;
+-	struct gfar_priv_tx_q *tx_queue = NULL;
+-	u32 tstat_txf, imask;
+-	int i;
+-	unsigned long flags;
++	struct gfar_priv_grp *gfargrp =
++		container_of(napi, struct gfar_priv_grp, napi_rx);
++	struct gfar __iomem *regs = gfargrp->regs;
++	struct gfar_priv_rx_q *rx_queue = gfargrp->priv->rx_queue[0];
++	int work_done = 0;
+ 
+-	tstat_txf = gfar_read(&regs->tstat) & TSTAT_TXF_MASK_ALL;
+ 	/* Clear IEVENT, so interrupts aren't called again
+ 	 * because of the packets that have already arrived
+ 	 */
+-	gfar_write(&regs->ievent, IEVENT_TX_MASK);
++	gfar_write(&regs->ievent, IEVENT_RX_MASK);
+ 
+-	for_each_set_bit(i, &napi_tx->tx_bit_map, priv->num_tx_queues) {
+-		if (tstat_txf & (TSTAT_TXF0_MASK >> i)) {
+-			tx_queue = priv->tx_queue[i];
+-			/* run Tx cleanup to completion */
+-			gfar_clean_tx_ring(tx_queue);
+-		}
++	work_done = gfar_clean_rx_ring(rx_queue, budget);
++
++	if (work_done < budget) {
++		u32 imask;
++		napi_complete(napi);
++		/* Clear the halt bit in RSTAT */
++		gfar_write(&regs->rstat, gfargrp->rstat);
++
++		spin_lock_irq(&gfargrp->grplock);
++		imask = gfar_read(&regs->imask);
++		imask |= IMASK_RX_DEFAULT;
++		gfar_write(&regs->imask, imask);
++		spin_unlock_irq(&gfargrp->grplock);
+ 	}
+ 
++	return work_done;
++}
++
++static int gfar_poll_tx_sq(struct napi_struct *napi, int budget)
++{
++	struct gfar_priv_grp *gfargrp =
++		container_of(napi, struct gfar_priv_grp, napi_tx);
++	struct gfar __iomem *regs = gfargrp->regs;
++	struct gfar_priv_tx_q *tx_queue = gfargrp->priv->tx_queue[0];
++	u32 imask;
++
++	/* Clear IEVENT, so interrupts aren't called again
++	 * because of the packets that have already arrived
++	 */
++	gfar_write(&regs->ievent, IEVENT_TX_MASK);
++
++	/* run Tx cleanup to completion */
++	if (tx_queue->tx_skbuff[tx_queue->skb_dirtytx])
++		gfar_clean_tx_ring(tx_queue);
++
+ 	napi_complete(napi);
+ 
+-	spin_lock_irqsave(&napi_tx->grp->grplock, flags);
++	spin_lock_irq(&gfargrp->grplock);
+ 	imask = gfar_read(&regs->imask);
+ 	imask |= IMASK_TX_DEFAULT;
+ 	gfar_write(&regs->imask, imask);
+-	spin_unlock_irqrestore(&napi_tx->grp->grplock, flags);
+-
+-	/* If we are coalescing interrupts, update the timer
+-	 * Otherwise, clear it
+-	 */
+-	gfar_configure_tx_coalescing(priv, napi_tx->tx_bit_map);
++	spin_unlock_irq(&gfargrp->grplock);
+ 
+ 	return 0;
+ }
+ 
+ static int gfar_poll_rx(struct napi_struct *napi, int budget)
+ {
+-	struct gfar_priv_napi_rx *napi_rx =
+-		container_of(napi, struct gfar_priv_napi_rx, napi);
+-	struct gfar_private *priv = napi_rx->grp->priv;
+-	struct gfar __iomem *regs = napi_rx->grp->regs;
++	struct gfar_priv_grp *gfargrp =
++		container_of(napi, struct gfar_priv_grp, napi_rx);
++	struct gfar_private *priv = gfargrp->priv;
++	struct gfar __iomem *regs = gfargrp->regs;
+ 	struct gfar_priv_rx_q *rx_queue = NULL;
+ 	int work_done = 0, work_done_per_q = 0;
+ 	int i, budget_per_q = 0;
+@@ -3475,59 +3479,81 @@ static int gfar_poll_rx(struct napi_struct *napi, int budget)
+ 	if (num_act_queues)
+ 		budget_per_q = budget/num_act_queues;
+ 
+-	while (1) {
+-		for_each_set_bit(i, &napi_rx->rx_bit_map, priv->num_rx_queues) {
+-			/* skip queue if not active */
+-			if (!(rstat_rxf & (RSTAT_CLEAR_RXF0 >> i)))
+-				continue;
+-
+-			rx_queue = priv->rx_queue[i];
+-			work_done_per_q =
+-				gfar_clean_rx_ring(rx_queue, budget_per_q);
+-			work_done += work_done_per_q;
+-
+-			/* finished processing this queue */
+-			if (work_done_per_q < budget_per_q) {
+-				/* clear active queue hw indication */
+-				gfar_write(&regs->rstat,
+-					   RSTAT_CLEAR_RXF0 >> i);
+-				rstat_rxf &= ~(RSTAT_CLEAR_RXF0 >> i);
+-				num_act_queues--;
+-
+-				if (!num_act_queues)
+-					break;
+-				/* recompute budget per Rx queue */
+-				budget_per_q =
+-					(budget - work_done) / num_act_queues;
+-			}
++	for_each_set_bit(i, &gfargrp->rx_bit_map, priv->num_rx_queues) {
++		/* skip queue if not active */
++		if (!(rstat_rxf & (RSTAT_CLEAR_RXF0 >> i)))
++			continue;
++
++		rx_queue = priv->rx_queue[i];
++		work_done_per_q =
++			gfar_clean_rx_ring(rx_queue, budget_per_q);
++		work_done += work_done_per_q;
++
++		/* finished processing this queue */
++		if (work_done_per_q < budget_per_q) {
++			/* clear active queue hw indication */
++			gfar_write(&regs->rstat,
++				   RSTAT_CLEAR_RXF0 >> i);
++			num_act_queues--;
++
++			if (!num_act_queues)
++				break;
+ 		}
++	}
+ 
+-		if (unlikely(work_done >= budget))
+-			break;
++	if (!num_act_queues) {
++		u32 imask;
++		napi_complete(napi);
+ 
+-		if (unlikely(!num_act_queues)) {
+-			u32 imask;
+-			unsigned long flags;
+-			napi_complete(napi);
++		/* Clear the halt bit in RSTAT */
++		gfar_write(&regs->rstat, gfargrp->rstat);
+ 
+-			/* Clear the halt bit in RSTAT */
+-			gfar_write(&regs->rstat, napi_rx->rstat);
++		spin_lock_irq(&gfargrp->grplock);
++		imask = gfar_read(&regs->imask);
++		imask |= IMASK_RX_DEFAULT;
++		gfar_write(&regs->imask, imask);
++		spin_unlock_irq(&gfargrp->grplock);
++	}
+ 
+-			spin_lock_irqsave(&napi_rx->grp->grplock, flags);
+-			imask = gfar_read(&regs->imask);
+-			imask |= IMASK_RX_DEFAULT;
+-			gfar_write(&regs->imask, imask);
+-			spin_unlock_irqrestore(&napi_rx->grp->grplock, flags);
++	return work_done;
++}
+ 
+-			/* If we are coalescing interrupts, update the timer
+-			 * Otherwise, clear it
+-			 */
+-			gfar_configure_rx_coalescing(priv, napi_rx->rx_bit_map);
+-			break;
++static int gfar_poll_tx(struct napi_struct *napi, int budget)
++{
++	struct gfar_priv_grp *gfargrp =
++		container_of(napi, struct gfar_priv_grp, napi_tx);
++	struct gfar_private *priv = gfargrp->priv;
++	struct gfar __iomem *regs = gfargrp->regs;
++	struct gfar_priv_tx_q *tx_queue = NULL;
++	int has_tx_work = 0;
++	int i;
++
++	/* Clear IEVENT, so interrupts aren't called again
++	 * because of the packets that have already arrived
++	 */
++	gfar_write(&regs->ievent, IEVENT_TX_MASK);
++
++	for_each_set_bit(i, &gfargrp->tx_bit_map, priv->num_tx_queues) {
++		tx_queue = priv->tx_queue[i];
++		/* run Tx cleanup to completion */
++		if (tx_queue->tx_skbuff[tx_queue->skb_dirtytx]) {
++			gfar_clean_tx_ring(tx_queue);
++			has_tx_work = 1;
+ 		}
+ 	}
+ 
+-	return work_done;
++	if (!has_tx_work) {
++		u32 imask;
++		napi_complete(napi);
++
++		spin_lock_irq(&gfargrp->grplock);
++		imask = gfar_read(&regs->imask);
++		imask |= IMASK_TX_DEFAULT;
++		gfar_write(&regs->imask, imask);
++		spin_unlock_irq(&gfargrp->grplock);
++	}
++
++	return 0;
+ }
+ 
+ 
+diff --git a/drivers/net/ethernet/freescale/gianfar.h b/drivers/net/ethernet/freescale/gianfar.h
+index 080501d..bf03475 100644
+--- a/drivers/net/ethernet/freescale/gianfar.h
++++ b/drivers/net/ethernet/freescale/gianfar.h
+@@ -1061,13 +1061,13 @@ struct gfar_irqinfo {
+ 
+ struct gfar_priv_grp {
+ 	spinlock_t grplock __attribute__ ((aligned (SMP_CACHE_BYTES)));
+-	struct	napi_struct napi;
++	struct	napi_struct napi_rx;
++	struct	napi_struct napi_tx;
+ 	struct gfar_private *priv;
+ 	struct gfar __iomem *regs;
+ 	unsigned int rstat;
+ 	unsigned long num_rx_queues;
+ 	unsigned long rx_bit_map;
+-	/* cacheline 3 */
+ 	unsigned int tstat;
+ 	unsigned long num_tx_queues;
+ 	unsigned long tx_bit_map;
+-- 
+1.7.5.4
+
