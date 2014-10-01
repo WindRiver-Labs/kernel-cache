@@ -1,0 +1,806 @@
+From e5baa77fb832b558fc04688461681d4a4231d2b5 Mon Sep 17 00:00:00 2001
+From: Brad Volkin <bradley.d.volkin@intel.com>
+Date: Tue, 18 Feb 2014 10:15:46 -0800
+Subject: [PATCH 331/479] drm/i915: Implement command buffer parsing logic
+
+commit 351e3db2b3631556607d0d94fa26df8e2e0d0fd8 upstream.
+
+The command parser scans batch buffers submitted via execbuffer ioctls before
+the driver submits them to hardware. At a high level, it looks for several
+things:
+
+1) Commands which are explicitly defined as privileged or which should only be
+   used by the kernel driver. The parser generally rejects such commands, with
+   the provision that it may allow some from the drm master process.
+2) Commands which access registers. To support correct/enhanced userspace
+   functionality, particularly certain OpenGL extensions, the parser provides a
+   whitelist of registers which userspace may safely access (for both normal and
+   drm master processes).
+3) Commands which access privileged memory (i.e. GGTT, HWS page, etc). The
+   parser always rejects such commands.
+
+See the overview comment in the source for more details.
+
+This patch only implements the logic. Subsequent patches will build the tables
+that drive the parser.
+
+v2: Don't set the secure bit if the parser succeeds
+Fail harder during init
+Makefile cleanup
+Kerneldoc cleanup
+Clarify module param description
+Convert ints to bools in a few places
+Move client/subclient defs to i915_reg.h
+Remove the bits_count field
+
+OTC-Tracker: AXIA-4631
+Change-Id: I50b98c71c6655893291c78a2d1b8954577b37a30
+Signed-off-by: Brad Volkin <bradley.d.volkin@intel.com>
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+[danvet: Appease checkpatch.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/gpu/drm/i915/Makefile              |   1 +
+ drivers/gpu/drm/i915/i915_cmd_parser.c     | 485 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h            |  93 ++++++
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |  18 ++
+ drivers/gpu/drm/i915/i915_params.c         |   5 +
+ drivers/gpu/drm/i915/i915_reg.h            |  12 +
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |   2 +
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |  32 ++
+ 8 files changed, 648 insertions(+)
+ create mode 100644 drivers/gpu/drm/i915/i915_cmd_parser.c
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index f33902f..fd59a13 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -14,6 +14,7 @@ i915-y := i915_drv.o i915_dma.o i915_irq.o \
+ 	  i915_gem_gtt.o \
+ 	  i915_gem_stolen.o \
+ 	  i915_gem_tiling.o \
++	  i915_cmd_parser.o \
+ 	  i915_params.o \
+ 	  i915_sysfs.o \
+ 	  i915_trace_points.o \
+diff --git a/drivers/gpu/drm/i915/i915_cmd_parser.c b/drivers/gpu/drm/i915/i915_cmd_parser.c
+new file mode 100644
+index 0000000..7a5756e
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_cmd_parser.c
+@@ -0,0 +1,485 @@
++/*
++ * Copyright © 2013 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Authors:
++ *    Brad Volkin <bradley.d.volkin@intel.com>
++ *
++ */
++
++#include "i915_drv.h"
++
++/**
++ * DOC: i915 batch buffer command parser
++ *
++ * Motivation:
++ * Certain OpenGL features (e.g. transform feedback, performance monitoring)
++ * require userspace code to submit batches containing commands such as
++ * MI_LOAD_REGISTER_IMM to access various registers. Unfortunately, some
++ * generations of the hardware will noop these commands in "unsecure" batches
++ * (which includes all userspace batches submitted via i915) even though the
++ * commands may be safe and represent the intended programming model of the
++ * device.
++ *
++ * The software command parser is similar in operation to the command parsing
++ * done in hardware for unsecure batches. However, the software parser allows
++ * some operations that would be noop'd by hardware, if the parser determines
++ * the operation is safe, and submits the batch as "secure" to prevent hardware
++ * parsing.
++ *
++ * Threats:
++ * At a high level, the hardware (and software) checks attempt to prevent
++ * granting userspace undue privileges. There are three categories of privilege.
++ *
++ * First, commands which are explicitly defined as privileged or which should
++ * only be used by the kernel driver. The parser generally rejects such
++ * commands, though it may allow some from the drm master process.
++ *
++ * Second, commands which access registers. To support correct/enhanced
++ * userspace functionality, particularly certain OpenGL extensions, the parser
++ * provides a whitelist of registers which userspace may safely access (for both
++ * normal and drm master processes).
++ *
++ * Third, commands which access privileged memory (i.e. GGTT, HWS page, etc).
++ * The parser always rejects such commands.
++ *
++ * The majority of the problematic commands fall in the MI_* range, with only a
++ * few specific commands on each ring (e.g. PIPE_CONTROL and MI_FLUSH_DW).
++ *
++ * Implementation:
++ * Each ring maintains tables of commands and registers which the parser uses in
++ * scanning batch buffers submitted to that ring.
++ *
++ * Since the set of commands that the parser must check for is significantly
++ * smaller than the number of commands supported, the parser tables contain only
++ * those commands required by the parser. This generally works because command
++ * opcode ranges have standard command length encodings. So for commands that
++ * the parser does not need to check, it can easily skip them. This is
++ * implementated via a per-ring length decoding vfunc.
++ *
++ * Unfortunately, there are a number of commands that do not follow the standard
++ * length encoding for their opcode range, primarily amongst the MI_* commands.
++ * To handle this, the parser provides a way to define explicit "skip" entries
++ * in the per-ring command tables.
++ *
++ * Other command table entries map fairly directly to high level categories
++ * mentioned above: rejected, master-only, register whitelist. The parser
++ * implements a number of checks, including the privileged memory checks, via a
++ * general bitmasking mechanism.
++ */
++
++static u32 gen7_render_get_cmd_length_mask(u32 cmd_header)
++{
++	u32 client = (cmd_header & INSTR_CLIENT_MASK) >> INSTR_CLIENT_SHIFT;
++	u32 subclient =
++		(cmd_header & INSTR_SUBCLIENT_MASK) >> INSTR_SUBCLIENT_SHIFT;
++
++	if (client == INSTR_MI_CLIENT)
++		return 0x3F;
++	else if (client == INSTR_RC_CLIENT) {
++		if (subclient == INSTR_MEDIA_SUBCLIENT)
++			return 0xFFFF;
++		else
++			return 0xFF;
++	}
++
++	DRM_DEBUG_DRIVER("CMD: Abnormal rcs cmd length! 0x%08X\n", cmd_header);
++	return 0;
++}
++
++static u32 gen7_bsd_get_cmd_length_mask(u32 cmd_header)
++{
++	u32 client = (cmd_header & INSTR_CLIENT_MASK) >> INSTR_CLIENT_SHIFT;
++	u32 subclient =
++		(cmd_header & INSTR_SUBCLIENT_MASK) >> INSTR_SUBCLIENT_SHIFT;
++
++	if (client == INSTR_MI_CLIENT)
++		return 0x3F;
++	else if (client == INSTR_RC_CLIENT) {
++		if (subclient == INSTR_MEDIA_SUBCLIENT)
++			return 0xFFF;
++		else
++			return 0xFF;
++	}
++
++	DRM_DEBUG_DRIVER("CMD: Abnormal bsd cmd length! 0x%08X\n", cmd_header);
++	return 0;
++}
++
++static u32 gen7_blt_get_cmd_length_mask(u32 cmd_header)
++{
++	u32 client = (cmd_header & INSTR_CLIENT_MASK) >> INSTR_CLIENT_SHIFT;
++
++	if (client == INSTR_MI_CLIENT)
++		return 0x3F;
++	else if (client == INSTR_BC_CLIENT)
++		return 0xFF;
++
++	DRM_DEBUG_DRIVER("CMD: Abnormal blt cmd length! 0x%08X\n", cmd_header);
++	return 0;
++}
++
++static void validate_cmds_sorted(struct intel_ring_buffer *ring)
++{
++	int i;
++
++	if (!ring->cmd_tables || ring->cmd_table_count == 0)
++		return;
++
++	for (i = 0; i < ring->cmd_table_count; i++) {
++		const struct drm_i915_cmd_table *table = &ring->cmd_tables[i];
++		u32 previous = 0;
++		int j;
++
++		for (j = 0; j < table->count; j++) {
++			const struct drm_i915_cmd_descriptor *desc =
++				&table->table[i];
++			u32 curr = desc->cmd.value & desc->cmd.mask;
++
++			if (curr < previous)
++				DRM_ERROR("CMD: table not sorted ring=%d table=%d entry=%d cmd=0x%08X prev=0x%08X\n",
++					  ring->id, i, j, curr, previous);
++
++			previous = curr;
++		}
++	}
++}
++
++static void check_sorted(int ring_id, const u32 *reg_table, int reg_count)
++{
++	int i;
++	u32 previous = 0;
++
++	for (i = 0; i < reg_count; i++) {
++		u32 curr = reg_table[i];
++
++		if (curr < previous)
++			DRM_ERROR("CMD: table not sorted ring=%d entry=%d reg=0x%08X prev=0x%08X\n",
++				  ring_id, i, curr, previous);
++
++		previous = curr;
++	}
++}
++
++static void validate_regs_sorted(struct intel_ring_buffer *ring)
++{
++	check_sorted(ring->id, ring->reg_table, ring->reg_count);
++	check_sorted(ring->id, ring->master_reg_table, ring->master_reg_count);
++}
++
++/**
++ * i915_cmd_parser_init_ring() - set cmd parser related fields for a ringbuffer
++ * @ring: the ringbuffer to initialize
++ *
++ * Optionally initializes fields related to batch buffer command parsing in the
++ * struct intel_ring_buffer based on whether the platform requires software
++ * command parsing.
++ */
++void i915_cmd_parser_init_ring(struct intel_ring_buffer *ring)
++{
++	if (!IS_GEN7(ring->dev))
++		return;
++
++	switch (ring->id) {
++	case RCS:
++		ring->get_cmd_length_mask = gen7_render_get_cmd_length_mask;
++		break;
++	case VCS:
++		ring->get_cmd_length_mask = gen7_bsd_get_cmd_length_mask;
++		break;
++	case BCS:
++		ring->get_cmd_length_mask = gen7_blt_get_cmd_length_mask;
++		break;
++	case VECS:
++		/* VECS can use the same length_mask function as VCS */
++		ring->get_cmd_length_mask = gen7_bsd_get_cmd_length_mask;
++		break;
++	default:
++		DRM_ERROR("CMD: cmd_parser_init with unknown ring: %d\n",
++			  ring->id);
++		BUG();
++	}
++
++	validate_cmds_sorted(ring);
++	validate_regs_sorted(ring);
++}
++
++static const struct drm_i915_cmd_descriptor*
++find_cmd_in_table(const struct drm_i915_cmd_table *table,
++		  u32 cmd_header)
++{
++	int i;
++
++	for (i = 0; i < table->count; i++) {
++		const struct drm_i915_cmd_descriptor *desc = &table->table[i];
++		u32 masked_cmd = desc->cmd.mask & cmd_header;
++		u32 masked_value = desc->cmd.value & desc->cmd.mask;
++
++		if (masked_cmd == masked_value)
++			return desc;
++	}
++
++	return NULL;
++}
++
++/*
++ * Returns a pointer to a descriptor for the command specified by cmd_header.
++ *
++ * The caller must supply space for a default descriptor via the default_desc
++ * parameter. If no descriptor for the specified command exists in the ring's
++ * command parser tables, this function fills in default_desc based on the
++ * ring's default length encoding and returns default_desc.
++ */
++static const struct drm_i915_cmd_descriptor*
++find_cmd(struct intel_ring_buffer *ring,
++	 u32 cmd_header,
++	 struct drm_i915_cmd_descriptor *default_desc)
++{
++	u32 mask;
++	int i;
++
++	for (i = 0; i < ring->cmd_table_count; i++) {
++		const struct drm_i915_cmd_descriptor *desc;
++
++		desc = find_cmd_in_table(&ring->cmd_tables[i], cmd_header);
++		if (desc)
++			return desc;
++	}
++
++	mask = ring->get_cmd_length_mask(cmd_header);
++	if (!mask)
++		return NULL;
++
++	BUG_ON(!default_desc);
++	default_desc->flags = CMD_DESC_SKIP;
++	default_desc->length.mask = mask;
++
++	return default_desc;
++}
++
++static bool valid_reg(const u32 *table, int count, u32 addr)
++{
++	if (table && count != 0) {
++		int i;
++
++		for (i = 0; i < count; i++) {
++			if (table[i] == addr)
++				return true;
++		}
++	}
++
++	return false;
++}
++
++static u32 *vmap_batch(struct drm_i915_gem_object *obj)
++{
++	int i;
++	void *addr = NULL;
++	struct sg_page_iter sg_iter;
++	struct page **pages;
++
++	pages = drm_malloc_ab(obj->base.size >> PAGE_SHIFT, sizeof(*pages));
++	if (pages == NULL) {
++		DRM_DEBUG_DRIVER("Failed to get space for pages\n");
++		goto finish;
++	}
++
++	i = 0;
++	for_each_sg_page(obj->pages->sgl, &sg_iter, obj->pages->nents, 0) {
++		pages[i] = sg_page_iter_page(&sg_iter);
++		i++;
++	}
++
++	addr = vmap(pages, i, 0, PAGE_KERNEL);
++	if (addr == NULL) {
++		DRM_DEBUG_DRIVER("Failed to vmap pages\n");
++		goto finish;
++	}
++
++finish:
++	if (pages)
++		drm_free_large(pages);
++	return (u32*)addr;
++}
++
++/**
++ * i915_needs_cmd_parser() - should a given ring use software command parsing?
++ * @ring: the ring in question
++ *
++ * Only certain platforms require software batch buffer command parsing, and
++ * only when enabled via module paramter.
++ *
++ * Return: true if the ring requires software command parsing
++ */
++bool i915_needs_cmd_parser(struct intel_ring_buffer *ring)
++{
++	/* No command tables indicates a platform without parsing */
++	if (!ring->cmd_tables)
++		return false;
++
++	return (i915.enable_cmd_parser == 1);
++}
++
++#define LENGTH_BIAS 2
++
++/**
++ * i915_parse_cmds() - parse a submitted batch buffer for privilege violations
++ * @ring: the ring on which the batch is to execute
++ * @batch_obj: the batch buffer in question
++ * @batch_start_offset: byte offset in the batch at which execution starts
++ * @is_master: is the submitting process the drm master?
++ *
++ * Parses the specified batch buffer looking for privilege violations as
++ * described in the overview.
++ *
++ * Return: non-zero if the parser finds violations or otherwise fails
++ */
++int i915_parse_cmds(struct intel_ring_buffer *ring,
++		    struct drm_i915_gem_object *batch_obj,
++		    u32 batch_start_offset,
++		    bool is_master)
++{
++	int ret = 0;
++	u32 *cmd, *batch_base, *batch_end;
++	struct drm_i915_cmd_descriptor default_desc = { 0 };
++	int needs_clflush = 0;
++
++	ret = i915_gem_obj_prepare_shmem_read(batch_obj, &needs_clflush);
++	if (ret) {
++		DRM_DEBUG_DRIVER("CMD: failed to prep read\n");
++		return ret;
++	}
++
++	batch_base = vmap_batch(batch_obj);
++	if (!batch_base) {
++		DRM_DEBUG_DRIVER("CMD: Failed to vmap batch\n");
++		i915_gem_object_unpin_pages(batch_obj);
++		return -ENOMEM;
++	}
++
++	if (needs_clflush)
++		drm_clflush_virt_range((char *)batch_base, batch_obj->base.size);
++
++	cmd = batch_base + (batch_start_offset / sizeof(*cmd));
++	batch_end = cmd + (batch_obj->base.size / sizeof(*batch_end));
++
++	while (cmd < batch_end) {
++		const struct drm_i915_cmd_descriptor *desc;
++		u32 length;
++
++		if (*cmd == MI_BATCH_BUFFER_END)
++			break;
++
++		desc = find_cmd(ring, *cmd, &default_desc);
++		if (!desc) {
++			DRM_DEBUG_DRIVER("CMD: Unrecognized command: 0x%08X\n",
++					 *cmd);
++			ret = -EINVAL;
++			break;
++		}
++
++		if (desc->flags & CMD_DESC_FIXED)
++			length = desc->length.fixed;
++		else
++			length = ((*cmd & desc->length.mask) + LENGTH_BIAS);
++
++		if ((batch_end - cmd) < length) {
++			DRM_DEBUG_DRIVER("CMD: Command length exceeds batch length: 0x%08X length=%d batchlen=%ld\n",
++					 *cmd,
++					 length,
++					 batch_end - cmd);
++			ret = -EINVAL;
++			break;
++		}
++
++		if (desc->flags & CMD_DESC_REJECT) {
++			DRM_DEBUG_DRIVER("CMD: Rejected command: 0x%08X\n", *cmd);
++			ret = -EINVAL;
++			break;
++		}
++
++		if ((desc->flags & CMD_DESC_MASTER) && !is_master) {
++			DRM_DEBUG_DRIVER("CMD: Rejected master-only command: 0x%08X\n",
++					 *cmd);
++			ret = -EINVAL;
++			break;
++		}
++
++		if (desc->flags & CMD_DESC_REGISTER) {
++			u32 reg_addr = cmd[desc->reg.offset] & desc->reg.mask;
++
++			if (!valid_reg(ring->reg_table,
++				       ring->reg_count, reg_addr)) {
++				if (!is_master ||
++				    !valid_reg(ring->master_reg_table,
++					       ring->master_reg_count,
++					       reg_addr)) {
++					DRM_DEBUG_DRIVER("CMD: Rejected register 0x%08X in command: 0x%08X (ring=%d)\n",
++							 reg_addr,
++							 *cmd,
++							 ring->id);
++					ret = -EINVAL;
++					break;
++				}
++			}
++		}
++
++		if (desc->flags & CMD_DESC_BITMASK) {
++			int i;
++
++			for (i = 0; i < MAX_CMD_DESC_BITMASKS; i++) {
++				u32 dword;
++
++				if (desc->bits[i].mask == 0)
++					break;
++
++				dword = cmd[desc->bits[i].offset] &
++					desc->bits[i].mask;
++
++				if (dword != desc->bits[i].expected) {
++					DRM_DEBUG_DRIVER("CMD: Rejected command 0x%08X for bitmask 0x%08X (exp=0x%08X act=0x%08X) (ring=%d)\n",
++							 *cmd,
++							 desc->bits[i].mask,
++							 desc->bits[i].expected,
++							 dword, ring->id);
++					ret = -EINVAL;
++					break;
++				}
++			}
++
++			if (ret)
++				break;
++		}
++
++		cmd += length;
++	}
++
++	if (cmd >= batch_end) {
++		DRM_DEBUG_DRIVER("CMD: Got to the end of the buffer w/o a BBE cmd!\n");
++		ret = -EINVAL;
++	}
++
++	vunmap(batch_base);
++
++	i915_gem_object_unpin_pages(batch_obj);
++
++	return ret;
++}
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index e8650ab..677e2d5 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1850,6 +1850,90 @@ struct drm_i915_file_private {
+ 	atomic_t rps_wait_boost;
+ };
+ 
++/*
++ * A command that requires special handling by the command parser.
++ */
++struct drm_i915_cmd_descriptor {
++	/*
++	 * Flags describing how the command parser processes the command.
++	 *
++	 * CMD_DESC_FIXED: The command has a fixed length if this is set,
++	 *                 a length mask if not set
++	 * CMD_DESC_SKIP: The command is allowed but does not follow the
++	 *                standard length encoding for the opcode range in
++	 *                which it falls
++	 * CMD_DESC_REJECT: The command is never allowed
++	 * CMD_DESC_REGISTER: The command should be checked against the
++	 *                    register whitelist for the appropriate ring
++	 * CMD_DESC_MASTER: The command is allowed if the submitting process
++	 *                  is the DRM master
++	 */
++	u32 flags;
++#define CMD_DESC_FIXED    (1<<0)
++#define CMD_DESC_SKIP     (1<<1)
++#define CMD_DESC_REJECT   (1<<2)
++#define CMD_DESC_REGISTER (1<<3)
++#define CMD_DESC_BITMASK  (1<<4)
++#define CMD_DESC_MASTER   (1<<5)
++
++	/*
++	 * The command's unique identification bits and the bitmask to get them.
++	 * This isn't strictly the opcode field as defined in the spec and may
++	 * also include type, subtype, and/or subop fields.
++	 */
++	struct {
++		u32 value;
++		u32 mask;
++	} cmd;
++
++	/*
++	 * The command's length. The command is either fixed length (i.e. does
++	 * not include a length field) or has a length field mask. The flag
++	 * CMD_DESC_FIXED indicates a fixed length. Otherwise, the command has
++	 * a length mask. All command entries in a command table must include
++	 * length information.
++	 */
++	union {
++		u32 fixed;
++		u32 mask;
++	} length;
++
++	/*
++	 * Describes where to find a register address in the command to check
++	 * against the ring's register whitelist. Only valid if flags has the
++	 * CMD_DESC_REGISTER bit set.
++	 */
++	struct {
++		u32 offset;
++		u32 mask;
++	} reg;
++
++#define MAX_CMD_DESC_BITMASKS 3
++	/*
++	 * Describes command checks where a particular dword is masked and
++	 * compared against an expected value. If the command does not match
++	 * the expected value, the parser rejects it. Only valid if flags has
++	 * the CMD_DESC_BITMASK bit set. Only entries where mask is non-zero
++	 * are valid.
++	 */
++	struct {
++		u32 offset;
++		u32 mask;
++		u32 expected;
++	} bits[MAX_CMD_DESC_BITMASKS];
++};
++
++/*
++ * A table of commands requiring special handling by the command parser.
++ *
++ * Each ring has an array of tables. Each table consists of an array of command
++ * descriptors, which must be sorted with command opcodes in ascending order.
++ */
++struct drm_i915_cmd_table {
++	const struct drm_i915_cmd_descriptor *table;
++	int count;
++};
++
+ #define INTEL_INFO(dev)	(&to_i915(dev)->info)
+ 
+ #define IS_I830(dev)		((dev)->pdev->device == 0x3577)
+@@ -2012,6 +2096,7 @@ struct i915_params {
+ 	int enable_pc8;
+ 	int pc8_timeout;
+ 	int invert_brightness;
++	int enable_cmd_parser;
+ 	/* leave bools at the end to not create holes */
+ 	bool enable_hangcheck;
+ 	bool fastboot;
+@@ -2489,6 +2574,14 @@ void i915_destroy_error_state(struct drm_device *dev);
+ void i915_get_extra_instdone(struct drm_device *dev, uint32_t *instdone);
+ const char *i915_cache_level_str(int type);
+ 
++/* i915_cmd_parser.c */
++void i915_cmd_parser_init_ring(struct intel_ring_buffer *ring);
++bool i915_needs_cmd_parser(struct intel_ring_buffer *ring);
++int i915_parse_cmds(struct intel_ring_buffer *ring,
++		    struct drm_i915_gem_object *batch_obj,
++		    u32 batch_start_offset,
++		    bool is_master);
++
+ /* i915_suspend.c */
+ extern int i915_save_state(struct drm_device *dev);
+ extern int i915_restore_state(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 1c93cb9..16a9957 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1182,6 +1182,24 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	}
+ 	batch_obj->base.pending_read_domains |= I915_GEM_DOMAIN_COMMAND;
+ 
++	if (i915_needs_cmd_parser(ring)) {
++		ret = i915_parse_cmds(ring,
++				      batch_obj,
++				      args->batch_start_offset,
++				      file->is_master);
++		if (ret)
++			goto err;
++
++		/*
++		 * XXX: Actually do this when enabling batch copy...
++		 *
++		 * Set the DISPATCH_SECURE bit to remove the NON_SECURE bit
++		 * from MI_BATCH_BUFFER_START commands issued in the
++		 * dispatch_execbuffer implementations. We specifically don't
++		 * want that set when the command parser is enabled.
++		 */
++	}
++
+ 	/* snb/ivb/vlv conflate the "batch in ppgtt" bit with the "non-secure
+ 	 * batch" bit. Hence we need to pin secure batches into the global gtt.
+ 	 * hsw should have this fixed, but bdw mucks it up again. */
+diff --git a/drivers/gpu/drm/i915/i915_params.c b/drivers/gpu/drm/i915/i915_params.c
+index 3b48258..a66ffb6 100644
+--- a/drivers/gpu/drm/i915/i915_params.c
++++ b/drivers/gpu/drm/i915/i915_params.c
+@@ -48,6 +48,7 @@ struct i915_params i915 __read_mostly = {
+ 	.reset = true,
+ 	.invert_brightness = 0,
+ 	.disable_display = 0,
++	.enable_cmd_parser = 0,
+ };
+ 
+ module_param_named(modeset, i915.modeset, int, 0400);
+@@ -157,3 +158,7 @@ MODULE_PARM_DESC(invert_brightness,
+ 
+ module_param_named(disable_display, i915.disable_display, bool, 0600);
+ MODULE_PARM_DESC(disable_display, "Disable display (default: false)");
++
++module_param_named(enable_cmd_parser, i915.enable_cmd_parser, int, 0600);
++MODULE_PARM_DESC(enable_cmd_parser,
++		 "Enable command parsing (1=enabled, 0=disabled [default])");
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index e00d6e4..e13f276 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -175,6 +175,18 @@
+ #define VGA_CR_DATA_CGA 0x3d5
+ 
+ /*
++ * Instruction field definitions used by the command parser
++ */
++#define INSTR_CLIENT_SHIFT      29
++#define INSTR_CLIENT_MASK       0xE0000000
++#define   INSTR_MI_CLIENT       0x0
++#define   INSTR_BC_CLIENT       0x2
++#define   INSTR_RC_CLIENT       0x3
++#define INSTR_SUBCLIENT_SHIFT   27
++#define INSTR_SUBCLIENT_MASK    0x18000000
++#define   INSTR_MEDIA_SUBCLIENT 0x2
++
++/*
+  * Memory interface instructions used by the kernel
+  */
+ #define MI_INSTR(opcode, flags) (((opcode) << 23) | (flags))
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index a83ff91..8590921 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1388,6 +1388,8 @@ static int intel_init_ring_buffer(struct drm_device *dev,
+ 	if (IS_I830(ring->dev) || IS_845G(ring->dev))
+ 		ring->effective_size -= 128;
+ 
++	i915_cmd_parser_init_ring(ring);
++
+ 	return 0;
+ 
+ err_unmap:
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 08b91c6..09af920 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -164,6 +164,38 @@ struct  intel_ring_buffer {
+ 		u32 gtt_offset;
+ 		volatile u32 *cpu_page;
+ 	} scratch;
++
++	/*
++	 * Tables of commands the command parser needs to know about
++	 * for this ring.
++	 */
++	const struct drm_i915_cmd_table *cmd_tables;
++	int cmd_table_count;
++
++	/*
++	 * Table of registers allowed in commands that read/write registers.
++	 */
++	const u32 *reg_table;
++	int reg_count;
++
++	/*
++	 * Table of registers allowed in commands that read/write registers, but
++	 * only from the DRM master.
++	 */
++	const u32 *master_reg_table;
++	int master_reg_count;
++
++	/*
++	 * Returns the bitmask for the length field of the specified command.
++	 * Return 0 for an unrecognized/invalid command.
++	 *
++	 * If the command parser finds an entry for a command in the ring's
++	 * cmd_tables, it gets the command's length based on the table entry.
++	 * If not, it calls this function to determine the per-ring length field
++	 * encoding for the command (i.e. certain opcode ranges use certain bits
++	 * to encode the command length in the header).
++	 */
++	u32 (*get_cmd_length_mask)(u32 cmd_header);
+ };
+ 
+ static inline bool
+-- 
+2.0.2
+

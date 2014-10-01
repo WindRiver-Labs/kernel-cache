@@ -1,0 +1,330 @@
+From f990ff4d928aa806a57aae132a21acf73bccbbe1 Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <ben@bwidawsk.net>
+Date: Fri, 6 Dec 2013 14:11:21 -0800
+Subject: [PATCH 035/479] drm/i915: Get context early in execbuf
+
+commit 41bde5535a7d48876095926bb55b1aed5ccd6b2c upstream.
+
+We need to have the address space when reserving space for the objects.
+Since the address space and context are tied together, and reserve
+occurs before context switch (for good reason), we must lookup our
+context earlier in the process.
+
+This leaves some room for optimizations where we no longer need to use
+ctx_id in certain places. This will be addressed in a subsequent patch.
+
+Important tricky bit:
+Because slow relocations during execbuffer drop struct_mutex
+
+Perhaps it would be best to acquire the reference when we get the
+context, but I'll save that for another day (note I have written the
+patch before, and I found the changes required to be uglier than this).
+
+Note that since we currently access everything via context id, and not
+the data structure this is fine, though not desirable. The next change
+attempts to get the context only once via the context ID idr lookup, and
+as such, the following can happen:
+
+CTX-A is created, refcount = 1
+CTX-A execbuf, mutex dropped
+close IOCTL called on CTX-A, refcount = 0
+CTX-A resumes in execbuf.
+
+v2: Rebased on top of
+commit b6359918b885da7c7b58c050674278dbd06020ab
+Author: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Date:   Wed Oct 30 15:44:16 2013 +0200
+
+    drm/i915: add i915_get_reset_stats_ioctl
+
+v3: Rebased on top of
+commit 25b3dfc87bff80317d67ddd2cd4cfb91e6fe7d79
+Author: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date:   Tue Nov 12 11:57:30 2013 +0200
+
+Author: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Date:   Tue Nov 26 16:14:33 2013 +0200
+
+    drm/i915: check context reset stats before relocations
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h            |  8 ++----
+ drivers/gpu/drm/i915/i915_gem.c            |  2 +-
+ drivers/gpu/drm/i915/i915_gem_context.c    | 32 ++++------------------
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c | 44 ++++++++++++++++++------------
+ drivers/gpu/drm/i915/intel_uncore.c        |  8 ++++--
+ 5 files changed, 41 insertions(+), 53 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 6d193a6..1dc8ae4 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2258,7 +2258,9 @@ int i915_gem_context_open(struct drm_device *dev, struct drm_file *file);
+ int i915_gem_context_enable(struct drm_i915_private *dev_priv);
+ void i915_gem_context_close(struct drm_device *dev, struct drm_file *file);
+ int i915_switch_context(struct intel_ring_buffer *ring,
+-			struct drm_file *file, int to_id);
++			struct drm_file *file, struct i915_hw_context *to);
++struct i915_hw_context *
++i915_gem_context_get(struct drm_i915_file_private *file_priv, u32 id);
+ void i915_gem_context_free(struct kref *ctx_ref);
+ static inline void i915_gem_context_reference(struct i915_hw_context *ctx)
+ {
+@@ -2272,10 +2274,6 @@ static inline void i915_gem_context_unreference(struct i915_hw_context *ctx)
+ 		kref_put(&ctx->ref, i915_gem_context_free);
+ }
+ 
+-struct i915_ctx_hang_stats * __must_check
+-i915_gem_context_get_hang_stats(struct drm_device *dev,
+-				struct drm_file *file,
+-				u32 id);
+ int i915_gem_context_create_ioctl(struct drm_device *dev, void *data,
+ 				  struct drm_file *file);
+ int i915_gem_context_destroy_ioctl(struct drm_device *dev, void *data,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 5a2b98c..d339ef9 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2847,7 +2847,7 @@ int i915_gpu_idle(struct drm_device *dev)
+ 
+ 	/* Flush everything onto the inactive list. */
+ 	for_each_ring(ring, dev_priv, i) {
+-		ret = i915_switch_context(ring, NULL, DEFAULT_CONTEXT_ID);
++		ret = i915_switch_context(ring, NULL, ring->default_context);
+ 		if (ret)
+ 			return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 362de0d..165a5c7 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -96,8 +96,6 @@
+ #define GEN6_CONTEXT_ALIGN (64<<10)
+ #define GEN7_CONTEXT_ALIGN 4096
+ 
+-static struct i915_hw_context *
+-i915_gem_context_get(struct drm_i915_file_private *file_priv, u32 id);
+ static int do_switch(struct intel_ring_buffer *ring,
+ 		     struct i915_hw_context *to);
+ 
+@@ -485,20 +483,6 @@ static int context_idr_cleanup(int id, void *p, void *data)
+ 	return 0;
+ }
+ 
+-struct i915_ctx_hang_stats *
+-i915_gem_context_get_hang_stats(struct drm_device *dev,
+-				struct drm_file *file,
+-				u32 id)
+-{
+-	struct i915_hw_context *ctx;
+-
+-	ctx = i915_gem_context_get(file->driver_priv, id);
+-	if (ctx == NULL)
+-		return ERR_PTR(-ENOENT);
+-
+-	return &ctx->hang_stats;
+-}
+-
+ int i915_gem_context_open(struct drm_device *dev, struct drm_file *file)
+ {
+ 	struct drm_i915_file_private *file_priv = file->driver_priv;
+@@ -541,9 +525,12 @@ void i915_gem_context_close(struct drm_device *dev, struct drm_file *file)
+ 	idr_destroy(&file_priv->context_idr);
+ }
+ 
+-static struct i915_hw_context *
++struct i915_hw_context *
+ i915_gem_context_get(struct drm_i915_file_private *file_priv, u32 id)
+ {
++	if (!HAS_HW_CONTEXTS(file_priv->dev_priv->dev))
++		return file_priv->private_default_ctx;
++
+ 	return (struct i915_hw_context *)idr_find(&file_priv->context_idr, id);
+ }
+ 
+@@ -716,20 +703,13 @@ done:
+  */
+ int i915_switch_context(struct intel_ring_buffer *ring,
+ 			struct drm_file *file,
+-			int to_id)
++			struct i915_hw_context *to)
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+-	struct i915_hw_context *to;
+ 
+ 	WARN_ON(!mutex_is_locked(&dev_priv->dev->struct_mutex));
+ 
+-	if (file == NULL)
+-		to = ring->default_context;
+-	else
+-		to = i915_gem_context_get(file->driver_priv, to_id);
+-
+-	if (to == NULL)
+-		return -ENOENT;
++	BUG_ON(file && to == NULL);
+ 
+ 	/* We have the fake context, but don't supports switching. */
+ 	if (!HAS_HW_CONTEXTS(ring->dev))
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 1d453c9..3ee7709 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -900,22 +900,24 @@ validate_exec_list(struct drm_i915_gem_exec_object2 *exec,
+ 	return 0;
+ }
+ 
+-static int
++static struct i915_hw_context *
+ i915_gem_validate_context(struct drm_device *dev, struct drm_file *file,
+ 			  const u32 ctx_id)
+ {
++	struct i915_hw_context *ctx = NULL;
+ 	struct i915_ctx_hang_stats *hs;
+ 
+-	hs = i915_gem_context_get_hang_stats(dev, file, ctx_id);
+-	if (IS_ERR(hs))
+-		return PTR_ERR(hs);
++	ctx = i915_gem_context_get(file->driver_priv, ctx_id);
++	if (IS_ERR_OR_NULL(ctx))
++		return ctx;
+ 
++	hs = &ctx->hang_stats;
+ 	if (hs->banned) {
+ 		DRM_DEBUG("Context %u tried to submit while banned\n", ctx_id);
+-		return -EIO;
++		return ERR_PTR(-EIO);
+ 	}
+ 
+-	return 0;
++	return ctx;
+ }
+ 
+ static void
+@@ -991,14 +993,15 @@ static int
+ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 		       struct drm_file *file,
+ 		       struct drm_i915_gem_execbuffer2 *args,
+-		       struct drm_i915_gem_exec_object2 *exec,
+-		       struct i915_address_space *vm)
++		       struct drm_i915_gem_exec_object2 *exec)
+ {
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+ 	struct eb_vmas *eb;
+ 	struct drm_i915_gem_object *batch_obj;
+ 	struct drm_clip_rect *cliprects = NULL;
+ 	struct intel_ring_buffer *ring;
++	struct i915_hw_context *ctx;
++	struct i915_address_space *vm;
+ 	const u32 ctx_id = i915_execbuffer2_get_context_id(*args);
+ 	u32 exec_start, exec_len;
+ 	u32 mask, flags;
+@@ -1114,11 +1117,18 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 		goto pre_mutex_err;
+ 	}
+ 
+-	ret = i915_gem_validate_context(dev, file, ctx_id);
+-	if (ret) {
++	ctx = i915_gem_validate_context(dev, file, ctx_id);
++	if (IS_ERR_OR_NULL(ctx)) {
+ 		mutex_unlock(&dev->struct_mutex);
++		ret = PTR_ERR(ctx);
+ 		goto pre_mutex_err;
+-	}
++	} 
++
++	i915_gem_context_reference(ctx);
++
++	/* HACK until we have full PPGTT */
++	/* vm = ctx->vm; */
++	vm = &dev_priv->gtt.base;
+ 
+ 	eb = eb_create(args);
+ 	if (eb == NULL) {
+@@ -1178,7 +1188,7 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto err;
+ 
+-	ret = i915_switch_context(ring, file, ctx_id);
++	ret = i915_switch_context(ring, file, ctx);
+ 	if (ret)
+ 		goto err;
+ 
+@@ -1233,6 +1243,8 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	i915_gem_execbuffer_retire_commands(dev, file, ring, batch_obj);
+ 
+ err:
++	/* the request owns the ref now */
++	i915_gem_context_unreference(ctx);
+ 	eb_destroy(eb);
+ 
+ 	mutex_unlock(&dev->struct_mutex);
+@@ -1254,7 +1266,6 @@ int
+ i915_gem_execbuffer(struct drm_device *dev, void *data,
+ 		    struct drm_file *file)
+ {
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_i915_gem_execbuffer *args = data;
+ 	struct drm_i915_gem_execbuffer2 exec2;
+ 	struct drm_i915_gem_exec_object *exec_list = NULL;
+@@ -1310,8 +1321,7 @@ i915_gem_execbuffer(struct drm_device *dev, void *data,
+ 	exec2.flags = I915_EXEC_RENDER;
+ 	i915_execbuffer2_set_context_id(exec2, 0);
+ 
+-	ret = i915_gem_do_execbuffer(dev, data, file, &exec2, exec2_list,
+-				     &dev_priv->gtt.base);
++	ret = i915_gem_do_execbuffer(dev, data, file, &exec2, exec2_list);
+ 	if (!ret) {
+ 		struct drm_i915_gem_exec_object __user *user_exec_list =
+ 			to_user_ptr(args->buffers_ptr);
+@@ -1340,7 +1350,6 @@ int
+ i915_gem_execbuffer2(struct drm_device *dev, void *data,
+ 		     struct drm_file *file)
+ {
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_i915_gem_execbuffer2 *args = data;
+ 	struct drm_i915_gem_exec_object2 *exec2_list = NULL;
+ 	int ret;
+@@ -1371,8 +1380,7 @@ i915_gem_execbuffer2(struct drm_device *dev, void *data,
+ 		return -EFAULT;
+ 	}
+ 
+-	ret = i915_gem_do_execbuffer(dev, data, file, args, exec2_list,
+-				     &dev_priv->gtt.base);
++	ret = i915_gem_do_execbuffer(dev, data, file, args, exec2_list);
+ 	if (!ret) {
+ 		/* Copy the new buffer offsets back to the user's exec list. */
+ 		struct drm_i915_gem_exec_object2 *user_exec_list =
+diff --git a/drivers/gpu/drm/i915/intel_uncore.c b/drivers/gpu/drm/i915/intel_uncore.c
+index c879631..92a5445 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -854,6 +854,7 @@ int i915_get_reset_stats_ioctl(struct drm_device *dev,
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_i915_reset_stats *args = data;
+ 	struct i915_ctx_hang_stats *hs;
++	struct i915_hw_context *ctx;
+ 	int ret;
+ 
+ 	if (args->flags || args->pad)
+@@ -866,11 +867,12 @@ int i915_get_reset_stats_ioctl(struct drm_device *dev,
+ 	if (ret)
+ 		return ret;
+ 
+-	hs = i915_gem_context_get_hang_stats(dev, file, args->ctx_id);
+-	if (IS_ERR(hs)) {
++	ctx = i915_gem_context_get(file->driver_priv, args->ctx_id);
++	if (IS_ERR(ctx)) {
+ 		mutex_unlock(&dev->struct_mutex);
+-		return PTR_ERR(hs);
++		return PTR_ERR(ctx);
+ 	}
++	hs = &ctx->hang_stats;
+ 
+ 	if (capable(CAP_SYS_ADMIN))
+ 		args->reset_count = i915_reset_count(&dev_priv->gpu_error);
+-- 
+2.0.2
+

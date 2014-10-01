@@ -1,0 +1,192 @@
+From b3f307f191061bfa97cf254ec2f29aa260183fa4 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 25 Feb 2014 17:11:23 +0200
+Subject: [PATCH 282/479] drm/i915: Rely on accurate request tracking for
+ finding hung batches
+
+commit 8d9fc7fd2de6edc3b9c3f828a701bfa6891987e7 upstream.
+
+In the past, it was possible to have multiple batches per request due to
+a stray signal or ENOMEM. As a result we had to scan each active object
+(filtered by those having the COMMAND domain) for the one that contained
+the ACTHD pointer. This was then made more complicated by the
+introduction of ppgtt, whereby ACTHD then pointed into the address space
+of the context and so also needed to be taken into account.
+
+This is a fairly robust approach (though the implementation is a little
+fragile and depends upon the per-generation setup, registers and
+parameters). However, due to the requirements for hangstats, we needed a
+robust method for associating batches with a particular request and
+having that we can rely upon it for finding the associated batch object
+for error capture.
+
+If the batch buffer tracking is not robust enough, that should become
+apparent quite quickly through an erroneous error capture. That should
+also help to make sure that the runtime reporting to userspace is
+robust. It also means that we then report the oldest incomplete batch on
+each ring, which can be useful for determining the state of userspace at
+the time of a hang.
+
+v2: Use i915_gem_find_active_request (Mika)
+
+v3: remove check for ring->get_seqno, split long lines (Ben)
+
+v4: check that context is available (Chris)
+    checkpatch warnings fixed
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk> (v1)
+Signed-off-by: Mika Kuoppala <mika.kuoppala@intel.com> (v3)
+Cc: Ben Widawsky <benjamin.widawsky@intel.com>
+Reviewed-by: Ben Widawsky <ben@bwidawsk.net> (v3)
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h       |  3 ++
+ drivers/gpu/drm/i915/i915_gem.c       | 10 +++--
+ drivers/gpu/drm/i915/i915_gpu_error.c | 72 ++++++-----------------------------
+ 3 files changed, 21 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 9e990ff..81536a6 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2170,6 +2170,9 @@ i915_gem_object_unpin_fence(struct drm_i915_gem_object *obj)
+ 	}
+ }
+ 
++struct drm_i915_gem_request *
++i915_gem_find_active_request(struct intel_ring_buffer *ring);
++
+ bool i915_gem_retire_requests(struct drm_device *dev);
+ void i915_gem_retire_requests_ring(struct intel_ring_buffer *ring);
+ int __must_check i915_gem_check_wedge(struct i915_gpu_error *error,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index d7b94ce..69b6999 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2298,11 +2298,13 @@ static void i915_gem_free_request(struct drm_i915_gem_request *request)
+ 	kfree(request);
+ }
+ 
+-static struct drm_i915_gem_request *
+-i915_gem_find_first_non_complete(struct intel_ring_buffer *ring)
++struct drm_i915_gem_request *
++i915_gem_find_active_request(struct intel_ring_buffer *ring)
+ {
+ 	struct drm_i915_gem_request *request;
+-	const u32 completed_seqno = ring->get_seqno(ring, false);
++	u32 completed_seqno;
++
++	completed_seqno = ring->get_seqno(ring, false);
+ 
+ 	list_for_each_entry(request, &ring->request_list, list) {
+ 		if (i915_seqno_passed(completed_seqno, request->seqno))
+@@ -2320,7 +2322,7 @@ static void i915_gem_reset_ring_status(struct drm_i915_private *dev_priv,
+ 	struct drm_i915_gem_request *request;
+ 	bool ring_hung;
+ 
+-	request = i915_gem_find_first_non_complete(ring);
++	request = i915_gem_find_active_request(ring);
+ 
+ 	if (request == NULL)
+ 		return;
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 000b369..1940d67 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -716,46 +716,14 @@ static void i915_gem_record_fences(struct drm_device *dev,
+ 	}
+ }
+ 
+-/* This assumes all batchbuffers are executed from the PPGTT. It might have to
+- * change in the future. */
+-static bool is_active_vm(struct i915_address_space *vm,
+-			 struct intel_ring_buffer *ring)
+-{
+-	struct drm_device *dev = vm->dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct i915_hw_ppgtt *ppgtt;
+-
+-	if (INTEL_INFO(dev)->gen < 7)
+-		return i915_is_ggtt(vm);
+-
+-	/* FIXME: This ignores that the global gtt vm is also on this list. */
+-	ppgtt = container_of(vm, struct i915_hw_ppgtt, base);
+-
+-	if (INTEL_INFO(dev)->gen >= 8) {
+-		u64 pdp0 = (u64)I915_READ(GEN8_RING_PDP_UDW(ring, 0)) << 32;
+-		pdp0 |=  I915_READ(GEN8_RING_PDP_LDW(ring, 0));
+-		return pdp0 == ppgtt->pd_dma_addr[0];
+-	} else {
+-		u32 pp_db;
+-		pp_db = I915_READ(RING_PP_DIR_BASE(ring));
+-		return (pp_db >> 10) == ppgtt->pd_offset;
+-	}
+-}
+-
+ static struct drm_i915_error_object *
+ i915_error_first_batchbuffer(struct drm_i915_private *dev_priv,
+ 			     struct intel_ring_buffer *ring)
+ {
+-	struct i915_address_space *vm;
+-	struct i915_vma *vma;
+-	struct drm_i915_gem_object *obj;
+-	bool found_active = false;
+-	u32 seqno;
+-
+-	if (!ring->get_seqno)
+-		return NULL;
++	struct drm_i915_gem_request *request;
+ 
+ 	if (HAS_BROKEN_CS_TLB(dev_priv->dev)) {
++		struct drm_i915_gem_object *obj;
+ 		u32 acthd = I915_READ(ACTHD);
+ 
+ 		if (WARN_ON(ring->id != RCS))
+@@ -768,33 +736,17 @@ i915_error_first_batchbuffer(struct drm_i915_private *dev_priv,
+ 			return i915_error_ggtt_object_create(dev_priv, obj);
+ 	}
+ 
+-	seqno = ring->get_seqno(ring, false);
+-	list_for_each_entry(vm, &dev_priv->vm_list, global_link) {
+-		if (!is_active_vm(vm, ring))
+-			continue;
+-
+-		found_active = true;
+-
+-		list_for_each_entry(vma, &vm->active_list, mm_list) {
+-			obj = vma->obj;
+-			if (obj->ring != ring)
+-				continue;
+-
+-			if (i915_seqno_passed(seqno, obj->last_read_seqno))
+-				continue;
+-
+-			if ((obj->base.read_domains & I915_GEM_DOMAIN_COMMAND) == 0)
+-				continue;
+-
+-			/* We need to copy these to an anonymous buffer as the simplest
+-			 * method to avoid being overwritten by userspace.
+-			 */
+-			return i915_error_object_create(dev_priv, obj, vm);
+-		}
+-	}
++	request = i915_gem_find_active_request(ring);
++	if (request == NULL)
++		return NULL;
+ 
+-	WARN_ON(!found_active);
+-	return NULL;
++	/* We need to copy these to an anonymous buffer as the simplest
++	 * method to avoid being overwritten by userspace.
++	 */
++	return i915_error_object_create(dev_priv, request->batch_obj,
++					request->ctx ?
++					request->ctx->vm :
++					&dev_priv->gtt.base);
+ }
+ 
+ static void i915_record_ring_state(struct drm_device *dev,
+-- 
+2.0.2
+
