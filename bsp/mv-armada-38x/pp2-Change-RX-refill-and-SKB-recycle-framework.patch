@@ -1,0 +1,1174 @@
+From ab543ed0a6939bb23b1b2032f636b23be797b797 Mon Sep 17 00:00:00 2001
+From: Dmitri Epshtein <dima@marvell.com>
+Date: Sun, 28 Jul 2013 10:12:49 -0400
+Subject: [PATCH 0900/1825] pp2: Change RX refill and SKB recycle framework
+
+https://github.com/MISL-EBU-System-SW/misl-windriver.git linux-3.4.69-14t2-read
+commit 3614bae487289d5d1c76293f9300fa0b9dd135e8
+
+        - don't use eth_pbuf structure on buffer allocation
+        - remove Stack usage from skb recycle
+        - skb->hw_cookie is 32 bits data contains cpu, pool, qset, flags
+        - use lockless mechanism for bm pool refill
+
+Change-Id: Id44d28b4235f3a2d261b724e79cfdcc7db38a1be
+Signed-off-by: Dmitri Epshtein <dima@marvell.com>
+Reviewed-on: http://vgitil04.il.marvell.com:8080/2856
+Reviewed-by: Jonatan Farhadian <yonif@marvell.com>
+Reviewed-by: Uri Eliyahu <uriel@marvell.com>
+Tested-by: Star_Automation <star@marvell.com>
+Signed-off-by: Zhong Hongbo <hongbo.zhong@windriver.com>
+---
+ .../mv_drivers_lsp/mv_pp2/net_dev/mv_netdev.c      |  526 +++++++++-----------
+ .../mv_drivers_lsp/mv_pp2/net_dev/mv_netdev.h      |  130 +++--
+ 2 files changed, 306 insertions(+), 350 deletions(-)
+
+diff --git a/arch/arm/plat-armada/mv_drivers_lsp/mv_pp2/net_dev/mv_netdev.c b/arch/arm/plat-armada/mv_drivers_lsp/mv_pp2/net_dev/mv_netdev.c
+index 1251b39..f1b60b1 100644
+--- a/arch/arm/plat-armada/mv_drivers_lsp/mv_pp2/net_dev/mv_netdev.c
++++ b/arch/arm/plat-armada/mv_drivers_lsp/mv_pp2/net_dev/mv_netdev.c
+@@ -131,6 +131,7 @@ static u32 mv_eth_netdev_fix_features(struct net_device *dev, u32 features);
+ static netdev_features_t mv_eth_netdev_fix_features(struct net_device *dev, netdev_features_t features);
+ #endif
+ 
++static struct sk_buff *mv_eth_skb_alloc(struct bm_pool *pool, MV_ULONG *phys_addr);
+ static MV_STATUS mv_eth_pool_create(int pool, int capacity);
+ static int mv_eth_pool_add(int pool, int buf_num);
+ static int mv_eth_pool_free(int pool, int num);
+@@ -861,7 +862,7 @@ int mv_eth_ctrl_txq_size_set(int port, int txp, int txq, int txq_size, int hwf_s
+ 	txq_ctrl->hwf_size = hwf_size;
+ 
+ 	/* right now, all cpus have same size */
+-	cpu_size = (txq_size - hwf_size) / MV_ETH_MAX_CPU;
++	cpu_size = (txq_size - hwf_size) / nr_cpu_ids;
+ 	for_each_possible_cpu(cpu) {
+ 		txq_cpu_ptr = &txq_ctrl->txq_cpu[cpu];
+ 		txq_cpu_ptr->txq_size = cpu_size;
+@@ -1254,63 +1255,97 @@ static inline int mv_eth_tx_policy(struct eth_port *pp, struct sk_buff *skb)
+ }
+ 
+ #ifdef CONFIG_NET_SKB_RECYCLE
++struct bm_in_use_update {
++	struct bm_pool *ppool;
++	int delta;
++};
++void mv_eth_bm_in_use_update(void *data)
++{
++	struct bm_in_use_update *in_use_delta = (struct bm_in_use_update *)data;
++
++	STAT_DBG(in_use_delta->ppool->stats.in_use_update_on_other_cpu++);
++	this_cpu_add(*in_use_delta->ppool->pcpu_in_use, in_use_delta->delta);
++}
++
+ int mv_eth_skb_recycle(struct sk_buff *skb)
+ {
+-	struct eth_pbuf *pkt = (struct eth_pbuf *)(skb->hw_cookie & ~BIT(0));
+-	struct bm_pool  *pool;
+-	int             status = 0;
++	int pool, cpu;
++	__u32 bm = skb->hw_cookie;
++	unsigned long phys_addr;
++	struct bm_pool *ppool;
++	bool is_recyclable;
+ 
+-	if (mvPp2MaxCheck(pkt->pool, MV_ETH_BM_POOLS, "bm_pool"))
+-		goto err;
++	skb->hw_cookie = 0;
++	skb->skb_recycle = NULL;
+ 
+-	pool = &mv_eth_pool[pkt->pool];
+-	if (skb->hw_cookie & BIT(0)) {
+-		/* hw_cookie is not valid for recycle */
+-		STAT_DBG(pool->stats.skb_hw_cookie_err++);
+-		goto err;
+-	}
++	cpu = mv_eth_bm_cookie_cpu_get(bm);
+ 
+-	/* Check validity of skb->head - some Linux functions (skb_expand_head) reallocate it */
+-	if (skb->head != pkt->pBuf) {
+-		/*
+-		pr_err("%s: skb=%p, pkt=%p, Wrong skb->head=%p != pkt->pBuf=%p\n",
+-			__func__, skb, pkt, skb->head, pkt->pBuf);
+-		*/
+-		STAT_DBG(pool->stats.skb_hw_cookie_err++);
+-		goto err;
+-	}
++	pool = mv_eth_bm_cookie_pool_get(bm);
++	if (mvPp2MaxCheck(pool, MV_ETH_BM_POOLS, "bm_pool"))
++		return 1;
++
++	ppool = &mv_eth_pool[pool];
+ 
+-	if (skb_recycle_check(skb, pool->pkt_size)) {
++	if (bm & MV_ETH_BM_COOKIE_F_INVALID) {
++		/* hw_cookie is not valid for recycle */
++		STAT_DBG(ppool->stats.bm_cookie_err++);
++		is_recyclable = false;
++	} else if (!skb_recycle_check(skb, ppool->pkt_size)) {
++		STAT_DBG(ppool->stats.skb_recycled_err++);
++		is_recyclable = false;
++	} else
++		is_recyclable = true;
++
++	if (is_recyclable) {
+ #ifdef CONFIG_MV_ETH_DEBUG_CODE
+ 		/* Sanity check */
+ 		if (SKB_TRUESIZE(skb->end - skb->head) != skb->truesize) {
+-			printk(KERN_ERR "%s: skb=%p, Wrong SKB_TRUESIZE(end - head)=%d\n",
++			pr_err("%s: skb=%p, Wrong SKB_TRUESIZE(end - head)=%d\n",
+ 				__func__, skb, SKB_TRUESIZE(skb->end - skb->head));
+ 			mv_eth_skb_print(skb);
+ 		}
+ #endif /* CONFIG_MV_ETH_DEBUG_CODE */
+ 
+-		STAT_DBG(pool->stats.skb_recycled_ok++);
+-		mvOsCacheInvalidate(NULL, skb->head, RX_BUF_SIZE(pool->pkt_size));
+-
+-		status = mv_eth_pool_put(pool, pkt);
++		STAT_DBG(ppool->stats.skb_recycled_ok++);
++		phys_addr = dma_map_single(NULL, skb->head, RX_BUF_SIZE(ppool->pkt_size), DMA_FROM_DEVICE);
++		/*phys_addr = virt_to_phys(skb->head);*/
++	} else {
++/*
++		pr_err("%s: Failed - skb=%p, pool=%d, bm_cookie=0x%x\n",
++			__func__, skb, MV_ETH_BM_COOKIE_POOL(bm), bm.word);
+ 
+-		return 0;
++		mv_eth_skb_print(skb);
++*/
++		skb = mv_eth_skb_alloc(ppool, &phys_addr);
++		if (!skb) {
++			pr_err("Linux processing - Can't refill\n");
++			return 1;
++		}
+ 	}
+-	STAT_DBG(pool->stats.skb_recycled_err++);
+-	/* printk(KERN_ERR "mv_eth_skb_recycle failed: pool=%d, pkt=%p, skb=%p\n", pkt->pool, pkt, skb); */
+-err:
+-	mvOsFree(pkt);
+-	skb->hw_cookie = 0;
+-	skb->skb_recycle = NULL;
++	mv_eth_pool_refill(ppool, bm, phys_addr, (unsigned long) skb);
++	this_cpu_dec(*ppool->pcpu_in_use);
+ 
+-	return 1;
++	if (cpu != smp_processor_id()) {
++		int in_use = *per_cpu_ptr(ppool->pcpu_in_use, smp_processor_id());
++		STAT_DBG(ppool->stats.skb_recycle_on_other_cpu++);
++		if (abs(in_use) > 0xFFFF) {
++			struct bm_in_use_update in_use_update;
++
++			in_use_update.ppool = ppool;
++			in_use_update.delta = in_use;
++			if (smp_call_function_single(cpu, mv_eth_bm_in_use_update, (void *)&in_use_update, 1))
++				pr_err("%s: smp_call_function_single on cpu %d failed\n", __func__, cpu);
++			else
++				this_cpu_sub(*ppool->pcpu_in_use, in_use);
++		}
++	}
++	return !is_recyclable;
+ }
+ EXPORT_SYMBOL(mv_eth_skb_recycle);
+ 
+ #endif /* CONFIG_NET_SKB_RECYCLE */
+ 
+-static struct sk_buff *mv_eth_skb_alloc(struct bm_pool *pool, struct eth_pbuf *pkt)
++static struct sk_buff *mv_eth_skb_alloc(struct bm_pool *pool, MV_ULONG *phys_addr)
+ {
+ 	struct sk_buff *skb;
+ 
+@@ -1319,31 +1354,26 @@ static struct sk_buff *mv_eth_skb_alloc(struct bm_pool *pool, struct eth_pbuf *p
+ 		STAT_ERR(pool->stats.skb_alloc_oom++);
+ 		return NULL;
+ 	}
+-	STAT_DBG(pool->stats.skb_alloc_ok++);
++	if (phys_addr)
++		*phys_addr = dma_map_single(NULL, skb->head, RX_BUF_SIZE(pool->pkt_size), DMA_FROM_DEVICE);
++		/* *phys_addr = virt_to_phys(skb->head); */
+ 
+-	pkt->osInfo = (void *)skb;
+-	pkt->pBuf = skb->head;
+-	pkt->physAddr = mvOsCacheInvalidate(NULL, skb->head, RX_BUF_SIZE(pool->pkt_size));
+-	pkt->offset = NET_SKB_PAD;
+-	pkt->pool = pool->pool;
++	STAT_DBG(pool->stats.skb_alloc_ok++);
+ 
+ 	return skb;
+ }
+ 
+-static unsigned char *mv_eth_hwf_buff_alloc(struct bm_pool *pool, struct eth_pbuf *pkt)
++static unsigned char *mv_eth_hwf_buff_alloc(struct bm_pool *pool, MV_ULONG *phys_addr)
+ {
+ 	unsigned char *buff;
+-	int buf_size = RX_HWF_BUF_SIZE(pool->pkt_size);
++	int size = RX_HWF_BUF_SIZE(pool->pkt_size);
+ 
+-	buff = mvOsMalloc(buf_size);
++	buff = mvOsMalloc(size);
+ 	if (!buff)
+ 		return NULL;
+ 
+-	pkt->osInfo = NULL;
+-	pkt->pBuf = buff;
+-	pkt->physAddr = mvOsCacheInvalidate(NULL, buff, buf_size);
+-	pkt->offset = RX_HWF_PKT_OFFS;
+-	pkt->pool = pool->pool;
++	if (phys_addr != NULL)
++		*phys_addr = mvOsCacheInvalidate(NULL, buff, size);
+ 
+ 	return buff;
+ }
+@@ -1396,56 +1426,24 @@ inline u32 mv_eth_txq_done(struct eth_port *pp, struct tx_queue *txq_ctrl)
+ }
+ EXPORT_SYMBOL(mv_eth_txq_done);
+ 
+-inline struct eth_pbuf *mv_eth_pool_get(struct bm_pool *pool)
++/* Reuse skb if possible, allocate new skb and move to BM pool */
++inline int mv_eth_refill(struct bm_pool *ppool, __u32 bm, int is_recycle)
+ {
+-	struct eth_pbuf *pkt = NULL;
+ 	struct sk_buff *skb;
+-	unsigned long flags = 0;
+-
+-	MV_ETH_LOCK(&pool->lock, flags);
++	MV_ULONG phys_addr;
+ 
+-	if (mvStackIndex(pool->stack) > 0) {
+-		STAT_DBG(pool->stats.stack_get++);
+-		pkt = (struct eth_pbuf *)mvStackPop(pool->stack);
+-	} else
+-		STAT_ERR(pool->stats.stack_empty++);
+-
+-	MV_ETH_UNLOCK(&pool->lock, flags);
+-	if (pkt)
+-		return pkt;
+-
+-	/* Try to allocate new pkt + skb */
+-	pkt = mvOsMalloc(sizeof(struct eth_pbuf));
+-	if (pkt) {
+-		skb = mv_eth_skb_alloc(pool, pkt);
+-		if (!skb) {
+-			mvOsFree(pkt);
+-			pkt = NULL;
+-		}
+-	}
+-	return pkt;
+-}
+-
+-/* Reuse pkt if possible, allocate new skb and move BM pool or RXQ ring */
+-inline int mv_eth_refill(struct eth_port *pp,
+-				struct eth_pbuf *pkt, struct bm_pool *pool, struct pp2_rx_desc *rx_desc)
+-{
+-	if (pkt == NULL) {
+-		pkt = mv_eth_pool_get(pool);
+-		if (pkt == NULL)
+-			return 1;
+-	} else {
+-		struct sk_buff *skb;
++	if (is_recycle && (mv_eth_bm_in_use_read(ppool) < ppool->in_use_thresh))
++		return 0;
+ 
+-		/* No recycle -  alloc new skb */
+-		skb = mv_eth_skb_alloc(pool, pkt);
+-		if (!skb) {
+-			mvOsFree(pkt);
+-			pool->missed++;
+-			return 1;
+-		}
++	/* No recycle or too many buffers are in use - alloc new skb */
++	skb = mv_eth_skb_alloc(ppool, &phys_addr);
++	if (!skb) {
++		pr_err("Linux processing - Can't refill\n");
++		return 1;
+ 	}
+-	mv_eth_pool_refill(pkt, pool, rx_desc);
++	STAT_DBG(ppool->stats.no_recycle++);
++	mv_eth_pool_refill(ppool, bm, phys_addr, (unsigned long) skb);
++	this_cpu_dec(*ppool->pcpu_in_use);
+ 
+ 	return 0;
+ }
+@@ -1516,10 +1514,8 @@ void mv_eth_buff_hdr_rx(struct eth_port *pp, struct pp2_rx_desc *rx_desc)
+ 	int mc_id, pool_id;
+ 	PP2_BUFF_HDR *buff_hdr;
+ 	MV_U32 buff_phys_addr, buff_virt_addr, buff_phys_addr_next, buff_virt_addr_next;
+-
+-#ifdef CONFIG_MV_ETH_DEBUG_CODE
+ 	int count = 0;
+-#endif
++
+ #ifdef CONFIG_MV_ETH_PP2_1
+ 	int qset, is_grntd;
+ 
+@@ -1532,20 +1528,21 @@ void mv_eth_buff_hdr_rx(struct eth_port *pp, struct pp2_rx_desc *rx_desc)
+ 	buff_virt_addr = rx_desc->bufCookie;
+ 
+ 	do {
+-		buff_hdr = (PP2_BUFF_HDR *)(((struct eth_pbuf *)buff_virt_addr)->pBuf);
++		buff_hdr = (PP2_BUFF_HDR *)(((struct sk_buff *)buff_virt_addr)->head);
+ 		mc_id = PP2_BUFF_HDR_INFO_MC_ID(buff_hdr->info);
+ 
+ #ifdef CONFIG_MV_ETH_DEBUG_CODE
+ 		if (pp->dbg_flags & MV_ETH_F_DBG_BUFF_HDR) {
+-			printk(KERN_ERR "buff header #%d:\n", ++count);
++			printk(KERN_ERR "buff header #%d:\n", count);
+ 			mvDebugMemDump(buff_hdr, 32, 1);
+ 
+ 			printk(KERN_ERR "byte count = %d   MC ID = %d   last = %d\n",
+ 				buff_hdr->byteCount, mc_id,
+ 				PP2_BUFF_HDR_INFO_IS_LAST(buff_hdr->info));
+ 		}
+-#endif
++#endif /* CONFIG_MV_ETH_DEBUG_CODE */
+ 
++		count++;
+ 		buff_phys_addr_next = buff_hdr->nextBuffPhysAddr;
+ 		buff_virt_addr_next = buff_hdr->nextBuffVirtAddr;
+ 
+@@ -1566,7 +1563,8 @@ void mv_eth_buff_hdr_rx(struct eth_port *pp, struct pp2_rx_desc *rx_desc)
+ 
+ 	} while (!PP2_BUFF_HDR_INFO_IS_LAST(buff_hdr->info));
+ 
+-	STAT_DBG(pp->stats.rx_drop_sw++);
++	mvOsCacheLineInv(NULL, rx_desc);
++	STAT_INFO(pp->stats.rx_buf_hdr++);
+ }
+ 
+ void mv_eth_buff_hdr_rx_dump(struct eth_port *pp, struct pp2_rx_desc *rx_desc)
+@@ -1605,13 +1603,13 @@ static inline int mv_eth_rx(struct eth_port *pp, int rx_todo, int rxq, struct na
+ {
+ 	struct net_device *dev = pp->dev;
+ 	MV_PP2_PHYS_RXQ_CTRL *rx_ctrl = pp->rxq_ctrl[rxq].q;
+-	int rx_done, rx_filled, err;
++	int rx_done, pool;
+ 	struct pp2_rx_desc *rx_desc;
+ 	u32 rx_status;
+ 	int rx_bytes;
+-	struct eth_pbuf *pkt;
+ 	struct sk_buff *skb;
+-	struct bm_pool *pool;
++	__u32 bm;
++	struct bm_pool *ppool;
+ 
+ 	/* Get number of received packets */
+ 	rx_done = mvPp2RxqBusyDescNumGet(pp->port, rxq);
+@@ -1624,7 +1622,6 @@ static inline int mv_eth_rx(struct eth_port *pp, int rx_todo, int rxq, struct na
+ 		return 0;
+ 
+ 	rx_done = 0;
+-	rx_filled = 0;
+ 
+ 	/* Fairness NAPI loop */
+ 	while (rx_done < rx_todo) {
+@@ -1638,11 +1635,6 @@ static inline int mv_eth_rx(struct eth_port *pp, int rx_todo, int rxq, struct na
+ #endif /* CONFIG_MV_ETH_RX_DESC_PREFETCH */
+ 
+ 		rx_done++;
+-		rx_filled++;
+-
+-#if defined(MV_CPU_BE)
+-	/*	mvNetaRxqDescSwap(rx_desc);*/
+-#endif /* MV_CPU_BE */
+ 
+ #ifdef CONFIG_MV_ETH_DEBUG_CODE
+ 		if (pp->dbg_flags & MV_ETH_F_DBG_RX) {
+@@ -1652,25 +1644,27 @@ static inline int mv_eth_rx(struct eth_port *pp, int rx_todo, int rxq, struct na
+ #endif /* CONFIG_MV_ETH_DEBUG_CODE */
+ 
+ 		rx_status = rx_desc->status;
++		bm = mv_eth_bm_cookie_build(rx_desc);
++		pool = mv_eth_bm_cookie_pool_get(bm);
++		ppool = &mv_eth_pool[pool];
++
+ 		/* check if buffer header is used */
+ 		if (rx_status & PP2_RX_BUF_HDR_MASK) {
+ 			mv_eth_buff_hdr_rx(pp, rx_desc);
+ 			continue;
+ 		}
+ 
+-		pkt = (struct eth_pbuf *)rx_desc->bufCookie;
+-		pool = &mv_eth_pool[pkt->pool];
+-
+-
+ 		if (rx_status & PP2_RX_ES_MASK) {
+ 			mv_eth_rx_error(pp, rx_desc);
+ 
+-			mv_eth_pool_refill(pkt, pool, rx_desc);
++			mv_eth_pool_refill(ppool, bm, rx_desc->bufPhysAddr, rx_desc->bufCookie);
++			mvOsCacheLineInv(NULL, rx_desc);
+ 			continue;
+ 		}
++		skb = (struct sk_buff *)rx_desc->bufCookie;
++		this_cpu_inc(*ppool->pcpu_in_use);
+ 
+-		/* Speculative ICache prefetch WA: should be replaced with dma_unmap_single (invalidate l2) */
+-		mvOsCacheMultiLineInv(NULL, pkt->pBuf + pkt->offset, rx_desc->dataSize);
++		/*dma_unmap_single(NULL, rx_desc->bufPhysAddr, RX_BUF_SIZE(ppool->pkt_size), DMA_FROM_DEVICE);*/
+ 
+ 		STAT_DBG(pp->stats.rxq[rxq]++);
+ 		dev->stats.rx_packets++;
+@@ -1680,13 +1674,12 @@ static inline int mv_eth_rx(struct eth_port *pp, int rx_todo, int rxq, struct na
+ 
+ #ifdef CONFIG_MV_ETH_DEBUG_CODE
+ 		if (pp->dbg_flags & MV_ETH_F_DBG_RX) {
+-			printk(KERN_ERR "pkt=%p, pBuf=%p, ksize=%d\n", pkt, pkt->pBuf, ksize(pkt->pBuf));
+-			mvDebugMemDump(pkt->pBuf + pkt->offset, 64, 1);
++			printk(KERN_ERR "skb=%p, buf=%p, ksize=%d\n", skb, skb->head, ksize(skb->head));
++			mvDebugMemDump(skb->head + NET_SKB_PAD, 64, 1);
+ 		}
+ #endif /* CONFIG_MV_ETH_DEBUG_CODE */
+ 
+ 		/* Linux processing */
+-		skb = (struct sk_buff *)(pkt->osInfo);
+ 		__skb_put(skb, rx_bytes);
+ 
+ #if defined(CONFIG_MV_ETH_RX_SPECIAL)
+@@ -1697,12 +1690,8 @@ static inline int mv_eth_rx(struct eth_port *pp, int rx_todo, int rxq, struct na
+ 				STAT_INFO(pp->stats.rx_special++);
+ 
+ 				/* Refill processing */
+-				err = mv_eth_refill(pp, pkt, pool, rx_desc);
+-				if (err) {
+-					printk(KERN_ERR "Linux processing - Can't refill\n");
+-					pp->rxq_ctrl[rxq].missed++;
+-					rx_filled--;
+-				}
++				mv_eth_refill(ppool, &bm, 0);
++				mvOsCacheLineInv(NULL, rx_desc);
+ 				continue;
+ 			}
+ 		}
+@@ -1711,8 +1700,7 @@ static inline int mv_eth_rx(struct eth_port *pp, int rx_todo, int rxq, struct na
+ #ifdef CONFIG_NET_SKB_RECYCLE
+ 		if (mv_eth_is_recycle()) {
+ 			skb->skb_recycle = mv_eth_skb_recycle;
+-			skb->hw_cookie = (__u32)pkt;
+-			pkt = NULL;
++			skb->hw_cookie = bm;
+ 		}
+ #endif /* CONFIG_NET_SKB_RECYCLE */
+ 
+@@ -1720,7 +1708,7 @@ static inline int mv_eth_rx(struct eth_port *pp, int rx_todo, int rxq, struct na
+ 
+ 		if (pp->tagged) {
+ 			mv_mux_rx(skb, pp->port, napi);
+-			STAT_INFO(pp->stats.rx_tagged++);
++			STAT_DBG(pp->stats.rx_tagged++);
+ 			skb = NULL;
+ 		} else {
+ 			dev->stats.rx_bytes -= mv_eth_mh_skb_skip(skb);
+@@ -1742,17 +1730,13 @@ static inline int mv_eth_rx(struct eth_port *pp, int rx_todo, int rxq, struct na
+ 		}
+ 
+ 		/* Refill processing: */
+-		err = mv_eth_refill(pp, pkt, pool, rx_desc);
+-		if (err) {
+-			printk(KERN_ERR "Linux processing - Can't refill\n");
+-			pp->rxq_ctrl[rxq].missed++;
+-			rx_filled--;
+-		}
++		mv_eth_refill(ppool, bm, mv_eth_is_recycle());
++		mvOsCacheLineInv(NULL, rx_desc);
+ 	}
+ 
+ 	/* Update RxQ management counters */
+ 	wmb();
+-	mvPp2RxqDescNumUpdate(pp->port, rxq, rx_done, rx_filled);
++	mvPp2RxqDescNumUpdate(pp->port, rxq, rx_done, rx_done);
+ 
+ 	return rx_done;
+ }
+@@ -2218,15 +2202,12 @@ int mv_eth_tx_tso(struct sk_buff *skb, struct net_device *dev, struct mv_eth_tx_
+ }
+ #endif /* CONFIG_MV_ETH_TSO */
+ 
+-/* Drop packets received by the RXQ and free buffers */
++/* Push packets received by the RXQ to BM pool */
+ static void mv_eth_rxq_drop_pkts(struct eth_port *pp, int rxq)
+ {
+-	struct pp2_rx_desc *rx_desc;
+-	struct eth_pbuf     *pkt;
+-	struct bm_pool      *pool;
+-	int	                rx_done, i;
+-	MV_PP2_PHYS_RXQ_CTRL    *rx_ctrl = pp->rxq_ctrl[rxq].q;
+-
++	struct pp2_rx_desc   *rx_desc;
++	int	                 rx_done, i;
++	MV_PP2_PHYS_RXQ_CTRL *rx_ctrl = pp->rxq_ctrl[rxq].q;
+ 
+ 	if (rx_ctrl == NULL)
+ 		return;
+@@ -2235,16 +2216,18 @@ static void mv_eth_rxq_drop_pkts(struct eth_port *pp, int rxq)
+ 	mvOsCacheIoSync();
+ 
+ 	for (i = 0; i < rx_done; i++) {
++		__u32 bm;
++		int pool;
++		struct bm_pool *ppool;
++
+ 		rx_desc = mvPp2RxqNextDescGet(rx_ctrl);
+-		mvOsCacheLineInv(NULL, rx_desc);
+ 
+-#if defined(MV_CPU_BE)
+-		/*mvNetaRxqDescSwap(rx_desc);*/
+-#endif /* MV_CPU_BE */
++		bm = mv_eth_bm_cookie_build(rx_desc);
++		pool = mv_eth_bm_cookie_pool_get(bm);
++		ppool = &mv_eth_pool[pool];
+ 
+-		pkt = (struct eth_pbuf *)rx_desc->bufCookie;
+-		pool = &mv_eth_pool[pkt->pool];
+-		mv_eth_pool_refill(pkt, pool, rx_desc);
++		mv_eth_pool_refill(ppool, bm, rx_desc->bufPhysAddr, rx_desc->bufCookie);
++		mvOsCacheLineInv(NULL, rx_desc);
+ 	}
+ 	if (rx_done) {
+ 		mvOsCacheIoSync();
+@@ -2386,7 +2369,6 @@ static void mv_eth_tx_frag_process(struct eth_port *pp, struct sk_buff *skb, str
+ /* Free "num" buffers from the pool */
+ static int mv_eth_pool_free(int pool, int num)
+ {
+-	struct eth_pbuf *pkt;
+ 	int i = 0, buf_size, total_size;
+ 	struct bm_pool *ppool = &mv_eth_pool[pool];
+ 	bool free_all = false;
+@@ -2405,62 +2387,26 @@ static int mv_eth_pool_free(int pool, int num)
+ 		total_size = RX_TOTAL_SIZE(buf_size);
+ 	}
+ 
+-	if (mv_eth_pool_bm(ppool)) {
+-		while (i < num) {
+-			MV_U32 *va;
+-			va = (MV_U32 *)mvBmPoolGet(pool);
+-			if (va == 0)
+-				break;
+-
+-			pkt = (struct eth_pbuf *)va;
+-#if !defined(CONFIG_MV_ETH_BE_WA)
+-			pkt = (struct eth_pbuf *)MV_32BIT_LE((MV_U32)pkt);
+-#endif /* !CONFIG_MV_ETH_BE_WA */
+-
+-			if (!MV_ETH_BM_POOL_IS_HWF(ppool->type)) {
+-				if (pkt)
+-					mv_eth_pkt_free(pkt);
+-			} else if (pkt) { /* HWF pool */
+-				mvOsFree(pkt->pBuf);
+-				mvOsFree(pkt);
+-			}
+-			i++;
+-		}
+-		pr_info("bm pool #%d: pkt_size=%4d, buf_size=%4d, total buf_size=%4d - %d of %d buffers free\n",
+-			pool, ppool->pkt_size, buf_size, total_size, i, num);
+-	}
+-
+-	ppool->buf_num -= num;
+-
+-	if (MV_ETH_BM_POOL_IS_HWF(ppool->type))
+-		return i;
+-
+-	/* Free buffers from the pool stack too */
+-	if (free_all)
+-		num = mvStackIndex(ppool->stack);
+-	else if (mv_eth_pool_bm(ppool))
+-		num = 0;
+-
+-	i = 0;
+ 	while (i < num) {
+-		/* sanity check */
+-		if (mvStackIndex(ppool->stack) == 0) {
+-			printk(KERN_ERR "%s: No more buffers in the stack\n", __func__);
++		MV_U32 *va;
++		va = (MV_U32 *)mvBmPoolGet(pool);
++		if (va == 0)
+ 			break;
+-		}
+-		pkt = (struct eth_pbuf *)mvStackPop(ppool->stack);
+-		if (pkt) {
+-			if (!MV_ETH_BM_POOL_IS_HWF(ppool->type))
+-				mv_eth_pkt_free(pkt);
+-			else /* HWF packet - no skb */
+-				mvOsFree(pkt);
++
++		va = (MV_U32 *)MV_32BIT_LE((MV_U32)va);
++
++		if (!MV_ETH_BM_POOL_IS_HWF(ppool->type)) {
++			mv_eth_skb_free((struct sk_buff *)va);
++		} else { /* HWF pool */
++			mvOsFree((char *)va);
+ 		}
+ 		i++;
+ 	}
+-	if (i > 0)
+-		pr_info("stack pool #%d: pkt_size=%4d, buf_size=%4d, total buf_size=%4d - %d of %d buffers free\n",
++	pr_info("bm pool #%d: pkt_size=%4d, buf_size=%4d, total buf_size=%4d - %d of %d buffers free\n",
+ 			pool, ppool->pkt_size, buf_size, total_size, i, num);
+ 
++	ppool->buf_num -= num;
++
+ 	return i;
+ }
+ 
+@@ -2476,8 +2422,6 @@ static int mv_eth_pool_destroy(int pool)
+ 		return MV_ERROR;
+ 	}
+ 
+-	status = mvStackDelete(ppool->stack);
+-
+ 	mvBmPoolControl(pool, MV_STOP);
+ 
+ 	/* Note: we don't free the bm_pool here ! */
+@@ -2494,14 +2438,13 @@ static int mv_eth_pool_add(int pool, int buf_num)
+ {
+ 	struct bm_pool *bm_pool;
+ 	struct sk_buff *skb;
+-	struct eth_pbuf *pkt;
+ 	unsigned char *hwf_buff;
+ 	int i, buf_size, total_size;
++	__u32 bm = 0;
++	unsigned long phys_addr;
+ 
+-	if ((pool < 0) || (pool >= MV_ETH_BM_POOLS)) {
+-		printk(KERN_ERR "%s: invalid pool number %d\n", __func__, pool);
++	if (mvPp2MaxCheck(pool, MV_ETH_BM_POOLS, "bm_pool"))
+ 		return 0;
+-	}
+ 
+ 	bm_pool = &mv_eth_pool[pool];
+ 
+@@ -2515,8 +2458,8 @@ static int mv_eth_pool_add(int pool, int buf_num)
+ 
+ 	/* Check buffer size */
+ 	if (bm_pool->pkt_size == 0) {
+-		printk(KERN_ERR "%s: invalid pool #%d state: pkt_size=%d, buf_num=%d\n",
+-		       __func__, pool, bm_pool->pkt_size, bm_pool->buf_num);
++		printk(KERN_ERR "%s: invalid pool #%d state: pkt_size=%d, buf_size=%d, buf_num=%d\n",
++		       __func__, pool, bm_pool->pkt_size, RX_BUF_SIZE(bm_pool->pkt_size), bm_pool->buf_num);
+ 		return 0;
+ 	}
+ 
+@@ -2527,33 +2470,32 @@ static int mv_eth_pool_add(int pool, int buf_num)
+ 		return 0;
+ 	}
+ 
++	bm = mv_eth_bm_cookie_pool_set(bm, pool);
+ 	for (i = 0; i < buf_num; i++) {
+-		pkt = mvOsMalloc(sizeof(struct eth_pbuf));
+-		if (!pkt) {
+-			printk(KERN_ERR "%s: can't allocate %d bytes\n", __func__, sizeof(struct eth_pbuf));
+-			break;
+-		}
+ 
+ 		if (!MV_ETH_BM_POOL_IS_HWF(bm_pool->type)) {
+-			skb = mv_eth_skb_alloc(bm_pool, pkt);
+-			if (!skb) {
+-				kfree(pkt);
++			/* Allocate skb for pool used for SWF */
++			skb = mv_eth_skb_alloc(bm_pool, &phys_addr);
++			if (!skb)
+ 				break;
+-			}
++
++			mv_eth_pool_refill(bm_pool, bm, phys_addr, (unsigned long) skb);
+ 		} else {
+-			hwf_buff = mv_eth_hwf_buff_alloc(bm_pool, pkt);
+-			if (!hwf_buff) {
+-				kfree(pkt);
++			/* Allocate pkt + buffer for pool used for HWF */
++			hwf_buff = mv_eth_hwf_buff_alloc(bm_pool, &phys_addr);
++			if (!hwf_buff)
+ 				break;
+-			}
+-			memset(hwf_buff, 0, buf_size);
++
++			memset(hwf_buff, 0, sizeof(buf_size));
++			mv_eth_pool_refill(bm_pool, bm, phys_addr, (MV_ULONG) hwf_buff);
+ 		}
+-		mvBmPoolPut(pool, pkt->physAddr, (MV_ULONG)pkt);
+-		STAT_DBG(bm_pool->stats.bm_put++);
+ 	}
+ 	bm_pool->buf_num += i;
++	bm_pool->in_use_thresh = bm_pool->buf_num / 4;
+ 
+-	pr_info("bm pool #%d: pkt_size=%4d, buf_size=%4d, total buf_size=%4d - %d of %d buffers added\n",
++	pr_info("%s %s pool #%d: pkt_size=%4d, buf_size=%4d, total_size=%4d - %d of %d buffers added\n",
++		MV_ETH_BM_POOL_IS_HWF(bm_pool->type) ? "HWF" : "SWF",
++		MV_ETH_BM_POOL_IS_SHORT(bm_pool->type) ? "short" : " long",
+ 		pool, bm_pool->pkt_size, buf_size, total_size, i, buf_num);
+ 
+ 	return i;
+@@ -2566,7 +2508,6 @@ void	*mv_eth_bm_pool_create(int pool, int capacity, MV_ULONG *pPhysAddr)
+ 	MV_STATUS status;
+ 
+ 	pVirt = mvOsIoUncachedMalloc(NULL, sizeof(MV_U32) * capacity, &physAddr, NULL);
+-
+ 	if (pVirt == NULL) {
+ 		mvOsPrintf("%s: Can't allocate %d bytes for Long pool #%d\n",
+ 				__func__, MV_BM_POOL_CAP_MAX * sizeof(MV_U32), pool);
+@@ -2608,24 +2549,16 @@ static MV_STATUS mv_eth_pool_create(int pool, int capacity)
+ 	bm_pool = &mv_eth_pool[pool];
+ 	memset(bm_pool, 0, sizeof(struct bm_pool));
+ 
+-	bm_pool->bm_pool = mv_eth_bm_pool_create(pool, capacity, &physAddr /*NULL*/);
++	bm_pool->bm_pool = mv_eth_bm_pool_create(pool, capacity, &physAddr);
+ 	if (bm_pool->bm_pool == NULL)
+ 		return MV_FAIL;
+ 
+-	/* Create Stack as container of alloacted skbs for SKB_RECYCLE and for RXQs working without BM support */
+-	bm_pool->stack = mvStackCreate(capacity);
+-
+-	if (bm_pool->stack == NULL) {
+-		printk(KERN_ERR "Can't create MV_STACK structure for %d elements\n", capacity);
+-		return MV_OUT_OF_CPU_MEM;
+-	}
+-
+ 	bm_pool->pool = pool;
+ 	bm_pool->type = MV_ETH_BM_FREE;
+ 	bm_pool->capacity = capacity;
+ 	bm_pool->pkt_size = 0;
+ 	bm_pool->buf_num = 0;
+-	bm_pool->physAddr = physAddr;
++	bm_pool->pcpu_in_use = alloc_percpu(int);
+ 	spin_lock_init(&bm_pool->lock);
+ 
+ 	return MV_OK;
+@@ -3096,7 +3029,6 @@ static int mv_eth_port_link_speed_fc(int port, MV_ETH_PORT_SPEED port_speed, int
+ 			printk(KERN_ERR "mvEthFlowCtrlSet failed\n");
+ 			return -EIO;
+ 		}
+-
+ 	}
+ 
+ 	return 0;
+@@ -3695,7 +3627,7 @@ int mv_eth_hal_init(struct eth_port *pp)
+ 				txq_cpu_ptr = &txq_ctrl->txq_cpu[cpu];
+ 				txq_cpu_ptr->shadow_txq = NULL;
+ 				txq_cpu_ptr->txq_size =
+-					(CONFIG_MV_ETH_TXQ_DESC - CONFIG_MV_ETH_TXQ_HWF_DESC) / MV_ETH_MAX_CPU;
++					(CONFIG_MV_ETH_TXQ_DESC - CONFIG_MV_ETH_TXQ_HWF_DESC) / nr_cpu_ids;
+ 				txq_cpu_ptr->txq_count = 0;
+ 				txq_cpu_ptr->shadow_txq_put_i = 0;
+ 				txq_cpu_ptr->shadow_txq_get_i = 0;
+@@ -4611,8 +4543,7 @@ void mv_eth_pool_status_print(int pool)
+ {
+ 	const char *type;
+ 	struct bm_pool *bm_pool = &mv_eth_pool[pool];
+-	int buf_size, total_size, true_size;
+-
++	int buf_size, total_size, true_size, cpu;
+ 
+ 	if (MV_ETH_BM_POOL_IS_HWF(bm_pool->type)) {
+ 		buf_size = RX_HWF_BUF_SIZE(bm_pool->pkt_size);
+@@ -4650,29 +4581,32 @@ void mv_eth_pool_status_print(int pool)
+ 	}
+ 
+ 	pr_info("\nBM Pool #%d: pool type = %s, buffers num = %d\n", pool, type, bm_pool->buf_num);
+-	pr_info("     packet size = %d,  buffer size = %d\n", bm_pool->pkt_size, buf_size);
+-	pr_info("     total buffer size = %d, true buffer size = %d\n", total_size, true_size);
+-	pr_info("     bm_pool=%p, stack=%p, capacity=%d, buf_num=%d, port_map=0x%x missed=%d\n",
+-			bm_pool->bm_pool, bm_pool->stack, bm_pool->capacity, bm_pool->buf_num,
+-			bm_pool->port_map, bm_pool->missed);
++	pr_info("     packet size = %d, buffer size = %d, total size = %d, true size = %d\n",
++		bm_pool->pkt_size, buf_size, total_size, true_size);
++	pr_info("     capacity=%d, buf_num=%d, port_map=0x%x, in_use_thresh=%u\n",
++		bm_pool->capacity, bm_pool->buf_num, bm_pool->port_map, bm_pool->in_use_thresh);
+ 
+ #ifdef CONFIG_MV_ETH_STAT_ERR
+-	pr_info("     Errors: skb_alloc_oom=%u, stack_empty=%u, stack_full=%u\n",
+-	       bm_pool->stats.skb_alloc_oom, bm_pool->stats.stack_empty, bm_pool->stats.stack_full);
++	pr_cont("     skb_alloc_oom=%u", bm_pool->stats.skb_alloc_oom);
+ #endif /* #ifdef CONFIG_MV_ETH_STAT_ERR */
+ 
+ #ifdef CONFIG_MV_ETH_STAT_DBG
+-	pr_info("     skb_alloc_ok=%u, bm_put=%u, stack_put=%u, stack_get=%u\n",
+-	       bm_pool->stats.skb_alloc_ok, bm_pool->stats.bm_put, bm_pool->stats.stack_put, bm_pool->stats.stack_get);
++	pr_cont(", skb_alloc_ok=%u, bm_put=%u\n",
++	       bm_pool->stats.skb_alloc_ok, bm_pool->stats.bm_put);
++
++	pr_info("     no_recycle=%u, skb_recycled_ok=%u, skb_recycled_err=%u, bm_cookie_err=%u\n",
++		bm_pool->stats.no_recycle, bm_pool->stats.skb_recycled_ok,
++		bm_pool->stats.skb_recycled_err, bm_pool->stats.bm_cookie_err);
+ 
+-	pr_info("     skb_recycled_ok=%u, skb_recycled_err=%u, skb_hw_cookie_err=%u\n",
+-	       bm_pool->stats.skb_recycled_ok, bm_pool->stats.skb_recycled_err, bm_pool->stats.skb_hw_cookie_err);
++	pr_info("     skb_recycle_on_other_cpu=%u, in_use_update=%u\n",
++		bm_pool->stats.skb_recycle_on_other_cpu,
++		bm_pool->stats.in_use_update_on_other_cpu);
+ #endif /* CONFIG_MV_ETH_STAT_DBG */
+ 
+-	if (bm_pool->stack) {
+-		pr_info("     "); /* indent */
+-		mvStackStatus(bm_pool->stack, 0);
+-	}
++	pr_info("in_use[cpu]     = ");
++	for_each_possible_cpu(cpu)
++		pr_cont("%3d  ", *per_cpu_ptr(bm_pool->pcpu_in_use, cpu));
++	pr_cont("  [%d]\n", mv_eth_bm_in_use_read(bm_pool));
+ 
+ 	memset(&bm_pool->stats, 0, sizeof(bm_pool->stats));
+ }
+@@ -4775,10 +4709,17 @@ void mv_eth_port_status_print(unsigned int port)
+ 		}
+ 		printk(KERN_CONT "\n");
+ 
+-		printk(KERN_ERR "txq_sw_desc(num) [%2d.q] = ", txp);
++		printk(KERN_ERR "txq_hwf_desc(num) [%2d.q] = ", txp);
++		for (q = 0; q < CONFIG_MV_ETH_TXQ; q++) {
++			txq_ctrl = &pp->txq_ctrl[txp * CONFIG_MV_ETH_TXQ + q];
++			printk(KERN_CONT "%4d ", txq_ctrl->hwf_size);
++		}
++		printk(KERN_CONT "\n");
++
++		printk(KERN_ERR "txq_swf_desc(num) [%2d.q] = ", txp);
+ 		for (q = 0; q < CONFIG_MV_ETH_TXQ; q++) {
+ 			txq_ctrl = &pp->txq_ctrl[txp * CONFIG_MV_ETH_TXQ + q];
+-			printk(KERN_CONT "%4d ", txq_ctrl->txq_cpu[0].txq_size); /*TODO: for every cpu?*/
++			printk(KERN_CONT "%4d ", txq_ctrl->txq_cpu[0].txq_size);
+ 		}
+ 		printk(KERN_CONT "\n");
+ 	}
+@@ -4840,7 +4781,6 @@ void mv_eth_port_stats_print(unsigned int port)
+ 	struct tx_queue *txq_ctrl;
+ 	struct txq_cpu_ctrl *txq_cpu_ptr;
+ 	int txp, queue, cpu = smp_processor_id();
+-	u32 total_rx_ok, total_rx_fill_ok;
+ 
+ 	pr_info("\n====================================================\n");
+ 	pr_info("ethPort_%d: Statistics (running on cpu#%d)", port, cpu);
+@@ -4853,12 +4793,12 @@ void mv_eth_port_stats_print(unsigned int port)
+ 	stat = &(pp->stats);
+ 
+ #ifdef CONFIG_MV_ETH_STAT_ERR
+-	printk(KERN_ERR "Errors:\n");
+-	printk(KERN_ERR "rx_error......................%10u\n", stat->rx_error);
+-	printk(KERN_ERR "tx_timeout....................%10u\n", stat->tx_timeout);
+-	printk(KERN_ERR "ext_stack_empty...............%10u\n", stat->ext_stack_empty);
+-	printk(KERN_ERR "ext_stack_full ...............%10u\n", stat->ext_stack_full);
+-	printk(KERN_ERR "state_err.....................%10u\n", stat->state_err);
++	pr_info("Errors:\n");
++	pr_info("rx_error..................%10u\n", stat->rx_error);
++	pr_info("tx_timeout................%10u\n", stat->tx_timeout);
++	pr_info("ext_stack_empty...........%10u\n", stat->ext_stack_empty);
++	pr_info("ext_stack_full............%10u\n", stat->ext_stack_full);
++	pr_info("state_err.................%10u\n", stat->state_err);
+ #endif /* CONFIG_MV_ETH_STAT_ERR */
+ 
+ #ifdef CONFIG_MV_ETH_STAT_INF
+@@ -4889,44 +4829,25 @@ void mv_eth_port_stats_print(unsigned int port)
+ 		printk(KERN_CONT "%8d ", stat->tx_done_timer_add[cpu]);
+ 
+ 	pr_info("\n");
+-	printk(KERN_ERR "tx_done_event.................%10u\n", stat->tx_done);
+-	printk(KERN_ERR "link..........................%10u\n", stat->link);
+-	printk(KERN_ERR "netdev_stop...................%10u\n", stat->netdev_stop);
+-	if (pp->tagged)
+-		printk(KERN_ERR "rx_tagged....................%10u\n",  stat->rx_tagged);
++	pr_info("tx_done_event.............%10u\n", stat->tx_done);
++	pr_info("link......................%10u\n", stat->link);
++	pr_info("netdev_stop...............%10u\n", stat->netdev_stop);
++	pr_info("rx_buf_hdr................%10u\n", stat->rx_buf_hdr);
++
+ #ifdef CONFIG_MV_ETH_RX_SPECIAL
+-	printk(KERN_ERR "rx_special....................%10u\n", stat->rx_special);
++	pr_info("rx_special................%10u\n", stat->rx_special);
+ #endif /* CONFIG_MV_ETH_RX_SPECIAL */
++
+ #ifdef CONFIG_MV_ETH_TX_SPECIAL
+-	printk(KERN_ERR "tx_special....................%10u\n", stat->tx_special);
++	pr_info("tx_special................%10u\n", stat->tx_special);
+ #endif /* CONFIG_MV_ETH_TX_SPECIAL */
+ #endif /* CONFIG_MV_ETH_STAT_INF */
+ 
+-	printk(KERN_ERR "\n");
+-	total_rx_ok = total_rx_fill_ok = 0;
+-	printk(KERN_ERR "RXQ:       rx_ok      rx_fill_ok     missed\n\n");
+-	for (queue = 0; queue < pp->rxq_num; queue++) {
+-		u32 rxq_ok = 0, rxq_fill = 0;
+-
+-#ifdef CONFIG_MV_ETH_STAT_DBG
+-		rxq_ok = stat->rxq[queue];
+-		rxq_fill = stat->rxq_fill[queue];
+-#endif /* CONFIG_MV_ETH_STAT_DBG */
+-
+-		printk(KERN_ERR "%3d:  %10u    %10u          %d\n",
+-			queue, rxq_ok, rxq_fill,
+-			pp->rxq_ctrl[queue].missed);
+-		total_rx_ok += rxq_ok;
+-		total_rx_fill_ok += rxq_fill;
+-	}
+-	printk(KERN_ERR "SUM:  %10u    %10u\n", total_rx_ok, total_rx_fill_ok);
+-
+ #ifdef CONFIG_MV_ETH_STAT_DBG
+ 	{
+-		printk(KERN_ERR "\n====================================================\n");
+-		printk(KERN_ERR "ethPort_%d: Debug statistics", port);
+-		printk(KERN_CONT "\n-------------------------------\n");
++		__u32 total_rx_ok = 0;
+ 
++		pr_info("\nDebug statistics:\n");
+ 		printk(KERN_ERR "\n");
+ 		printk(KERN_ERR "rx_gro....................%10u\n", stat->rx_gro);
+ 		printk(KERN_ERR "rx_gro_bytes .............%10u\n", stat->rx_gro_bytes);
+@@ -4950,6 +4871,17 @@ void mv_eth_port_stats_print(unsigned int port)
+ 		printk(KERN_ERR "ext_stack_put ............%10u\n", stat->ext_stack_put);
+ 
+ 		printk(KERN_ERR "\n");
++
++		printk(KERN_ERR "RXQ:       rx_ok\n\n");
++		for (queue = 0; queue < pp->rxq_num; queue++) {
++			u32 rxq_ok = 0;
++
++			rxq_ok = stat->rxq[queue];
++
++			pr_info("%3d:  %10u\n",	queue, rxq_ok);
++			total_rx_ok += rxq_ok;
++		}
++		printk(KERN_ERR "SUM:  %10u\n", total_rx_ok);
+ 	}
+ #endif /* CONFIG_MV_ETH_STAT_DBG */
+ 
+@@ -4978,10 +4910,10 @@ void mv_eth_port_stats_print(unsigned int port)
+ 				memset(&txq_ctrl->stats, 0, sizeof(txq_ctrl->stats));
+ 			}
+ 	}
+-	printk(KERN_ERR "\n\n");
+-
+ 	memset(stat, 0, sizeof(struct port_stats));
+ 
++	mv_eth_ext_pool_print(pp);
++
+ 	/* RX pool statistics */
+ 	if (pp->pool_short)
+ 		mv_eth_pool_status_print(pp->pool_short->pool);
+@@ -4989,8 +4921,6 @@ void mv_eth_port_stats_print(unsigned int port)
+ 	if (pp->pool_long)
+ 		mv_eth_pool_status_print(pp->pool_long->pool);
+ 
+-		mv_eth_ext_pool_print(pp);
+-
+ #ifdef CONFIG_MV_ETH_STAT_DIST
+ 	{
+ 		int i;
+diff --git a/arch/arm/plat-armada/mv_drivers_lsp/mv_pp2/net_dev/mv_netdev.h b/arch/arm/plat-armada/mv_drivers_lsp/mv_pp2/net_dev/mv_netdev.h
+index 5015799..84070ee 100644
+--- a/arch/arm/plat-armada/mv_drivers_lsp/mv_pp2/net_dev/mv_netdev.h
++++ b/arch/arm/plat-armada/mv_drivers_lsp/mv_pp2/net_dev/mv_netdev.h
+@@ -42,12 +42,6 @@ disclaimer.
+ #include "bm/mvBmRegs.h"
+ #include "bm/mvBm.h"
+ 
+-#ifdef CONFIG_SMP
+-# define MV_ETH_MAX_CPU CONFIG_NR_CPUS
+-#else
+-# define MV_ETH_MAX_CPU 1
+-#endif
+-
+ /******************************************************
+  * driver statistics control --                       *
+  ******************************************************/
+@@ -175,7 +169,7 @@ struct port_stats {
+ 	u32 tx_done;
+ 	u32 link;
+ 	u32 netdev_stop;
+-	u32 rx_tagged;
++	u32 rx_buf_hdr;
+ 
+ #ifdef CONFIG_MV_ETH_RX_SPECIAL
+ 	u32 rx_special;
+@@ -189,7 +183,7 @@ struct port_stats {
+ 
+ #ifdef CONFIG_MV_ETH_STAT_DBG
+ 	u32 rxq[CONFIG_MV_ETH_RXQ];
+-	u32 rxq_fill[CONFIG_MV_ETH_RXQ];
++	u32 rx_tagged;
+ 	u32 rx_netif;
+ 	u32 rx_gro;
+ 	u32 rx_gro_bytes;
+@@ -210,7 +204,7 @@ struct port_stats {
+ 
+ #define MV_ETH_TX_DESC_ALIGN		0x1f
+ 
+-/* Used for define type of data saved in shadow: SKB or eth_pbuf or nothing */
++/* Used for define type of data saved in shadow: SKB or extended buffer or nothing */
+ #define MV_ETH_SHADOW_SKB		0x1
+ #define MV_ETH_SHADOW_EXT		0x2
+ 
+@@ -307,7 +301,6 @@ struct aggr_tx_queue {
+ struct rx_queue {
+ 	MV_PP2_PHYS_RXQ_CTRL	*q;
+ 	int                 	rxq_size;
+-	int                 	missed;
+ 	MV_U32	            	rxq_pkts_coal;
+ 	MV_U32	            	rxq_time_coal;
+ };
+@@ -422,13 +415,16 @@ struct pool_stats {
+ #endif /* CONFIG_MV_ETH_STAT_ERR */
+ 
+ #ifdef CONFIG_MV_ETH_STAT_DBG
++	u32 no_recycle;
+ 	u32 bm_put;
+ 	u32 stack_put;
+ 	u32 stack_get;
+ 	u32 skb_alloc_ok;
+ 	u32 skb_recycled_ok;
+ 	u32 skb_recycled_err;
+-	u32 skb_hw_cookie_err;
++	u32 bm_cookie_err;
++	u32 skb_recycle_on_other_cpu;
++	u32 in_use_update_on_other_cpu;
+ #endif /* CONFIG_MV_ETH_STAT_DBG */
+ };
+ 
+@@ -486,18 +482,71 @@ enum mv_eth_bm_type {
+ struct bm_pool {
+ 	int			pool;
+ 	enum mv_eth_bm_type	type;
+-	int			capacity;
+-	int			buf_num;
+-	int			pkt_size;
+-	u32			*bm_pool;
+-	MV_STACK		*stack;
+-	spinlock_t		lock;
+-	u32			port_map;
+-	int			missed;		/* FIXME: move to stats */
+-	MV_ULONG		physAddr;
+-	struct			pool_stats stats;
++	int                 capacity;
++	int                 buf_num;
++	int                 pkt_size;
++	u32                 *bm_pool;
++	MV_ULONG            physAddr;
++	spinlock_t          lock;
++	u32                 port_map;
++	int        __percpu *pcpu_in_use;
++	int                 in_use_thresh;
++	struct              pool_stats stats;
+ };
+ 
++/* BM cookie (32 bits) definition */
++/* bits[0-7]   - Flags  */
++/*      bit0 - bm_cookie is invalid for SKB recycle */
++#define MV_ETH_BM_COOKIE_F_INVALID            (1 << 0)
++/*      bit7 - buffer is guaranteed */
++#define MV_ETH_BM_COOKIE_F_BUF_GRNTD          (1 << 7)
++/* bits[8-15]  - PoolId */
++#define MV_ETH_BM_COOKIE_POOL_OFFS            8
++/* bits[16-23] - Qset   */
++#define MV_ETH_BM_COOKIE_QSET_OFFS            16
++/* bits[24-31] - Cpu    */
++#define MV_ETH_BM_COOKIE_CPU_OFFS             24
++
++static inline int mv_eth_bm_cookie_pool_get(__u32 cookie)
++{
++	return (cookie >> 8) & 0xFF;
++}
++
++static inline __u32 mv_eth_bm_cookie_pool_set(__u32 cookie, int pool)
++{
++	__u32 bm;
++
++	bm = cookie & ~(0xFF << MV_ETH_BM_COOKIE_POOL_OFFS);
++	bm |= ((pool & 0xFF) << MV_ETH_BM_COOKIE_POOL_OFFS);
++
++	return bm;
++}
++static inline int mv_eth_bm_cookie_cpu_get(__u32 cookie)
++{
++	return (cookie >> MV_ETH_BM_COOKIE_CPU_OFFS) & 0xFF;
++}
++
++/* Build bm cookie from rx_desc */
++/* Cookie includes information needed to return buffer to bm pool: poolid, qset, etc */
++static inline __u32 mv_eth_bm_cookie_build(struct pp2_rx_desc *rx_desc)
++{
++	int pool = mvPp2RxBmPoolId(rx_desc);
++	int cpu = smp_processor_id();
++
++	return ((pool & 0xFF) << MV_ETH_BM_COOKIE_POOL_OFFS) |
++		((cpu & 0xFF) << MV_ETH_BM_COOKIE_CPU_OFFS);
++}
++
++static inline int mv_eth_bm_in_use_read(struct bm_pool *bm)
++{
++	int cpu, in_use = 0;
++
++	for_each_possible_cpu(cpu)
++		in_use += *per_cpu_ptr(bm->pcpu_in_use, cpu);
++
++	return in_use;
++}
++
+ extern struct bm_pool mv_eth_pool[MV_ETH_BM_POOLS];
+ extern struct eth_port **mv_eth_ports;
+ 
+@@ -690,51 +739,29 @@ static inline void mv_eth_shadow_push(struct txq_cpu_ctrl *txq_cpu, int val)
+ 		txq_cpu->shadow_txq_put_i = 0;
+ }
+ 
+-/* Free pkt + skb pair */
+-static inline void mv_eth_pkt_free(struct eth_pbuf *pkt)
++/* Free skb pair */
++static inline void mv_eth_skb_free(struct sk_buff *skb)
+ {
+-	struct sk_buff *skb = (struct sk_buff *)pkt->osInfo;
+-
+ #ifdef CONFIG_NET_SKB_RECYCLE
+ 	skb->skb_recycle = NULL;
+ 	skb->hw_cookie = 0;
+ #endif /* CONFIG_NET_SKB_RECYCLE */
+ 
+ 	dev_kfree_skb_any(skb);
+-	mvOsFree(pkt);
+-}
+-
+-static inline int mv_eth_pool_put(struct bm_pool *pool, struct eth_pbuf *pkt)
+-{
+-	unsigned long flags = 0;
+-
+-	MV_ETH_LOCK(&pool->lock, flags);
+-	if (mvStackIsFull(pool->stack)) {
+-		STAT_ERR(pool->stats.stack_full++);
+-		MV_ETH_UNLOCK(&pool->lock, flags);
+-
+-		/* free pkt+skb */
+-		mv_eth_pkt_free(pkt);
+-		return 1;
+-	}
+-	mvStackPush(pool->stack, (MV_U32) pkt);
+-	STAT_DBG(pool->stats.stack_put++);
+-	MV_ETH_UNLOCK(&pool->lock, flags);
+-	return 0;
+ }
+ 
+-
+ /* Pass pkt to BM Pool or RXQ ring */
+-static inline void mv_eth_pool_refill(struct eth_pbuf *pkt, struct bm_pool *pool, struct pp2_rx_desc *rx_desc)
++static inline void mv_eth_pool_refill(struct bm_pool *ppool, __u32 bm,
++					MV_ULONG phys_addr, MV_ULONG cookie)
+ {
++	int pool = mv_eth_bm_cookie_pool_get(bm);
+ 	unsigned long flags = 0;
+ 
+ 	/* Refill BM pool */
+-	STAT_DBG(pool->stats.bm_put++);
++	STAT_DBG(ppool->stats.bm_put++);
+ 	MV_ETH_LIGHT_LOCK(flags);
+-	mvBmPoolPut(pkt->pool, (MV_ULONG) pkt->physAddr, (MV_ULONG) pkt);
++	mvBmPoolPut(pool, phys_addr, cookie);
+ 	MV_ETH_LIGHT_UNLOCK(flags);
+-	mvOsCacheLineInv(NULL, rx_desc);
+ }
+ 
+ /******************************************************
+@@ -873,8 +900,7 @@ int  mv_eth_poll(struct napi_struct *napi, int budget);
+ void mv_eth_link_event(struct eth_port *pp, int print);
+ 
+ int mv_eth_rx_policy(u32 cause);
+-int mv_eth_refill(struct eth_port *pp, struct eth_pbuf *pkt,
+-			struct bm_pool *pool, struct pp2_rx_desc *rx_desc);
++int mv_eth_refill(struct bm_pool *ppool, __u32 bm, int is_recycle);
+ u32 mv_eth_txq_done(struct eth_port *pp, struct tx_queue *txq_ctrl);
+ u32 mv_eth_tx_done_gbe(struct eth_port *pp, u32 cause_tx_done, int *tx_todo);
+ u32 mv_eth_tx_done_pon(struct eth_port *pp, int *tx_todo);
+-- 
+1.7.5.4
+
