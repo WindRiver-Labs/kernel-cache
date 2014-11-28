@@ -1,0 +1,259 @@
+From 1bc8bcdde635f3ace213b1e1cc7927bb00fb05c9 Mon Sep 17 00:00:00 2001
+From: Yonghong Song <ysong@broadcom.com>
+Date: Thu, 25 Apr 2013 13:38:11 -0700
+Subject: [PATCH] kvm: bug fix and support dynamic paging for guest
+
+Commit 1ab3bc736c821853407ba47ff84f5ceae8d40df9 from Broadcom SDK 3.0.2
+
+o flush the cache (L2 and L3) if the allocated page is for reset vector
+  region 0x1fc00000 - 0x1fd00000. This region is acessed with
+  guest uncached/unmapped mode.
+o handle dynamic paging for guest memory. If certain gpa access faults,
+  find the corresponding hva and do the normal page fault handling,
+  at the end, populate gpa->pa page table with allocated memory.
+o Handling certain mtcr/mfcr variants in the 3.7 kernel
+o For KVM, let disable pgd_reg for now. Additional hooks during
+  gpa->pa and hva->pa page table transition are required to support this.
+
+Signed-off-by: Yonghong Song <ysong@broadcom.com>
+Signed-off-by: Nam Ninh <nam.ninh@windriver.com>
+
+diff --git a/arch/mips/include/asm/netlogic/kvm_xlp.h b/arch/mips/include/asm/netlogic/kvm_xlp.h
+index dcd0dbc..abcb21f 100644
+--- a/arch/mips/include/asm/netlogic/kvm_xlp.h
++++ b/arch/mips/include/asm/netlogic/kvm_xlp.h
+@@ -70,6 +70,7 @@ extern void kvm_save_guest_context(struct pt_regs *regs, struct kvm_vcpu_guest *
+ extern void kvm_uart_insert_char(struct kvm *kvm, char c);
+ extern void xlp_kvm_destroy_vm(struct kvm *kvm);
+ extern void kvm_xlp_check_exit_request(struct kvm_vcpu *);
++extern void nlm_flush_cache_L2L3(unsigned long, unsigned long);
+ 
+ /* defined in arch/mips/mm/kvm_uart.c */
+ extern void kvm_handle_pcie_uart(struct pt_regs *regs, unsigned long write,
+diff --git a/arch/mips/kvm/kvm.c b/arch/mips/kvm/kvm.c
+index ea6aff5..9111d6b 100644
+--- a/arch/mips/kvm/kvm.c
++++ b/arch/mips/kvm/kvm.c
+@@ -90,7 +90,7 @@ static void kvm_sync_gpa_map(struct kvm *kvm)
+ 
+ 	for (t = 0; t < KVM_MEMORY_SLOTS; t++) {
+ 		struct kvm_memory_slot *s = &kvm->memslots->memslots[t];
+-		uint64_t msize, gpa, hva, address;
++		uint64_t msize, gpa, hva, address, pa;
+ 
+ 		if (!s->npages)
+ 			continue;
+@@ -137,6 +137,15 @@ static void kvm_sync_gpa_map(struct kvm *kvm)
+ 
+ 			ptep = (pte_t *)*(unsigned long *)pmdp + __pte_offset(gpa);
+ 			*ptep = pte;
++
++			/* flush the Reset Vector region as it will be accessed as uncached. */
++			if ((gpa & 0xfffffffffff00000ULL) == 0x1fc00000) {
++				if ((pte_val(pte) >> _PAGE_PRESENT_SHIFT) & 0x1) {
++					pa = (pte_val(pte) >> (_PAGE_GLOBAL_SHIFT + 6)) << 12;
++					nlm_flush_cache_L2L3(pa, PAGE_SIZE);
++				}
++			}
++
+ 			address += PAGE_SIZE, gpa += PAGE_SIZE;
+ 		}
+ 	}
+diff --git a/arch/mips/mm/fault.c b/arch/mips/mm/fault.c
+index cd03005..379aa4c 100644
+--- a/arch/mips/mm/fault.c
++++ b/arch/mips/mm/fault.c
+@@ -20,6 +20,11 @@
+ #include <linux/kprobes.h>
+ #include <linux/perf_event.h>
+ 
++#ifdef CONFIG_KVM
++#include <linux/kvm.h>
++#include <linux/kvm_host.h>
++#endif
++
+ #include <asm/branch.h>
+ #include <asm/mmu_context.h>
+ #include <asm/uaccess.h>
+@@ -27,6 +32,57 @@
+ #include <asm/highmem.h>		/* For VMALLOC_END */
+ #include <linux/kdebug.h>
+ 
++#ifdef CONFIG_KVM
++#include <asm/kvm.h>
++#include <asm/kvm_host.h>
++#include <asm/netlogic/kvm_xlp.h>
++#endif
++
++#ifdef CONFIG_KVM
++static void nlm_kvm_populate_page(struct pt_regs *regs, unsigned long address,
++	unsigned long gpa_address, unsigned long *pa_address, unsigned long *page_size)
++{
++	pgd_t		*pgdp;
++	pud_t		*pudp;
++        pmd_t		*pmdp;
++        pte_t		*ptep, pte;
++        struct kvm_vcpu	*vcpu;
++        unsigned long	*ptr;
++        int		i;
++
++	pgdp = (pgd_t *)pgd_current[smp_processor_id()] + __pgd_offset(address);
++	pudp = pud_offset(pgdp, address);
++	pmdp = pmd_offset(pudp, address);
++	ptep = pte_offset(pmdp, address);
++	pte = *ptep;
++
++	vcpu = (struct kvm_vcpu *)regs->cp0_osscratch7;
++	pgdp = (pgd_t *)vcpu->arch.gpa_pgd + __pgd_offset(gpa_address);
++	pudp = (pud_t *)pgdp;
++	if (*(unsigned long *)pudp == (unsigned long)invalid_pmd_table) {
++		/* allocate a page for pmd and initialize it */
++		ptr = (unsigned long *)__get_free_page(GFP_KERNEL|GFP_DMA);
++		for (i = 0; i < PTRS_PER_PMD; i++)
++			ptr[i] = (unsigned long)invalid_pte_table;
++		*(unsigned long *)pudp = (unsigned long)ptr;
++	}
++
++	pmdp = pmd_offset(pudp, gpa_address);
++	if (*(unsigned long *)pmdp == (unsigned long)invalid_pte_table) {
++		/* allocate a page for pmd and initialize it */
++		ptr = (unsigned long *)__get_free_page(GFP_KERNEL|GFP_DMA);
++		for (i = 0; i < PTRS_PER_PTE; i++)
++			ptr[i] = 0;
++		*(unsigned long *)pmdp = (unsigned long)ptr;
++	}
++
++	ptep = pte_offset(pmdp, gpa_address);
++	*page_size = PAGE_SIZE;
++	*ptep = pte;
++	*pa_address = (pte_val(pte) >> (_PAGE_GLOBAL_SHIFT + 6)) << 12;
++}
++#endif
++
+ /*
+  * This routine handles page faults.  It determines the address,
+  * and the problem, and then passes it off to one of the appropriate
+@@ -43,6 +99,9 @@ asmlinkage void __kprobes do_page_fault(struct pt_regs *regs, unsigned long writ
+ 	int fault;
+ 	unsigned int flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE |
+ 						 (write ? FAULT_FLAG_WRITE : 0);
++#ifdef CONFIG_KVM
++	unsigned long gpa_address = 0;
++#endif
+ 
+ #if 0
+ 	printk("Cpu%d[%s:%d:%0*lx:%ld:%0*lx]\n", raw_smp_processor_id(),
+@@ -50,6 +109,29 @@ asmlinkage void __kprobes do_page_fault(struct pt_regs *regs, unsigned long writ
+ 	       field, regs->cp0_epc);
+ #endif
+ 
++#ifdef CONFIG_KVM
++	/* If a page fault for a guest memory, change "address" (gpa) to hva */
++	if (regs->cp0_guestctl0 >> 31) {
++		int t;
++		struct kvm_vcpu *vcpu = (struct kvm_vcpu *)regs->cp0_osscratch7;
++
++		gpa_address = address;
++		for (t = 0; t < KVM_MEMORY_SLOTS; t++) {
++			struct kvm_memory_slot *s = &vcpu->kvm->memslots->memslots[t];
++
++			if (gpa_address >= (s->base_gfn << PAGE_SHIFT)
++				&& gpa_address < ((s->base_gfn + s->npages) << PAGE_SHIFT)) {
++				address = s->userspace_addr + gpa_address - (s->base_gfn << PAGE_SHIFT);
++				break;
++			}
++		}
++
++		if (t == KVM_MEMORY_SLOTS) {
++			goto bad_area_nosemaphore;
++		}
++	}
++#endif
++
+ #ifdef CONFIG_KPROBES
+ 	/*
+ 	 * This is to notify the fault handler of the kprobes.	The
+@@ -184,6 +266,21 @@ good_area:
+ 	}
+ 
+ 	up_read(&mm->mmap_sem);
++
++#ifdef CONFIG_KVM
++	if (regs->cp0_guestctl0 >> 31) {
++		unsigned long pa_address, page_size;
++
++		/* Populate the gpa->pa page table. */
++		nlm_kvm_populate_page(regs, address, gpa_address, &pa_address, &page_size);
++
++		/* flush the Reset Vector region as it will be accessed as uncached. */
++		if ((gpa_address & 0xfffffffffff00000ULL) == 0x1fc00000) {
++			nlm_flush_cache_L2L3(pa_address, page_size);
++		}
++	}
++#endif
++
+ 	return;
+ 
+ /*
+diff --git a/arch/mips/mm/tlbex-fault.S b/arch/mips/mm/tlbex-fault.S
+index ffb88d4..c00e405 100644
+--- a/arch/mips/mm/tlbex-fault.S
++++ b/arch/mips/mm/tlbex-fault.S
+@@ -22,6 +22,7 @@
+ 
+ #ifdef CONFIG_KVM
+ 	/* guest check for memory fault */
++	MFC0	a2, CP0_BADVADDR
+ 	move	a0, sp
+ 	li	a1, \write
+ 	jal	do_guest_fault_check
+diff --git a/arch/mips/mm/tlbex.c b/arch/mips/mm/tlbex.c
+index 8e0eb70..a129392f 100644
+--- a/arch/mips/mm/tlbex.c
++++ b/arch/mips/mm/tlbex.c
+@@ -311,7 +311,7 @@ static struct uasm_reloc relocs[128] __cpuinitdata;
+ static int check_for_high_segbits __cpuinitdata;
+ 
+ #ifdef CONFIG_KVM
+-#ifdef CONFIG_NLM_XLP
++#ifdef CONFIG_CPU_XLP
+ static unsigned int kscratch_used_mask __cpuinitdata = (0x1 << 0) | (0x1 << 1);
+ #else
+ static unsigned int kscratch_used_mask __cpuinitdata = (0x1 << 2) | (0x1 << 3);
+diff --git a/arch/mips/netlogic/kvm/kvm_traps.c b/arch/mips/netlogic/kvm/kvm_traps.c
+index 1a75c7c..c11e152 100644
+--- a/arch/mips/netlogic/kvm/kvm_traps.c
++++ b/arch/mips/netlogic/kvm/kvm_traps.c
+@@ -102,7 +102,13 @@ static void process_psi(struct pt_regs *regs)
+ 			unsigned int rt = (badinstr >> 16) & 0x1f;
+ 			unsigned int cr = regs->regs[rs];
+ 
+-			if (cr == 0x304) {
++			if (cr == 0x007) {
++				/* IFU BRUB reserve register */
++				;
++			} else if (cr == 0x100) {
++				/* ICU defeature register */
++				;
++			} else if (cr == 0x304) {
+ 				/* LSU defeature register */
+ 			} else if (cr == 0x305) {
+ 				/* LSU debug addr */
+@@ -123,7 +129,13 @@ static void process_psi(struct pt_regs *regs)
+ 			unsigned int rt = (badinstr >> 16) & 0x1f;
+ 			unsigned int cr = regs->regs[rs];
+ 
+-			if (cr == 0x304) {
++			if (cr == 0x007) {
++				/* IFU BRUB reserve register */
++				;
++			} else if (cr == 0x100) {
++				/* ICU defeature register */
++				;
++			} else if (cr == 0x304) {
+ 				/* LSU defeature register */
+ 				;
+ 			} else if (cr == 0x305) {
+-- 
+1.9.1
+
