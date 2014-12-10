@@ -1,0 +1,193 @@
+From ea9312515cb68c7a190c62a7288e5e0ad1447dd1 Mon Sep 17 00:00:00 2001
+From: Mark Brown <broonie@linaro.org>
+Date: Thu, 16 Jan 2014 12:22:43 +0000
+Subject: spi: Provide core support for DMA mapping transfers
+
+The process of DMA mapping buffers for SPI transfers does not vary between
+devices so in order to save duplication of code in drivers this can be
+factored out into the core, allowing it to be integrated with the work that
+is being done on factoring out the common elements from the data path
+including more sharing of dmaengine code.
+
+In order to use this masters need to provide a can_dma() operation and while
+the hardware is prepared they should ensure that DMA channels are provided
+in tx_dma and rx_dma. The core will then ensure that the buffers are mapped
+for DMA prior to calling transfer_one_message().
+
+Currently the cleanup on error is not complete, this needs to be improved.
+
+Signed-off-by: Mark Brown <broonie@linaro.org>
+(cherry picked from commit 99adef310f682d6343cb40c1f6c9c25a4b3a450d)
+Signed-off-by: Simon Horman <horms+renesas@verge.net.au>
+---
+ drivers/spi/spi.c       | 82 +++++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/spi/spi.h | 18 +++++++++++
+ 2 files changed, 100 insertions(+)
+
+diff --git a/drivers/spi/spi.c b/drivers/spi/spi.c
+index fbf3b22efe5a..048eb72029a4 100644
+--- a/drivers/spi/spi.c
++++ b/drivers/spi/spi.c
+@@ -24,6 +24,8 @@
+ #include <linux/device.h>
+ #include <linux/init.h>
+ #include <linux/cache.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmaengine.h>
+ #include <linux/mutex.h>
+ #include <linux/of_device.h>
+ #include <linux/of_irq.h>
+@@ -580,6 +582,77 @@ static void spi_set_cs(struct spi_device *spi, bool enable)
+ 		spi->master->set_cs(spi, !enable);
+ }
+ 
++static int spi_map_msg(struct spi_master *master, struct spi_message *msg)
++{
++	struct device *dev = master->dev.parent;
++	struct device *tx_dev, *rx_dev;
++	struct spi_transfer *xfer;
++
++	if (msg->is_dma_mapped || !master->can_dma)
++		return 0;
++
++	tx_dev = &master->dma_tx->dev->device;
++	rx_dev = &master->dma_rx->dev->device;
++
++	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
++		if (!master->can_dma(master, msg->spi, xfer))
++			continue;
++
++		if (xfer->tx_buf != NULL) {
++			xfer->tx_dma = dma_map_single(tx_dev,
++						      (void *)xfer->tx_buf,
++						      xfer->len,
++						      DMA_TO_DEVICE);
++			if (dma_mapping_error(dev, xfer->tx_dma)) {
++				dev_err(dev, "dma_map_single Tx failed\n");
++				return -ENOMEM;
++			}
++		}
++
++		if (xfer->rx_buf != NULL) {
++			xfer->rx_dma = dma_map_single(rx_dev,
++						      xfer->rx_buf, xfer->len,
++						      DMA_FROM_DEVICE);
++			if (dma_mapping_error(dev, xfer->rx_dma)) {
++				dev_err(dev, "dma_map_single Rx failed\n");
++				dma_unmap_single(tx_dev, xfer->tx_dma,
++						 xfer->len, DMA_TO_DEVICE);
++				return -ENOMEM;
++			}
++		}
++	}
++
++	master->cur_msg_mapped = true;
++
++	return 0;
++}
++
++static int spi_unmap_msg(struct spi_master *master, struct spi_message *msg)
++{
++	struct spi_transfer *xfer;
++	struct device *tx_dev, *rx_dev;
++
++	if (!master->cur_msg_mapped || msg->is_dma_mapped || !master->can_dma)
++		return 0;
++
++	tx_dev = &master->dma_tx->dev->device;
++	rx_dev = &master->dma_rx->dev->device;
++
++	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
++		if (!master->can_dma(master, msg->spi, xfer))
++			continue;
++
++		if (xfer->rx_buf)
++			dma_unmap_single(rx_dev, xfer->rx_dma, xfer->len,
++					 DMA_FROM_DEVICE);
++		if (xfer->tx_buf)
++			dma_unmap_single(tx_dev, xfer->tx_dma, xfer->len,
++					 DMA_TO_DEVICE);
++	}
++
++	return 0;
++}
++
+ /*
+  * spi_transfer_one_message - Default implementation of transfer_one_message()
+  *
+@@ -752,6 +825,13 @@ static void spi_pump_messages(struct kthread_work *work)
+ 		master->cur_msg_prepared = true;
+ 	}
+ 
++	ret = spi_map_msg(master, master->cur_msg);
++	if (ret) {
++		master->cur_msg->status = ret;
++		spi_finalize_current_message(master);
++		return;
++	}
++
+ 	ret = master->transfer_one_message(master, master->cur_msg);
+ 	if (ret) {
+ 		dev_err(&master->dev,
+@@ -839,6 +919,8 @@ void spi_finalize_current_message(struct spi_master *master)
+ 	queue_kthread_work(&master->kworker, &master->pump_messages);
+ 	spin_unlock_irqrestore(&master->queue_lock, flags);
+ 
++	spi_unmap_msg(master, mesg);
++
+ 	if (master->cur_msg_prepared && master->unprepare_message) {
+ 		ret = master->unprepare_message(master, mesg);
+ 		if (ret) {
+diff --git a/include/linux/spi/spi.h b/include/linux/spi/spi.h
+index 4203c66d8803..dd8b91d95110 100644
+--- a/include/linux/spi/spi.h
++++ b/include/linux/spi/spi.h
+@@ -25,6 +25,8 @@
+ #include <linux/kthread.h>
+ #include <linux/completion.h>
+ 
++struct dma_chan;
++
+ /*
+  * INTERFACES between SPI master-side drivers and SPI infrastructure.
+  * (There's no SPI slave support for Linux yet...)
+@@ -390,6 +392,17 @@ struct spi_master {
+ 	void			(*cleanup)(struct spi_device *spi);
+ 
+ 	/*
++	 * Used to enable core support for DMA handling, if can_dma()
++	 * exists and returns true then the transfer will be mapped
++	 * prior to transfer_one() being called.  The driver should
++	 * not modify or store xfer and dma_tx and dma_rx must be set
++	 * while the device is prepared.
++	 */
++	bool			(*can_dma)(struct spi_master *master,
++					   struct spi_device *spi,
++					   struct spi_transfer *xfer);
++
++	/*
+ 	 * These hooks are for drivers that want to use the generic
+ 	 * master transfer queueing mechanism. If these are used, the
+ 	 * transfer() function above must NOT be specified by the driver.
+@@ -407,6 +420,7 @@ struct spi_master {
+ 	bool				rt;
+ 	bool				auto_runtime_pm;
+ 	bool                            cur_msg_prepared;
++	bool				cur_msg_mapped;
+ 	struct completion               xfer_completion;
+ 
+ 	int (*prepare_transfer_hardware)(struct spi_master *master);
+@@ -428,6 +442,10 @@ struct spi_master {
+ 
+ 	/* gpio chip select */
+ 	int			*cs_gpios;
++
++	/* DMA channels for use with core dmaengine helpers */
++	struct dma_chan		*dma_tx;
++	struct dma_chan		*dma_rx;
+ };
+ 
+ static inline void *spi_master_get_devdata(struct spi_master *master)
+-- 
+2.1.2
+
