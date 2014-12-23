@@ -1,0 +1,235 @@
+From 8fc039136425ebb828dc6be9c4462e4077d8bd39 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Thu, 31 May 2012 15:31:23 +0200
+Subject: [PATCH] uio: Use simple wait queue for read
+
+That allows us to have non threaded irq handlers on RT if the
+application is using read (poll and fasync require thread context on
+RT)
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Michael Barabanov <michael.barabanov@windriver.com>
+
+diff --git a/drivers/uio/uio.c b/drivers/uio/uio.c
+index a783d53..16cb9c0 100644
+--- a/drivers/uio/uio.c
++++ b/drivers/uio/uio.c
+@@ -25,6 +25,7 @@
+ #include <linux/kobject.h>
+ #include <linux/cdev.h>
+ #include <linux/uio_driver.h>
++#include <linux/wait-simple.h>
+ 
+ #define UIO_MAX_DEVICES		(1U << MINORBITS)
+ 
+@@ -34,7 +35,8 @@ struct uio_device {
+ 	int			minor;
+ 	atomic_t		event;
+ 	struct fasync_struct	*async_queue;
+-	wait_queue_head_t	wait;
++	struct swait_head	wait;
++	wait_queue_head_t	poll_wait;
+ 	int			vma_count;
+ 	struct uio_info		*info;
+ 	struct kobject		*map_dir;
+@@ -400,19 +402,31 @@ static void uio_free_minor(struct uio_device *idev)
+ 	mutex_unlock(&minor_lock);
+ }
+ 
++static void uio_event_notify_async(struct uio_device *idev)
++{
++	wake_up_interruptible(&idev->poll_wait);
++	kill_fasync(&idev->async_queue, SIGIO, POLL_IN);
++}
++
+ /**
+  * uio_event_notify - trigger an interrupt event
+  * @info: UIO device capabilities
+  */
+-void uio_event_notify(struct uio_info *info)
++static irqreturn_t uio_event_notify(struct uio_device *idev)
+ {
+-	struct uio_device *idev = info->uio_dev;
+-
+ 	atomic_inc(&idev->event);
+-	wake_up_interruptible(&idev->wait);
+-	kill_fasync(&idev->async_queue, SIGIO, POLL_IN);
++	swait_wake_interruptible(&idev->wait);
++
++#ifdef CONFIG_PREEMPT_RT_FULL
++	if (hardirq_count()) {
++		if (waitqueue_active(&idev->poll_wait) || idev->async_queue)
++			return IRQ_WAKE_THREAD;
++		return IRQ_HANDLED;
++	}
++#endif
++	uio_event_notify_async(idev);
++	return IRQ_HANDLED;
+ }
+-EXPORT_SYMBOL_GPL(uio_event_notify);
+ 
+ /**
+  * uio_interrupt - hardware interrupt handler
+@@ -425,11 +439,19 @@ static irqreturn_t uio_interrupt(int irq, void *dev_id)
+ 	irqreturn_t ret = idev->info->handler(irq, idev->info);
+ 
+ 	if (ret == IRQ_HANDLED)
+-		uio_event_notify(idev->info);
++		ret = uio_event_notify(idev);
+ 
+ 	return ret;
+ }
+ 
++static irqreturn_t uio_thread_handler(int irq, void *dev_id)
++{
++	struct uio_device *idev = (struct uio_device *)dev_id;
++
++	uio_event_notify_async(idev);
++	return IRQ_HANDLED;
++}
++
+ struct uio_listener {
+ 	struct uio_device *dev;
+ 	s32 event_count;
+@@ -503,6 +525,11 @@ static int uio_release(struct inode *inode, struct file *filep)
+ 	return ret;
+ }
+ 
++static inline bool uio_check(struct uio_device *idev, struct uio_listener *l)
++{
++	return l->event_count != atomic_read(&idev->event);
++}
++
+ static unsigned int uio_poll(struct file *filep, poll_table *wait)
+ {
+ 	struct uio_listener *listener = filep->private_data;
+@@ -511,8 +538,8 @@ static unsigned int uio_poll(struct file *filep, poll_table *wait)
+ 	if (!idev->info->irq)
+ 		return -EIO;
+ 
+-	poll_wait(filep, &idev->wait, wait);
+-	if (listener->event_count != atomic_read(&idev->event))
++	poll_wait(filep, &idev->poll_wait, wait);
++	if (uio_check(idev, listener))
+ 		return POLLIN | POLLRDNORM;
+ 	return 0;
+ }
+@@ -520,10 +547,8 @@ static unsigned int uio_poll(struct file *filep, poll_table *wait)
+ static ssize_t uio_read(struct file *filep, char __user *buf,
+ 			size_t count, loff_t *ppos)
+ {
+-	struct uio_listener *listener = filep->private_data;
+-	struct uio_device *idev = listener->dev;
+-	DECLARE_WAITQUEUE(wait, current);
+-	ssize_t retval;
++	struct uio_listener *l = filep->private_data;
++	struct uio_device *idev = l->dev;
+ 	s32 event_count;
+ 
+ 	if (!idev->info->irq)
+@@ -532,38 +557,21 @@ static ssize_t uio_read(struct file *filep, char __user *buf,
+ 	if (count != sizeof(s32))
+ 		return -EINVAL;
+ 
+-	add_wait_queue(&idev->wait, &wait);
+-
+-	do {
+-		set_current_state(TASK_INTERRUPTIBLE);
++	if (uio_check(idev, l))
++		goto copy;
+ 
+-		event_count = atomic_read(&idev->event);
+-		if (event_count != listener->event_count) {
+-			if (copy_to_user(buf, &event_count, count))
+-				retval = -EFAULT;
+-			else {
+-				listener->event_count = event_count;
+-				retval = count;
+-			}
+-			break;
+-		}
++	if (filep->f_flags & O_NONBLOCK)
++		return -EAGAIN;
+ 
+-		if (filep->f_flags & O_NONBLOCK) {
+-			retval = -EAGAIN;
+-			break;
+-		}
+-
+-		if (signal_pending(current)) {
+-			retval = -ERESTARTSYS;
+-			break;
+-		}
+-		schedule();
+-	} while (1);
+-
+-	__set_current_state(TASK_RUNNING);
+-	remove_wait_queue(&idev->wait, &wait);
++	if (swait_event_interruptible(idev->wait, uio_check(idev, l)))
++		return -ERESTARTSYS;
++copy:
++	event_count = atomic_read(&idev->event);
++	if (copy_to_user(buf, &event_count, count))
++		return -EFAULT;
+ 
+-	return retval;
++	l->event_count = event_count;
++	return count;
+ }
+ 
+ static ssize_t uio_write(struct file *filep, const char __user *buf,
+@@ -792,6 +800,19 @@ static void release_uio_class(void)
+ 	uio_major_cleanup();
+ }
+ 
++static int uio_request_irq(struct uio_info *info, struct uio_device *idev)
++{
++	irq_handler_t ihandle = uio_interrupt;
++	irq_handler_t thandle = NULL;
++
++#ifdef CONFIG_PREEMPT_RT_FULL
++	if (info->irq_flags & IRQF_NO_THREAD)
++		thandle = uio_thread_handler;
++#endif
++	return request_threaded_irq(info->irq, ihandle, thandle,
++				    info->irq_flags, info->name, idev);
++}
++
+ /**
+  * uio_register_device - register a new userspace IO device
+  * @owner:	module that creates the new device
+@@ -820,7 +841,8 @@ int __uio_register_device(struct module *owner,
+ 
+ 	idev->owner = owner;
+ 	idev->info = info;
+-	init_waitqueue_head(&idev->wait);
++	init_waitqueue_head(&idev->poll_wait);
++	init_swait_head(&idev->wait);
+ 	atomic_set(&idev->event, 0);
+ 
+ 	ret = uio_get_minor(idev);
+@@ -843,8 +865,7 @@ int __uio_register_device(struct module *owner,
+ 	info->uio_dev = idev;
+ 
+ 	if (info->irq && (info->irq != UIO_IRQ_CUSTOM)) {
+-		ret = request_irq(info->irq, uio_interrupt,
+-				  info->irq_flags, info->name, idev);
++		ret = uio_request_irq(info, idev);
+ 		if (ret)
+ 			goto err_request_irq;
+ 	}
+diff --git a/include/linux/uio_driver.h b/include/linux/uio_driver.h
+index 1ad4724..1bd5fa2 100644
+--- a/include/linux/uio_driver.h
++++ b/include/linux/uio_driver.h
+@@ -107,7 +107,6 @@ extern int __must_check
+ 	__uio_register_device(THIS_MODULE, parent, info)
+ 
+ extern void uio_unregister_device(struct uio_info *info);
+-extern void uio_event_notify(struct uio_info *info);
+ 
+ /* defines for uio_info->irq */
+ #define UIO_IRQ_CUSTOM	-1
+-- 
+1.7.9.5
+
