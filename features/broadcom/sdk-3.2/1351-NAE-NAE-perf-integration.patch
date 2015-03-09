@@ -1,0 +1,3531 @@
+From 6132d5292eedfc9f7d84c18f58c6aca8f7c2cfbe Mon Sep 17 00:00:00 2001
+From: Hareesh R <hareeshr@broadcom.com>
+Date: Fri, 13 Apr 2012 13:49:02 +0530
+Subject: [PATCH 1351/1532] NAE & NAE-perf integration
+
+[Based on SDK 3.2]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ drivers/net/ethernet/broadcom/nae/init_nae.c   |  334 +++-
+ drivers/net/ethernet/broadcom/nae/net_common.h |   79 +-
+ drivers/net/ethernet/broadcom/nae/xlp_hw.c     |   77 +-
+ drivers/net/ethernet/broadcom/nae/xlp_nae.c    | 2330 ++++++++++++------------
+ drivers/net/ethernet/broadcom/nae/xlp_nae.h    |  124 +-
+ 5 files changed, 1721 insertions(+), 1223 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/nae/init_nae.c b/drivers/net/ethernet/broadcom/nae/init_nae.c
+index 8e41ca2..654e74f 100644
+--- a/drivers/net/ethernet/broadcom/nae/init_nae.c
++++ b/drivers/net/ethernet/broadcom/nae/init_nae.c
+@@ -2,61 +2,337 @@
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+ #include <linux/delay.h>
+-
++#include <linux/skbuff.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/inet_lro.h>
+ #include <asm/netlogic/msgring.h>
+ #include <asm/netlogic/cpumask.h>
+-
+ #include <asm/netlogic/hal/nlm_hal_fmn.h>
+ #include <asm/netlogic/hal/nlm_hal_nae.h>
+ #include <asm/netlogic/hal/nlm_hal_xlp_dev.h>
+-#include <asm/netlogic/xlp_irq.h>
+ #include <ops.h>
+-
++#include <asm/netlogic/xlp.h>
+ #include "net_common.h"
++#include "xlp_nae.h"
++
++unsigned int cpu_2_normal_frfifo[NLM_MAX_NODES][NLM_NCPUS_PER_NODE];
++unsigned int cpu_2_jumbo_frfifo[NLM_MAX_NODES][NLM_NCPUS_PER_NODE];
++static unsigned int lnx_normal_mask;
++static unsigned int lnx_jumbo_mask;
++extern int num_descs_perq; 	
+ 
+-extern int rely_on_firmware_config;
++struct nlm_nae_linux_shinfo {
++	int valid;
++	int rxvc;
++	int domid;
++	int mode;
++	int jumbo_enabled;
++	int node;
++	/* logical cpu to physical cpu map */
++	unsigned int lcpu_2_pcpu_map[NLM_NAE_SH_LCPU_TO_MAP_SZ];
++	/* cpu to freein fifo map */
++	unsigned int cpu_2_freeinfifo_map[NLM_NAE_SH_LCPU_TO_MAP_SZ];
++	unsigned int cpu_2_jumbo_freeinfifo_map[NLM_NAE_SH_LCPU_TO_MAP_SZ];
++};
+ 
+-static void config_fmn(void)
++struct nlm_nae_linux_shinfo lnx_shinfo[NLM_NAE_MAX_SHARED_DOMS + 1]; //1 extra for owned domain
++
++
++/* As there is a port level fifo checkup done in NAE h/w, we need to fill up the port
++ fifos ( 0, 4, 8, 12 & 16) with some dummy entries if it is not owned by linux. 
++ If these owned by an app, these dummy entries need to be cleared by the app before reinitializing it
++ */
++static int init_dummy_entries_for_port_fifos(int node, nlm_nae_config_ptr nae_cfg, int jumbo_enabled)
+ {
+-	unsigned long mflags = 0;
+-	struct cpumask cpumask;
++	static unsigned long long msg;
++	unsigned long __attribute__ ((unused)) mflags;
++	int rv = 0, vc_index, i, j, ret, code;
++
++	if(!nae_cfg->dummy_pktdata_addr)
++		return 0;
+ 
+-	/* bind cpu to n0c0t0 and drain all leftover firmware messages */
+-	sched_bindto_save_affinity(0, &cpumask);
++	msg = (unsigned long long)nae_cfg->dummy_pktdata_addr & 0xffffffffffULL;
+ 
+-	/* Configure FMN again but only cpu credits */
+ 	msgrng_access_enable(mflags);
++	for(i = 0; i < nae_cfg->frin_total_queue; i += 4) {
++		/* nothing to do, if it is owned by linux */
++		if((1 << i) & nae_cfg->freein_fifo_dom_mask) 
++			continue;
+ 
+-	nlm_xlp_msgring_int_handler(XLP_IRQ_MSGRING_RVEC, NULL);
++		vc_index = i + nae_cfg->frin_queue_base;
+ 
++		for(j = 0; j < 4; j++) {
++			if ( (ret = nlm_hal_send_msg1(vc_index, code, msg)) & 0x7) {
++				print_fmn_send_error(__func__, ret);
++				printk("Unable to send configured free desc, check freein carving (qid=%d)\n", vc_index);
++				rv = -1;
++				goto err;
++			}
++		}
++	}
++err:
+ 	msgrng_access_disable(mflags);
+-
+-	sched_bindto_restore_affinity(&cpumask);
++	return rv;
+ }
+ 
+ 
+-int initialize_nae(uint32_t cm0, uint32_t cm1, uint32_t cm2, uint32_t cm3)
++static int nlm_initialize_vfbid(int node, nlm_nae_config_ptr nae_cfg)
++{
++	int cpu =0, tblidx, i = 0;
++	uint32_t vfbid_tbl[128];
++	int start = nae_cfg->vfbtbl_sw_offset;
++	int end = start + nae_cfg->vfbtbl_sw_nentries;
++	int frin_q_base = nlm_node_cfg.nae_cfg[0]->frin_queue_base;
++	
++	/* For s/w replenishment, each nodes tx completes can send to his own node cpus only */
++	for (tblidx = start; tblidx < end ; tblidx++, cpu++) {
++		vfbid_tbl[tblidx] = (cpu * 4) + nae_cfg->fb_vc + (node * 1024);
++	}
++	nlm_config_vfbid_table(node, start, end - start, &vfbid_tbl[start]);
++	/* For h/w replenishment, each node fills up 20 entries for all other nodes
++	starting from node0's queue-id. Software should offset the hw-offset + rx-node id
++	to get the actual index 
++	 */
++	start = nae_cfg->vfbtbl_hw_offset;
++	end = start + nae_cfg->vfbtbl_hw_nentries;
++	for(tblidx = start; tblidx < end; tblidx++, i++) {
++		if(i >= NLM_NAE_MAX_FREEIN_FIFOS_PER_NODE) {
++			i = 0;
++			frin_q_base = 1024 + frin_q_base;
++		}
++		vfbid_tbl[tblidx] = frin_q_base + i;
++	}
++	nlm_config_vfbid_table(node, start, end - start, &vfbid_tbl[start]);
++
++	/* NULL FBID Should map to cpu0 to detect NAE send message errors*/
++	vfbid_tbl[127] = 0;
++	nlm_config_vfbid_table(node, 127, 1, &vfbid_tbl[127]);
++	return 0;
++}
++
++static void dump_lnx_shinfo(int node)
+ {
+-	int dom_id = 0, node;
+-	unsigned long mflags;
++	int i, pos, bitoff;
++	return;
++	printk("%s(node %d) in, valid %d rxvc %d domid %d jumbo-en %d mode %d node %d\n", 
++			__FUNCTION__, node,
++			lnx_shinfo[0].valid, lnx_shinfo[0].rxvc, lnx_shinfo[0].domid,
++			lnx_shinfo[0].jumbo_enabled, lnx_shinfo[0].mode,  lnx_shinfo[0].node);
++	for(i = 0; i < NLM_NCPUS_PER_NODE; i++) {
++		pos = i / NLM_NAE_SH_LCPU_TO_MAP_SZ;
++		bitoff = (i % NLM_NAE_SH_LCPU_TO_MAP_NVALS_PER_ENTRY) * 
++			NLM_NAE_SH_LCPU_TO_MAP_SNG_VAL_SZ;
++		printk(" node %d lcpu %d pcpu %d rxfifo %d jumbo-rxfifo %d \n", 
++				node, i, (lnx_shinfo[0].lcpu_2_pcpu_map[pos] >> bitoff) & 0x1f,
++				(lnx_shinfo[0].cpu_2_freeinfifo_map[pos] >> bitoff) & 0x1f,
++				(lnx_shinfo[0].cpu_2_jumbo_freeinfifo_map[pos] >> bitoff) & 0x1f
++				);
++	}
++	for(i = 0; i < NLM_NCPUS_PER_NODE; i++) {
++		printk(" node %d cpu %d cpu2nor-fr %d cpu2jum-fr %d\n", node, i, cpu_2_normal_frfifo[node][i],
++				cpu_2_jumbo_frfifo[node][i]);
++	}
++}
++         
+ 
+-	config_fmn();
++int initialize_nae(unsigned int *phys_cpu_map, int mode, int *jumbo_enabled)
++{
++	int dom_id = 0;
++	int node = 0;
++	unsigned long __attribute__ ((unused)) mflags;
++	int i,pos, bitoff;
++	int rv = -1;
++	nlm_nae_config_ptr nae_cfg;
+ 
+ 	msgrng_access_enable(mflags);
++
+ 	nlm_hal_init_nae(fdt, dom_id);
+ 
+-	printk("Overriding HAL POE configuration based on current active cpumask\n");
+-	for(node = 0; node < nlm_node_cfg.num_nodes; node++) {
+-		nlm_hal_init_poe_distvec(node, 0, cm0, cm1, cm2, cm3, (1 << nlm_node_cfg.nae_cfg[node]->rx_vc)); 
++	for(node = 0; node < NLM_MAX_NODES; node++) {
++		nae_cfg = nlm_node_cfg.nae_cfg[node];
++		if (nae_cfg == NULL) 
++			continue;
++		
++		/* This driver works only with freein-fifo shared mode */
++		if(!nae_cfg->freein_fifo_shared) {
++			printk("%s, Error, Driver works only with freein fifo shared mode\n", __FUNCTION__);
++			goto err;
++		}
++		
++
++		for(i = 0; i <= NLM_NAE_MAX_SHARED_DOMS; i++) {
++			lnx_shinfo[i].valid = nae_cfg->shinfo[i].valid;
++			lnx_shinfo[i].rxvc = nae_cfg->shinfo[i].rxvc;
++			lnx_shinfo[i].domid = nae_cfg->shinfo[i].domid;
++			memcpy(&lnx_shinfo[i].lcpu_2_pcpu_map, nae_cfg->shinfo[i].lcpu_2_pcpu_map, 
++					sizeof(nae_cfg->shinfo[i].lcpu_2_pcpu_map));
++			memcpy(&lnx_shinfo[i].cpu_2_freeinfifo_map, nae_cfg->shinfo[i].cpu_2_freeinfifo_map, 
++					sizeof(nae_cfg->shinfo[i].cpu_2_freeinfifo_map));
++		}
++
++		lnx_normal_mask = nae_cfg->freein_fifo_dom_mask;
++
++		/* if jumbo enabled , we use half of the linux owned freein fifos for jumbo skbs */
++		if(*jumbo_enabled) {
++			int mine = 1;
++			for(i = 0; i < nae_cfg->frin_total_queue; i++) {
++				if((1 << i) & nae_cfg->freein_fifo_dom_mask) {
++					if(mine) {
++						mine = 0;
++						continue;
++					}
++					lnx_normal_mask &= (~(1 << i));
++					lnx_jumbo_mask |= (1 << i);
++					mine = 1;
++				}
++			}
++			if(lnx_jumbo_mask) {
++				nlm_hal_derive_cpu_to_freein_fifo_map(node, phys_cpu_map[node],
++					       	lnx_normal_mask, cpu_2_normal_frfifo[node]);
++				nlm_hal_derive_cpu_to_freein_fifo_map(node, phys_cpu_map[node],
++					       	lnx_jumbo_mask, cpu_2_jumbo_frfifo[node]);
++				memset(lnx_shinfo[0].cpu_2_freeinfifo_map, 0, 
++						sizeof(lnx_shinfo[0].cpu_2_freeinfifo_map));
++				for(i = 0; i < NLM_NCPUS_PER_NODE; i++) {
++					pos = i / NLM_NAE_SH_LCPU_TO_MAP_SZ;
++					bitoff = (i % NLM_NAE_SH_LCPU_TO_MAP_NVALS_PER_ENTRY) * 
++						NLM_NAE_SH_LCPU_TO_MAP_SNG_VAL_SZ;
++					lnx_shinfo[0].cpu_2_freeinfifo_map[pos] |= (cpu_2_normal_frfifo[node][i] << bitoff);
++					lnx_shinfo[0].cpu_2_jumbo_freeinfifo_map[pos] |= (cpu_2_jumbo_frfifo[node][i] << bitoff);
++				}
++			} else {
++				printk("Disabling Jumbo because of unavailability of freein-fifo\n");
++				*jumbo_enabled = 0;
++			}
++		} 
++		if(*jumbo_enabled == 0) {
++			for(i = 0; i < NLM_NCPUS_PER_NODE; i++) {
++				pos = i / NLM_NAE_SH_LCPU_TO_MAP_SZ;
++				bitoff = (i % NLM_NAE_SH_LCPU_TO_MAP_NVALS_PER_ENTRY) *
++					NLM_NAE_SH_LCPU_TO_MAP_SNG_VAL_SZ;
++				cpu_2_normal_frfifo[node][i] = (lnx_shinfo[0].cpu_2_freeinfifo_map[pos] >> bitoff) & 0x1f;
++			}
++		}
++
++		lnx_shinfo[0].mode = mode;
++		lnx_shinfo[0].jumbo_enabled = *jumbo_enabled;
++		lnx_shinfo[0].node = node;
++		if(nae_cfg->owned) {
++			nlm_hal_write_ucore_shared_mem(node, (unsigned int *)lnx_shinfo, sizeof(lnx_shinfo)/sizeof(uint32_t));
++			nlm_hal_restart_ucore(node, fdt);
++		}
++
++		dump_lnx_shinfo(node);
+ 	}
+-	/* 
+-	 {
+-		nlm_hal_init_poe_distvec(0, 0, cm0, 0, 0, 0, (1 << nlm_node_cfg.nae_cfg[0]->rx_vc));
+-		nlm_hal_init_poe_distvec(1, 0, 0, cm1, 0, 0, (1 << nlm_node_cfg.nae_cfg[1]->rx_vc));
+-	 }
+-	*/
+-	
+ 
++	for(node = 0; node < NLM_MAX_NODES; node++) {
++		nae_cfg = nlm_node_cfg.nae_cfg[node];
++		if (nae_cfg == NULL) 
++			continue;
++		/* initialize my vfbid table */
++		if(!(nae_cfg->flags & VFBID_FROM_FDT))
++			nlm_initialize_vfbid(node, nae_cfg);
++		
++		if(nae_cfg->owned == 0)
++			continue;
++
++		/* Update RX_CONFIG for desc size */
++		if(*jumbo_enabled)
++			nlm_hal_init_ingress (node, (ETH_JUMBO_DATA_LEN+ETH_HLEN+ETH_FCS_LEN+SMP_CACHE_BYTES) & ~(SMP_CACHE_BYTES - 1));
++		else
++			nlm_hal_init_ingress (node, (ETH_DATA_LEN+ETH_HLEN+ETH_FCS_LEN+SMP_CACHE_BYTES) & ~(SMP_CACHE_BYTES - 1));
++
++		if(init_dummy_entries_for_port_fifos(node, nae_cfg, *jumbo_enabled) != 0)
++			goto err;
++
++	}
++	rv = 0;
++err:
+ 	msgrng_access_disable(mflags);
+-	return 0;
++	return rv;
++}
++
++static int nlm_replenish_per_cpu_buffer(int node, nlm_nae_config_ptr nae_cfg, int qindex, int bufcnt)
++{
++	int i, port;
++	int vc_index = 0;
++	int __attribute__ ((unused)) mflags, code;
++	struct xlp_msg msg;
++	struct sk_buff * skb;
++	int ret = 0;
++	int size = NLM_RX_ETH_BUF_SIZE;
++
++	if((1 << qindex) & lnx_jumbo_mask)
++		size = NLM_RX_JUMBO_BUF_SIZE;
++
++	/* For queue index 16 and 17, we still use  the port level descriptor info */
++	if(qindex >= 16) {
++		for(port = 0; port < nae_cfg->num_ports; port++) {
++			if(nae_cfg->ports[port].hw_port_id == qindex)
++				bufcnt = nae_cfg->ports[port].num_free_desc;
++	 	}
++	}
++
++	for(i = 0; i < bufcnt; i++)
++	{
++		vc_index = qindex + nae_cfg->frin_queue_base;
++		skb = nlm_xlp_alloc_skb_atomic(size, node);
++		if(!skb)
++		{
++			printk("[%s] alloc skb failed\n",__FUNCTION__);
++			break;
++		}
++		/* Store skb in back_ptr */
++		mac_put_skb_back_ptr(skb);
++		code = 0;
++
++		/* Send the free Rx desc to the MAC */
++		msgrng_access_enable(mflags);
++		msg.entry[0] = (unsigned long long)virt_to_bus(skb->data) & 0xffffffffffULL;
++		msg.entry[1]= msg.entry[2] = msg.entry[3] = 0;
++		/* Send the packet to nae rx  */
++		__sync();
++
++		if ( (ret = nlm_hal_send_msg1(vc_index, code, msg.entry[0])) & 0x7)
++		{
++			print_fmn_send_error(__func__, ret);
++			printk("Unable to send configured free desc, check freein carving (qid=%d)\n", vc_index);
++			/* free the buffer and return! */
++			dev_kfree_skb_any(skb);
++
++			msgrng_access_disable(mflags);
++			ret = -EBUSY;
++			break;
++		}
++		msgrng_access_disable(mflags);
++	}
++	printk("Send %d descriptors for queue %d(vc %d) of length %d\n", bufcnt, qindex, vc_index, size);
++	return ret;
++}
++
++
++int replenish_freein_fifos(void)
++{
++	int node, i, rv;
++	nlm_nae_config_ptr nae_cfg;
++	int max_descs_pqueue, num_descs;
++
++	for(node = 0; node < NLM_MAX_NODES; node++) {
++		nae_cfg = nlm_node_cfg.nae_cfg[node];
++		if (nae_cfg == NULL) 
++			continue;
++
++		/* configure the descs */
++		max_descs_pqueue = nae_cfg->freein_fifo_onchip_num_descs +  nae_cfg->freein_fifo_spill_num_descs;
++		num_descs = num_descs_perq <= max_descs_pqueue ? num_descs_perq : max_descs_pqueue;
++
++		for(i = 0; i < nae_cfg->frin_total_queue; i++) {
++			if(((1 << i) & lnx_normal_mask) || ((1 << i) & lnx_jumbo_mask)) 
++				rv = nlm_replenish_per_cpu_buffer(node, nae_cfg, i, num_descs);
++		}
++		if(rv != 0)
++			break;
++	}
++	return rv;
+ }
+diff --git a/drivers/net/ethernet/broadcom/nae/net_common.h b/drivers/net/ethernet/broadcom/nae/net_common.h
+index 9cecbcf..539d8d0 100644
+--- a/drivers/net/ethernet/broadcom/nae/net_common.h
++++ b/drivers/net/ethernet/broadcom/nae/net_common.h
+@@ -15,6 +15,81 @@
+ 
+ #define MAX_DEST_QID            50
+ 
++
++#if 1
++#include <asm/atomic.h>
++
++#define STATS_SET(x,v)  //atomic64_set((atomic64_t *)&(x), (v))
++#define STATS_ADD(x,v)  //atomic64_add((long)(v), (atomic64_t *)&(x))
++#define STATS_INC(x)    //atomic64_inc((atomic64_t *)&(x))
++#define STATS_READ(x)   (x)//atomic64_read((atomic64_t *)&(x))
++#else
++#define STATS_SET(x,v)  do { (x) = (v); } while (0)
++#define STATS_ADD(x,v)  do { (x) += (v); } while (0)
++#define STATS_INC(x)    do { (x) += 1; } while (0)
++#define STATS_READ(x)   (x)
++#endif
++
++#define XLP_SOC_MAC_DRIVER "XLP Mac Driver"
++
++/* On-Chip NAE PCI Header */
++#undef PCI_NETL_VENDOR
++#define PCI_NETL_VENDOR			0xfecc
++#define PCI_DEVID_BASE			0
++#define PCI_DEVID_OFF_NET		0
++
++#define MAX_GMAC_PORT               	18
++#define XLP_SGMII_RCV_CONTEXT_NUM	8
++
++
++#define  DUMP_PKT(str, x, y)	{	\
++	int i;      					\
++        printk(" %s \n", str);                  	\
++        for(i = 0; i < y; i++)				\
++        {						\
++                printk("%02x ", (x)[i]);		\
++                if( i % 16 == 15)			\
++                        printk("\n");			\
++        }						\
++	printk("\n"); }
++
++
++#define NUM_XLP8XX_MGMT_PORTS	2
++
++#define MAX_TSO_SKB_PEND_REQS	200
++#define MAX_PACKET_SZ_PER_MSG	16384
++#define P2P_EXTRA_DESCS		((PAGE_SIZE / MAX_PACKET_SZ_PER_MSG) + 4)
++#define P2P_SKB_OFF		(MAX_SKB_FRAGS + P2P_EXTRA_DESCS - 1)
++#define tso_dbg(fmt, args...)	//printk(fmt, ##args);
++#define RX_UNCLASSIFIED_PKT 	(1<<5)
++#define RX_IP_CSUM_VALID 	(1<<3)
++#define RX_TCP_CSUM_VALID 	(1<<2)
++
++struct p2p_desc_mem {
++	void *mem;
++	uint64_t dsize;
++	uint64_t pad[6];
++};
++
++enum msc_opcodes { IP_CHKSUM = 1,
++	TCP_CHKSUM,
++	UDP_CHKSUM,
++	SCTP_CRC,
++	FCOE_CRC,
++	IP_TCP_CHKSUM,
++	TSO_IP_TCP_CHKSUM,
++	IP_UDP_CHKSUM,
++	IP_CHKSUM_SCTP_CRC
++};
++
++#define ETHER_FRAME_MIN_LEN	64
++
++/* Use index of 8 as the offset because of n64 abi and 64B cacheline size */
++#define CPU_INDEX(cpu) ((cpu) * 8)
++
++
++#define napi_dbg(fmt, args...) { }
++
+ typedef struct fmn_credit_struct {
+    unsigned int   s_qid;
+    unsigned int   d_qid;
+@@ -173,7 +248,9 @@ struct nae_config {
+ 	struct nae_port ports[18];
+ };
+ 
+-extern int initialize_nae(uint32_t cm0, uint32_t cm1, uint32_t cm2, uint32_t cm3);
++extern int initialize_nae(unsigned int *phys_cpu_map, int mode, int *jumbo_enabled);
+ extern void nlm_xlp_msgring_int_handler(unsigned int irq, struct pt_regs *regs);
++extern int replenish_freein_fifos(void);
++
+ 
+ #endif
+diff --git a/drivers/net/ethernet/broadcom/nae/xlp_hw.c b/drivers/net/ethernet/broadcom/nae/xlp_hw.c
+index 8dad49f..d75ce9b 100755
+--- a/drivers/net/ethernet/broadcom/nae/xlp_hw.c
++++ b/drivers/net/ethernet/broadcom/nae/xlp_hw.c
+@@ -36,6 +36,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <linux/mii.h>
++#include <linux/inet_lro.h>
+ 
+ #include <asm/netlogic/xlr_mac.h>
+ #include <asm/netlogic/hal/nlm_hal_nae.h>
+@@ -325,25 +326,59 @@ static void xlp_get_strings (struct net_device *dev, u32 stringset, u8 *buf)
+ void xlp_get_mac_stats(struct net_device *dev, struct net_device_stats *stats)
+ {
+ 	struct dev_data *priv = netdev_priv(dev);
++#ifdef CONFIG_64BIT
++	unsigned long long val;
++#endif
+ 
+ 	if (priv->type == INTERLAKEN_IF)
+ 		return;
+ 
+-	stats->tx_errors = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index, TX_FCS_ERROR_COUNTER);
+-	stats->tx_dropped = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index, TX_DROP_FRAME_COUNTER);
+-	stats->multicast = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index, RX_MULTICAST_PACKET_COUNTER);
+-	stats->collisions = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index, TX_TOTAL_COLLISION_COUNTER);
+-	stats->rx_length_errors = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index, RX_FRAME_LENGTH_ERROR_COUNTER);
+-	stats->rx_over_errors = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index, RX_DROP_PACKET_COUNTER);
+-	stats->rx_crc_errors = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index, RX_FCS_ERROR_COUNTER);
+-	stats->rx_frame_errors = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index, RX_ALIGNMENT_ERROR_COUNTER);
+-	stats->rx_fifo_errors = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index,RX_DROP_PACKET_COUNTER);
+-	stats->rx_missed_errors = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index,RX_CARRIER_SENSE_ERROR_COUNTER);
++	stats->tx_packets = nlm_hal_read_mac_reg(priv->node, priv->block, priv->index, TX_PACKET_COUNTER);
++#ifdef CONFIG_64BIT
++	val = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, 0x1f);
++	stats->tx_packets |= ( val << 32);
++#endif
++
++	stats->rx_packets = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, RX_PACKET_COUNTER);
++#ifdef CONFIG_64BIT
++	val = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, 0x1f);
++	stats->rx_packets |= ( val << 32);
++#endif
++
++	stats->tx_bytes = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, TX_BYTE_COUNTER);
++#ifdef CONFIG_64BIT
++	val = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, 0x1f);
++	stats->tx_bytes |= ( val << 32);
++#endif
++
++	stats->rx_bytes = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, RX_BYTE_COUNTER);
++#ifdef CONFIG_64BIT
++	val = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, 0x1f);
++	stats->rx_bytes |= ( val << 32);
++#endif
++
++	stats->tx_errors = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, TX_FCS_ERROR_COUNTER);
++	stats->rx_dropped = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, RX_DROP_PACKET_COUNTER);
++	stats->tx_dropped = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, TX_DROP_FRAME_COUNTER);
++
++	stats->multicast = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, RX_MULTICAST_PACKET_COUNTER);
++#ifdef CONFIG_64BIT
++	val = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, 0x1f);
++	stats->multicast |= ( val << 32);
++#endif
++
++	stats->collisions = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, TX_TOTAL_COLLISION_COUNTER);
++	stats->rx_length_errors = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, RX_FRAME_LENGTH_ERROR_COUNTER);
++	stats->rx_over_errors = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, RX_DROP_PACKET_COUNTER);
++	stats->rx_crc_errors = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, RX_FCS_ERROR_COUNTER);
++	stats->rx_frame_errors = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, RX_ALIGNMENT_ERROR_COUNTER);
++	stats->rx_fifo_errors = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index,RX_DROP_PACKET_COUNTER);
++	stats->rx_missed_errors = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index,RX_CARRIER_SENSE_ERROR_COUNTER);
+ 	stats->rx_errors = (stats->rx_over_errors + stats->rx_crc_errors + stats->rx_frame_errors + stats->rx_fifo_errors +stats->rx_missed_errors);
+-	stats->tx_aborted_errors = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index, TX_EXCESSIVE_COLLISION_PACKET_COUNTER);
++	stats->tx_aborted_errors = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, TX_EXCESSIVE_COLLISION_PACKET_COUNTER);
+ 	/*
+-	stats->tx_carrier_errors = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index, TX_DROP_FRAME_COUNTER);
+-	stats->tx_fifo_errors = nlm_hal_read_mac_reg( priv->node, priv->block, priv->index, TX_DROP_FRAME_COUNTER);
++	stats->tx_carrier_errors = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, TX_DROP_FRAME_COUNTER);
++	stats->tx_fifo_errors = nlm_hal_read_mac_reg(priv->node,  priv->block, priv->index, TX_DROP_FRAME_COUNTER);
+ 	*/
+ 	return;
+ }
+@@ -360,7 +395,7 @@ static void xlp_get_ethtool_stats (struct net_device *dev,
+ 	struct dev_data *priv = netdev_priv(dev);
+ 	unsigned long flags;
+ 	unsigned long *tmp_stats;
+-	
++
+ 	spin_lock_irqsave(&priv->lock, flags);
+ 
+ 	xlp_get_mac_stats(dev, &priv->stats);
+@@ -437,7 +472,7 @@ void nlm_xlp_mac_set_enable(struct dev_data *priv, int flag)
+ 	int inf;
+ 	uint32_t speed = 0, duplex = 0, ifmode = 0;
+ 	uint32_t netwk_inf = 0, mac_cfg2 = 0;
+-	
++
+ 
+ 	if ((priv->type != SGMII_IF) && (priv->type != XAUI_IF))
+ 		return;
+@@ -460,12 +495,12 @@ void nlm_xlp_mac_set_enable(struct dev_data *priv, int flag)
+ 				ifmode = ((speed == 2) ? 2: 1);
+ 				nlm_hal_mac_disable(priv->node, inf, priv->type);
+ 			        netwk_inf  = read_gmac_reg(priv->node, inf, NETWK_INF_CTRL_REG);
+-		        	netwk_inf &= (~(0x3));
+-	        		write_gmac_reg(priv->node, inf , NETWK_INF_CTRL_REG, netwk_inf | speed);
+-		        	mac_cfg2 = read_gmac_reg(priv->node, inf, MAC_CONF2);
+-	        		mac_cfg2 &= (~((0x3 << 8) | 1));
+-		        	write_gmac_reg(priv->node, inf , MAC_CONF2,
+-                			              mac_cfg2 | (ifmode << 8) | duplex);
++				netwk_inf &= (~(0x3));
++				write_gmac_reg(priv->node, inf , NETWK_INF_CTRL_REG, netwk_inf | speed);
++				mac_cfg2 = read_gmac_reg(priv->node, inf, MAC_CONF2);
++				mac_cfg2 &= (~((0x3 << 8) | 1));
++				write_gmac_reg(priv->node, inf , MAC_CONF2,
++					              mac_cfg2 | (ifmode << 8) | duplex);
+ 			}
+ 		}
+ 		nlm_hal_mac_enable(priv->node, inf, priv->type);
+diff --git a/drivers/net/ethernet/broadcom/nae/xlp_nae.c b/drivers/net/ethernet/broadcom/nae/xlp_nae.c
+index 55f3a33..3bdd414 100755
+--- a/drivers/net/ethernet/broadcom/nae/xlp_nae.c
++++ b/drivers/net/ethernet/broadcom/nae/xlp_nae.c
+@@ -46,6 +46,8 @@
+ #include <linux/mman.h>
+ #include <linux/mm.h>
+ #include <linux/pci.h>
++#include <linux/kthread.h>
++#include <linux/inet_lro.h>
+ 
+ #include <net/ip.h>
+ 
+@@ -54,172 +56,308 @@
+ #include <asm/uaccess.h>
+ #include <asm/netlogic/msgring.h>
+ #include <asm/netlogic/cpumask.h>
+-#include <asm/netlogic/xlp.h>
+ 
+ #include <asm/netlogic/hal/nlm_hal_fmn.h>
+ #include <asm/netlogic/hal/nlm_hal_nae.h>
++#include <asm/netlogic/xlp.h>
+ #include <asm/netlogic/xlp_irq.h>
++#include <asm/netlogic/hal/nlm_eeprom.h>
+ 
+ #include "net_common.h"
+-#include <asm/netlogic/hal/nlm_eeprom.h>
+ #include "xlp_nae.h"
+ 
+-#if 1
+-#include <asm/atomic.h>
++#define NLM_TCP_MODE	1
++#define NLM_RT_MODE	2
+ 
+-#ifdef CONFIG_64BIT
+-#define STATS_SET(x,v)         atomic64_set((atomic64_t *)&(x), (v))
+-#define STATS_ADD(x,v)         atomic64_add((long)(v), (atomic64_t *)&(x))
+-#define STATS_DEC(x)           atomic64_dec((atomic64_t *)&(x))
+-#define STATS_INC(x)           atomic64_inc((atomic64_t *)&(x))
+-#define STATS_READ(x)          atomic64_read((atomic64_t *)&(x))
+-#define STATS_INC_RET(x)       atomic64_inc_return((atomic64_t *)&(x))
+-#else
+-#define STATS_SET(x,v)         atomic_set((atomic_t *)&(x), (v))
+-#define STATS_ADD(x,v)         atomic_add((long)(v), (atomic_t *)&(x))
+-#define STATS_INC(x)           atomic_inc((atomic_t *)&(x))
+-#define STATS_DEC(x)           atomic_dec((atomic_t *)&(x))
+-#define STATS_READ(x)          atomic_read((atomic_t *)&(x))
+-#define STATS_INC_RET(x)       atomic_inc_return((atomic_t *)&(x))
+-#endif
++/* Applicable only in tcp mode */
++#define TSO_ENABLED 	1
+ 
+-#else
+-#define STATS_SET(x,v)  do { (x) = (v); } while (0)
+-#define STATS_ADD(x,v)  do { (x) += (v); } while (0)
+-#define STATS_INC(x)    do { (x) += 1; } while (0)
+-#define STATS_READ(x)   (x)
+-#endif
++/*Enable sanity checks while receiving or transmitting buffer */
++#undef ENABLE_SANITY_CHECKS
++
++/* Module Parameters */
++
++static int perf_mode= NLM_TCP_MODE;
++module_param(perf_mode, int, 0);
+ 
+-#define XLP_SOC_MAC_DRIVER "XLP Mac Driver"
+-
+-/* On-Chip NAE PCI Header */
+-//#define PCI_NETL_VENDOR			0xfecc
+-#define PCI_DEVID_BASE			0
+-#define PCI_DEVID_OFF_NET		0
+-
+-#define MAX_NET_INF             	1
+-#define MAX_GMAC_PORT               	18
+-#define XLP_SGMII_RCV_CONTEXT_NUM	8
+-
+-/* FMN send failure errors */
+-#define MSG_DST_FC_FAIL                 0x01
+-#define MSG_INFLIGHT_MSG_EX             0x02
+-#define MSG_TXQ_FULL                    0x04
+-
+-#define ETH_MTU_SIZE		 	1536
+-#define MIN_ETH_FRAME_SIZE		64
+-
+-#define  DUMP_PKT(str, x, y)	if (debug == 2)  {	\
+-	int i;      				\
+-        printk(" %s \n", str);                  \
+-        for(i = 0; i < y; i++)			\
+-        {					\
+-                printk("%02x ", (x)[i]);		\
+-                if( i % 16 == 15)		\
+-                        printk("\n");		\
+-        }					\
+-	printk("\n"); }
+-
+-/* This includes extra space and so with 64K PAGE_SIZE, we can have upto
+-   7 buffers. We need 32 bytes for prepad and another cacheline for storing
+-   s/w info
++static int enable_lro =  0;
++module_param(enable_lro, int, 0);
++
++static int enable_napi =  1;
++module_param(enable_napi, int, 0);
++
++int num_descs_perq = 500;
++module_param(num_descs_perq, int, 0);
++
++static int enable_jumbo = 0;
++module_param(enable_jumbo, int, 0);
++
++static int exclusive_vc = 0;
++module_param(exclusive_vc, int, 0);
++/***************************************************************
++ *
++ * Below parameters are set during FDT file parsing
+  */
+-#ifdef CONFIG_64BIT
+-#define DEFAULT_JUMBO_MTU	5568  // for mtu 16384 : 5568
+-#else
+-#define DEFAULT_JUMBO_MTU       3268  // for mtu 16384 : 5568
++
++extern uint32_t nae_rx_vc;
++extern uint32_t nae_fb_vc;
++/***************************************************************/
++
++unsigned char eth_hw_addr[NLM_MAX_NODES][MAX_GMAC_PORT][6];
++static unsigned int phys_cpu_map[NLM_MAX_NODES];
++extern uint32_t cpu_2_normal_frfifo[NLM_MAX_NODES][NLM_NCPUS_PER_NODE];
++extern uint32_t cpu_2_jumbo_frfifo[NLM_MAX_NODES][NLM_NCPUS_PER_NODE];
++
++static uint64_t nlm_mode[NR_CPUS*8] ____cacheline_aligned;
++
++#ifdef CONFIG_NLM_NET_OPTS
++static struct sk_buff *last_rcvd_skb[NR_CPUS * 8] ____cacheline_aligned;
++static uint32_t last_rcvd_len[NR_CPUS * 8] ____cacheline_aligned;
++static uint32_t last_rcvd_node[NR_CPUS * 8] ____cacheline_aligned;
++static uint64_t last_rcvd_skb_phys[NR_CPUS * 8] ____cacheline_aligned;
+ #endif
+-#define JUMBO_RX_OFFSET		64
+-#define PREPAD_LEN		0
+-/* THIS MUST be multiple of cache line size */
+-#define DEFAULT_JUMBO_BUFFER_SIZE	\
+-		(DEFAULT_JUMBO_MTU + PREPAD_LEN + JUMBO_RX_OFFSET)
+-
+-#define NETL_JUMBO_SKB_HDR_LEN 64
+-#define MAC_FRIN_WORK_NUM NR_CPUS
+-#define PHOENIX_MAX_MACS 18
+-#define MAX_TSO_SKB_PEND_REQS 50
+-
+-static uint32_t maxnae;
+-/* THIS MUST be multiple of cache line size */
+-static int jumbo_buffer_size = DEFAULT_JUMBO_BUFFER_SIZE; /*or set in set_mtu */
+-static int jumbo_mtu = DEFAULT_JUMBO_MTU; /* or set in set_mtu */
+-typedef struct jumbo_rx_info {
+-	struct page *page;
+-	unsigned int page_offset;
+-	unsigned int space;
+-	atomic_t alloc_fails[NLM_MAX_NODES][PHOENIX_MAX_MACS];
+-}jumbo_rx_info_t;
+-
+-/* This struct size MUST be at most 32 bytes */
+-struct jumbo_rx_cookie {
+-	struct page *page;
+-	unsigned int page_offset;
++
++static uint64_t receive_count[NR_CPUS * 8] __cacheline_aligned;
++static uint64_t fast_replenish_count[NR_CPUS * 8] __cacheline_aligned;
++static uint64_t slow_replenish_count[NR_CPUS * 8] __cacheline_aligned;
++static uint64_t err_replenish_count[NR_CPUS * 8] __cacheline_aligned;
++static uint64_t p2p_dynamic_alloc_cnt[NR_CPUS * 8] __cacheline_aligned;
++
++static struct net_device *per_cpu_netdev[NLM_MAX_NODES][NR_CPUS][24] __cacheline_aligned;
++static struct pci_device_id soc_pci_table[] __devinitdata = {
++        {PCI_NETL_VENDOR, PCI_DEVID_BASE + PCI_DEVID_OFF_NET,
++         PCI_ANY_ID, PCI_ANY_ID, 0},
++        {}
+ };
++#ifdef CONFIG_INET_LRO
++static int lro_flush_priv_cnt[NR_CPUS];
++static int lro_flush_needed[NR_CPUS][20];
++static struct dev_data *lro_flush_priv[NR_CPUS][20];
++#endif
++static uint64_t dummy_pktdata_addr[NLM_MAX_NODES];
++static struct p2p_desc_mem p2p_desc_mem[NR_CPUS] __cacheline_aligned;
++static struct net_device_stats *nlm_xlp_mac_get_stats(struct net_device *dev);
++static struct net_device *dev_mac[NLM_MAX_NODES][MAX_GMAC_PORT];
++
++extern void xlp_set_ethtool_ops(struct net_device *netdev);
++extern void xlp_get_mac_stats(struct net_device* dev, struct net_device_stats* stats);
++static void nlm_xlp_nae_init(void);
++static int xlp_mac_proc_read(char *page, char **start, off_t off,int count, int *eof, void *data);
++static int  nlm_xlp_nae_open (struct net_device *dev);
++static int  nlm_xlp_nae_stop (struct net_device *dev);
++static int  nlm_xlp_nae_start_xmit (struct sk_buff *skb, struct net_device *dev);
++static void  nlm_xlp_set_multicast_list (struct net_device *dev);
++static int  nlm_xlp_nae_ioctl (struct net_device *dev, struct ifreq *rq, int cmd);
++static int  nlm_xlp_nae_change_mtu(struct net_device *dev, int new_mtu);
++static void  nlm_xlp_nae_tx_timeout (struct net_device *dev);
++static void xlp_mac_setup_hwaddr(struct dev_data *priv);
++static int nlm_xlp_nae_set_hwaddr(struct net_device *dev, void *p);
++extern void nlm_xlp_mac_set_enable(struct dev_data *priv, int flag);
++extern struct proc_dir_entry *nlm_root_proc;
++extern struct eeprom_data * get_nlm_eeprom(void);
++#ifdef  ENABLE_NAE_PIC_INT
++static irqreturn_t nlm_xlp_nae_int_handler(int irq, void * dev_id);
++#endif
+ 
+-jumbo_rx_info_t  jumbo_rx_buff[NR_CPUS];
+-//static struct tasklet_struct mac_frin_replenish_task[MAC_FRIN_WORK_NUM];
+-static struct work_struct mac_frin_replenish_work[MAC_FRIN_WORK_NUM];
+-static void mac_frin_replenish(unsigned long arg /* ignored */);
+-static void tx_free_buffer(unsigned long arg /* ignored */);
++#define Message(fmt, args...) { }
++//#define Message(fmt, args...) printk(fmt, ##args)
+ 
+-#define MAX_PACKET_SZ_PER_MSG	16384
+-#define P2P_EXTRA_DESCS	      	((PAGE_SIZE / MAX_PACKET_SZ_PER_MSG) + 4)
+-#define P2P_SKB_OFF	      	(MAX_SKB_FRAGS + P2P_EXTRA_DESCS - 1)
+-#define CPU_INDEX(x) (x * 8)
+ 
++static unsigned short  nlm_select_queue(struct net_device *dev, struct sk_buff *skb)
++{
++	        return (unsigned short)smp_processor_id();
++}
+ 
+-struct p2p_desc_mem {
+-	void *mem;
+-	uint64_t dsize;
+-	uint64_t pad[6];
+-	spinlock_t lock;
+-};
+-struct p2p_desc_mem p2p_desc_mem[NR_CPUS] __cacheline_aligned;
+-static uint64_t p2p_dynamic_alloc_cnt[NR_CPUS * 8] __cacheline_aligned;
+-static int p2p_desc_mem_init(void);
+-
+-enum msc_opcodes { IP_CHKSUM = 1,
+-	TCP_CHKSUM,
+-	UDP_CHKSUM,
+-	SCTP_CRC,
+-	FCOE_CRC,
+-	IP_TCP_CHKSUM,
+-	TSO_IP_TCP_CHKSUM,
+-	IP_UDP_CHKSUM,
+-	IP_CHKSUM_SCTP_CRC
++static const struct net_device_ops nlm_xlp_nae_ops = {
++	.ndo_open			= nlm_xlp_nae_open,
++	.ndo_stop			= nlm_xlp_nae_stop,
++	.ndo_start_xmit			= nlm_xlp_nae_start_xmit,
++	.ndo_set_multicast_list		= nlm_xlp_set_multicast_list,
++	.ndo_do_ioctl			= nlm_xlp_nae_ioctl,
++	.ndo_tx_timeout 		= nlm_xlp_nae_tx_timeout,
++	.ndo_change_mtu			= nlm_xlp_nae_change_mtu,
++	.ndo_set_mac_address		= nlm_xlp_nae_set_hwaddr,
++	.ndo_get_stats 			= nlm_xlp_mac_get_stats,
++	.ndo_select_queue		= nlm_select_queue,
+ };
+ 
+-uint16_t tcp_pseuodo_chksum(uint16_t *ipsrc)
++static __inline__ void cpu_halt(void)
+ {
+-	uint32_t sum = 0;
+-	//*ipsrc = cpu_to_be16p(ipsrc);
+-	sum += cpu_to_be16(ipsrc[0]);
+-	sum += cpu_to_be16(ipsrc[1]);
+-	sum += cpu_to_be16(ipsrc[2]);
+-	sum += cpu_to_be16(ipsrc[3]);
+-	sum += 6;
+-	while(sum >> 16)
+-		sum = (sum & 0xffff)  + (sum >> 16);
+-	//      sum = ~sum;
+-	return (uint16_t)sum;
++	__asm__ volatile (".set push\n"
++			  ".set noreorder\n"
++			  "   wait\n"
++			  "1: b    1b\n"
++			  "   nop\n"
++			  ".set pop\n"
++		);
+ }
+ 
+-uint16_t udp_pseuodo_chksum(uint16_t *ipsrc)
++static void gen_mac_address(void)
++{
++	struct eeprom_data *nlm_eeprom=NULL;
++	unsigned char mac_base[6],temp,buf_write[2],buf0_read[2],buf1_read[2];
++	int if_mac_set=0,mac0_set=0, mac1_set=0;
++	int i,j;
++	buf_write[0]= MAC_MAGIC_BYTE0;
++	buf_write[1]= MAC_MAGIC_BYTE1;
++
++	memset(mac_base, '0', 6);
++	nlm_eeprom = get_nlm_eeprom();
++
++	eeprom_get_magic_bytes(nlm_eeprom,buf0_read,0);/* signature*/
++	eeprom_get_magic_bytes(nlm_eeprom,buf1_read,1);
++
++	if((buf0_read[0]==buf_write[0]) && (buf0_read[1]==buf_write[1]))/*match the signature*/
++	{
++		mac0_set=1;
++		eeprom_get_mac_addr(nlm_eeprom, mac_base,0);/* get the mac address*/
++	}
++	else if((buf1_read[0]==buf_write[0]) && (buf1_read[1]==buf_write[1]))
++	{
++		mac1_set=1;
++		eeprom_get_mac_addr(nlm_eeprom, mac_base,1);/* get the mac address*/
++	}
++
++	for(temp=0;temp<6;temp++)
++	{
++		if(mac_base[temp]!=0)
++		{
++			if_mac_set=1;
++		}
++	}
++	if( ((mac0_set | mac1_set) && if_mac_set) == 0){
++		random_ether_addr(mac_base);
++	}
++	for(i=0 ; i<NLM_MAX_NODES; i++){ /*poppulate the eth_hw_add array according to the get mac address*/
++		for(j=0;j<18;j++){
++			memcpy(eth_hw_addr[i][j], mac_base, 6);
++			mac_base[5] += 1;
++		}
++	}
++}
++
++
++
++static __inline__ struct sk_buff *mac_get_skb_back_ptr(uint64_t addr)
++{
++        uint64_t *back_ptr = (uint64_t *)(unsigned long)(addr - SKB_BACK_PTR_SIZE);
++        /* this function should be used only for newly allocated packets. It assumes
++         * the first cacheline is for the back pointer related book keeping info
++         */
++        return (struct sk_buff *)(unsigned long)(*back_ptr);
++}
++
++
++#define CACHELINE_ALIGNED_ADDR(addr) (((unsigned long)(addr)) & ~(CACHELINE_SIZE-1))
++
++/**********************************************************************
++ * cacheline_aligned_kmalloc -  64 bits cache aligned kmalloc
++ * return -  buffer address
++ *
++ **********************************************************************/
++static __inline__ void *cacheline_aligned_kmalloc(int size, int gfp_mask)
++{
++        void *buf = kmalloc(size + CACHELINE_SIZE, gfp_mask);
++        if (buf)
++                buf =(void*)(unsigned long)(CACHELINE_ALIGNED_ADDR((unsigned long)buf +
++						    CACHELINE_SIZE));
++        return buf;
++}
++
++/*********************************************************************
++  * set tso enable features in the dev list
++ **********************************************************************/
++static __inline__ int tso_enable(struct net_device *dev, u32 data)
++{
++	int rv;
++	rv = ethtool_op_set_tso(dev, data);
++	if(rv == 0)
++		rv = ethtool_op_set_tx_csum(dev, data);
++	if(rv == 0)
++		rv = ethtool_op_set_sg(dev, data);
++	dev->features |= NETIF_F_FRAGLIST | NETIF_F_HIGHDMA;
++	return rv;
++}
++
++static int p2p_desc_mem_init(void)
++{
++	int cpu, cnt;
++	int dsize, tsize;
++	void *buf;
++	/* MAX_SKB_FRAGS + 4.  Out of 4, 2 will be used for skb and freeback storage */
++	dsize = ((((MAX_SKB_FRAGS + P2P_EXTRA_DESCS) * sizeof(uint64_t)) + CACHELINE_SIZE - 1) & (~((CACHELINE_SIZE)-1)));
++	tsize = dsize * MAX_TSO_SKB_PEND_REQS;
++
++	printk("%s in, dsize %d tsize %d \n", __FUNCTION__, dsize, tsize);
++
++	for(cpu = 0; cpu < NR_CPUS; cpu++) {
++		buf = cacheline_aligned_kmalloc(tsize, GFP_KERNEL);
++		if (!buf)
++			return -ENOMEM;
++		p2p_desc_mem[cpu].mem = buf;
++		for(cnt = 1; cnt < MAX_TSO_SKB_PEND_REQS; cnt++) {
++			*(unsigned long *)buf = (unsigned long)(buf + dsize);
++			buf += dsize;
++			*(unsigned long *)buf = 0;
++		}
++		p2p_desc_mem[cpu].dsize = dsize;
++	}
++	return 0;
++}
++
++static inline void *alloc_p2p_desc_mem(int cpu)
++{
++	void *buf;
++	buf = p2p_desc_mem[cpu].mem;
++	if(buf) {
++		p2p_desc_mem[cpu].mem = (void *)*(unsigned long *)(buf);
++	} else {
++		buf = cacheline_aligned_kmalloc(p2p_desc_mem[cpu].dsize, GFP_KERNEL);
++		p2p_dynamic_alloc_cnt[CPU_INDEX(cpu)]++;
++	}
++	return buf;
++}
++
++static inline void free_p2p_desc_mem(int cpu, void *buf)
++{
++	*(unsigned long *)buf = (unsigned long)p2p_desc_mem[cpu].mem;
++	p2p_desc_mem[cpu].mem = buf;
++
++}
++
++static inline int create_p2p_desc(uint64_t paddr, uint64_t len, uint64_t *p2pmsg, int idx)
++{
++	int plen;
++	do {
++		plen = len >= MAX_PACKET_SZ_PER_MSG ? (MAX_PACKET_SZ_PER_MSG - 64): len;
++		p2pmsg[idx] = cpu_to_be64(nae_tx_desc(P2D_NEOP, 0, NULL_VFBID, plen, paddr));
++		len -= plen;
++		paddr += plen;
++		idx++;
++	} while(len > 0);
++	return idx;
++}
++
++static inline void create_last_p2p_desc(uint64_t *p2pmsg, struct sk_buff *skb, int idx)
++{
++	p2pmsg[idx -1 ] = cpu_to_be64(be64_to_cpu(p2pmsg[idx - 1]) | ((uint64_t)P2D_EOP << 62));
++	p2pmsg[P2P_SKB_OFF] = (uint64_t)(unsigned long)skb;
++}
++
++uint16_t pseuodo_chksum(uint16_t *ipsrc, uint16_t proto)
+ {
+ 	uint32_t sum = 0;
+-	sum += cpu_to_be16(ipsrc[0]);
+-	sum += cpu_to_be16(ipsrc[1]);
+-	sum += cpu_to_be16(ipsrc[2]);
+-	sum += cpu_to_be16(ipsrc[3]);
+-	sum += 0x11;
++	sum += ipsrc[0];
++	sum += ipsrc[1];
++	sum += ipsrc[2];
++	sum += ipsrc[3];
++	sum += proto;
+ 	while(sum >> 16)
+ 		sum = (sum & 0xffff)  + (sum >> 16);
+ 	//      sum = ~sum;
+ 	return (uint16_t)sum;
+ }
+ 
+-
+ static __inline__ uint64_t nae_tso_desc0(
+ 		unsigned int type,
+ 		unsigned int subtype,
+@@ -260,508 +398,623 @@ static __inline__ uint64_t nae_tso_desc1(
+ 
+ }
+ 
+-static __inline__ int tso_enable(struct net_device *dev, u32 data)
++#define NUM_VC_PER_THREAD 4
++#define NUM_CPU_VC	  128
++#define RX_PARSER_EN 	1
++#define RX_PPAD_EN 	0
++#define RX_PPAD_SZ	3
++static void nlm_enable_l3_l4_parser(int node)
+ {
+-	int rv;
+-	rv = ethtool_op_set_tso(dev, data);
+-	if(rv == 0)
+-		rv = ethtool_op_set_tx_csum(dev, data);
+-	if(rv == 0)
+-		rv = ethtool_op_set_sg(dev, data);
+-	dev->features |= NETIF_F_FRAGLIST | NETIF_F_HIGHDMA;
+-	return rv;
++	int l2proto = 1; //ethernet
++	int port = 0, i, ipchk = 1;
++	uint32_t val = 0;
++	uint32_t naereg;
++
++	//enabling hardware parser
++	naereg = nlm_hal_read_nae_reg(node, RX_CONFIG);
++	nlm_hal_write_nae_reg(node, RX_CONFIG, (naereg | RX_PARSER_EN << 12 | RX_PPAD_EN << 13 | RX_PPAD_SZ << 22));
++	//printk("Enabling parser, reg content = %x\n", nlm_hal_read_nae_reg(node, RX_CONFIG));
++
++	/* enabling extraction of data */
++	for(i=0; i<16;i++)
++		nlm_hal_write_nae_reg(node, L2_TYPE_0 + i, l2proto);
++
++	nlm_hal_write_nae_reg(node, L3_CTABLE_MASK_0, port | 0 << 5 | 1 << 6); // l2proto and ethtype included
++
++	val = ((0 << 26) | (9 << 20) | (ipchk << 18) | (1 << 16) | (0x800));
++	nlm_hal_write_nae_reg(node, L3_CTABLE_0_0, val);
++	val =   (12 << 26) | (4 << 21) | (16 << 15) | (4 << 10); /* extract sourceip and dstip */
++	nlm_hal_write_nae_reg(node, L3_CTABLE_0_1, val);
++
++	nlm_hal_write_nae_reg(node, L4_CTABLE_0_0, 1 << 17 | 0x6); /* ip_proto = tcp */
++	val = ((0 << 21) | (2 << 17) | (2 << 11) | (2 << 7)); /* extract source and dst port*/
++	nlm_hal_write_nae_reg(node, L4_CTABLE_0_1, val);
++
+ }
+ 
++static int lro_get_skb_hdr(struct sk_buff *skb, void **iphdr, void **tcph,
++		u64 *hdr_flags, void *priv)
++{
++	skb_reset_network_header(skb);
++	skb_set_transport_header(skb, ip_hdrlen(skb));
+ 
++	if(ip_hdr(skb)->protocol != 0x6)
++		return -1;
+ 
+-#ifdef CONFIG_64BIT
+-#define MY_XKPHYS 0xa800000000000000ULL
+-#else
+-#define MY_XKPHYS 0xc0000000
++	*iphdr = ip_hdr(skb);
++	*tcph = tcp_hdr(skb);
++
++	*hdr_flags = LRO_IPV4 | LRO_TCP;
++
++	return 0;
++}
++
++void lro_init(struct net_device *dev)
++{
++	struct dev_data* priv;
++	static int done = 0;
++	int cpu;
++	priv = netdev_priv(dev);
++
++#ifdef CONFIG_INET_LRO
++	if(enable_lro) {
++		printk("LRO is enabled \n");
++		dev->features |= NETIF_F_LRO;
++		for (cpu=0; cpu<NR_CPUS; cpu++) {
++			memset(&priv->lro_mgr[cpu], 0, sizeof(struct net_lro_mgr));
++			priv->lro_mgr[cpu].max_aggr = 48;
++			priv->lro_mgr[cpu].max_desc = LRO_MAX_DESCS;
++			priv->lro_mgr[cpu].get_skb_header = lro_get_skb_hdr;
++			priv->lro_mgr[cpu].features = LRO_F_NAPI;
++			priv->lro_mgr[cpu].dev = dev;
++			priv->lro_mgr[cpu].ip_summed = CHECKSUM_UNNECESSARY;
++			priv->lro_mgr[cpu].ip_summed_aggr = CHECKSUM_UNNECESSARY;
++			priv->lro_mgr[cpu].lro_arr = cacheline_aligned_kmalloc(
++					sizeof(struct net_lro_desc) * LRO_MAX_DESCS, GFP_KERNEL);
++			memset(priv->lro_mgr[cpu].lro_arr, 0, sizeof(struct net_lro_desc) * LRO_MAX_DESCS);
++		}
++	}
++#endif
++	if(!done) {
++		done = 1;
++		nlm_enable_l3_l4_parser(priv->node);
++	}
++}
++
++#if 0
++static void dump_skbuff (struct sk_buff *skb)
++{
++	int cpu = hard_smp_processor_id();
++	char buf[512];
++	int blen = 0, i, len = 64;
++	unsigned char *data = skb->data;
++
++	for(i = 0; i < len;) {
++		if(i != 0 && (i % 16 == 0))
++			blen += sprintf(&buf[blen], "\n");
++		blen += sprintf(&buf[blen], "%02x ", data[i]);
++		i++;
++	}
++	printk("data recived on cpu %d len %d = \n%s\n", cpu, len, buf);
++}
+ #endif
+-static inline struct jumbo_rx_cookie *get_rx_cookie(uint64_t phys)
++
++#ifdef CONFIG_NLM_NET_OPTS
++/* Get the hardware replenishment queue id */
++static int get_hw_frfifo_queue_id(int rxnode, nlm_nae_config_ptr nae_cfg, int cpu, unsigned int truesize)
+ {
+-	/* rx cookie is  stored one cacheline before the start of rxbuf */
+-	unsigned long *ptr = (unsigned long *)(unsigned long)
+-		 		(MY_XKPHYS | (phys - SMP_CACHE_BYTES));
++	int qid;
++	int node_cpu = cpu % NLM_NCPUS_PER_NODE;
+ 
+-	return (struct jumbo_rx_cookie *)ptr;
++	qid = cpu_2_normal_frfifo[rxnode][node_cpu];
++	if (enable_jumbo)
++	{
++		if(truesize > NLM_RX_JUMBO_BUF_SIZE) 
++			qid = cpu_2_jumbo_frfifo[rxnode][node_cpu];
++	}
++	/* all the nodes vfbtable should be filled with starting node of 0 to ending node 
++	 with 20 entries each */
++	return nae_cfg->vfbtbl_hw_offset + (rxnode * NLM_NAE_MAX_FREEIN_FIFOS_PER_NODE) + qid;
+ }
++#endif
+ 
+-/* Here
+-   length -> is the exact length of the data (excluding BYTE_OFFSET, CRClen,
+-   prepad)
+-   hlen -> is the length of the data to be copied to the skb
+-   */
++static int mac_refill_frin_skb(int node, int cpu, uint64_t paddr, unsigned int bufsize)
++{
++	int ret, code, qid;
++	nlm_nae_config_ptr nae_cfg;
++	int node_cpu = cpu % NLM_NCPUS_PER_NODE;
++	unsigned long __attribute__ ((unused)) mflags;
+ 
+-/* Module Parameters */
+-static int debug = 0;
+-module_param(debug, int, 0);
+ 
+-static int drop_uboot_pkt = 1;
+-module_param(drop_uboot_pkt, int, 0);
+-static unsigned long stats_uboot_pkts;
++	qid = (bufsize >= NLM_RX_JUMBO_BUF_SIZE) ? cpu_2_jumbo_frfifo[node][node_cpu] : cpu_2_normal_frfifo[node][node_cpu];
++	
++	nae_cfg = nlm_node_cfg.nae_cfg[node];
++	if(nae_cfg == NULL) {
++		printk("%s Error, Invalid node id %d\n", __FUNCTION__, node);
++		return -1;
++	}
++	Message("%s in cpu %d bufsize %d node %d qid %d qbase %d\n", __FUNCTION__, cpu, bufsize, node, qid,  nae_cfg->frin_queue_base);
+ 
+-static int rely_on_firmware_config=1;
+-module_param(rely_on_firmware_config, int, 0);
++	ret = 0;
++	qid = nae_cfg->frin_queue_base + qid;
+ 
+-/***************************************************************
+- *
+- * Below parameters are set during FDT file parsing
+- */
+-static int frin_desc_thres = 24;
+-module_param(frin_desc_thres, int, 0);
++	/* Assumption: SKB is all set to go */
++	/* Send the free Rx desc to the MAC */
++	code = 0;
+ 
+-extern uint32_t nae_rx_vc;
+-extern uint32_t nae_fb_vc;
+-/***************************************************************/
++	/* Send the packet to nae rx  */
++	msgrng_access_enable(mflags);
++	for(;;) {
++	  ret = nlm_hal_send_msg1(qid, code, (paddr & 0xffffffffffULL) );
++	  if (!ret) break;
++	}
++	msgrng_access_disable(mflags);
+ 
+-extern struct eeprom_data * get_nlm_eeprom(void);
++	return ret;
++}
+ 
+-unsigned char eth_hw_addr[NLM_MAX_NODES][18][6];
++static int mac_refill_frin_one_buffer(struct net_device *dev, int cpu, unsigned int truesize)
++{
++	struct dev_data* priv = netdev_priv(dev);
++	struct sk_buff * skb;
++	int buf_size = NLM_RX_ETH_BUF_SIZE;
+ 
+-#define ETHER_FRAME_MIN_LEN	64
+-static struct pci_device_id soc_pci_table[] __devinitdata = {
+-        {PCI_NETL_VENDOR, PCI_DEVID_BASE + PCI_DEVID_OFF_NET,
+-         PCI_ANY_ID, PCI_ANY_ID, 0},
+-        {}
+-};
++	if (enable_jumbo)
++	{
++		if(truesize > NLM_RX_JUMBO_BUF_SIZE) 
++			buf_size = NLM_RX_JUMBO_BUF_SIZE; 
++	}
+ 
+-extern void xlp_set_ethtool_ops(struct net_device *netdev);
+-extern void xlp_get_mac_stats(struct net_device* dev, struct net_device_stats* stats);
+-spinlock_t  nlm_xlp_nae_lock;
+-static void nlm_xlp_nae_init(void);
+-static int xlp_mac_proc_read(char *page, char **start, off_t off,int count, int *eof, void *data);
+-static int  nlm_xlp_nae_open (struct net_device *dev);
+-static int  nlm_xlp_nae_stop (struct net_device *dev);
+-static int  nlm_xlp_nae_start_xmit (struct sk_buff *skb, struct net_device *dev);
+-static void  nlm_xlp_set_multicast_list (struct net_device *dev);
+-static int  nlm_xlp_nae_ioctl (struct net_device *dev, struct ifreq *rq, int cmd);
+-static int  nlm_xlp_nae_change_mtu(struct net_device *dev, int new_mtu);
+-static void  nlm_xlp_nae_tx_timeout (struct net_device *dev);
+-static void xlp_mac_setup_hwaddr(struct dev_data *priv);
+-static int nlm_xlp_nae_set_hwaddr(struct net_device *dev, void *p);
++	skb = nlm_xlp_alloc_skb_atomic(buf_size, priv->node);
++	if(!skb)
++	{
++		printk("[%s] alloc skb failed\n",__FUNCTION__);
++		panic("panic...");
++		return -ENOMEM;
++	}
+ 
+-#ifdef  ENABLE_NAE_PIC_INT
+-static irqreturn_t nlm_xlp_nae_int_handler(int irq, void * dev_id);
++	skb->dev = dev;
++
++	mac_put_skb_back_ptr(skb);
++
++	return mac_refill_frin_skb(priv->node, cpu, (unsigned long long)virt_to_bus(skb->data), buf_size);
++}
++
++static int nae_proc_read(char *page, char **start, off_t off,
++			     int count, int *eof, void *data)
++{
++	int len = 0;
++	int i = 0;
++	uint64_t total_err = 0, total_fast = 0, total_slow = 0, total_recv = 0;
++
++	for(i=0; i<32; i++){
++		printk("cpu%d, recv %ld fast_repl %ld, slow_repl %ld, err_repl %ld p2pdalloc %lld\n",i,
++			(unsigned long)receive_count[CPU_INDEX(i)],
++			(unsigned long)fast_replenish_count[CPU_INDEX(i)],
++			(unsigned long)slow_replenish_count[CPU_INDEX(i)],
++			(unsigned long)err_replenish_count[CPU_INDEX(i)],
++			p2p_dynamic_alloc_cnt[CPU_INDEX(i)]);
++
++		total_err += err_replenish_count[CPU_INDEX(i)];
++		total_fast += fast_replenish_count[CPU_INDEX(i)];
++		total_slow += slow_replenish_count[CPU_INDEX(i)];
++		total_recv += receive_count[CPU_INDEX(i)];
++
++		p2p_dynamic_alloc_cnt[CPU_INDEX(i)] = 0;
++		slow_replenish_count[CPU_INDEX(i)] = 0;
++		fast_replenish_count[CPU_INDEX(i)] = 0;
++		err_replenish_count[CPU_INDEX(i)] = 0;
++		receive_count[CPU_INDEX(i)] = 0;
++	}
++	/*check how many hash are empty...*/
++	printk("TOTAL_FAST_REPL %ld, TOTAL_SLOW_REPL %ld, TOTAL_ERR_REPL %ld TOTAL_RECV %ld\n",
++			(unsigned long)total_fast,
++			(unsigned long)total_slow,
++			(unsigned long)total_err,
++			(unsigned long)total_recv);
++
++	*eof = 1;
++	return len;
++}
++
++static inline void process_tx_complete(int cpu, unsigned int src_id, unsigned long long msg0)
++{
++	struct sk_buff* skb;
++	struct dev_data *priv;
++#ifdef TSO_ENABLED
++	uint64_t *p2pfbdesc;
+ #endif
++	unsigned long long addr;
++	unsigned int context, port, node;
+ 
+-static void nlm_xlp_nae_msgring_handler(uint32_t vc, uint32_t src_id,
+-					uint32_t size, uint32_t code,
+-					uint64_t msg0, uint64_t msg1,
+-					uint64_t msg2, uint64_t msg3, void* data);
++	Message("%s cpu %d src_id %d\n", __FUNCTION__, cpu, src_id);
+ 
+-static void nlm_xlp_mac_timer(unsigned long data);
+-static struct net_device_stats *nlm_xlp_mac_get_stats(struct net_device *dev);
++	/* Process Transmit Complete, addr is the skb pointer */
++	addr = msg0 & 0xffffffffffULL;
+ 
+-static struct net_device *dev_mac[NLM_MAX_NODES][MAX_GMAC_PORT];
++	/* context field is currently unused */
++	context = (msg0 >> 40) & 0x3fff;
++	node = (src_id >> 10) & 0x3;
++	port = *(cntx2port[node] + context);
++
++	if (addr == dummy_pktdata_addr[node]){
++		printk("Dropping firmware RX packet (addr=%llx)!\n", addr);
++		return;
++	}
++
++#ifdef TSO_ENABLED
++	if(nlm_mode[CPU_INDEX(cpu)] == NLM_TCP_MODE){
++		p2pfbdesc = bus_to_virt(addr);
++		skb = (struct sk_buff *)(unsigned long)(p2pfbdesc[P2P_SKB_OFF]);
++		free_p2p_desc_mem(cpu, p2pfbdesc);
++	} else
++#endif
++		skb = (struct sk_buff *)bus_to_virt(addr);
++
++	if(skb)
++	{
++		priv = netdev_priv(skb->dev);
++		dev_kfree_skb_any(skb);
++	}
++	else {
++		printk("[%s]: [txc] Null skb? paddr = %llx (halting cpu!)\n", __func__, addr);
++		cpu_halt();
++	}
++}
+ 
+-extern struct proc_dir_entry *nlm_root_proc;
++static inline void process_rx_packets(int cpu, unsigned int src_id, 
++		unsigned long long msg0, unsigned long long msg1)
++{
++	uint64_t addr;
++	uint32_t len, context, truesize;
++	int port, node, err;
++	struct net_device *pdev;
++	struct dev_data *priv = NULL;
++	uint64_t vaddr;
++	struct sk_buff* skb;
+ 
+-extern void nlm_xlp_mac_set_enable(struct dev_data *priv, int flag);
++	err = (msg1 >> 4) & 0x1;
+ 
++	/* Rx packet */
++	addr	= msg1 & 0xffffffffc0ULL;
++	len	= (msg1 >> 40) & 0x3fff;
++	context = (msg1 >> 54) & 0x3ff;
++	node = (src_id >> 10) & 0x3;
+ 
+-static const struct net_device_ops nlm_xlp_nae_ops = {
+-	.ndo_open	= nlm_xlp_nae_open,
+-	.ndo_stop	= nlm_xlp_nae_stop,
+-	.ndo_start_xmit	= nlm_xlp_nae_start_xmit,
+-	.ndo_set_multicast_list	= nlm_xlp_set_multicast_list,
+-	.ndo_do_ioctl	= nlm_xlp_nae_ioctl,
+-	.ndo_tx_timeout = nlm_xlp_nae_tx_timeout,
+-	.ndo_change_mtu	= nlm_xlp_nae_change_mtu,
+-	.ndo_set_mac_address	= nlm_xlp_nae_set_hwaddr,
+-	.ndo_get_stats = nlm_xlp_mac_get_stats,
+-};
++	Message("%s in cpu %d src_id %d len %d context %d node %d err %d\n", __FUNCTION__,
++			cpu, src_id, len, context, node, err);
++	if (err) {
+ 
+-static __inline__ void cpu_halt(void)
+-{
+-	__asm__ volatile (".set push\n"
+-			  ".set noreorder\n"
+-			  "   wait\n"
+-			  "1: b    1b\n"
+-			  "   nop\n"
+-			  ".set pop\n"
+-		);
+-}
++		vaddr = (uint64_t)(unsigned long)bus_to_virt(addr);
++		skb = mac_get_skb_back_ptr(vaddr);
++		mac_refill_frin_skb(node, cpu, addr, skb->truesize);
++		/*
++		   Commenting as priv is not available here
++		   STATS_INC(priv->stats.rx_errors);
++		   STATS_INC(priv->stats.rx_dropped);
++		 */
++		err_replenish_count[CPU_INDEX(cpu)]++;
++		return;
++	}
+ 
+-static __inline__ void print_fmn_send_error(const char *str, uint32_t send_result)
+-{
+-	if (debug < 1) return;
++	if (addr == dummy_pktdata_addr[node]){
++		printk("Dropping firmware RX packet (addr=%llx)!\n", addr);
++		return;
++	}
++	port = *(cntx2port[node] + context);
+ 
+-	if(send_result & MSG_DST_FC_FAIL)
++#ifdef ENABLE_SANITY_CHECKS
++	if(port >= MAX_GMAC_PORT)
+ 	{
+-		printk("[%s] Msg Destination flow control credit fail(send_result=%08x)\n",
+-		       str, send_result);
+-	}
+-	else if (send_result & MSG_INFLIGHT_MSG_EX) {
+-		printk("[%s] MSG_INFLIGHT_MSG_EX(send_result=%08x)\n", __func__, send_result);
+-	}
+-	else if (send_result & MSG_TXQ_FULL) {
+-		printk("[%s] TX message Q full(send_result=%08x)\n", __func__, send_result);
++		printk("[%s]: bad port=%d, context=%d\n", __func__, port, context);
++		/*TODO: Where to replenish this packet ???? Context is out of range!*/
++		return;
+ 	}
+-	else {
+-		printk("[%s] Unknown send error type(send_result=%08x)\n", __func__, send_result);
++#endif
++	pdev = per_cpu_netdev[node][cpu][port];
++#ifdef ENABLE_SANITY_CHECKS
++	if(!pdev) {
++		printk("[%s]: [rx] wrong port=%d(context=%d)? pdev = NULL!\n", __func__, port, context);
++		return;
+ 	}
+-}
+-
+-static __inline__ struct sk_buff *mac_get_skb_back_ptr(uint64_t addr)
+-{
+-        uint64_t *back_ptr = (uint64_t *)(addr - CACHELINE_SIZE);
+-        /* this function should be used only for newly allocated packets. It assumes
+-         * the first cacheline is for the back pointer related book keeping info
+-         */
+-        return (struct sk_buff *)(*back_ptr);
+-}
++#endif
++	priv = netdev_priv(pdev);
+ 
+-static __inline__ void mac_put_skb_back_ptr(struct sk_buff *skb)
+-{
+-        uint64_t *back_ptr = (uint64_t *)skb->data;
++	vaddr = (uint64_t)(unsigned long)bus_to_virt(addr);
+ 
+-        /* this function should be used only for newly allocated packets. It assumes
+-         * the first cacheline is for the back pointer related book keeping info
+-         */
+-        skb_reserve(skb, CACHELINE_SIZE);
+-        *back_ptr = (uint64_t)skb;
+-}
++	len = len  - ETH_FCS_LEN;
+ 
+-#define CACHELINE_ALIGNED_ADDR(addr) (((unsigned long)(addr)) & ~(CACHELINE_SIZE-1))
++	skb = mac_get_skb_back_ptr(vaddr);
+ 
+-/**********************************************************************
+- * cacheline_aligned_kmalloc -  64 bits cache aligned kmalloc
+- * return -  buffer address
+- *
+- **********************************************************************/
+-static __inline__ void *cacheline_aligned_kmalloc(int size, int gfp_mask)
+-{
+-        void *buf = kmalloc(size + CACHELINE_SIZE, gfp_mask);
+-        if (buf)
+-                buf =(void*)(CACHELINE_ALIGNED_ADDR((unsigned long)buf +
+-						    CACHELINE_SIZE));
+-        return buf;
+-}
++#ifdef ENABLE_SANITY_CHECKS
++	if (!skb) {
++		STATS_INC(priv->stats.rx_dropped);
++		printk("[%s] Null skb? addr=%llx, vaddr=%llx, dropping it and losing one buffer!\n",
++				__func__, addr, vaddr);
++		STATS_INC(priv->stats.rx_dropped);
++		err_replenish_count[CPU_INDEX(cpu)]++;
++		return;
++	}
++#endif
+ 
++	skb->dev = pdev;
++	skb_put(skb, len);
++	skb->protocol = eth_type_trans(skb, pdev);
++
++	/* We use jumbo rx buffers if the ethernet type is not ip, see perf_nae ucore file */
++	truesize = skb->truesize;
++	if(skb->protocol != htons(ETH_P_IP))
++		truesize = NLM_RX_JUMBO_BUF_SIZE + sizeof(struct sk_buff);
++
++#ifdef CONFIG_NLM_NET_OPTS
++	/* Pass the packet to Network stack */
++	last_rcvd_skb[CPU_INDEX(cpu)] = skb;
++	last_rcvd_skb_phys[CPU_INDEX(cpu)] = addr;
++	last_rcvd_len[CPU_INDEX(cpu)] = len;
++	last_rcvd_node[CPU_INDEX(cpu)] = node;
++#endif
+ 
+-static __inline__ int mac_send_fr(struct dev_data *priv, unsigned long addr, int len)
+-{
+-	struct xlp_msg msg;
+-	int code = 0;
+-	int ret;
+-	msg.entry[0] = (unsigned long long)addr & 0xffffffffe0ULL;
+-	msg.entry[1]= msg.entry[2] = msg.entry[3] = 0;
+-	/* Send the packet to nae rx  */
+-	__sync();
+-        if ( (ret = nlm_hal_send_msg1(priv->nae_rx_qid, code, msg.entry[0])) ){
+-		print_fmn_send_error(__func__, ret);
+-		printk("Unable to send configured free desc, check freein carving (qid=%d) ret 0x%x\n", priv->nae_rx_qid, ret);
+-		return ret;
++#ifdef CONFIG_INET_LRO
++	if((skb->dev->features & NETIF_F_LRO) &&
++			(msg1 & RX_IP_CSUM_VALID) && (msg1 & RX_TCP_CSUM_VALID)) {
++
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++		lro_receive_skb(&priv->lro_mgr[cpu], skb, NULL);
++		if(!lro_flush_needed[cpu][priv->port]) {
++			lro_flush_priv[cpu][lro_flush_priv_cnt[cpu]] = priv;
++			lro_flush_needed[cpu][priv->port] = 1;
++			lro_flush_priv_cnt[cpu]++;
++			Message("Adding to lro flush queue cpu %d port %d\n", cpu, priv->port);
++		}
++	} else
++#endif
++	{
++		netif_receive_skb(skb);
+ 	}
+-	return ret;
+ 
++	/* Update Stats */
++	STATS_ADD(priv->stats.rx_bytes, len);
++	STATS_INC(priv->stats.rx_packets);
++	receive_count[CPU_INDEX(cpu)]++;
++
++#ifdef CONFIG_NLM_NET_OPTS
++	if (last_rcvd_skb[CPU_INDEX(cpu)]) {
++		slow_replenish_count[CPU_INDEX(cpu)]++;
++		mac_refill_frin_one_buffer(pdev, cpu, truesize);
++		last_rcvd_skb[CPU_INDEX(cpu)] = NULL;
++		last_rcvd_len[CPU_INDEX(cpu)] = 0;
++	}
++#else
++	slow_replenish_count[CPU_INDEX(cpu)]++;
++	mac_refill_frin_one_buffer(pdev, cpu, truesize);
++#endif
+ }
+ 
+-void build_skb(struct sk_buff *skb, uint64_t *rxp2d, uint32_t*p2d_len, int num_desc,
+-			uint32_t hlen, uint32_t length)
++#ifdef CONFIG_INET_LRO
++static inline void napi_lro_flush(int cpu)
+ {
+-	int idx;
+-	struct skb_shared_info *sp = skb_shinfo(skb);
+-	struct jumbo_rx_cookie *rx_cookie = get_rx_cookie(rxp2d[0]);
+-	struct page *pg = rx_cookie->page;
+-	int rx_offset =  JUMBO_RX_OFFSET;
+-	uint8_t *va = page_address(pg) + rx_cookie->page_offset + rx_offset;
+-	skb_frag_t *fp = &sp->frags[0];
+-
+-	/* actual data starts IP header align */
+-	skb_reserve(skb, 2);
+-
+-	skb->len = skb->data_len = length;
+-	skb->truesize = length + sizeof(struct sk_buff);
+-
+-	fp->page= pg;
+-	fp->page_offset = rx_cookie->page_offset + rx_offset + hlen;
+-	fp->size = p2d_len[0]- hlen;
+-
+-	skb_copy_to_linear_data(skb, va, hlen);
+-	skb->data_len -= hlen;
+-	skb->tail += hlen;
+-
+-	/*fill other frags*/
+-	for(idx=1; idx<num_desc; idx++){
+-		fp = &sp->frags[idx];
+-		rx_cookie = get_rx_cookie(rxp2d[idx]);
+-		pg = rx_cookie->page;
+-		rx_offset =  JUMBO_RX_OFFSET;
+-		va = page_address(pg) + rx_cookie->page_offset + rx_offset;
+-		fp->page= pg;
+-		fp->page_offset = rx_cookie->page_offset + rx_offset;
+-		fp->size = p2d_len[idx];
+-	}
+-	skb_shinfo(skb)->nr_frags = num_desc;
++	struct dev_data *priv = NULL;
++	int i;
++	for(i = 0; i < lro_flush_priv_cnt[cpu]; i++) {
++		priv = lro_flush_priv[cpu][i];
++		lro_flush_all(&priv->lro_mgr[cpu]);
++		lro_flush_needed[cpu][priv->port] = 0;
++		Message("Lro flush cpu %d port %d\n", cpu, priv->port);
++	}
++	lro_flush_priv_cnt[cpu] = 0;
+ }
+ 
+-/* assumes that buffer is setup correctly */
+-static void recycle_rx_desc(uint64_t phys, struct net_device *dev)
++static void xlp_napi_lro_flush(void *arg)
+ {
+-	struct dev_data* priv = netdev_priv(dev);
+-	unsigned long msgrng_flags;
+-
+-	msgrng_access_enable(msgrng_flags);
+-	mac_send_fr(priv, phys, jumbo_mtu);
+-	msgrng_access_disable(msgrng_flags);
++	int cpu = hard_smp_processor_id();
++	napi_lro_flush(cpu);
+ }
++#endif
+ 
+-static int mac_frin_replenish_one_normal_msg(struct net_device *dev)
++/*
++ * NAE poll function on freeback only if rx and freeback vcs are different
++*/
++static void xlp_poll_upper(int cpu)
+ {
+-	jumbo_rx_info_t *rx;
+-	struct dev_data* priv = netdev_priv(dev);
+-	int ret = 0,num_buff;
+-	unsigned long msgrng_flags;
+-	struct jumbo_rx_cookie *rx_cookie;
+-	struct page *pg;
+-	void *va;
+-	uint64_t pa, phys;
+-	int cpu = smp_processor_id();
+-
+-	rx = &jumbo_rx_buff[cpu];
+-
+-	if(rx->space >= jumbo_buffer_size){
+-		pg = rx->page;
+-	} else {
+-		/* alloc a new page */
+-		pg = alloc_pages_exact_node(priv->node, GFP_KERNEL, 0); //alloc_pages(GFP_KERNEL, 0);
+-		if(pg == NULL) {
+-			panic("alloc_pages failure\n");
+-		}
++	unsigned int status;
++	uint64_t msg0 = 0;
++	uint32_t src_id = 0, size, code;
++	unsigned long __attribute__ ((unused)) mflags;
++
++	if(nae_rx_vc == nae_fb_vc)
++		return;
++	
++	while (1) {
++			msgrng_access_enable(mflags);
++			status = xlp_message_receive_1(nae_fb_vc, &src_id, &size, &code, &msg0);
++			msgrng_access_disable(mflags);
+ 
+-		rx->page = pg;
+-		rx->page_offset = 0;
+-		rx->space = PAGE_SIZE;
+-		num_buff = (PAGE_SIZE/jumbo_buffer_size);
+-		atomic_set(&pg->_count, num_buff);
+-	}
+-	va = page_address(pg) + rx->page_offset;
+-	pa = page_to_phys(pg) + rx->page_offset;
+-	rx_cookie = (struct jumbo_rx_cookie *)va;
+-	rx_cookie->page = pg;
+-	rx_cookie->page_offset = rx->page_offset;
+-
+-	msgrng_access_enable(msgrng_flags);
+-	/* account for s/w space and prepad */
+-	phys = pa + JUMBO_RX_OFFSET;
+-	if (mac_send_fr(priv, phys, jumbo_mtu)) {
+-		msgrng_access_disable(msgrng_flags);
+-		put_page(pg);
+-		printk
+-			("message_send failed!, unable to send free desc to mac\n");
+-		ret = -EIO;
+-		return ret;
+-	}
+-	msgrng_access_disable(msgrng_flags);
+-	rx->page_offset += jumbo_buffer_size;
+-	rx->space -= jumbo_buffer_size;
++			if(status) break;
++			__sync();
+ 
+-	return ret;
++			Message("poll upper cpu %d src_id %d size %d\n", cpu, src_id, size);
++			process_tx_complete(cpu, src_id, msg0);
++
++	} /* closing while (1) */
+ }
+ 
+-static int mac_frin_replenish_msgs(struct net_device *dev, int num)
++/*
++ * NAE poll function on lower four buckets
++ */
++static int xlp_poll_lower(int budget, int cpu)
+ {
+-	jumbo_rx_info_t *rx;
+-	struct dev_data* priv = netdev_priv(dev);
+-	int cpu = smp_processor_id();
++	int status;
++	uint64_t msg0 = 0, msg1 = 0;
++	int no_rx_pkt_rcvd = 0;
++	uint32_t src_id = 0, size = 0, code;
++	unsigned long __attribute__ ((unused)) mflags;
++
++	while (budget--) {
++		msgrng_access_enable(mflags);
++		status = xlp_message_receive_2(nae_rx_vc, &src_id, &size, &code, &msg0, &msg1);
++		msgrng_access_disable(mflags);
++
++		if(status) {
++			if(enable_napi)
++				break;
++			continue;
++		}
+ 
+-	rx = &jumbo_rx_buff[cpu];
+-	atomic_add(num, &rx->alloc_fails[priv->node][priv->port]);
+-	schedule_work(&mac_frin_replenish_work[cpu]);
+-	//tasklet_schedule(&mac_frin_replenish_task[cpu]);
+-	return 0;
++		no_rx_pkt_rcvd++;
++#ifdef ENABLE_SANITY_CHECKS
++		if((size != 2) && (size != 1)) {
++			printk("Unexpected single entry packet in poll_lower\n");
++			continue;
++		}
++#endif
++		if(size == 2)
++			process_rx_packets(cpu, src_id, msg0, msg1);
++		else if(size == 1)
++			process_tx_complete(cpu, src_id, msg0);
++		else {
++			printk("%s , Error invalid message, size %d\n", __FUNCTION__, size);
++			continue;
++		}	
++	}
++#ifdef CONFIG_INET_LRO
++	if(enable_lro)
++		napi_lro_flush(cpu);
++#endif
++	return no_rx_pkt_rcvd;
+ }
+ 
+-static void mac_frin_replenish(unsigned long  arg/* ignored */)
+-{
+-	int node = 0;
+-	jumbo_rx_info_t *rx;
+-	int cpu = smp_processor_id();
+-	int done = 0, i, j;
+ 
+-	rx = &jumbo_rx_buff[cpu];
+ 
+-	for(node = 0; node < maxnae; node++) {
+-	    for (;;) {
+-		done = 0;
+-	     	for (i = 0; i < PHOENIX_MAX_MACS; i++) {
+-			struct net_device *dev;
+-			struct dev_data* priv;
+-			atomic_t *frin_to_be_sent;
+-			int num_fr_in=0;
++/**********************************************************************
++ * nlm_xlp_nae_msgring_handler -  message ring interrupt handler
++ * @vc-  virtual channel number
++ * @dev_id  -  this device
++ *
++ **********************************************************************/
++static void nlm_xlp_nae_msgring_handler(uint32_t vc, uint32_t src_id,
++					uint32_t size, uint32_t code,
++					uint64_t msg0, uint64_t msg1,
++					uint64_t msg2, uint64_t msg3, void* data)
++{
++	int cpu = hard_smp_processor_id();
+ 
+-			dev = dev_mac[node][i];
+-			if (dev == 0)
+-				goto skip;
++	if( vc == nae_rx_vc && size == 2)
++		 process_rx_packets(cpu, src_id, msg0, msg1);
++	else if(vc == nae_fb_vc && size == 1)
++		process_tx_complete(cpu, src_id, msg0);
++	else {
++		printk("%s , Error invalid message, vc %d size %d\n", __FUNCTION__, vc, size);
++	}	
++}
+ 
+-			priv = netdev_priv(dev);
+-			frin_to_be_sent = &rx->alloc_fails[priv->node][i];
+-			num_fr_in = atomic_read(frin_to_be_sent);
+-			//if(!(MSGRNG_OWN(priv->cfg_flag)))
+-			//	goto skip;
+-
+-			if (atomic_read(frin_to_be_sent) < 0) {
+-				panic
+-					("BUG?: [%s]: gmac_%d illegal value for frin_to_be_sent=%d\n",
+-					 __FUNCTION__, i,
+-					 atomic_read(frin_to_be_sent));
+-			}
++/*
++ * Main NAE poll loop
++ */
+ 
+-			if (!atomic_read(frin_to_be_sent))
+-				goto skip;
++static int xlp_nae_napi_poll(int vc, int budget)
++{
++	int rx_pkts = 0;
++	int cpu = hard_smp_processor_id();
+ 
+-			for(j=0; j<num_fr_in; j++)
+-				mac_frin_replenish_one_normal_msg(dev);
++	Message("%s in vc %d budget %d\n", __FUNCTION__, vc, budget);
+ 
+-			atomic_sub(num_fr_in, frin_to_be_sent);
+-			atomic_add(num_fr_in, &priv->total_frin_sent);
++	xlp_poll_upper(cpu);
++	rx_pkts = xlp_poll_lower(budget, cpu);
+ 
+-			continue;
+-		skip:
+-			done++;
+-		}
+-		if (done == PHOENIX_MAX_MACS)
+-			break;
+-	    }
+-	}
++	return rx_pkts;
+ }
+ 
+-static int mac_fill_rxfr(struct net_device *dev)
++static int xlp_nae_poll(void *buf)
+ {
+-	struct dev_data *priv = netdev_priv(dev);
+-	unsigned long msgrng_flags;
+-	int i, j;
+-	int ret = 0;
+-	struct page *pg;
+-	void *va;
+-	phys_t pa, phys;
+-	struct jumbo_rx_cookie *rx_cookie;
+-	int nr_buffs,limit;
+-
+-#ifdef CONFIG_PHOENIX_HW_BUFFER_MGMT
+-#error "Jumbo support cannot be enabled with CONFIG_PHOENIX_HW_BUFFER_MGMT"
+-#endif /* CONFIG_PHOENIX_HW_BUFFER_MGMT */
+-
+-	//printk(" mac_fill_rxfr--------\n");
+-	//if (!priv->init_frin_desc) return ret;
+-	//priv->init_frin_desc = 0;
+-
+-	//if(!(MSGRNG_OWN(priv->cfg_flag)))
+-	//	return ret;
+-	limit = atomic_read(&priv->frin_to_be_sent);
+-
+-	for(i = 0; i < limit; i++){
+-		/*  get a page */
+-		pg = alloc_pages_exact_node(priv->node, GFP_KERNEL, 0);
+-		if(pg == NULL) {
+-			ret = -ENOMEM;
+-			break;
+-		}
+-		nr_buffs = (PAGE_SIZE/jumbo_buffer_size);
+-		if((i + nr_buffs) >= limit)
+-			nr_buffs = (limit - i);
+-		i += nr_buffs;
+-
+-		pa = page_to_phys(pg);
+-		va = page_address(pg);
+-		j = 0;
+-		while(nr_buffs) {
+-			rx_cookie = (struct jumbo_rx_cookie *)va;
+-			rx_cookie->page = pg;
+-			rx_cookie->page_offset = (j * jumbo_buffer_size) ;
+-			/* Send the free Rx desc to the MAC */
+-			msgrng_access_enable(msgrng_flags);
+-			phys = pa + JUMBO_RX_OFFSET;
+-			if (mac_send_fr(priv, phys, jumbo_mtu)) {
+-				msgrng_access_disable(msgrng_flags);
+-				if(j)
+-					put_page(pg);
+-				printk
+-				("message_send failed!, unable to send free desc to mac\n");
+-				ret = -EIO;
+-				break;
+-			}
+-			msgrng_access_disable(msgrng_flags);
+-			va += jumbo_buffer_size;
+-			pa += jumbo_buffer_size;
+-			/* increment ref count from second particle */
+-			if(j)
+-				get_page(pg);
+-			j++;
+-			nr_buffs--;
+-			atomic_dec(&priv->frin_to_be_sent);
+-
+-			atomic_inc(&priv->total_frin_sent);
+-		}
+-	}
+-	return 0;
++	//unsigned int count=0;
++	int rx_pkts = 0;
++	int cpu = hard_smp_processor_id();
++	int budget = 96;
+ 
+-}
++	if(perf_mode == NLM_RT_MODE)
++		budget = 300000;
+ 
+-static int nlm_initialize_vfbid(int node, int fbvc)
+-{
+-	int cpu, i, dst_node = 0;
+-	uint32_t vfbid_tbl[128];
++	while (1) {
+ 
+-	for(i = 0; i < 128; i++)
+-		vfbid_tbl[i] = 0;
++		local_bh_disable();
++		xlp_poll_upper(cpu);
++		rx_pkts = xlp_poll_lower(budget, cpu);
++		local_bh_enable();
+ 
+-	for (cpu = 0; cpu < NR_CPUS ; cpu++) {
+-		if(!cpu_isset(cpu, phys_cpu_present_map))
+-                        continue;
+-		dst_node = cpu / 32;
+-		vfbid_tbl[cpu] = (dst_node << 10) | (((cpu % 32) * 4) + fbvc);
++
++		schedule();
+ 	}
+-	nlm_config_vfbid_table(node, 0, NR_CPUS, vfbid_tbl);	//FIXME change mappings for 127 and 126
+ 	return 0;
+ }
+ 
+-static int gen_mac_address(void)
++void nlm_spawn_kthread(void)
+ {
+-	struct eeprom_data *nlm_eeprom=NULL;
+-	unsigned char mac_base[6],temp,buf_write[2],buf0_read[2],buf1_read[2];
+-	int if_mac_set=0,mac0_set=0, mac1_set=0;
+-	int i,j;
+-	buf_write[0]= MAC_MAGIC_BYTE0;
+-	buf_write[1]= MAC_MAGIC_BYTE1;
++    unsigned int i = 0, nr_cpus;
++    char buf[20];
++    static struct task_struct *task[NR_CPUS];
++
++    nr_cpus = nlm_node_cfg.num_nodes * NLM_NCPUS_PER_NODE;	
++    /*Spawn kthread*/
++    for(i=0; i<nr_cpus; i++){
++	if(!cpu_isset(i, cpu_present_map))
++		continue;
++        sprintf(buf,"nae_task_%d",i);
++        task[i] = kthread_create(xlp_nae_poll, (void *)(long)i, (void *)&buf);
++        if(!task[i])
++            break;
++    }
++    if(i == nr_cpus){
++        for(i=0; i<nr_cpus; i++){
++	    if(!cpu_isset(i, cpu_present_map))
++		    continue;
++            kthread_bind(task[i], i);
++            wake_up_process(task[i]);
++        }
++    }
+ 
+-	memset(mac_base, '0', 6);
+-	nlm_eeprom = get_nlm_eeprom();
++}
+ 
+-	eeprom_get_magic_bytes(nlm_eeprom,buf0_read,0);/* signature*/
+-	eeprom_get_magic_bytes(nlm_eeprom,buf1_read,1);
+ 
+-	if((buf0_read[0]==buf_write[0]) && (buf0_read[1]==buf_write[1]))/*match the signature*/
+-        {
+-                mac0_set=1;
+-                eeprom_get_mac_addr(nlm_eeprom, mac_base,0);/* get the mac address*/
+-        }
+-	else if((buf1_read[0]==buf_write[0]) && (buf1_read[1]==buf_write[1]))
+-	{
+-		 mac1_set=1;
+-		 eeprom_get_mac_addr(nlm_eeprom, mac_base,1);/* get the mac address*/
+-	}
++/*
++ * Setup XLP NAPI subsystem
++ */
++extern int nlm_xlp_register_napi_vc_handler(int nae_rx_vc, int (*napi_msgint_handler)(int, int));
++extern int nlm_xlp_register_napi_final_handler(int major, void (*napi_final)(void *arg), void *arg);
+ 
+-	for(temp=0;temp<6;temp++)
+-	{
+-		if(mac_base[temp]!=0)
+-		{
+-			if_mac_set=1;
++static int nlm_xlp_enable_napi(void)
++{
++	if(exclusive_vc) {
++		printk("Registering exclusive napi vc handler\n");
++		nlm_xlp_register_napi_vc_handler(nae_rx_vc, xlp_nae_napi_poll);
++		nlm_xlp_register_napi_vc_handler(nae_fb_vc, xlp_nae_napi_poll);
++	} else {
++		printk("Registering nae msgring handler\n");
++		if(register_xlp_msgring_handler(XLP_MSG_HANDLE_NAE_0 , nlm_xlp_nae_msgring_handler, NULL)) {
++			printk("Fatal error! Can't register msgring handler for XLP_MSG_HANDLE_NAE_0");
++			return -1;
+ 		}
++#ifdef CONFIG_INET_LRO
++		if(enable_lro) {
++			printk("Registering napi final handler\n");
++			nlm_xlp_register_napi_final_handler(XLP_MSG_HANDLE_NAE_0, xlp_napi_lro_flush, NULL);
++		}
++#endif
+ 	}
+ 
+-	if( ((mac0_set | mac1_set) && if_mac_set) == 0){
+-		 random_ether_addr(mac_base);
+-	}
+-	for(i=0 ; i<NLM_MAX_NODES; i++){ /*poppulate the eth_hw_add array according to the get mac address*/
+-		 for(j=0;j<18;j++){
+-			  memcpy(eth_hw_addr[i][j], mac_base, 6);
+-			  mac_base[5] += 1;
+-		 }
++	return 0;
++}
++
++static int nlm_xlp_disable_napi(void)
++{
++	int node, i;
++	for(i=0; i<NR_CPUS; i++){
++		if(!cpu_isset(i, phys_cpu_present_map))
++			continue;
++		node = i / 32;
++		nlm_hal_disable_vc_intr(node, (i*NLM_MAX_VC_PER_THREAD + nae_rx_vc) & 0x7f);
++		nlm_hal_disable_vc_intr(node, (i*NLM_MAX_VC_PER_THREAD + nae_fb_vc) & 0x7f);
+ 	}
++	return 0;
+ }
+ 
+ /**********************************************************************
+@@ -774,42 +1027,46 @@ static void nlm_xlp_nae_init(void)
+ {
+ 	struct net_device *dev = NULL;
+ 	struct dev_data *priv;
+-	int i, node = 0, cpu, j;
++	int i, node = 0, maxnae;
+ 	struct proc_dir_entry *entry;
++	int cpu = 0;
++	unsigned char *mode_str[3] = {"INVALID","TCP_PERF","ROUTE_PERF"};
+ 	nlm_nae_config_ptr nae_cfg;
+-	uint32_t cpu_mask[NLM_MAX_NODES];
+-	char buf[CPUMASK_BUF];
+ 
+-	for(i=0; i < NLM_MAX_NODES; i++)
+-		cpu_mask[i] = 0;
+-
+-	cpumask_scnprintf(buf, CPUMASK_BUF, &phys_cpu_present_map);
+-
+-	for (cpu = 0, node = 0; cpu < NR_CPUS ; cpu++) {
+-                if(!cpu_isset(cpu, phys_cpu_present_map))
+-                        continue;
+-		node = cpu / 32;
+-		cpu_mask[node] |= (1 << (cpu % 32));
++	if(!(perf_mode == NLM_TCP_MODE || perf_mode == NLM_RT_MODE)){
++		printk("Invalid perf mode passed -- Using TCP_PERF mode\n");
++		perf_mode = NLM_TCP_MODE;
+ 	}
+ 
+-
+ 	printk("======= Module Parameters =========\n");
+-	printk("debug = %d, frin_desc_thres=%d drop_uboot_pkt=%d\n",
+-	       debug, frin_desc_thres, drop_uboot_pkt);
+-	printk("rely_on_firmware_config = %d\n", rely_on_firmware_config);
++	printk("num_descs_perq=%d perf_mode=%s enable_napi=%d enable_lro=%d enable_jumbo=%d\n",
++	       num_descs_perq, mode_str[perf_mode], enable_napi, enable_lro, enable_jumbo);
+ 
+-	if (initialize_nae(cpu_mask[0], cpu_mask[1], cpu_mask[2], cpu_mask[3])) //FIXME find a better way to do this
+-		return;
+-	p2p_desc_mem_init();
++	/* msgring intr may not work in [8421]xxAx parts, disabling the napi */
++	if(is_nlm_xlp8xx_ax() && enable_napi) {
++		printk("NAPI cannot be enabled on XLP Ax parts\n");
++		enable_napi = 0;
++	}
++	
++	for(i=0; i<NR_CPUS; i++)
++		nlm_mode[CPU_INDEX(i)] = perf_mode;
+ 
+-	for (i = 0; i < ((node+1) * 32); i++) {
+-		//tasklet_init(&mac_frin_replenish_task[i], mac_frin_replenish, 0UL);
+-		INIT_WORK(&mac_frin_replenish_work[i], mac_frin_replenish);
++	/*Disable interrupts for VC - 0-127*/
++	for(i=0; i<NR_CPUS; i++){
++	        if(!cpu_isset(cpu, phys_cpu_present_map))
++                        continue;
++		phys_cpu_map[i / NLM_NCPUS_PER_NODE] |= (1 << (i % NLM_NCPUS_PER_NODE));
+ 	}
+ 
++	if(perf_mode == NLM_TCP_MODE)
++		p2p_desc_mem_init();
++
+ 	gen_mac_address();
+ 
+-	maxnae = nlm_node_cfg.num_nodes;
++	if (initialize_nae(phys_cpu_map, perf_mode, &enable_jumbo))
++		return;
++
++	maxnae = nlm_node_cfg.num_nodes;	
+ 	for(node = 0; node < maxnae; node++) {
+ 		nae_cfg = nlm_node_cfg.nae_cfg[node];
+ 		if (nae_cfg == NULL)
+@@ -819,13 +1076,14 @@ static void nlm_xlp_nae_init(void)
+ 		{
+ 			/* Register only valid ports which are management */
+ 			if (!nae_cfg->ports[i].valid)
+-			continue;
++				continue;
+ 
+-			dev = alloc_etherdev(sizeof(struct dev_data));
++			dev = alloc_etherdev_mq(sizeof(struct dev_data), maxnae * NLM_NCPUS_PER_NODE);
+ 			if(!dev)
+ 				return;
+ 
+ 			ether_setup(dev);
++			dev->tx_queue_len = 0;	/* routing gives good performance with tx_queue_len = 0; */
+ 
+ 			priv = netdev_priv(dev);
+ 			spin_lock_init(&priv->lock);
+@@ -835,67 +1093,85 @@ static void nlm_xlp_nae_init(void)
+ 			/* set ethtool_ops which is inside xlp_ethtool.c file*/
+ 			xlp_set_ethtool_ops(dev);
+ 
+-			/*netif_napi_add(dev, &priv->napi, nlm_xlp_napi_poll, 16);*/
+-
+-			dev->dev_addr = eth_hw_addr[node][i];
++			dev->dev_addr 	= eth_hw_addr[node][i];
+ 			priv->port	= i;
++			priv->hw_port_id = nae_cfg->ports[i].hw_port_id;
+ 
+-			priv->frin_desc_thres = nae_cfg->ports[i].num_free_desc / 3;
+-			atomic_set(&priv->frin_to_be_sent, nae_cfg->ports[i].num_free_desc);
+-			atomic_set(&priv->num_replenishes, 0);
+-			atomic_set(&priv->total_frin_sent, 0);
++			priv->inited	= 0;
++			priv->node 	= node;
++			priv->block	= nae_cfg->ports[i].hw_port_id / 4;
++			priv->type	= nae_cfg->ports[i].iftype;
+ 
+-			priv->inited = 0;
+-			priv->node = node;
+-			priv->block 	= nae_cfg->ports[i].hw_port_id / 4;
+-			priv->type = nae_cfg->ports[i].iftype;
+ 			switch(nae_cfg->ports[i].iftype) {
+ 				case SGMII_IF:
+ 					priv->index = nae_cfg->ports[i].hw_port_id & 0x3;
+ 					priv->phy.addr = nae_cfg->ports[i].hw_port_id;
+ 					break;
+ 				case XAUI_IF:
++					nlm_hal_write_mac_reg(priv->node, (nae_cfg->ports[i].hw_port_id / 4),
++							XGMAC, XAUI_MAX_FRAME_LEN , 0x01800600);
+ 					priv->index = XGMAC;
+ 					break;
+ 				case INTERLAKEN_IF:
+ 					priv->index = INTERLAKEN;
+ 					priv->phy.addr = nae_cfg->ports[i].ext_phy_addr;
+ 					if (nae_cfg->ports[i].hw_port_id == 0) {
+-                        	               if (dev_alloc_name(dev, "ilk0-%d") < 0)
+-                                	                printk("alloc name failed \n");
+-		                        }
+-                	                else {
+-                        	                if (dev_alloc_name(dev, "ilk8-%d") < 0)
+-                                	                printk("alloc name failed \n");
+-	                                }
++						if (dev_alloc_name(dev, "ilk0-%d") < 0)
++							printk("alloc name failed \n");
++					}
++					else {
++						if (dev_alloc_name(dev, "ilk8-%d") < 0)
++							printk("alloc name failed \n");
++					}
+ 					break;
+ 				default:
+ 					priv->index=0;
+ 					break;
+ 			}
+-			printk("port%d hw %d block %d index %d type %d \n",i, nae_cfg->ports[i].hw_port_id,
+-									priv->block, priv->index, priv->type);
+-			priv->nae_tx_qid 	= nae_cfg->ports[i].txq;
++			//nlm_print("port%d hw %d block %d index %d type %d \n",i, nae_cfg->ports[i].hw_port_id,
++			//							priv->block, priv->index, priv->type);
++			priv->nae_tx_qid	= nae_cfg->ports[i].txq;
+ 			priv->nae_rx_qid 	= nae_cfg->ports[i].rxq;
++			dev->features 		|= NETIF_F_LLTX;
+ 
+ 			register_netdev(dev);
+ 
+ 			dev_mac[node][i] = dev;
+ 			xlp_mac_setup_hwaddr(priv);
+ 
++			dummy_pktdata_addr[node] = nae_cfg->dummy_pktdata_addr;
++
++			for(cpu = 0; cpu<NR_CPUS; cpu++){
++				per_cpu_netdev[node][cpu][i] = dev;
++			}
++
+ 		}
+-		nlm_initialize_vfbid(node, nae_cfg->fb_vc);
+ 	}
+ 
+ 	entry = create_proc_read_entry("mac_stats", 0 /* def mode */ ,
+ 				       nlm_root_proc /* parent */ ,
+ 				       xlp_mac_proc_read /* proc read function */ ,
+-				       0	/* no client data */
+-		);
++				       0	/* no client data */);
+ 	if (!entry) {
+ 		printk("[%s]: Unable to create proc read entry for xlp_mac!\n",
+ 		       __FUNCTION__);
+ 	}
++	entry = create_proc_read_entry("nae_stat", 0, nlm_root_proc, nae_proc_read, 0);
++	if (!entry) {
++		printk("[%s]: Unable to create proc read entry for nae_proc!\n",
++		       __FUNCTION__);
++	}
++
++	if(!enable_napi) {
++		nlm_xlp_disable_napi();
++		/*spawn percpu kthread*/
++		nlm_spawn_kthread();
++	}
++
++	if(replenish_freein_fifos() != 0) {
++		printk("Replenishmemt of freein fifos failed\n");
++	}
++	return;
+ }
+ 
+ /**********************************************************************
+@@ -908,22 +1184,23 @@ static int  nlm_xlp_nae_open (struct net_device *dev)
+ 	struct dev_data *priv = netdev_priv(dev);
+ 	int i;
+ 	int ret = 0;
++	nlm_nae_config_ptr nae_cfg = nlm_node_cfg.nae_cfg[priv->node];
+ 
+-	if (priv->inited) return 0;
+-	tso_enable(dev, 1);
+-	dev->features |= NETIF_F_FRAGLIST | NETIF_F_HIGHDMA | NETIF_F_SG;
+-	//dev->features |= NETIF_F_IP_CSUM | NETIF_F_HW_CSUM;
+-
+-	ret = mac_fill_rxfr(dev);
+-	if (ret) goto out;
+-
+-	if(register_xlp_msgring_handler( XLP_MSG_HANDLE_NAE_0 , nlm_xlp_nae_msgring_handler, dev))
+-	{
+-		printk("Fatal error! Can't register msgring handler for TX_STN_GMAC0");
+-		ret = -1;
+-		goto out;
++	if(perf_mode == NLM_TCP_MODE) {
++#ifdef TSO_ENABLED
++		tso_enable(dev, 1);
++#endif
++		lro_init(dev);
+ 	}
+ 
++	if (priv->inited) {
++		spin_lock_irq(&priv->lock);
++		if(nae_cfg->owned)
++			nlm_xlp_mac_set_enable(priv, 1);
++		netif_tx_wake_all_queues(dev);
++		spin_unlock_irq(&priv->lock);
++		return 0;
++	}
+ 
+ #ifdef ENABLE_NAE_PIC_INT
+ 	{
+@@ -937,17 +1214,7 @@ static int  nlm_xlp_nae_open (struct net_device *dev)
+ 	}
+ #endif
+ 
+-	/* set timer to test rx routine */
+-	init_timer(&priv->link_timer);
+-	priv->link_timer.expires = jiffies + HZ ; /* First timer after 1 sec */
+-	priv->link_timer.data    = (unsigned long)((priv->node << 16) | priv->port);
+-	priv->link_timer.function = &nlm_xlp_mac_timer;
+-	priv->phy_oldlinkstat = -1;
+-
+ 	netif_tx_start_all_queues(dev);
+-//	add_timer(&priv->link_timer);
+-
+-/*	napi_enable(&priv->napi);*/
+ 
+ 	STATS_SET(priv->stats.tx_packets, 0);
+ 	STATS_SET(priv->stats.tx_errors, 0);
+@@ -962,186 +1229,155 @@ static int  nlm_xlp_nae_open (struct net_device *dev)
+ 
+ 	for(i = 0; i < NR_CPUS; i++)
+ 	{
+-		priv->cpu_stats[i].tx_packets	= 0;
+-		priv->cpu_stats[i].txc_packets	= 0;
+-		priv->cpu_stats[i].rx_packets	= 0;
+-		priv->cpu_stats[i].interrupts	= 0;
+-
+-	}
+-	priv->inited = 1;
+-	nlm_xlp_mac_set_enable(priv, 1);
+-
+- out:
+-	return ret;
+-}
+-
+-/**********************************************************************
+- * nlm_xlp_nae_stop -  called when bring down the interface
+- * @dev  -  this is per device based function
+- *
+- **********************************************************************/
+-static int  nlm_xlp_nae_stop (struct net_device *dev)
+-{
+-	struct dev_data *priv = netdev_priv(dev);
+-
+-	spin_lock_irq(&priv->lock);
+-	nlm_xlp_mac_set_enable(priv, 0);
+-	priv->inited = 0;
+-	del_timer_sync(&priv->link_timer);
+-
+-	netif_tx_stop_all_queues(dev);
+-
+-//	napi_disable(&priv->napi);
+-	spin_unlock_irq(&priv->lock);
+-	return 0;
+-}
+-
+-static int p2p_desc_mem_init(void)
+-{
+-	int cpu, cnt;
+-	int dsize, tsize;
+-	void *buf;
+-	/* MAX_SKB_FRAGS + 4.  Out of 4, 2 will be used for skb and freeback storage */
+-	dsize = ((((MAX_SKB_FRAGS + P2P_EXTRA_DESCS) * sizeof(uint64_t)) + CACHELINE_SIZE - 1) & (~((CACHELINE_SIZE)-1)));
+-	tsize = dsize * MAX_TSO_SKB_PEND_REQS;
+-
+-
+-	for(cpu = 0; cpu < NR_CPUS; cpu++) {
+-		buf = cacheline_aligned_kmalloc(tsize, GFP_KERNEL);
+-		//spin_lock_init(&p2p_desc_mem[cpu].lock);
+-		if (!buf)
+-			return -ENOMEM;
+-		p2p_desc_mem[cpu].mem = buf;
+-		for(cnt = 1; cnt < MAX_TSO_SKB_PEND_REQS; cnt++) {
+-			*(unsigned long *)buf = (unsigned long)(buf + dsize);
+-			buf += dsize;
+-			*(unsigned long *)buf = 0;
+-		}
++		priv->cpu_stats[i].tx_packets	= 0;
++		priv->cpu_stats[i].txc_packets	= 0;
++		priv->cpu_stats[i].rx_packets	= 0;
++		priv->cpu_stats[i].interrupts	= 0;
+ 
+-		p2p_desc_mem[cpu].dsize = dsize;
+ 	}
+-	return 0;
+-}
+ 
+-static inline void *alloc_p2p_desc_mem(int cpu)
+-{
+-	void *buf;
+-    	//unsigned long flags;
+-    	//spin_lock_irqsave(&p2p_desc_mem[cpu].lock, flags);
+-    	/*Disabling irq as the critical section shared between
+- 	inteerupt context and xmit path. */
+-    	local_irq_disable();
+-	buf = p2p_desc_mem[cpu].mem;
+-	if(buf) {
+-		p2p_desc_mem[cpu].mem = (void *)*(unsigned long *)(buf);
++	priv->inited = 1;
+ 
+-	} else {
+-		buf = cacheline_aligned_kmalloc(p2p_desc_mem[cpu].dsize, GFP_KERNEL);
+-		p2p_dynamic_alloc_cnt[CPU_INDEX(cpu)]++;
+-		//printk("alloc_p2p_desc_mem p2p_dynamic_alloc_cnt cpu=0x%x\n", cpu);
+-	}
+-    	local_irq_enable();
+-	//spin_unlock_irqrestore(&p2p_desc_mem[cpu].lock, flags);
+-	return buf;
+-}
++	if(nae_cfg->owned)
++		nlm_xlp_mac_set_enable(priv, 1);
+ 
+-static inline void free_p2p_desc_mem(int cpu, void *buf)
+-{
+-	unsigned long flags;
+-    	//spin_lock_irqsave(&p2p_desc_mem[cpu].lock, flags);
+-	*(unsigned long *)buf = (unsigned long)p2p_desc_mem[cpu].mem;
+-	p2p_desc_mem[cpu].mem = buf;
+-	//spin_unlock_irqrestore(&p2p_desc_mem[cpu].lock, flags);
++	return ret;
+ }
+ 
+-static inline int create_p2p_desc(uint64_t paddr, uint64_t len, uint64_t *p2pmsg, int idx)
++/**********************************************************************
++ * nlm_xlp_nae_stop -  called when bring down the interface
++ * @dev  -  this is per device based function
++ *
++ **********************************************************************/
++static int  nlm_xlp_nae_stop (struct net_device *dev)
+ {
+-	int plen;
+-	do {
+-		plen = len >= MAX_PACKET_SZ_PER_MSG ? (MAX_PACKET_SZ_PER_MSG - 64): len;
+-		p2pmsg[idx] = cpu_to_be64(nae_tx_desc(P2D_NEOP, 0, NULL_VFBID, plen, paddr));
+-		len -= plen;
+-		paddr += plen;
+-		idx++;
++	struct dev_data *priv = netdev_priv(dev);
++	nlm_nae_config_ptr nae_cfg = nlm_node_cfg.nae_cfg[priv->node];
+ 
+-	} while(len > 0);
+-	return idx;
+-}
++	spin_lock_irq(&priv->lock);
+ 
+-static inline void create_last_p2p_desc(uint64_t *p2pmsg, struct sk_buff *skb, int idx)
+-{
+-	p2pmsg[idx - 1] |= cpu_to_be64(((uint64_t)P2D_EOP << 62));
+-	p2pmsg[P2P_SKB_OFF] = (uint64_t)skb;
+-}
++	if(nae_cfg->owned)
++		nlm_xlp_mac_set_enable(priv, 0);
++	priv->inited = 0;
++	netif_tx_stop_all_queues(dev);
+ 
++	spin_unlock_irq(&priv->lock);
++	return 0;
++}
+ 
+-static int nlm_xlp_nae_start_xmit(struct sk_buff *skb, struct net_device *dev)
++/*This macro resets first 164 (offsetof(struct sk_buff, tail))bytes of skb header.*/
++#define fast_reset_skbptrs(skb) \
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 0) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 1) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 2) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 3) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 4) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 5) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 6) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 7) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 8) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 9) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 10) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 11) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 12) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 13) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 14) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 15) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 16) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 17) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 18) = 0;\
++		*(uint64_t *)(unsigned long)((uint64_t *)skb + 19) = 0;\
++		*(uint32_t *)(unsigned long)((uint64_t *)skb + 20) = 0;\
++/*
++ * This helper macro resets SKB data pointers for reuse
++ * as free-in buffer
++*/
++#define skb_reset_ptrs(skb) \
++do { \
++	struct skb_shared_info *shinfo; \
++	\
++	shinfo = skb_shinfo(skb); \
++	\
++	\
++	/* Now reinitialize old skb, cut & paste from dev_alloc_skb */ \
++	/*memset(skb, 0, offsetof(struct sk_buff, tail));*/ \
++	fast_reset_skbptrs(skb);\
++	skb->data = skb->head;  \
++	skb_reset_tail_pointer(skb);\
++	\
++	atomic_set(&shinfo->dataref, 1); \
++	shinfo->nr_frags  = 0; \
++	shinfo->gso_size = 0; \
++	shinfo->gso_segs = 0; \
++	shinfo->gso_type = 0; \
++	shinfo->ip6_frag_id = 0; \
++	shinfo->frag_list = NULL; \
++} while (0)
++
++static inline int tso_xmit_skb(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	int mss  = 0, idx = 0, len, i ;
+ 	struct skb_shared_info *sp = skb_shinfo(skb);
+ 	struct iphdr *iph;
+ 	struct dev_data *priv = netdev_priv(dev);
+ 	uint64_t msg, mscmsg0, mscmsg1;
+-	//unsigned int mflags;
+-	unsigned long *p2pdesc;
++	uint64_t *p2pdesc = NULL;
+ 	int cpu = hard_smp_processor_id();
+-	int  ret, retry_cnt = 0;
+-	unsigned long mflags = 0;
+-
++	int  ret, retry_cnt = 0, qid;
++	nlm_nae_config_ptr nae_cfg = nlm_node_cfg.nae_cfg[priv->node];
++	unsigned long __attribute__ ((unused)) mflags;
+ 
+ 	p2pdesc = alloc_p2p_desc_mem(cpu);
+ 	if(p2pdesc == NULL) {
+-		printk("Failed to allocate p2p desc\n");
+-		dev_kfree_skb_any(skb);
+ 		goto out_unlock;
+ 	}
+-	//printk("%s ipchksum_part= %d in gso_size %d nrfrags %d len %d p2pdesc %llx skb %llx headlen %d cpu=%d\n", __FUNCTION__, skb->ip_summed,
+-	//		sp->gso_size, sp->nr_frags, skb->len, (uint64_t)p2pdesc, (uint64_t)skb, skb_headlen(skb), cpu);
++	tso_dbg("%s in gso_size %d nrfrags %d len %d p2pdesc %llx skb %llx headlen %d\n", __FUNCTION__,
++			sp->gso_size, sp->nr_frags, skb->len, (uint64_t)p2pdesc, (uint64_t)skb, skb_headlen(skb));
++
+ 
+ 	if (((mss = sp->gso_size) != 0) || (skb->ip_summed == CHECKSUM_PARTIAL)) {
+-		u32 iphdroff, pyldoff, tcppcsum, udppcsum, l4hoff;
++		u32 iphdroff, tcphdroff, pyldoff, pcsum, tcp_packet = 1;
+ 
+ 		if (skb_header_cloned(skb) &&
+ 				pskb_expand_head(skb, 0, 0, GFP_ATOMIC)) {
+-			dev_kfree_skb_any(skb);
+-			free_p2p_desc_mem(cpu, p2pdesc);
+ 			goto out_unlock;
+ 		}
+ 
+ 		iph = ip_hdr(skb);
+ 		iphdroff = (char *)iph - (char *)skb->data;
+-		l4hoff = iphdroff + ip_hdrlen(skb);
+-
+-		if(ip_hdr(skb)->protocol == IPPROTO_UDP){
+-			pyldoff = iphdroff + ip_hdrlen(skb) + sizeof(struct udphdr);
+-			//printk("iphdroff %d udphdroff %d pyldoff %d\n", iphdroff, l4hoff, pyldoff);
+-			udppcsum = udp_pseuodo_chksum((uint16_t *)((char *)iph + 12));
+-			udp_hdr(skb)->check = 0;
+-		}else{
++		tcphdroff = iphdroff + ip_hdrlen(skb);
++		if(ip_hdr(skb)->protocol == 0x6) {
+ 			pyldoff = iphdroff + ip_hdrlen(skb) + sizeof(struct tcphdr) + tcp_optlen(skb);
+-			//printk("iphdroff %d tcphdroff %d pyldoff %d\n", iphdroff, l4hoff, pyldoff);
+-			tcppcsum = tcp_pseuodo_chksum(((uint16_t *)((char *)iph + 12)));
++			pcsum = pseuodo_chksum((uint16_t *)((char *)iph + 12), 0x6);
+ 			tcp_hdr(skb)->check = 0;
++		} else if(ip_hdr(skb)->protocol == 0x11) {
++			pyldoff = iphdroff + ip_hdrlen(skb) + sizeof(struct udphdr);
++			pcsum = pseuodo_chksum((uint16_t *)((char *)iph + 12), 0x11);
++			udp_hdr(skb)->check = 0;
++			tcp_packet = 0;
++		} else {
++			printk("Invalid packet in %s\n", __FUNCTION__);
++			goto out_unlock;
+ 		}
+ 
++		tso_dbg("iphdroff %d tcphdroff %d pyldoff %d\n", iphdroff, tcphdroff, pyldoff);
+ 		if(mss) {
+ 			iph->check = 0;
+ 			iph->tot_len = 0;
+ 			mscmsg0 = nae_tso_desc0(MSC, 1, TSO_IP_TCP_CHKSUM,
+-				iphdroff, l4hoff, (iphdroff + 10),
+-				tcppcsum, l4hoff + 16, pyldoff);
++				iphdroff, tcphdroff, (iphdroff + 10),
++				pcsum, tcphdroff + 16, pyldoff);
+ 			mscmsg1 = nae_tso_desc1(MSC, 2, 0, mss, 0, 0);
++		} else if(tcp_packet) {
++			mscmsg0 = nae_tso_desc0(MSC, 0, TCP_CHKSUM,
++				iphdroff, tcphdroff, (iphdroff + 10),
++				pcsum, tcphdroff + 16, pyldoff);
+ 		} else {
+-			if(ip_hdr(skb)->protocol == IPPROTO_UDP){
+-				mscmsg0 = nae_tso_desc0(MSC, 0, UDP_CHKSUM,
+-					iphdroff, l4hoff, (iphdroff + 10),
+-					udppcsum, l4hoff + 6, pyldoff);
+-			}else{
+-				mscmsg0 = nae_tso_desc0(MSC, 0, TCP_CHKSUM,
+-					iphdroff, l4hoff, (iphdroff + 10),
+-					tcppcsum, l4hoff + 16, pyldoff);
+-			}
++			mscmsg0 = nae_tso_desc0(MSC, 0, UDP_CHKSUM,
++				iphdroff, tcphdroff, (iphdroff + 10),
++				pcsum, tcphdroff + 6, pyldoff);
+ 		}
++
+ 	}
+ 
+ 	if((len = skb_headlen(skb)) != 0) {
+@@ -1150,15 +1386,21 @@ static int nlm_xlp_nae_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 
+ 	for (i = 0; i < sp->nr_frags; i++)  {
+ 		skb_frag_t *fp = &sp->frags[i];
+-		//printk("frags %d pageaddr %lx off %x size %d\n", i, (long)page_address(fp->page),
+-		//		fp->page_offset, fp->size);
++		tso_dbg("frags %d pageaddr %lx off %x size %d\n", i, (long)page_address(fp->page),
++				fp->page_offset, fp->size);
+ 		idx = create_p2p_desc(virt_to_bus(((char *)page_address(fp->page)) + fp->page_offset),
+ 				fp->size, p2pdesc, idx);
+ 	}
+ 
+ 	create_last_p2p_desc(p2pdesc, skb, idx);
+-	msg = nae_tx_desc(P2P, 0, cpu, idx, virt_to_bus(p2pdesc));
+ 
++	qid = nae_cfg->vfbtbl_sw_offset + (cpu % NLM_NCPUS_PER_NODE);
++	msg = nae_tx_desc(P2P, 0, qid, idx, virt_to_bus(p2pdesc));
++
++	tso_dbg("msg0 %llx p2pdesc0 %llx p2pdesc1 %llx p2pdesc2 %llx idx %d\n",
++			msg, p2pdesc[0], p2pdesc[1], p2pdesc[2], idx);
++
++	__sync();
+ retry_send:
+ 	msgrng_access_enable(mflags);
+ 	if(mss)
+@@ -1168,13 +1410,10 @@ retry_send:
+ 	else
+ 		ret = nlm_hal_send_msg1(priv->nae_tx_qid, 0, msg);
+ 	msgrng_access_disable(mflags);
+-	if(ret){
+-		//xlp_poll_upper(cpu);
++	if(ret)	{
++		xlp_poll_upper(cpu);
+ 		retry_cnt++;
+ 		if(retry_cnt >= 128) {
+-			dev_kfree_skb_any(skb);
+-			free_p2p_desc_mem(cpu, p2pdesc);
+-			STATS_ADD(priv->stats.tx_errors, 1);
+ 			goto out_unlock;
+ 		}
+ 		goto retry_send;
+@@ -1182,17 +1421,121 @@ retry_send:
+ 
+ 	dev->trans_start = jiffies;
+ 	STATS_ADD(priv->stats.tx_bytes, skb->len);
+-	STATS_ADD(priv->stats.tx_packets, 1);
+-	priv->cpu_stats[cpu].tx_packets += 1;
++	STATS_ADD(priv->stats.tx_packets, idx);
++	priv->cpu_stats[cpu].tx_packets += idx;
+ 
++	return NETDEV_TX_OK;
+ out_unlock:
+-	//if(ret)
+-	//	return NETDEV_TX_BUSY;
+-	//	printk("Failed to send the msg\n");
++
++	dev_kfree_skb_any(skb);
++	if(p2pdesc)
++		free_p2p_desc_mem(cpu, p2pdesc);
+ 	return NETDEV_TX_OK;
++}
++
++
++
++/**********************************************************************
++ * nlm_xlp_nae_start_xmit -  transmit a packet from buffer
++ * @dev  -  this is per device based function
++ * @skb  -  data buffer to send
++ **********************************************************************/
++static int nlm_xlp_nae_start_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct dev_data *priv = netdev_priv(dev);
++	int cpu = hard_smp_processor_id(), ret = 0;
++	uint64_t msg0, msg1;
++	int retry_count = 128;
++	volatile int hw_repl = 0;
++	int  offset, qid;
++	unsigned long __attribute__ ((unused)) mflags;
++	nlm_nae_config_ptr nae_cfg = nlm_node_cfg.nae_cfg[priv->node];
++
++
++#ifdef ENABLE_SANITY_CHECKS
++	if(!skb)
++	{
++		printk("[%s] skb is NULL\n",__FUNCTION__);
++		return -1;
++	}
++	if(skb->len == 0)
++	{
++		printk("[%s] skb empty packet\n",__FUNCTION__);
++		return -1;
++	}
++#endif
++#ifdef TSO_ENABLED
++	if(nlm_mode[CPU_INDEX(cpu)] == NLM_TCP_MODE){
++		return tso_xmit_skb(skb, dev);
++	}
++#endif
++
++#ifdef CONFIG_NLM_NET_OPTS
++	if(skb->netl_skb && (last_rcvd_skb[CPU_INDEX(cpu)] == skb->netl_skb)
++		&& !skb_shared(skb) && (last_rcvd_len[CPU_INDEX(cpu)] == skb->len)
++		&& !skb_cloned(skb) && nae_cfg->vfbtbl_hw_nentries)
++	{
++		last_rcvd_skb[CPU_INDEX(cpu)] = NULL;
++		last_rcvd_len[CPU_INDEX(cpu)] = 0;
+ 
++		qid = get_hw_frfifo_queue_id(last_rcvd_node[CPU_INDEX(cpu)], nae_cfg, cpu, skb->truesize);
++		msg0 = nae_tx_desc(P2D_NEOP, 0, qid,
++				0, last_rcvd_skb_phys[CPU_INDEX(cpu)]);
++		hw_repl = 1;
++
++		Message("Tx, tx complete to nae, cpu %d len %d qid %d\n", cpu, skb->len, qid);
++
++		fast_replenish_count[CPU_INDEX(cpu)]++;
++	}
++	else 
++#endif
++	{
++		qid = nae_cfg->vfbtbl_sw_offset + (cpu % NLM_NCPUS_PER_NODE);
++		msg0 = nae_tx_desc(P2D_NEOP, 0, qid, 0, virt_to_bus(skb));
++
++		Message("Tx, tx complete to cpu, cpu %d len %d qid %d\n", cpu, skb->len, qid);
++	}
++	msg1 = nae_tx_desc(P2D_EOP, 0, NULL_VFBID, skb->len,
++		       virt_to_bus(skb->data));
++	if(hw_repl) {
++		/* reset the skb for next rx */
++
++		//dst_release((struct dst_entry *)skb->_skb_dst);
++		skb_dst_drop(skb);
++
++		/* Reset all fields to 0, reset data pointers */
++		skb_reset_ptrs(skb);
++
++		offset = (((unsigned long)skb->data + CACHELINE_SIZE) & ~(CACHELINE_SIZE - 1));
++		skb_reserve(skb, (offset - (unsigned long)skb->data));
++
++		/*this buffer already has backptr...
++		mac_put_skb_back_ptr(skb); */
++		skb_reserve(skb, SKB_BACK_PTR_SIZE);
++	}
++
++
++retry_send:
++	msgrng_access_enable(mflags);
++	ret = nlm_hal_send_msg2(priv->nae_tx_qid, 0, msg0, msg1);
++	msgrng_access_disable(mflags);
++	if (ret)
++	{
++		xlp_poll_upper(cpu);
++		retry_count--;
++		if(retry_count){
++			goto retry_send;
++		}
++		dev_kfree_skb_any(skb);
++        }
++
++	dev->trans_start = jiffies;
++	STATS_ADD(priv->stats.tx_bytes, skb->len);
++	STATS_INC(priv->stats.tx_packets);
++
++	return NETDEV_TX_OK;
+ }
+-//#endif
++
+ /**********************************************************************
+  * nlm_xlp_set_multicast_list
+  *
+@@ -1213,8 +1556,6 @@ static void xlp_mac_setup_hwaddr(struct dev_data *priv)
+ {
+         struct net_device *dev = priv->dev;
+ 
+-	//dev->dev_addr[1] = priv->node;
+-
+         nlm_hal_write_mac_reg(priv->node, priv->block, priv->index, MAC_ADDR0_LO, (dev->dev_addr[5] << 24) |
+ 				(dev->dev_addr[4] << 16) | (dev->dev_addr[3] << 8) | (dev->dev_addr[2]));
+ 
+@@ -1248,29 +1589,44 @@ static int  nlm_xlp_nae_ioctl (struct net_device *dev, struct ifreq *rq, int cmd
+ 
+ /**********************************************************************
+  * nlm_xlp_nae_change_mtu
+- *
++ * @dev   -  this is per device based function
++ * @new_mtu -  this is new mtu to be set for the device
+  **********************************************************************/
+ static int nlm_xlp_nae_change_mtu(struct net_device *dev, int new_mtu)
+ {
+ 	struct dev_data *priv = netdev_priv(dev);
+ 	unsigned long flags;
+-	unsigned long local_jumbo_mtu;
++	unsigned long local_mtu;
++	nlm_nae_config_ptr nae_cfg = nlm_node_cfg.nae_cfg[priv->node];
++
++	if (enable_jumbo && (new_mtu > ETH_JUMBO_DATA_LEN || new_mtu < ETH_ZLEN)) {
++		printk ("MTU should be between %d and %d\n", ETH_ZLEN, ETH_JUMBO_DATA_LEN);
++		return -EINVAL;
++	}
+ 
+-	if ((new_mtu > (DEFAULT_JUMBO_MTU * MAX_SKB_FRAGS)) || (new_mtu < MIN_ETH_FRAME_SIZE)) {
++	if (!enable_jumbo && (new_mtu > ETH_DATA_LEN || new_mtu < ETH_ZLEN)) {
++		printk ("MTU should be between %d and %d\n", ETH_ZLEN, ETH_DATA_LEN);
+ 		return -EINVAL;
+ 	}
++
+ 	spin_lock_irqsave(&priv->lock, flags);
+ 
+-	local_jumbo_mtu = new_mtu + ETH_HLEN + ETH_FCS_LEN;
+-	local_jumbo_mtu = (local_jumbo_mtu + SMP_CACHE_BYTES) & ~(SMP_CACHE_BYTES - 1);
++	local_mtu = (new_mtu+ETH_HLEN+ETH_FCS_LEN+SMP_CACHE_BYTES) & ~(SMP_CACHE_BYTES - 1);
++	if (netif_running(dev))
++	{
++		netif_tx_stop_all_queues (dev);
++		if(nae_cfg->owned)
++			nlm_xlp_mac_set_enable(priv, 0); /* Disable MAC TX/RX */
++	}
++
+ 	if(priv->type==SGMII_IF){
+-		nlm_hal_set_sgmii_framesize(priv->node, priv->block, priv->index, local_jumbo_mtu);
++		nlm_hal_set_sgmii_framesize(priv->node, priv->block, priv->index, local_mtu);
+ 	}
+ 	else if(priv->type==XAUI_IF){
+-		nlm_hal_set_xaui_framesize(priv->node, priv->block, local_jumbo_mtu, local_jumbo_mtu);
++		nlm_hal_set_xaui_framesize(priv->node, priv->block, local_mtu, local_mtu);
+ 	}
+-	else if(priv->type == INTERLAKEN_IF) {
+-		nlm_hal_set_ilk_framesize(priv->node, priv->block, priv->phy.addr, local_jumbo_mtu);
++	else if(priv->type==INTERLAKEN_IF){
++		nlm_hal_set_ilk_framesize(priv->node, priv->block, priv->phy.addr, local_mtu);
+ 	}
+ 	else {
+ 		spin_unlock_irqrestore(&priv->lock, flags);
+@@ -1279,13 +1635,11 @@ static int nlm_xlp_nae_change_mtu(struct net_device *dev, int new_mtu)
+ 
+ 	dev->mtu = new_mtu;
+ 
+-	if (netif_running(dev)) {
+-		/* Disable MAC TX/RX */
+-		nlm_xlp_mac_set_enable(priv, 0);
+-
+-		/* Flush RX FR IN */
+-		/* Flush TX IN */
+-		nlm_xlp_mac_set_enable(priv, 1);
++	if (netif_running(dev))
++	{
++		netif_tx_start_all_queues (dev);
++		if(nae_cfg->owned)
++			nlm_xlp_mac_set_enable(priv, 1);
+ 	}
+ 
+ 	spin_unlock_irqrestore(&priv->lock, flags);
+@@ -1322,7 +1676,7 @@ static void  nlm_xlp_nae_tx_timeout (struct net_device *dev)
+ 
+ 	spin_lock_irq(&priv->lock);
+ 
+-	STATS_ADD(priv->stats.tx_errors, 1);
++	priv->stats.tx_errors++;
+ 
+ 	spin_unlock_irq(&priv->lock);
+ 
+@@ -1359,7 +1713,6 @@ static int nlm_xlp_nae_set_hwaddr(struct net_device *dev, void *p)
+ 	return rc;
+ }
+ 
+-
+ #ifdef ENABLE_NAE_PIC_INT
+ /**********************************************************************
+  * nlm_xlp_nae_int_handler -  interrupt handler
+@@ -1392,294 +1745,6 @@ static irqreturn_t nlm_xlp_nae_int_handler(int irq, void *dev_id)
+ }
+ #endif
+ 
+-
+-
+-/**********************************************************************
+- * nlm_xlp_nae_msgring_handler -  message ring interrupt handler
+- * @vc-  virtual channel number
+- * @dev_id  -  this device
+- *
+- **********************************************************************/
+-static void nlm_xlp_nae_msgring_handler(uint32_t vc, uint32_t src_id,
+-					uint32_t size, uint32_t code,
+-					uint64_t msg0, uint64_t msg1,
+-					uint64_t msg2, uint64_t msg3, void* data)
+-{
+-        struct net_device *pdev;
+-        struct dev_data *priv;
+-	unsigned int len, hlen, port = 0, context;
+-        uint64_t addr , vaddr = 0;
+-	struct sk_buff* skb;
+-	struct jumbo_rx_cookie *rx_cookie = NULL;
+-	int cpu = 0, node = 0;
+-	uint64_t *p2pfbdesc;
+-
+-	cpu = hard_smp_processor_id();
+-	vc = vc & 0x03;
+-
+-	if (debug) {
+-		printk("[%s] src_id=%d vc = %d, size = %d, entry0=%llx entry1=%llx\n", __func__,
+-		       src_id, vc, size, msg0, msg1);
+-	}
+-
+-	if( vc == nae_fb_vc && size == 1)
+-	{
+-		/* Process Transmit Complete, addr is the skb pointer */
+-		addr = msg0 & 0xffffffffffULL;
+-
+-
+-		if (!addr || drop_uboot_pkt) {
+-			if ( (addr >= (192<<20)) && (addr < (256 << 20)) ) {
+-				printk("Dropping firmware TXC packet (addr=%llx)!\n", addr);
+-				stats_uboot_pkts++;
+-				return;
+-			}
+-		}
+-		node = (src_id >> 10) & 0x3;
+-		context = (msg0 >> 40) & 0x3fff;
+-		port = *(cntx2port[node] + context);
+-		//nlm_xlp_free_skb(addr, port);
+-//#if 0
+-		p2pfbdesc = bus_to_virt(addr);
+-		skb = (struct sk_buff *)(p2pfbdesc[P2P_SKB_OFF]);
+-		priv = netdev_priv(skb->dev);
+-		free_p2p_desc_mem(cpu, p2pfbdesc);
+-		//schedule_work(&tx_free_buffer_work[cpu]);
+-		if(skb)
+-			dev_kfree_skb_any(skb);
+-		priv->cpu_stats[cpu].txc_packets++;
+-//#endif
+-#if 0
+-
+-		/* context field is currently unused */
+-		context = (msg0 >> 40) & 0x3fff;
+-		port = cntx2port[context];
+-#ifdef DEBUG_CONTEXT_PORT_MAPPING
+-                if (port == 0) printk("FB context %d port %d \n",context, port);
+-#endif
+-		skb = (struct sk_buff *)bus_to_virt(addr);
+-		if(skb)
+-		{
+-			priv = netdev_priv(skb->dev);
+-
+-			if (debug) {
+-				printk("[%s][TXC] addr=%llx, skb=%p, context=%d, port=%d\n",
+-				       __func__, addr, skb, context, port);
+-			}
+-			dev_kfree_skb_any(skb);
+-
+-			priv->cpu_stats[cpu].txc_packets++;
+-		}
+-		else {
+-			printk("[%s]: [txc] Null skb? paddr = %llx (halting cpu!)\n", __func__, addr);
+-			cpu_halt();
+-		}
+-#endif
+-	}
+-	else if(vc == nae_rx_vc && size == 2)
+-	{
+-		int bad_pkt = 0;
+-		int is_p2p, num_p2d=0, tot_desc=0, idx;
+-		int err = (msg1 >> 4) & 0x1;
+-		int ip_csum_valid = (msg1 >> 3) & 0x1;
+-		int tcp_csum_valid = (msg1 >> 2) & 0x1;
+-		uint64_t p2d_addr[MAX_SKB_FRAGS];
+-		uint32_t p2d_len[MAX_SKB_FRAGS];
+-
+-		/* Rx packet */
+-		is_p2p  = msg1 & 0x1;
+-		addr	= msg1 & 0xffffffffe0ULL;
+-		len	= (msg1 >> 40) & 0x3fff;
+-		context = (msg1 >> 54) & 0x3ff;
+-		if(is_p2p){
+-			num_p2d = len;
+-			//printk("P2p size=0x%x\n", len);
+-		}
+-		//printk("[%s] src_id=%d vc = %d, size = %d, entry0=%llx entry1=%llx\n", __func__,
+-                //       src_id, vc, size, msg0, msg1);
+-
+-#ifdef DEBUG_RXPKT_ADDR_NULL
+-		if (addr == 0) {
+-			printk("Rcvd pkt address NULL !!!\n");
+-			printk("[%s] src_id=%d vc = %d, size = %d, entry0=%llx entry1=%llx\n", __func__,
+-                       src_id, vc, size, msg0, msg1);
+-			return;
+-		}
+-#endif
+-		if (err) bad_pkt = 1;
+-
+-
+-		if (drop_uboot_pkt) {
+-			if ( (addr >= (192<<20)) && (addr < (256 << 20)) ) {
+-				printk("Dropping firmware RX packet (addr=%llx)!\n", addr);
+-				stats_uboot_pkts++;
+-				return;
+-			}
+-		}
+-
+-		node = (src_id >> 10) & 0x3;
+-		port = *(cntx2port[node] + context);
+-
+-#ifdef DEBUG_CONTEXT_PORT_MAPPING
+-		if (port == 0) printk("Rx context %d port %d \n",context, port);
+-#endif
+-		if(port >= MAX_GMAC_PORT)
+-		{
+-			printk("[%s]: bad port=%d, context=%d\n", __func__, port, context);
+-			return;
+-		}
+-
+-		pdev = (struct net_device*)dev_mac[node][port];
+-		if(!pdev) {
+-			printk("[%s]: [rx] wrong port=%d(context=%d)? pdev = NULL!\n", __func__, port, context);
+-			return;
+-		}
+-		priv = netdev_priv(pdev);
+-
+-		/*check what kind of desc we received*/
+-		if(is_p2p){
+-			uint64_t p2d;
+-			int idx;
+-			struct page *pg;
+-			//printk("Total p2d in p2p desc are = 0x%x\n", len);
+-			num_p2d = len;
+-			len = 0;
+-			rx_cookie = get_rx_cookie(addr);
+-			pg = rx_cookie->page;
+-			/*free page count for P2P desc as it is not going to network stack */
+-			/*Get actual length*/
+-			for(idx=0; idx<num_p2d; idx++){
+-				vaddr = (uint64_t)bus_to_virt(addr + (8*idx)); //got p2d virt addr
+-				p2d = be64_to_cpu(*(uint64_t*)vaddr);
+-				p2d_addr[idx] = p2d & 0xffffffffe0ULL;
+-				p2d_len[idx] = (p2d >> 40) & 0x3fff;
+-				bad_pkt |= (p2d >> 4) & 0x1;
+-				len += (p2d >> 40) & 0x3fff;
+-				//printk("P2D is at = 0x%lx physbuff= 0x%lx len= 0x%x\n", vaddr, p2d_addr[idx],  p2d_len[idx] );
+-			}
+-			tot_desc = num_p2d +1; //p2ds + p2p
+-			put_page(pg);
+-			//printk("Total packet length is = 0x%x and desc = 0x%x\n", len, tot_desc);
+-		}else{ /*only one P2Dl_skb*/
+-			vaddr = (uint64_t)bus_to_virt(addr);
+-			p2d_addr[0] = addr;
+-			p2d_len[0] = len - MAC_CRC_LEN;
+-			len = len - MAC_CRC_LEN;
+-			num_p2d = 1;
+-			tot_desc = 1;
+-			//printk("P2D  len = %d\n", len);
+-		}
+-
+-		if (debug) {
+-			printk("[%s][RX] addr=%llx, len=%d, context=%d, port=%d, vaddr=%llx\n",
+-			       __func__, addr, len, context, port, vaddr);
+-		}
+-
+-		DUMP_PKT("RX Packet: ", (unsigned char *)vaddr, len);
+-		if (bad_pkt) {
+-			struct page *pg;
+-			int rx_offset;
+-			STATS_INC(priv->stats.rx_dropped);
+-			/*increase free count for used pages*/
+-			for(idx=0; idx<num_p2d; idx++){
+-				rx_cookie = get_rx_cookie(p2d_addr[idx]);
+-				rx_offset =  JUMBO_RX_OFFSET;
+-				pg = rx_cookie->page;
+-				put_page(pg);
+-			}
+-			mac_frin_replenish_msgs(dev_mac[node][port], tot_desc);
+-			return;
+-		}
+-		mac_frin_replenish_msgs(dev_mac[node][port], tot_desc);
+-
+-		/* allocate an skb for header */
+-		skb = dev_alloc_skb(NETL_JUMBO_SKB_HDR_LEN + 16);
+-		if(skb == NULL) {
+-			printk("FAILED TO ALLOCATE skb\n");
+-			STATS_INC(priv->stats.rx_dropped);
+-
+-			recycle_rx_desc(addr, pdev);
+-			return;
+-		}
+-		skb->dev = dev_mac[node][port];
+-		hlen = (len > NETL_JUMBO_SKB_HDR_LEN) ?
+-				NETL_JUMBO_SKB_HDR_LEN: len;
+-		/* after this call, skb->data is pointing to start of MAChdr */
+-		build_skb(skb, &p2d_addr[0], &p2d_len[0], num_p2d, hlen, len);
+-		if (hlen == len) {
+-			put_page(skb_shinfo(skb)->frags[0].page);
+-			skb_shinfo(skb)->nr_frags = 0;
+-			skb->data_len = 0;
+-		}
+-		skb->protocol = eth_type_trans(skb, skb->dev);
+-		skb->dev->last_rx = jiffies;
+-		netif_receive_skb(skb);
+-		/* Update Stats */
+-		STATS_ADD(priv->stats.rx_bytes, len);
+-		STATS_INC(priv->stats.rx_packets);
+-		priv->cpu_stats[cpu].rx_packets++;
+-		return;
+-#if 0
+-
+-		skb = mac_get_skb_back_ptr(vaddr);
+-		if (!skb) {
+-			STATS_INC(priv->stats.rx_errors);
+-			STATS_INC(priv->stats.rx_dropped);
+-			printk("[%s] Null skb? addr=%llx, vaddr=%llx, drop it!\n",
+-			       __func__, addr, vaddr);
+-			cpu_halt();
+-			return;
+-		}
+-
+-		if (debug) {
+-			struct iphdr *iph = (struct iphdr *)(vaddr + 14);
+-			int net_pkt_len = iph->tot_len + 14;
+-			int eth_proto = *(unsigned short *)(vaddr + 12);
+-
+-			if ((eth_proto == 0x800) && (net_pkt_len != len)) bad_pkt = 1;
+-
+-			if (bad_pkt) {
+-				printk("[%s]: vaddr=%llx (len:%d/%d) (ip:proto=%d) (%d/%d/%d))\n",
+-				       __func__, vaddr, net_pkt_len, len, iph->protocol,
+-				       err, ip_csum_valid, tcp_csum_valid);
+-			}
+-		}
+-
+-		if (bad_pkt) {
+-			STATS_INC(priv->stats.rx_errors);
+-			STATS_INC(priv->stats.rx_dropped);
+-
+-			dev_kfree_skb_any(skb);
+-			goto out;
+-		}
+-
+-		skb_put(skb, len);
+-		skb->dev = dev_mac[port];
+-		skb->protocol = eth_type_trans(skb, dev_mac[port]);
+-		skb->dev->last_rx = jiffies;
+-
+-		/* Pass the packet to Network stack */
+-		netif_rx (skb);
+-
+-		/* Update Stats */
+-		STATS_ADD(priv->stats.rx_bytes, len);
+-		STATS_INC(priv->stats.rx_packets);
+-		priv->cpu_stats[cpu].rx_packets++;
+-
+-	out:
+-		if (atomic_inc_ret(&priv->frin_to_be_sent) > priv->frin_desc_thres)
+-		{
+-			tasklet_schedule(&mac_refill_task[port]);
+-			//mac_refill_frin_desc((unsigned long) skb->dev) ;
+-		}
+-#endif
+-	} else {
+-		printk("[%s]: wrong vc=%d or size=%d?\n", __func__, vc, size);
+-	}
+-
+-	return;
+-}
+-
+ /**********************************************************************
+  * xlp_mac_proc_read -  proc file system read routine
+  * @page     -  buffer address
+@@ -1691,51 +1756,42 @@ static int xlp_mac_proc_read(char *page, char **start, off_t off,
+ {
+ 	int len = 0;
+ 	off_t begin = 0;
+-	int i = 0, cpu = 0;
++	int i = 0, cpu = 0, node;
+ 	struct net_device *dev = 0;
+ 	struct dev_data *priv = 0;
+ 
+-	len += sprintf(page + len, "uboot_pkts = %ld\n", stats_uboot_pkts);
+-
+-	for (i = 0; i < MAX_GMAC_PORT; i++) {
++	for(node = 0; node < NLM_MAX_NODES; node++) {
++		for (i = 0; i < MAX_GMAC_PORT; i++) {
+ 
+-		dev = dev_mac[i];
+-
+-		if(dev == 0) continue;
++			dev = dev_mac[node][i];
+ 
+-		priv = netdev_priv(dev);
++			if(dev == 0) continue;
+ 
+-		len += sprintf(page + len, "=============== port@%d ==================\n", i);
++			priv = netdev_priv(dev);
+ 
+-		len += sprintf(page + len, "per port@%d: frin_to_be_sent = %ld num_replenishes = %ld frin_sent = %ld\n",
+-			       i, atomic_read(&priv->frin_to_be_sent),
+-			       atomic_read(&priv->num_replenishes),
+-			       atomic_read(&priv->total_frin_sent));
++			len += sprintf(page + len, "=============== port@%d ==================\n", i);
+ 
+-		len += sprintf(page + len,
+-			       "per port@%d: %lu(rxp) %lu(rxb) %lu(txp) %lu(txerr) %lu(txb)\n",
+-			       i,
+-			       STATS_READ(priv->stats.rx_packets),
+-			       STATS_READ(priv->stats.rx_bytes),
+-			       STATS_READ(priv->stats.tx_packets),
+-			       STATS_READ(priv->stats.tx_errors),
+-			       STATS_READ(priv->stats.tx_bytes));
++			len += sprintf(page + len,
++					"per port@%d: %lu(rxp) %lu(rxb) %lu(txp) %lu(txb)\n",
++					i,
++					STATS_READ(priv->stats.rx_packets),
++					STATS_READ(priv->stats.rx_bytes),
++					STATS_READ(priv->stats.tx_packets),
++					STATS_READ(priv->stats.tx_bytes));
+ 
+-		for (cpu = 0; cpu < NR_CPUS ; cpu++) {
+-			unsigned long tx = priv->cpu_stats[cpu].tx_packets;
+-			unsigned long txc = priv->cpu_stats[cpu].txc_packets;
+-			unsigned long rx = priv->cpu_stats[cpu].rx_packets;
+-			unsigned long ints = priv->cpu_stats[cpu].interrupts;
++			for (cpu = 0; cpu < NR_CPUS ; cpu++) {
++				unsigned long tx = priv->cpu_stats[cpu].tx_packets;
++				unsigned long txc = priv->cpu_stats[cpu].txc_packets;
++				unsigned long rx = priv->cpu_stats[cpu].rx_packets;
++				unsigned long ints = priv->cpu_stats[cpu].interrupts;
+ 
+-			if (!tx && !txc && !rx && !ints) continue;
++				if (!tx && !txc && !rx && !ints) continue;
+ 
+-			len += sprintf(page + len, "per cpu@%d: %lu(txp) %lu(txcp) %lu(rxp) %lu(int)\n",
+-				       cpu, tx, txc, rx, ints);
++				len += sprintf(page + len, "per cpu@%d: %lu(txp) %lu(txcp) %lu(rxp) %lu(int)\n",
++						cpu, tx, txc, rx, ints);
++			}
+ 		}
+ 	}
+-	for (cpu = 0; cpu < NR_CPUS; cpu++) {
+-		len += sprintf(page + len, "per cpu@%d: %lu(p2p_dynamic_alloc_cnt)\n", cpu ,p2p_dynamic_alloc_cnt[CPU_INDEX(cpu)]);
+-	}
+ 
+ 	*eof = 1;
+ 
+@@ -1749,47 +1805,7 @@ static int xlp_mac_proc_read(char *page, char **start, off_t off,
+ 	return len;
+ }
+ 
+-/**********************************************************************
+- * nlm_xlp_mac_timer - interrupt handler routine
+- * @data - parameter passed in when timer interrupt handler is called.
+- **********************************************************************/
+-static void nlm_xlp_mac_timer(unsigned long data)
+-{
+-	unsigned port = data & 0xffff;
+-	unsigned node = (data >> 16) & 0xffff;
+-        struct net_device *dev = (struct net_device *)dev_mac[node][port];
+-        struct dev_data *priv = netdev_priv(dev);
+-        int next_tick = HZ / 1000; /* 1ms */
+-
+-	/* printk("[%s] A0 Workaround, forcing FMN int handling \n",__func__); */
+-#ifdef XLP_MSGRNG_TIMER
+-	if (priv->inited)
+-	{
+-		uint32_t cpumask = cpumask_to_uint32(&cpu_present_map); /* doesn't handle non-n0 nodes */
+-		uint32_t cpumask_lo;
+-		uint32_t cpumask_hi;
+-
+-		pic_reg_t *mmio = nlm_hal_pic_offset();
+-		int cpu = hard_smp_processor_id();
+-
+-		cpumask = cpumask & ~(1 << cpu);
+-		cpumask_hi = cpumask >> 16;;
+-		cpumask_lo = cpumask & 0xffff;
+-
+-		/* Send IRQ_MSGRING vector in an IPI to all cpus but the current one */
+-		if (cpumask_lo)
+-			nlm_hal_write_pic_reg(mmio, PIC_IPI_CTL, (XLP_IRQ_MSGRING_RVEC << 20) | cpumask_lo );
+ 
+-		if (cpumask_hi)
+-			nlm_hal_write_pic_reg(mmio, PIC_IPI_CTL, (XLP_IRQ_MSGRING_RVEC << 20) | (1 << 16) | (cpumask_hi));
+-
+-		/* Run IPI handler on this cpu too */
+-		nlm_xlp_msgring_int_handler(XLP_IRQ_MSGRING_RVEC, NULL);
+-	}
+-#endif
+-        priv->link_timer.expires = jiffies + next_tick;
+-        add_timer(&priv->link_timer);
+-}
+ 
+ static int __devinit nlm_xlp_nae_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ {
+@@ -1805,11 +1821,12 @@ static int __devinit nlm_xlp_nae_pci_probe(struct pci_dev *pdev, const struct pc
+  **********************************************************************/
+ static void nlm_xlp_nae_remove(void)
+ {
+-	int i,node;
++	int i;
+ 	struct net_device *dev = 0;
+         struct dev_data *priv = 0;
++	int node = 0;
+ 
+-	for(node=0; node< maxnae ; node++) {
++	for(node = 0; node < NLM_MAX_NODES; node++) {
+ 		for (i = 0; i < MAX_GMAC_PORT; i++)
+ 		{
+ 			dev = dev_mac[node][i];
+@@ -1817,7 +1834,6 @@ static void nlm_xlp_nae_remove(void)
+ 			if (dev == 0) continue;
+ 
+ 			priv = netdev_priv(dev);
+-			//netif_napi_del(&priv->napi);
+ 			unregister_netdev(dev);
+ 			free_netdev(dev);
+ 		}
+@@ -1836,8 +1852,12 @@ static struct pci_driver soc_driver = {
+ 
+ static int __init nlm_xlp_mac_init(void)
+ {
++
+ 	nlm_xlp_nae_init();
+ 
++	if(enable_napi)
++		nlm_xlp_enable_napi();
++
+ 	return pci_register_driver(&soc_driver);
+ }
+ 
+diff --git a/drivers/net/ethernet/broadcom/nae/xlp_nae.h b/drivers/net/ethernet/broadcom/nae/xlp_nae.h
+index e191842..fb27dd5 100644
+--- a/drivers/net/ethernet/broadcom/nae/xlp_nae.h
++++ b/drivers/net/ethernet/broadcom/nae/xlp_nae.h
+@@ -1,23 +1,41 @@
+ #ifndef _XLP_NAE_H
+ #define _XLP_NAE_H
+ 
+-#define MAC_MAX_FRAME_SIZE      9214
+-#define MAC_SKB_BACK_PTR_SIZE   SMP_CACHE_BYTES
++#if 0
++/*
++ *      IEEE 802.3 Ethernet magic constants.  The frame sizes omit the preamble
++ *      and FCS/CRC (frame check sequence).
++ */
+ 
++#define ETH_ALEN        6               /* Octets in one ethernet addr   */
++#define ETH_HLEN        14              /* Total octets in header.       */
++#define ETH_ZLEN        60              /* Min. octets in frame sans FCS */
++#define ETH_DATA_LEN    1500            /* Max. octets in payload        */
++#define ETH_FRAME_LEN   1514            /* Max. octets in frame sans FCS */
++#define ETH_FCS_LEN     4               /* Octets in the FCS             */
++#endif
+ 
+ #define MAC_PREPAD		0
+-#define BYTE_OFFSET             2
+-#define NLM_RX_BUF_SIZE (MAC_MAX_FRAME_SIZE+BYTE_OFFSET+MAC_PREPAD+MAC_SKB_BACK_PTR_SIZE+SMP_CACHE_BYTES)
+-#define MAC_CRC_LEN             4
+-#define CACHELINE_SIZE          (1ULL << 6)
+-#define CACHELINE_ALIGNED(addr) ( ((addr) + (CACHELINE_SIZE-1)) & ~(CACHELINE_SIZE-1) )
+-#define PHYS_TO_VIRT(paddr) (uint64_t)((paddr) - (netlib_paddrb) + (netlib_vaddrb))
+-#define VIRT_TO_PHYS(vaddr) (uint64_t)((vaddr) - (netlib_vaddrb) + (netlib_paddrb))
+-extern  unsigned long long netlib_vaddrb;
++#define BYTE_OFFSET		2
++#define ETH_JUMBO_DATA_LEN	16000
++
++#define CACHELINE_SIZE		(1ULL << 6)
++#define CACHELINE_ALIGNED(addr)	( ((addr) + (CACHELINE_SIZE-1)) & ~(CACHELINE_SIZE-1) )
++
++#define SKB_BACK_PTR_SIZE	CACHELINE_SIZE
++
++#define NLM_RX_ETH_BUF_SIZE	(ETH_DATA_LEN+ETH_HLEN+ETH_FCS_LEN+BYTE_OFFSET+MAC_PREPAD+SKB_BACK_PTR_SIZE+CACHELINE_SIZE)
++#define NLM_RX_JUMBO_BUF_SIZE	(ETH_JUMBO_DATA_LEN+ETH_HLEN+ETH_FCS_LEN+BYTE_OFFSET+MAC_PREPAD+SKB_BACK_PTR_SIZE+CACHELINE_SIZE)
++
++extern unsigned long long netlib_vaddrb;
+ extern unsigned long long netlib_paddrb;
+-#define PADDR_BASE 0x100000ULL
+-#define PADDR_SIZE 0x200000
+ #define INIT_VBASE( vbase, pbase) {netlib_vaddrb = vbase ; netlib_paddrb = pbase;}
++#define PHYS_TO_VIRT(paddr) 	(uint64_t)((paddr) - (netlib_paddrb) + (netlib_vaddrb))
++#define VIRT_TO_PHYS(vaddr) 	(uint64_t)((vaddr) - (netlib_vaddrb) + (netlib_paddrb))
++
++#define PADDR_BASE		0x100000ULL
++#define PADDR_SIZE		0x200000
++#define LRO_MAX_DESCS		8
+ 
+ struct cpu_stat {
+         unsigned long tx_packets;
+@@ -26,7 +44,6 @@ struct cpu_stat {
+         unsigned long interrupts;
+ };
+ 
+-
+ typedef enum xlp_net_types { TYPE_XLP_GMAC = 0, TYPE_XLP_XGMAC, TYPE_XLP_XAUI, TYPE_XLP_INTERLAKEN, MAX_XLP_NET_TYPES }xlp_interface_t;
+ 
+ typedef enum { xlp_mac_speed_10, xlp_mac_speed_100,
+@@ -65,10 +82,6 @@ struct dev_data
+         unsigned short type;
+         struct sk_buff* skb;
+         int phy_oldlinkstat;
+-	uint32_t  frin_desc_thres;
+-        atomic_t frin_to_be_sent;
+-	atomic_t num_replenishes;
+-	atomic_t total_frin_sent;
+         __u8 hwaddr[6];
+ 
+         xlp_mac_speed_t speed;  /* current speed */
+@@ -78,6 +91,83 @@ struct dev_data
+         struct phy_info phy;
+         int nae_rx_qid;
+         int nae_tx_qid;
++	int hw_port_id;
++	struct net_lro_mgr lro_mgr[NR_CPUS];
++	struct net_lro_desc lro_arr[NR_CPUS][LRO_MAX_DESCS];
+ };
+ 
++static inline void prefetch_local(const void *addr)
++{
++        __asm__ __volatile__(
++        "       .set    mips4           \n"
++        "       pref    %0, (%1)        \n"
++        "       .set    mips0           \n"
++        :
++        : "i" (Pref_StoreStreamed), "r" (addr));
++}
++
++/**********************************************************************
++ * nlm_xlp_alloc_skb_atomic -  Atomically allocates 64 bits cache aligned skb buffer
++ * return - skb buffer address
++ *
++ **********************************************************************/
++static __inline__ struct sk_buff *nlm_xlp_alloc_skb_atomic(int length, int node)
++{
++        int offset = 0;
++	gfp_t gfp_mask = GFP_ATOMIC;
++
++#if defined(CONFIG_NLM_COMMON) && defined(CONFIG_64BIT)
++	struct sk_buff *skb = __alloc_skb(length + NET_SKB_PAD, gfp_mask|GFP_DMA, 0, node);
++#else
++	struct sk_buff *skb = __alloc_skb(length + NET_SKB_PAD, gfp_mask, 0, node);
++#endif
++        if (!skb) 
++                return NULL;
++
++	skb_reserve(skb, NET_SKB_PAD);
++
++        /* align the data to the next cache line */
++        offset = ((unsigned long)skb->data + CACHELINE_SIZE) &
++                ~(CACHELINE_SIZE - 1);
++        skb_reserve(skb, (offset - (unsigned long)skb->data));
++#ifdef CONFIG_NLM_NET_OPTS
++        skb->netl_skb = skb;
++#endif
++        return skb;
++}
++
++static __inline__ void mac_put_skb_back_ptr(struct sk_buff *skb)
++{
++        uint64_t *back_ptr = (uint64_t *)skb->data;
++
++        /* this function should be used only for newly allocated packets. It assumes
++         * the first cacheline is for the back pointer related book keeping info
++         */
++        skb_reserve(skb, SKB_BACK_PTR_SIZE);
++        *back_ptr = (uint64_t)(unsigned long)skb;
++}
++
++/* FMN send failure errors */
++#define MSG_DST_FC_FAIL                 0x01
++#define MSG_INFLIGHT_MSG_EX             0x02
++#define MSG_TXQ_FULL                    0x04
++
++static __inline__ void print_fmn_send_error(const char *str, uint32_t send_result)
++{
++	if(send_result & MSG_DST_FC_FAIL)
++	{
++		printk("[%s] Msg Destination flow control credit fail(send_result=%08x)\n",
++		       str, send_result);
++	}
++	else if (send_result & MSG_INFLIGHT_MSG_EX) {
++		printk("[%s] MSG_INFLIGHT_MSG_EX(send_result=%08x)\n", __func__, send_result);
++	}
++	else if (send_result & MSG_TXQ_FULL) {
++		printk("[%s] TX message Q full(send_result=%08x)\n", __func__, send_result);
++	}
++	else {
++		printk("[%s] Unknown send error type(send_result=%08x)\n", __func__, send_result);
++	}
++}
++
+ #endif
+-- 
+1.9.1
+

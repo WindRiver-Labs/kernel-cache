@@ -1,0 +1,454 @@
+From ecf5a9d9c1fe7da373c741960f87d5c58e0a4f5b Mon Sep 17 00:00:00 2001
+From: Tanmay Jagdale <tanmayj@broadcom.com>
+Date: Sun, 6 Jul 2014 19:33:23 +0530
+Subject: [PATCH 1229/1532] fdtconf: Created a new module to configure FDT
+
+Created a new module that allows modification of dtb parameters at runtime.
+This module supports adding ucore code into the dtb at runtime.
+There is default ucore code loaded into the dtb when the module is loaded.
+[Based on SDK 3.2]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ drivers/misc/netlogic/fdtconf/fdtconf.c | 430 ++++++++++++++++++++++++++++++++
+ 1 file changed, 430 insertions(+)
+ create mode 100644 drivers/misc/netlogic/fdtconf/fdtconf.c
+
+diff --git a/drivers/misc/netlogic/fdtconf/fdtconf.c b/drivers/misc/netlogic/fdtconf/fdtconf.c
+new file mode 100644
+index 0000000..6a25b0a
+--- /dev/null
++++ b/drivers/misc/netlogic/fdtconf/fdtconf.c
+@@ -0,0 +1,430 @@
++/*-
++ * Copyright (c) 2003-2014 Broadcom Corporation
++ * All Rights Reserved
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY BROADCOM ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
++ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL BROADCOM OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
++ * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
++ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
++ * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
++ * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * #BRCM_2# */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/proc_fs.h>
++#include <linux/fs.h>
++#include <linux/device.h>
++#include <linux/string.h>
++#include <linux/ctype.h>
++#include <linux/platform_device.h>
++#include <linux/firmware.h>
++
++#include "libfdt.h"
++#include "nlm_hal.h"
++
++#define FDT_FIRMWARE	"xlp-config.dtb"
++#define FDT_ADDSZ	(16 * 1024)
++
++extern void *fdt;
++extern void *initial_boot_params;
++struct platform_device *fdtdev;
++struct bin_attribute binfdt_attr;
++struct bin_attribute bincontrol_attr;
++extern unsigned long pktmem_start_address;
++extern unsigned long pktmem_size;
++extern unsigned long frin_fifo_address;
++extern unsigned long frin_fifo_size;
++
++/*
++ * Add kernel parameters to the kernel-params section of fdt blob.
++ */
++#define CPUMASK_WORDS	((NR_CPUS + 31) / 32)
++static void parse_and_fill_kern_params(void)
++{
++	uint32_t	mask[CPUMASK_WORDS] = {0}, *prop;
++	int		err, node, i, pcpu, word, bit, plen;
++
++	node = fdt_path_offset(fdt, "/kernel-params");
++	if (node >= 0) {
++		err = fdt_setprop(fdt, node, "pktmem_start",
++			&pktmem_start_address, sizeof(pktmem_start_address));
++		if (err)
++			dev_err(&fdtdev->dev, "Couldn't set pktmem_start\n");
++
++		err = fdt_setprop(fdt, node, "pktmem_size", &pktmem_size,
++			sizeof(pktmem_size));
++		if (err)
++			dev_err(&fdtdev->dev, "Couldn't set pktmem_size\n");
++
++		/* Set the physical cpumask for userspace applications */
++		for_each_possible_cpu(i) {
++			pcpu = cpu_logical_map(i);
++			word = CPUMASK_WORDS - pcpu/32 - 1;
++			bit = pcpu % 32;
++			mask[word] |= 1u << bit;
++		}
++
++		if (fdt_setprop(fdt, node, "netlogic,cpumask", mask,
++				sizeof(mask)))
++			dev_err(&fdtdev->dev, "Couldn't set cpumask\n");
++
++	} else
++		dev_err(&fdtdev->dev, "kernel-params section missing in fdt\n");
++
++	/*
++	 * This is needed only for hybrid-nae and NAT applications that need
++	 * to use memory region allocated by linux for freein-fifos.
++	 */
++	/* TODO allocate freein-fifo memory for multiple domians */
++	node = fdt_path_offset(fdt, "/doms/dom@1/nae");
++	if (node < 0)
++		return;
++
++	prop = fdt_getprop(fdt, node, "freein-fifo-replenish-addr-info", &plen);
++	if (prop == NULL)
++		return;
++
++	/* Freein Fifo start address */
++	prop[1] = (frin_fifo_address >> 32) & 0xffffffff; /* High 32-bits */
++	prop[2] = frin_fifo_address & 0xffffffff;	/* Low 32-bits */
++
++	/* Freein Fifo size */
++	prop[3] = (frin_fifo_size >> 32) & 0xffffffff;	/* High 32-bits */
++	prop[4] = frin_fifo_size & 0xffffffff;		/* Low 32-bits */
++}
++
++/*
++ * Load ucore opcodes in the dtb.
++ */
++static int handle_opcodes(char *node, char *file)
++{
++	struct firmware	*fw;
++	char		*next, *ucode, *end_of_code;
++	uint32_t	ucode_buf[1024], ncodes, *umask;
++	int		err;
++	/*
++	 * 1. Open the file through request_firmware().
++	 * 2. Read that file and replace the opcode section of the fdt
++	 *    blob with the read file data.
++	 * 3. Set num-opcodes based on number of opcodes present in the file.
++	 * 4. Also check the ucore mask. 
++	 */
++	if (request_firmware(&fw, file, &fdtdev->dev))
++		return -ENOENT;
++
++	/*
++	 * Loop from beginning of code upto end of code file.
++	 * Opcodes are stored as hex values followed by space (' ').
++	 */
++	ncodes = 0;
++	ucode = fw->data;
++	end_of_code = ucode + fw->size;
++	while (ucode < end_of_code) {
++		if (isspace(*ucode)) {
++			ucode++;
++			continue;
++		}
++		ucode_buf[ncodes] = simple_strtoul(ucode, &next, 16);
++		ncodes++;
++		ucode = next;
++	}
++
++	err = fdt_setprop(fdt, node, "num-opcodes", &ncodes, sizeof(ncodes));
++	if (err)
++		goto out;
++
++	err = fdt_setprop(fdt, node, "opcodes", &ucode_buf,
++			(ncodes * sizeof(ncodes)));
++	if (err)
++		goto out;
++
++	/* Fix/check ucore mask based on board type */
++	umask = fdt_getprop(fdt, node, "mask", &ucode);
++	if (umask == NULL)
++		goto out;
++
++	if (is_nlm_xlp3xx() || is_nlm_xlp2xx())
++		*umask &= 0xff;
++
++out:
++	release_firmware(fw);
++	return err;
++}
++
++/*
++ * Parse the input string and write the passed value to the
++ * device tree blob. Thus allowing dtbs to be modified on the board.
++ */
++static ssize_t write_fdt(struct file *filep, struct kobject *kobj,
++			struct bin_attribute *bin_attr, char *buf,
++			loff_t pos, size_t size)
++{
++	int		err, k = 0, node, ret = size;
++	char		*path, *prop, *val, *p, *q;
++	uint32_t	value[16];
++
++	/*
++	 * The syntax to set a property is as follows :
++	 * -------------------------
++	 * <path>/<property> <value>
++	 * -------------------------
++	 * Example : /frequency-config/nae 500
++	 */
++	path = val = buf;
++	buf = strsep(&val, " \t");
++	if (buf == NULL)
++		return -EFAULT;
++
++	prop = strrchr(path, '/');
++	if (prop == NULL)
++		return -EFAULT;
++
++	*prop = '\0';
++	++prop;
++
++	val = strim(val);
++	node = fdt_path_offset(fdt, path);
++	if (node < 0) {
++		ret = -EFAULT;
++		goto out;
++	}
++
++	/*
++	 * Ucore code is passed in the following format :
++	 * ---------------------------------------------------
++	 * /soc/nae@node-0/ucore/src@1/opcodes linux-ucore.hex
++	 * ---------------------------------------------------
++	 */
++	if (strcmp(prop, "opcodes") == 0) {
++		if (*val == '"') {
++			q = strrchr(val, '"');
++			*q = '\0';
++			val++;
++		} else
++			return -EFAULT;
++		err = handle_opcodes(node, val);
++		if (err)
++			ret = err;
++		goto out;
++	}
++
++	/*
++	 * The passed string contains the value property in the following
++	 * format :
++	 * -------------------------------------------------------------------
++	 *  <500>  or  <0x500>  or  <0xffffffff 0xffffffff 0xffff> or "string"
++	 * -------------------------------------------------------------------
++	 * The initial 0x or 0X reprsents the base for conversion.
++	 * If a large value such as cpumask or node_vc_mask needs to be
++	 * specified then each value should be separated by ' '.
++	 */
++
++	p = &val[0];
++	if ((*p == '<') && (q = strchr(val, '>'))) {
++		/* Strip the braces */
++		*q = '\0';
++		p++;
++		/*
++		 * The delimiter for long strings is ' '.
++		 * Convert the string to integer at every delimiter.
++		 */
++		k = 0;
++		while ((val = strsep(&p, " ")) != NULL) {
++			value[k] = simple_strtoul(&val[0], 0, 0);
++			k++;
++		}
++
++		err = fdt_setprop(fdt, node, prop, &value,
++					(k * sizeof(uint32_t)));
++		if (err)
++			ret = err;
++	} else if ((*p == '"') && (q = strrchr(val, '"'))) {
++		/* Strip the quotes */
++		*q = '\0';
++		err = fdt_setprop_string(fdt, node, prop, (p + 1));
++		if (err)
++			ret = err;
++	} else
++		ret = -EFAULT;
++
++out:
++	return ret;
++}
++
++/*
++ * Read data from the device tree blob.
++ */
++static ssize_t read_fdt(struct file *filep, struct kobject *kobj,
++			struct bin_attribute *bin_attr, char *buf,
++			loff_t pos, size_t size)
++{
++	size_t fdt_size = bin_attr->size;
++
++	if (pos >= fdt_size)
++		return 0;
++
++	if ((pos + size) > fdt_size)
++		size = fdt_size - pos;
++
++	memcpy((void __force *)buf, (void __force *)((char *)fdt + pos), size);
++	return (size);
++}
++
++/*
++ * Expand the FDT blob.
++ */
++static void *fdt_expand_into(struct firmware *fw, int sizeincr)
++{
++	int size;
++	void *buf;
++
++	size = fdt_totalsize(fw->data) + sizeincr;
++	buf = kmalloc(size, GFP_KERNEL);
++	if (buf == NULL)
++		return NULL;
++
++	if (fdt_open_into(fw->data, buf, size)) {
++		kfree(buf);
++		return NULL;
++	}
++	return buf;
++}
++
++/*
++ * Init function.
++ */
++static int __init fdtconf_init(void)
++{
++	struct firmware *fw;
++	int err, ret = 0, node;
++
++	/*
++	 * If the dtb contains the doms section, then dtb passed to linux
++	 * at boot time contains all the sections and parameters needed to 
++	 * run all the applications and modules.
++	 */
++	fdt = initial_boot_params;
++	node = fdt_path_offset(fdt, "/doms/dom@0/cpu");
++	if (node >= 0) {
++		printk("Going into legacy mode and using the dtb passed at"
++			"boot time\n");
++		return 0;
++	}
++
++	/* Register a platform device */
++	fdtdev = platform_device_register_simple("fdtconf", -1, NULL, 0);
++
++	if (fdtdev == NULL) {
++		pr_err("fdtconf: Registering device failed\n");
++		return -ENODEV;
++	}
++
++	 /* Request system.dtb file through request_firmware interface */
++	err = request_firmware(&fw, FDT_FIRMWARE, &fdtdev->dev);
++	if (err) {
++		pr_err("request_firmware %s failed (%d_\n", FDT_FIRMWARE, ret);
++		ret = -ENODEV;
++		goto err_plat;
++	}
++
++	fdt = fdt_expand_into(fw, FDT_ADDSZ);
++	if (fdt == NULL) {
++		pr_err("fdt_expand_into failed\n");
++		err = -ENOMEM;
++		goto err_fw;
++	}
++	initial_boot_params = fdt;
++
++	/*
++	 * Add kernel paramters to the fdt blob so that it can be given to
++	 * userspace applications.
++	 */
++	parse_and_fill_kern_params();
++
++	/*
++	 * Insert the default ucore code into the dtb.
++	 */
++	node = fdt_path_offset(fdt, "/soc/nae@node-0/ucore/src@1");
++	if (node >= 0) {
++		err = handle_opcodes(node, "linux-ucore.hex");
++		if (err)
++			goto err_fw;
++	}
++
++	/* Create a sys file to read data from the fdt blob */
++	binfdt_attr.attr.name = "app.dtb";
++	binfdt_attr.attr.mode = (S_IRUSR);
++	binfdt_attr.read = read_fdt;
++	binfdt_attr.size = fdt_totalsize(fdt);
++
++	err = sysfs_create_bin_file(&fdtdev->dev.kobj, &binfdt_attr);
++	if (err) {
++		dev_err(&fdtdev->dev, "Could not create app.dtb %d\n", err);
++		ret = err;
++		goto err_sys1;
++	}
++
++	/* Create a sys file to control the operations on the fdt blob */
++	bincontrol_attr.attr.name = "control";
++	bincontrol_attr.attr.mode = (S_IWUSR);
++	bincontrol_attr.write = write_fdt;
++	bincontrol_attr.size = 1024;
++
++	err = sysfs_create_bin_file(&fdtdev->dev.kobj, &bincontrol_attr);
++	if (err) {
++		dev_err(&fdtdev->dev, "Couldn't create control file %d\n", err);
++		ret = err;
++		goto err_sys2;
++	}
++
++	release_firmware(fw);
++	return 0;
++
++err_sys2:
++	sysfs_remove_bin_file(&fdtdev->dev.kobj, &binfdt_attr);
++err_sys1:
++	kfree(fdt);
++	fdt = NULL;
++err_fw:
++	release_firmware(fw);
++err_plat:
++	platform_device_unregister(fdtdev);
++	return ret;
++}
++
++/*
++ * Exit function.
++ */
++static void __exit fdtconf_exit(void)
++{
++	sysfs_remove_bin_file(&fdtdev->dev.kobj, &binfdt_attr);
++	sysfs_remove_bin_file(&fdtdev->dev.kobj, &bincontrol_attr);
++	platform_device_unregister(fdtdev);
++	kfree(fdtdev);
++	kfree(fdt);
++}
++
++module_init(fdtconf_init);
++module_exit(fdtconf_exit);
++
++MODULE_AUTHOR("Broadcom");
++MODULE_DESCRIPTION("Configure FDT Module");
++MODULE_LICENSE("GPL v2");
+-- 
+1.9.1
+

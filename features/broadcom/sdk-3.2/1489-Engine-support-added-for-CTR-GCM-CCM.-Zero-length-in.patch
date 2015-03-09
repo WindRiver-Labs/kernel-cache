@@ -1,0 +1,2116 @@
+From 2e5df2038ba197a90c5e5f2352d5725474aac0ae Mon Sep 17 00:00:00 2001
+From: reshmic <reshmic@netlogicmicro.com>
+Date: Fri, 17 Feb 2012 11:36:00 +0530
+Subject: [PATCH 1489/1532] Engine support added for CTR, GCM ,CCM. Zero length
+ input handled through software
+
+[Based on SDK 3.2]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ drivers/crypto/sae/nlm_aead.c   | 1086 +++++++++++++++++++++++++++++++++++----
+ drivers/crypto/sae/nlm_async.h  |   19 +-
+ drivers/crypto/sae/nlm_auth.c   |  194 ++++++-
+ drivers/crypto/sae/nlm_crypto.c |   29 +-
+ drivers/crypto/sae/nlm_enc.c    |  123 ++++-
+ 5 files changed, 1275 insertions(+), 176 deletions(-)
+
+diff --git a/drivers/crypto/sae/nlm_aead.c b/drivers/crypto/sae/nlm_aead.c
+index 3a90dbc..9754170 100755
+--- a/drivers/crypto/sae/nlm_aead.c
++++ b/drivers/crypto/sae/nlm_aead.c
+@@ -26,6 +26,7 @@ THE POSSIBILITY OF SUCH DAMAGE.
+ #include <crypto/algapi.h>
+ #include <crypto/aes.h>
+ #include <crypto/des.h>
++#include <crypto/ctr.h>
+ #include <crypto/sha.h>
+ #include <crypto/aead.h>
+ #include <crypto/authenc.h>
+@@ -39,14 +40,19 @@ THE POSSIBILITY OF SUCH DAMAGE.
+ #undef NLM_CRYPTO_DEBUG
+ #define Message(a, b...) //printk("[%s @ %d] "a"\n",__FUNCTION__,__LINE__, ##b)
+ 
+-#define AES_CTR_IV_SIZE         8
+ #define XLP_CRYPT_PRIORITY      310
+ 
+ #define XCBC_DIGEST_SIZE        16
+ #define MD5_DIGEST_SIZE         16
+ #define MD5_BLOCK_SIZE          64
+-#define CTR_RFC3686_IV_SIZE 8
+ 
++#define GCM_RFC4106_IV_SIZE 8
++#define GCM_RFC4106_NONCE_SIZE 4
++#define GCM_RFC4106_DIGEST_SIZE 16
++
++#define CCM_RFC4309_NONCE_SIZE 3
++#define CCM_RFC4309_IV_SIZE 8
++#define CCM_RFC4309_DIGEST_SIZE 16
+ 
+ /*
+  						CTRL DESC MEMORY LAYOUT
+@@ -63,11 +69,15 @@ struct nlm_aead_ctx
+ 	uint32_t iv_len;
+ 	int cbc;
+ 	uint16_t stat;
++	struct crypto_aead  * fallback;
+ };
+ 
+ #define MAX_FRAGS		18
+ #define CTRL_DESC_SIZE		(sizeof(struct nlm_aead_ctx) + 128)
+ #define DES3_CTRL_DESC_SIZE	(2*CTRL_DESC_SIZE + 2*64)	//Allocate 2 separate control desc for encryption and decryption
++#define CACHE_ALIGN		64
++#define IV_AEAD_PADDING         128
++#define TAG_LEN			64
+ 
+ /*
+  						PACKET DESC MEMORY LAYOUT
+@@ -77,11 +87,11 @@ struct nlm_aead_ctx
+ 	 ------------------------------------------------------------------------------------------------------
+  */
+ 
+-#define PACKET_DESC_SIZE	(64 + sizeof(struct nlm_crypto_pkt_param) + MAX_FRAGS*(2*64) + 64 + sizeof(struct nlm_async_crypto) + 128 )
+-#define NLM_CRYPTO_PKT_PARAM_OFFSET(addr)	(((unsigned long)addr + 64) & ~0x3fULL)
+-#define NLM_ASYNC_PTR_PARAM_OFFSET(addr)	(((unsigned long)(addr + 64 + sizeof(struct nlm_crypto_pkt_param) + MAX_FRAGS*(2*64)) + 64) & ~0x3fULL)
+-#define NLM_HASH_OFFSET(addr)			((unsigned long)addr + (PACKET_DESC_SIZE - 64))
+-#define NLM_IV_OFFSET(addr)			((unsigned long)addr + (PACKET_DESC_SIZE - 128))
++#define PACKET_DESC_SIZE	(CACHE_ALIGN + sizeof(struct nlm_crypto_pkt_param) + MAX_FRAGS*(2*CACHE_ALIGN) + CACHE_ALIGN + sizeof(struct nlm_async_crypto) + IV_AEAD_PADDING + TAG_LEN)
++#define NLM_CRYPTO_PKT_PARAM_OFFSET(addr)	(((unsigned long)addr + CACHE_ALIGN ) & ~0x3fULL)
++#define NLM_ASYNC_PTR_PARAM_OFFSET(addr)	(((unsigned long)(addr + CACHE_ALIGN + sizeof(struct nlm_crypto_pkt_param) + MAX_FRAGS*(2*CACHE_ALIGN)) + CACHE_ALIGN) & ~0x3fULL)
++#define NLM_HASH_OFFSET(addr)			((unsigned long)addr + (PACKET_DESC_SIZE - TAG_LEN))
++#define NLM_IV_OFFSET(addr)			((unsigned long)addr + (PACKET_DESC_SIZE - TAG_LEN - IV_AEAD_PADDING ))
+ 
+ 
+ #define XLP_CRYPT_PRIORITY	310
+@@ -107,6 +117,9 @@ extern uint32_t nlm_hal_recv_msg2(uint32_t dst, uint32_t *src, uint32_t *size, u
+ extern int auth_mode_key_len[NLM_HASH_MAX][NLM_HASH_MODE_MAX];
+ extern int cipher_mode_iv_len[NLM_CIPHER_MAX][NLM_CIPHER_MODE_MAX];
+ 
++
++static int no_of_alg_registered = 0;
++
+ static void print_buf(unsigned char *msg, unsigned char *buf, int len)
+ {
+ #define TMP_BUF		50
+@@ -160,11 +173,29 @@ static int aead_cra_cbc_init(struct crypto_tfm *tfm)
+ 	return 0;
+ }
+ 
++static int aead_cra_init_ccm(struct crypto_tfm *tfm)
++{
++	struct nlm_aead_ctx *nlm_ctx = (struct nlm_aead_ctx *)nlm_crypto_tfm_ctx(tfm);
++	nlm_ctx->cbc = 0;
++	tfm->crt_aead.reqsize = PACKET_DESC_SIZE; 
++	nlm_ctx->fallback = crypto_alloc_aead("rfc4309(ccm(aes-generic))",CRYPTO_ALG_TYPE_AEAD ,0) ;
++	return 0;
++}
++
++static int aead_cra_init_gcm(struct crypto_tfm *tfm)
++{
++	struct nlm_aead_ctx *nlm_ctx = (struct nlm_aead_ctx *)nlm_crypto_tfm_ctx(tfm);
++	nlm_ctx->cbc = 0;
++	tfm->crt_aead.reqsize = PACKET_DESC_SIZE; 
++	nlm_ctx->fallback = crypto_alloc_aead("rfc4106(gcm(aes-generic))",CRYPTO_ALG_TYPE_AEAD ,0) ;
++	return 0;
++}
++
+ static int aead_cra_init(struct crypto_tfm *tfm)
+ {
+-	printk("[%s %d]\n",__FUNCTION__, __LINE__);
+-	tfm->crt_aead.reqsize = PACKET_DESC_SIZE;
+-	printk("[%s %d]\n",__FUNCTION__, __LINE__);
++	struct nlm_aead_ctx *nlm_ctx = (struct nlm_aead_ctx *)nlm_crypto_tfm_ctx(tfm);
++	nlm_ctx->cbc = 0;
++	tfm->crt_aead.reqsize = PACKET_DESC_SIZE; 
+ 	return 0;
+ }
+ 
+@@ -221,6 +252,27 @@ static int get_cipher_aes_algid(unsigned int cipher_keylen)
+ 	}
+ }
+ 
++
++static int get_auth_aes_algid(unsigned int hash_keylen)
++{
++
++	switch (hash_keylen) {
++	case 16:
++		return NLM_HASH_AES128;
++		break;
++	case 24:
++		return NLM_HASH_AES192;
++		break;
++	case 32:
++		return NLM_HASH_AES256;
++		break;
++	default:
++		printk(KERN_WARNING "[%s]: Cannot handle keylen = %d\n",
++		       __FUNCTION__, hash_keylen);
++	    return -EINVAL;
++	}
++}
++
+ /*
+    All Setkey goes here.
+  */
+@@ -253,7 +305,6 @@ static int xlp_aes_cbc_setkey( struct crypto_aead *tfm, uint8_t *key, unsigned i
+ 		return -EINVAL;
+ 	}
+ 
+-	printk("Initial authkeylen %d, cipherkeylen %d\n", cipher_keylen, auth_keylen);
+ 	key += RTA_ALIGN(rta->rta_len);
+ 	cipher_key = key + auth_keylen;
+ 	memcpy(auth_key, key, auth_keylen);
+@@ -265,8 +316,11 @@ static int xlp_aes_cbc_setkey( struct crypto_aead *tfm, uint8_t *key, unsigned i
+ 
+ 	auth_keylen = auth_mode_key_len[hash][mode];
+ 
++	#ifdef 	NLM_CRYPTO_DEBUG
++	printk("Initial authkeylen %d, cipherkeylen %d\n", cipher_keylen, auth_keylen);
+ 	print_buf("ENC_KEY:", cipher_key, cipher_keylen);
+ 	print_buf("AUTH_KEY:", auth_key, auth_keylen);
++	#endif
+ 
+ 	ret =  nlm_crypto_fill_pkt_ctrl(ctrl, hmac, hash, 
+ 			mode, cipher_alg, NLM_CIPHER_MODE_CBC, 0, cipher_key, 
+@@ -275,6 +329,66 @@ static int xlp_aes_cbc_setkey( struct crypto_aead *tfm, uint8_t *key, unsigned i
+ 	return ret;
+ }
+ 
++static int xlp_aes_ctr_setkey( struct crypto_aead *tfm, u8 *key,
++					unsigned int keylen, int hash, int mode, uint16_t h_stat)
++{
++	struct nlm_aead_ctx *ctx = (struct nlm_aead_ctx *)nlm_crypto_aead_ctx(tfm);
++	struct nlm_crypto_pkt_ctrl *ctrl = &ctx->ctrl;
++	unsigned int cipher_keylen=0, auth_keylen=0;
++	int ret;
++	int nonce_len = CTR_RFC3686_NONCE_SIZE;
++	int cipher_alg;
++	uint8_t auth_key[128];
++	uint8_t *cipher_key;
++	struct rtattr *rta = (struct rtattr *)key;
++	int hmac = ((mode == NLM_HASH_MODE_XCBC) ? 0: 1);
++
++	if ((ret = get_cipher_auth_keylen(key, keylen, &cipher_keylen,
++					  &auth_keylen)) < 0) {
++		crypto_aead_set_flags(tfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
++		printk("ERR: Bad key len\n");
++		return ret;
++	}
++
++	cipher_keylen -= nonce_len;
++
++	cipher_alg = get_cipher_aes_algid(cipher_keylen);
++	if (cipher_alg < 0) {
++		crypto_aead_set_flags(tfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
++		//sandip: check return val
++		printk("ERR: Bad aes key len\n");
++		return -EINVAL;
++	}
++	ctx->stat = cipher_alg - 1 + 3;
++	ctx->stat = ctx->stat | (h_stat << 8);
++	key += RTA_ALIGN(rta->rta_len);
++	memcpy(auth_key, key, auth_keylen);
++	cipher_key = key + auth_keylen;
++	memcpy(ctx->iv_buf,key+auth_keylen+cipher_keylen, nonce_len);
++	#ifdef 	NLM_CRYPTO_DEBUG
++	printk("Initial authkeylen %d, cipherkeylen %d\n", cipher_keylen, auth_keylen);
++	print_buf ( "key",key,128);
++	print_buf("NONCE:", &ctx->iv_buf[0] , nonce_len);
++	#endif
++
++	if ( auth_mode_key_len[hash][mode] > auth_keylen)
++		memset(auth_key + auth_keylen, 0,  auth_mode_key_len[hash][mode] - auth_keylen);
++	if(cipher_mode_iv_len[cipher_alg][NLM_CIPHER_MODE_CTR] > 0)
++		ctx->iv_len = cipher_mode_iv_len[cipher_alg][NLM_CIPHER_MODE_CTR];
++
++	auth_keylen = auth_mode_key_len[hash][mode];
++
++	#ifdef 	NLM_CRYPTO_DEBUG
++	print_buf("ENC_KEY:", cipher_key, cipher_keylen);
++	print_buf("AUTH_KEY:", auth_key, auth_keylen);
++	#endif
++
++	ret =  nlm_crypto_fill_pkt_ctrl(ctrl, hmac, hash,
++		mode, cipher_alg, NLM_CIPHER_MODE_CTR, 0, cipher_key,
++		cipher_keylen, auth_key, auth_keylen);
++
++	return ret;
++}
+ static int  xlp_3des_setkey(struct crypto_aead *tfm, u8 *key, unsigned int keylen, int hash, int mode,uint16_t h_stat )
+ {
+ 	struct nlm_aead_ctx *ctx = (struct nlm_aead_ctx *)nlm_crypto_aead_ctx(tfm);
+@@ -318,9 +432,11 @@ static int  xlp_3des_setkey(struct crypto_aead *tfm, u8 *key, unsigned int keyle
+ 	ret =  nlm_crypto_fill_pkt_ctrl(&nlm_ctx->ctrl, hmac, hash,
+ 		mode, cipher_alg, NLM_CIPHER_MODE_CBC, 0, ( unsigned char * )d_key,
+ 		cipher_keylen, auth_key, auth_keylen);
++	#ifdef NLM_CRYPTO_DEBUG 
+ 	print_buf("ENC_KEY:", cipher_key, cipher_keylen);
+ 	print_buf("AUTH_KEY:", auth_key, auth_keylen);
+ 	print_buf("DECRY_KEY",(unsigned char * )&d_key[0],cipher_keylen);
++	#endif
+ 
+         return ret;
+ }
+@@ -332,7 +448,6 @@ static int xlp_des_setkey( struct crypto_aead *tfm, uint8_t  *key, unsigned int
+ 	struct nlm_crypto_pkt_ctrl *ctrl = &ctx->ctrl;
+         int ret;
+ 	uint8_t auth_key[128];
+-	uint64_t d_key[3] ;
+ 	int cipher_alg = NLM_CIPHER_DES;
+ 	struct rtattr *rta = (struct rtattr *)key;
+ 	uint8_t *cipher_key;
+@@ -361,14 +476,105 @@ static int xlp_des_setkey( struct crypto_aead *tfm, uint8_t  *key, unsigned int
+ 		mode, cipher_alg,NLM_CIPHER_MODE_CBC,0,cipher_key,
+ 		 cipher_keylen, auth_key, auth_keylen);
+ 	
++	#ifdef NLM_CRYPTO_DEBUG 
+ 	print_buf("ENC_KEY:", cipher_key, cipher_keylen);
+ 	print_buf("AUTH_KEY:", auth_key, auth_keylen);
+-	print_buf("DECRY_KEY",(unsigned char *)&d_key[0],cipher_keylen);
++	#endif
+ 
+         return ret;
+ 
+ 
+ }
++static int aead_gcm_rfc4106_setkey( struct crypto_aead *tfm, const u8 *key,
++						unsigned int keylen)
++{
++	struct nlm_aead_ctx *ctx = (struct nlm_aead_ctx *)nlm_crypto_aead_ctx(tfm);
++	int cipher_alg;
++	unsigned int cipher_keylen=0;
++	int auth_alg;
++	int ret;
++	struct nlm_crypto_pkt_ctrl *ctrl = &ctx->ctrl;
++	if (keylen < GCM_RFC4106_NONCE_SIZE)
++                return -EINVAL;
++	cipher_keylen = keylen - GCM_RFC4106_NONCE_SIZE;
++	cipher_alg = get_cipher_aes_algid(cipher_keylen);
++	ctx->stat = cipher_alg - 1;
++	ctx->stat = ctx->stat | (GCM_STAT << 8);
++
++	if (cipher_alg < 0) {
++		crypto_aead_set_flags(tfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
++		//sandip: check return val
++		printk("ERR: Bad aes key len\n");
++		return -EINVAL;
++	}
++	auth_alg = get_auth_aes_algid(cipher_keylen);
++	if ( auth_alg < 0) {
++		crypto_aead_set_flags(tfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
++		printk("ERR: Bad aes key len\n");
++		return -EINVAL;
++	}
++	
++	ret = nlm_crypto_fill_pkt_ctrl(ctrl,0,auth_alg,NLM_HASH_MODE_GCM,cipher_alg,
++		NLM_CIPHER_MODE_GCM,0,key,cipher_keylen,key,cipher_keylen);
++	ctx->iv_len = cipher_mode_iv_len[cipher_alg][NLM_HASH_MODE_GCM];
++#ifdef	NLM_CRYPTO_DEBUG
++	print_buf("KEY\n",key,cipher_keylen);	
++#endif
++	
++	/*copy by nonce*/
++	memcpy(ctx->iv_buf, key + cipher_keylen, GCM_RFC4106_NONCE_SIZE);
++	crypto_aead_setkey(ctx->fallback, key, keylen);
++
++	return ret ;
++
++}
++
++static int aead_ccm_rfc4309_setkey(struct crypto_aead *tfm, const u8 *key, 
++				   unsigned int keylen)
++{
++	struct nlm_aead_ctx *ctx = (struct nlm_aead_ctx *)nlm_crypto_aead_ctx(tfm);
++	unsigned int cipher_keylen=0;
++	int ret;
++	int nonce_len = CCM_RFC4309_NONCE_SIZE;
++	int cipher_alg;
++	int auth_alg;
++	struct nlm_crypto_pkt_ctrl *ctrl = &ctx->ctrl;
++	if (keylen < CCM_RFC4309_NONCE_SIZE)
++                return -EINVAL;
++
++	cipher_keylen = keylen - nonce_len;
++	cipher_alg = get_cipher_aes_algid(cipher_keylen);
++	ctx->stat = cipher_alg - 1;
++	ctx->stat = ctx->stat | (CCM_STAT << 8);
++
++	cipher_alg = get_cipher_aes_algid(cipher_keylen);
++	if (cipher_alg < 0) {
++		crypto_aead_set_flags(tfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
++		//sandip: check return val
++		printk("ERR: Bad aes key len\n");
++		return -EINVAL;
++	}
++	auth_alg = get_auth_aes_algid(cipher_keylen);
++	if ( auth_alg < 0) {
++		crypto_aead_set_flags(tfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
++		printk("ERR: Bad aes key len\n");
++		return -EINVAL;
++	}
++	
++
++	
++	ret = nlm_crypto_fill_pkt_ctrl(ctrl,0,auth_alg,NLM_HASH_MODE_CCM,cipher_alg,NLM_CIPHER_MODE_CCM,0,key,cipher_keylen,key,cipher_keylen);
++	ctx->iv_len = cipher_mode_iv_len[cipher_alg][NLM_HASH_MODE_GCM];
++#ifdef	NLM_CRYPTO_DEBUG
++	print_buf("KEY\n",key,cipher_keylen);	
++#endif
++	
++	/*copy by nonce*/
++	memcpy(ctx->iv_buf, key + cipher_keylen, nonce_len);
++	crypto_aead_setkey(ctx->fallback, key, keylen);
++	return ret;
++}
++
+ static int xlp_aes_cbc_hmac_sha256_setkey( struct crypto_aead *tfm, const u8 *key, unsigned int keylen)
+ {
+ 	return xlp_aes_cbc_setkey(tfm, (uint8_t *)key, keylen,NLM_HASH_SHA,NLM_HASH_MODE_SHA256,H_SHA256_STAT);
+@@ -436,6 +642,28 @@ static int xlp_des_cbc_hmac_md5_setkey( struct crypto_aead *tfm, const u8 *key,
+ 
+ }
+ 
++static  int xlp_aes_ctr_hmac_sha256_setkey ( struct crypto_aead *tfm, const u8 *key,
++					unsigned int keylen)
++{
++	return xlp_aes_ctr_setkey(tfm, (uint8_t *)key, keylen,NLM_HASH_SHA,NLM_HASH_MODE_SHA256,H_SHA256_STAT);
++}
++static  int xlp_aes_ctr_hmac_sha1_setkey ( struct crypto_aead *tfm, const u8 *key,
++					unsigned int keylen)
++{
++	return xlp_aes_ctr_setkey(tfm, (uint8_t *)key, keylen,NLM_HASH_SHA,NLM_HASH_MODE_SHA1,H_SHA1_STAT);
++
++}
++static  int xlp_aes_ctr_aes_xcbc_mac_setkey ( struct crypto_aead *tfm, const u8 *key,
++					unsigned int keylen)
++{
++	return xlp_aes_ctr_setkey(tfm, (uint8_t *)key, keylen,NLM_HASH_AES128,NLM_HASH_MODE_XCBC,AES128_XCBC_STAT);
++}
++
++static int xlp_aes_ctr_hmac_md5_setkey(struct crypto_aead *tfm, const u8 *key,
++					unsigned int keylen)
++{
++	return xlp_aes_ctr_setkey(tfm, (uint8_t *)key, keylen,NLM_HASH_MD5,0,MD5_STAT);
++}
+ //returns nr_aad_frags... -1 for error
+ int fill_aead_aad(struct nlm_crypto_pkt_param *param, struct aead_request *req, unsigned int aad_len,int seg)
+ {
+@@ -507,107 +735,494 @@ int fill_aead_crypt(struct aead_request *req, unsigned int cipher_len,
+ 		cipher_len -= len;
+ 	}
+ 
+-	if (op == NETL_OP_DECRYPT)
+-		*actual_tag = virt + len;
++	if (op == NETL_OP_DECRYPT)
++		*actual_tag = virt + len;
++
++	if (nr_src_frags > nr_dst_frags) {
++		for (i = 0; i < nr_src_frags - nr_dst_frags; i++)
++			param->segment[seg + nr_dst_frags + i][1] = 0ULL;
++		return nr_src_frags;
++	}else{
++		if (nr_src_frags < nr_dst_frags) {
++			for (i = 0; i < nr_dst_frags - nr_src_frags; i++)
++				param->segment[seg + nr_src_frags + i][0] = 0ULL;
++		}
++		return nr_dst_frags;
++	}
++}
++
++/*
++   Generic Encrypt / Decrypt Function
++ */
++//op is either encrypt or decrypt
++
++static void aead_request_callback(struct nlm_async_crypto *async, uint64_t msg1)
++{
++	struct crypto_async_request *base = (struct crypto_async_request *)async->args;
++	int err = 0;
++	int cpu = hard_smp_processor_id();
++	int enc = async->stat & 0xff;
++	int auth = (async->stat >> 8 ) & 0xff;
++
++	if (msg1 & 0x7ff80) {
++		printk("\n Error: entry1 is %llx",msg1);
++		err = -EIO;
++		base->complete(base, err);
++		return;
++	}
++	if (async->op){
++		memcpy(async->actual_tag, async->hash_addr, async->authsize);
++	}else{
++		if(memcmp(async->actual_tag, async->hash_addr, async->authsize)){
++			err = -EBADMSG;
++		}
++	}
++	crypto_stat[cpu].enc[enc]++;
++	crypto_stat[cpu].auth[auth]++;	
++	crypto_stat[cpu].enc_tbytes[enc] += async->bytes;
++	crypto_stat[cpu].auth_tbytes[auth] += async->bytes;
++	base->complete(base, err);
++	return;
++}
++
++static int aead_crypt_gcm(struct aead_request *req, unsigned int op)
++{
++	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++	struct crypto_alg *alg = tfm->base.__crt_alg;
++	struct aead_alg *aead= &alg->cra_aead;
++	struct aead_tfm *crt = crypto_aead_crt(tfm);
++	struct nlm_aead_ctx *ctx = (struct nlm_aead_ctx *)nlm_crypto_aead_ctx(tfm);
++	struct nlm_crypto_pkt_param *param;
++	unsigned int cipher_off, auth_off, iv_off;
++	unsigned int auth_len, cipher_len;
++	unsigned char *actual_tag;
++	int seg = 0,iv_size =16;
++	unsigned int hash_source, nr_aad_frags;
++	uint64_t entry0, entry1, tx_id=0x12345678;
++	struct nlm_async_crypto *async = NULL;
++	uint8_t *hash_addr;
++	int fb_vc; 
++	int err=0;
++	int nr_enc_frags;
++	unsigned int authsize,maxauthsize;
++	struct nlm_crypto_pkt_ctrl *ctrl = &ctx->ctrl;
++	char * iv = (uint8_t *)NLM_IV_OFFSET(aead_request_ctx(req)); 
++	uint8_t *tmp_iv = iv;
++
++	authsize = crypto_aead_crt(crt->base)->authsize;
++	maxauthsize= aead->maxauthsize;
++
++	if ( (op &&  (req->cryptlen == 0 )) || (!op && req->cryptlen <= aead->maxauthsize))
++	{
++		int ret =0;
++		struct crypto_aead *tfm = req->base.tfm;
++		ret = crypto_aead_setauthsize(ctx->fallback, authsize);
++		aead_request_set_tfm(req, ctx->fallback);
++		if ( op )
++		ret = crypto_aead_encrypt(req);
++		else 
++		ret = crypto_aead_decrypt(req);
++		aead_request_set_tfm(req,tfm);
++		
++		return ret;
++	}
++	
++	
++
++	/*Copy nonce*/
++	memcpy(tmp_iv,  ctx->iv_buf, GCM_RFC4106_NONCE_SIZE);
++	tmp_iv += GCM_RFC4106_NONCE_SIZE;
++
++	/*Copy IV*/
++	memcpy(tmp_iv, req->iv, GCM_RFC4106_IV_SIZE);
++	tmp_iv += GCM_RFC4106_IV_SIZE;
++
++	/*Set counter*/
++	*((uint32_t*)tmp_iv) = (uint32_t)1;
++
++	param = (struct nlm_crypto_pkt_param *)NLM_CRYPTO_PKT_PARAM_OFFSET(aead_request_ctx(req));
++	hash_addr = (uint8_t *)NLM_HASH_OFFSET(aead_request_ctx(req));
++
++	iv_off = 0;
++	auth_off = iv_size;
++	cipher_off = req->assoclen + iv_size;
++
++	//check if it should be aip->tag_len or can be taken from tfm
++	cipher_len = op ? req->cryptlen: req->cryptlen - authsize;
++	auth_len = req->assoclen + cipher_len; 
++	hash_source = (op) ? 0 : 1;
++
++	/*Setup NONCE_IV_CTR COMBO*/
++	nlm_crypto_fill_src_seg(param, seg, iv, iv_size);
++	nlm_crypto_fill_dst_seg(param, seg, iv, iv_size);
++	seg++;
++	
++	/*Setup AAD - SPI/SEQ Number*/
++	nr_aad_frags = fill_aead_aad(param, req, req->assoclen,seg);
++	if (nr_aad_frags == 0)
++		return -1;
++	seg = nr_aad_frags;
++
++	nr_enc_frags = fill_aead_crypt(req, cipher_len, param, &actual_tag, op, seg);
++
++	if (nr_enc_frags == -1)
++		return -1;
++
++	seg += nr_enc_frags;
++
++
++	nlm_crypto_fill_cipher_auth_pkt_param(ctrl, param, op, hash_source, iv_off, 
++		iv_size, auth_off, auth_len, 0, cipher_off, cipher_len, hash_addr);
++	
++	fb_vc = crypto_get_fb_vc();
++
++	entry0 = nlm_crypto_form_pkt_fmn_entry0(fb_vc, 0, 0, ctrl->cipherkeylen, virt_to_phys(ctrl));
++	entry1 = nlm_crypto_form_pkt_fmn_entry1(0, ctrl->hashkeylen, (seg + 2)<<4, virt_to_phys(param));
++
++
++#ifdef NLM_CRYPTO_DEBUG
++	printk("*****ctrl descriptor phys addr %#lx\n",virt_to_phys(ctrl));
++	print_crypto_msg_desc(entry0, entry1, tx_id);
++	print_cntl_instr(ctrl->desc0);
++	print_buf("ENC_KEY:", (uint8_t *)ctrl->key, ctrl->cipherkeylen);
++	print_buf("AUTH_KEY:", (uint8_t *)ctrl->key + ctrl->cipherkeylen, ctrl->hashkeylen);
++	print_pkt_desc(param,seg);
++	printk("iv_off: %d, cipher_off: %d, auth_off: %d\n",iv_off, cipher_off, auth_off);
++	printk("auth_len: %d, cipher_len: %d\n", auth_len, cipher_len);
++#endif
++
++	async = (struct nlm_async_crypto *)NLM_ASYNC_PTR_PARAM_OFFSET(aead_request_ctx(req));
++	async->callback =  aead_request_callback;
++	async->args = (void *)&req->base; 
++	async->op  = op;
++	async->actual_tag = actual_tag;
++	async->hash_addr = hash_addr;
++	async->authsize = authsize;
++	async->stat = ctx->stat; 
++	async->bytes = req->cryptlen; 
++	tx_id = (uint64_t)async;
++
++	//construct pkt, send to engine and receive reply
++	err = nlm_hal_send_msg3(crypto_vc_base, 0 /*code */ , entry0, entry1, tx_id);
++	if(err){
++		printk("err\n");
++		return -EIO;
++	}
++
++
++	return -EINPROGRESS;
++
++}
++
++static int aead_crypt_ccm(struct aead_request *req, unsigned int op)
++{
++	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++	struct crypto_alg *alg = tfm->base.__crt_alg;
++	struct aead_alg *aead= &alg->cra_aead;
++	struct aead_tfm *crt = crypto_aead_crt(tfm);
++	struct nlm_aead_ctx *ctx = (struct nlm_aead_ctx *)nlm_crypto_aead_ctx(tfm);
++	struct nlm_crypto_pkt_param *param;
++	unsigned int cipher_off, auth_off, iv_off;
++	unsigned int auth_len, cipher_len;
++	unsigned char *actual_tag;
++	unsigned int hash_source, nr_aad_frags;
++	uint64_t entry0, entry1, tx_id=0x12345678;
++	struct nlm_async_crypto *async = NULL;
++	uint8_t *hash_addr;
++	int fb_vc; 
++	int err=0;
++	unsigned int authsize,maxauthsize;
++	struct nlm_crypto_pkt_ctrl *ctrl = &ctx->ctrl;
++	char * iv = (uint8_t *)NLM_IV_OFFSET(aead_request_ctx(req));
++	int iv_size = 16;
++	uint8_t *auth_iv = (uint8_t *)iv + iv_size;
++	unsigned int auth_iv_frag_len = iv_size; 
++	unsigned int extralen = req->assoclen;
++	int seg = 0;
++	int nr_enc_frags;
++	uint8_t *tmp_iv = &iv[1];
++	param = (struct nlm_crypto_pkt_param *)NLM_CRYPTO_PKT_PARAM_OFFSET(aead_request_ctx(req));
++	hash_addr = (uint8_t *)NLM_HASH_OFFSET(aead_request_ctx(req));
++
++	authsize = crypto_aead_crt(crt->base)->authsize;
++	maxauthsize= aead->maxauthsize;
++
++	if ( (op &&  (req->cryptlen == 0 )) || (!op && req->cryptlen <= aead->maxauthsize))
++	{
++		int ret =0;
++		struct crypto_aead *tfm = req->base.tfm;
++		ret = crypto_aead_setauthsize(ctx->fallback, authsize);
++		aead_request_set_tfm(req, ctx->fallback);
++		if ( op )
++		ret = crypto_aead_encrypt(req);
++		else 
++		ret = crypto_aead_decrypt(req);
++		aead_request_set_tfm(req,tfm);
++		
++		return ret;
++	}
++	
++		
++
++	/*Copy nonce*/
++	memcpy(tmp_iv,  &ctx->iv_buf, CCM_RFC4309_NONCE_SIZE);
++	tmp_iv += CCM_RFC4309_NONCE_SIZE;
++
++	/*Copy IV*/
++	memcpy(tmp_iv, req->iv, CCM_RFC4309_IV_SIZE);
++	tmp_iv += CCM_RFC4309_IV_SIZE;
++
++	/*Set counter*/
++	*((uint32_t*)tmp_iv) = (uint32_t)0;
++
++	memcpy(auth_iv,iv,iv_size);
++
++	/* Encryption iv  7            Reserved (always zero)
++	   6            Reserved (always zero)
++	   5 ... 3      Zero
++	   2 ... 0      L' ( L -1 ) ( Length of the counter ) */
++
++	iv[0] = 3;
++
++	//check if it should be aip->tag_len or can be taken from tfm
++	iv_off = 0;
++	auth_off = iv_size;
++	cipher_len = op ? req->cryptlen: req->cryptlen - authsize;
++	hash_source = (op) ? 0 : 1;
++
++
++	/*Setup ENCRYPTION IV*/
++	nlm_crypto_fill_src_seg(param, seg, iv, iv_size);
++	nlm_crypto_fill_dst_seg(param, seg, iv, iv_size);
++	seg++;
++
++	/*	7            Reserved (always zero)
++		6            Adata
++		5 ... 3      M' ( (tag_len -2) /2)
++		2 ... 0      L' */
++
++	auth_iv[0] = ((req->assoclen?1 : 0 ) << 6 )| ((authsize - 2 )/2) << 3 | 3;
++	if ( req->assoclen ) {
++
++
++		if ( req->assoclen  < 65280) { 
++			*(short*)(auth_iv + 16) = (short)req->assoclen;
++			extralen += 2;
++			auth_iv_frag_len = 18;
++		}
++		else
++		{
++			*(short*)(auth_iv+ 16) = (short)0xfffe;
++			*(short*)(auth_iv + 16) = (short)0xfffe;;
++			*(uint32_t*)(auth_iv + 18) = (uint32_t)req->assoclen;
++			*(uint32_t*)(auth_iv + 18) = (uint32_t)req->assoclen;
++			auth_iv_frag_len = 22;
++			extralen += 6;
++		}
++	}
++	/*Setup AUTH IV*/
++	*(uint32_t*)&auth_iv[12] |= (uint32_t )cipher_len;
++
++	nlm_crypto_fill_src_seg(param, seg,auth_iv,auth_iv_frag_len);
++	nlm_crypto_fill_dst_seg(param, seg,auth_iv,auth_iv_frag_len);
++	seg++;
++
++	//one for cipher iv one for auth iv
++	cipher_off = iv_size + iv_size + extralen;  
++
++	if ( req->assoclen ) {
++		/*Setup AAD - SPI/SEQ Number*/
++		nr_aad_frags = fill_aead_aad(param, req, req->assoclen,seg);
++		if (nr_aad_frags == -1)
++			return -1;
++
++		seg = nr_aad_frags;
++
++		/* AAD has to be block aligned */
++		extralen = extralen % 16;
++		if ( extralen ) {
++			extralen = AES_BLOCK_SIZE - extralen;
++			memset(auth_iv + 22,0,extralen);
++			nlm_crypto_fill_src_seg(param,seg,(auth_iv+22),extralen);
++			nlm_crypto_fill_dst_seg(param,seg,(auth_iv+22),extralen);
++			seg++;
++			cipher_off += extralen;
++		}
++	}
++
++	nr_enc_frags = fill_aead_crypt(req, cipher_len, param, &actual_tag, op, seg);
++
++	seg += nr_enc_frags;
++
++	extralen = cipher_len % 16;
++
++	if ( extralen ) {
++		extralen = AES_BLOCK_SIZE - extralen;
++		memset(auth_iv + 38,0,extralen);
++		nlm_crypto_fill_src_seg(param,seg,(auth_iv+38),extralen);
++		nlm_crypto_fill_dst_seg(param,seg,(auth_iv+38),extralen);
++		seg++;
++	}
++	auth_len = cipher_off + cipher_len - 16 + extralen; 
++
++	nlm_crypto_fill_cipher_auth_pkt_param(ctrl, param, op, hash_source, iv_off,
++			iv_size, auth_off, auth_len, 0, cipher_off, cipher_len, hash_addr);
++
++	fb_vc = crypto_get_fb_vc();
++	entry0 = nlm_crypto_form_pkt_fmn_entry0(fb_vc, 0, 0, ctrl->cipherkeylen, virt_to_phys(ctrl))
++;
++	entry1 = nlm_crypto_form_pkt_fmn_entry1(0, ctrl->hashkeylen, (seg + 2)<<4, virt_to_phys(param));
++
++
++#ifdef NLM_CRYPTO_DEBUG
++	printk("*****ctrl descriptor phys addr %#lx\n",virt_to_phys(ctrl));
++	print_crypto_msg_desc(entry0, entry1, tx_id);
++	print_cntl_instr(ctrl->desc0);
++	print_buf("ENC_KEY:", (uint8_t *)ctrl->key, ctrl->cipherkeylen);
++	print_buf("AUTH_KEY:", (uint8_t *)ctrl->key + ctrl->cipherkeylen, ctrl->hashkeylen);
++	print_pkt_desc(param,seg);
++	printk("iv_off: %d, cipher_off: %d, auth_off: %d\n",iv_off, cipher_off, auth_off);
++	printk("auth_len: %d, cipher_len: %d\n", auth_len, cipher_len);
++#endif
++
++
++	async = (struct nlm_async_crypto *)NLM_ASYNC_PTR_PARAM_OFFSET(aead_request_ctx(req));
++	async->callback =  aead_request_callback;
++	async->args = (void *)&req->base; 
++	async->op  = op;
++	async->actual_tag = actual_tag;
++	async->hash_addr = hash_addr;
++	async->authsize = authsize;
++	async->stat = ctx->stat; 
++	async->bytes = req->cryptlen; 
++	tx_id = (uint64_t)async;
++
++	//construct pkt, send to engine and receive reply
++	err = nlm_hal_send_msg3(crypto_vc_base, 0 /*code */ , entry0, entry1, tx_id);
++	if(err){
++		printk("err\n");
++		return -EIO;
++	}
++
++
++	return -EINPROGRESS;
++
++
++}
++static int aead_crypt_ctr(struct aead_request *req, unsigned int op)
++{
++	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++	struct crypto_alg *alg = tfm->base.__crt_alg;
++	struct aead_alg *aead= &alg->cra_aead;
++	struct aead_tfm *crt = crypto_aead_crt(tfm);
++	struct nlm_aead_ctx *ctx = (struct nlm_aead_ctx *)nlm_crypto_aead_ctx(tfm);
++	struct nlm_crypto_pkt_param *param;
++	unsigned int cipher_off, iv_off;
++	unsigned int auth_len, cipher_len, auth_off;
++	unsigned char *actual_tag;
++	int seg = 0, nr_enc_frags, ivsize;
++	unsigned int hash_source;
++	uint64_t entry0, entry1;
++	uint64_t tx_id=0x12345678;
++	void  * addr = aead_request_ctx(req);
++	struct nlm_async_crypto *async = NULL;
++	uint8_t *hash_addr;
++	int fb_vc; 
++	int err=0;
++	unsigned int authsize,maxauthsize;
++	uint8_t *iv = (uint8_t *)NLM_IV_OFFSET(addr); 
++	struct nlm_crypto_pkt_ctrl *ctrl = &ctx->ctrl;
++	
++	authsize = crypto_aead_crt(crt->base)->authsize;
++	maxauthsize= aead->maxauthsize;
++
++	if ( !op ) {
++		 uint8_t *tmp_iv = iv;
++		/*Copy nonce*/
++		memcpy(tmp_iv,  ctx->iv_buf, CTR_RFC3686_NONCE_SIZE);
++		tmp_iv += CTR_RFC3686_NONCE_SIZE;
+ 
+-	if (nr_src_frags > nr_dst_frags) {
+-		for (i = 0; i < nr_src_frags - nr_dst_frags; i++)
+-			param->segment[seg + nr_dst_frags + i][1] = 0ULL;
+-		return nr_src_frags;
+-	}else{
+-		if (nr_src_frags < nr_dst_frags) {
+-			for (i = 0; i < nr_dst_frags - nr_src_frags; i++)
+-				param->segment[seg + nr_src_frags + i][0] = 0ULL;
+-		}
+-		return nr_dst_frags;
++		memcpy(tmp_iv, req->iv, CTR_RFC3686_IV_SIZE);
++		tmp_iv += CTR_RFC3686_IV_SIZE;
++
++		/*Set counter*/
++		*((uint32_t *)tmp_iv) = (uint32_t)1;
+ 	}
+-}
+ 
+-/*
+-   Generic Encrypt / Decrypt Function
+- */
+-//op is either encrypt or decrypt
++	param = (struct nlm_crypto_pkt_param *)NLM_CRYPTO_PKT_PARAM_OFFSET(addr);
++	hash_addr = (uint8_t *)NLM_HASH_OFFSET(addr);
+ 
+-#if 1
+-static inline void ncd_block_fast_send(unsigned int dest)
+-{
+-	int success;
+-        __asm__ volatile (".set push\n"
+-                          ".set noreorder\n"
+-                          ".set arch=xlp\n"
+-                          "sync\n"
+-                          "1: msgsnds %0, %1\n"
+-			  "beqz %0, 1b\n"
+-			  "nop\n"
+-                          ".set pop\n"
+-			  : "=&r"(success)
+-			  : "r" (dest));
+-
+-        return ;
+-}
++	ivsize = crypto_aead_ivsize(crypto_aead_reqtfm(req));
+ 
+-static inline int ncd_fast_recv_msg2(uint32_t vc, uint64_t *msg0, uint64_t *msg1)
+-{
+-	if (!xlp_receive(vc))
+-		return -1;
++	auth_off = CTR_RFC3686_BLOCK_SIZE;
++	cipher_off = auth_off + req->assoclen + ivsize;
++	iv_off = 0;
+ 
+-	*msg0 = xlp_load_rx_msg0();
+-	*msg1 = xlp_load_rx_msg1();
+-	return 0;
+-}
++	//check if it should be aip->tag_len or can be taken from tfm
++	cipher_len = op ? req->cryptlen:req->cryptlen - authsize;
++	auth_len = cipher_off - auth_off + cipher_len;
++	hash_source = op;
++	nlm_crypto_fill_src_seg(param, seg, iv, CTR_RFC3686_BLOCK_SIZE);
++	nlm_crypto_fill_dst_seg(param, seg, iv, CTR_RFC3686_BLOCK_SIZE);
++	seg++;
+ 
+-static inline void ncd_fast_send_msg3(uint32_t dst, uint64_t data0, uint64_t data1, uint64_t data2)
+-{
+-  unsigned int dest = 0;
++	seg = fill_aead_aad(param, req, req->assoclen,seg);
++	if (seg == 0)
++		return -1;
++
++	if (ivsize) {
++		nlm_crypto_fill_src_seg(param, seg, iv+CTR_RFC3686_NONCE_SIZE, ivsize);
++		nlm_crypto_fill_dst_seg(param, seg, iv+CTR_RFC3686_NONCE_SIZE, ivsize);
++		seg++;
++	}
+ 
++	nr_enc_frags = fill_aead_crypt(req, cipher_len, param, &actual_tag, op, seg);
+ 
+-  xlp_load_tx_msg0(data0);
+-  xlp_load_tx_msg1(data1);
+-  xlp_load_tx_msg2(data2);
++	if (nr_enc_frags == -1)
++		return -1;
+ 
+-  dest = ((2 << 16) | dst);
++	seg += nr_enc_frags;
+ 
+-#ifdef MSGRING_DUMP_MESSAGES
+-  nlm_hal_dbg_msg("Sending msg<%llx, %llx, %llx> to dest = %x\n", 
+-	  data0, data1, data2, dest);
+-#endif
++	nlm_crypto_fill_cipher_auth_pkt_param(ctrl, param, op, op, iv_off, 
++			CTR_RFC3686_BLOCK_SIZE, auth_off, auth_len, 0, cipher_off, cipher_len, hash_addr);
+ 	
+-  ncd_block_fast_send(dest);
++	fb_vc = crypto_get_fb_vc();
+ 
+-  return;
+-}
++	entry0 = nlm_crypto_form_pkt_fmn_entry0(fb_vc, 0, 0, ctrl->cipherkeylen, virt_to_phys(ctrl));
++	entry1 = nlm_crypto_form_pkt_fmn_entry1(0, ctrl->hashkeylen, (seg + 2)<<4, virt_to_phys(param));
++
++
++#ifdef NLM_CRYPTO_DEBUG
++	printk("*****ctrl descriptor phys addr %#lx\n",virt_to_phys(ctrl));
++	print_crypto_msg_desc(entry0, entry1, tx_id);
++	print_cntl_instr(ctrl->desc0);
++	print_buf("ENC_KEY:", (uint8_t *)ctrl->key, ctrl->cipherkeylen);
++	print_buf("AUTH_KEY:", (uint8_t *)ctrl->key + ctrl->cipherkeylen, ctrl->hashkeylen);
++	print_pkt_desc(param,seg);
++	print_buf("IV ",iv,16);
++	printk("iv_off: %d, cipher_off: %d, auth_off: %d\n",iv_off, cipher_off, auth_off);
++	printk("auth_len: %d, cipher_len: %d\n", auth_len, cipher_len);
+ #endif
+ 
+-static void aead_request_callback(struct nlm_async_crypto *async, uint64_t msg1)
+-{
+-	struct crypto_async_request *base = (struct crypto_async_request *)async->args;
+-	int err = 0;
+-	int cpu = nlm_processor_id();
+-	int enc = async->stat & 0xff;
+-	int auth = (async->stat >> 8 ) & 0xff;
++	async = (struct nlm_async_crypto *)NLM_ASYNC_PTR_PARAM_OFFSET(addr);
++	async->callback =  aead_request_callback;
++	async->args = (void *)&req->base; 
++	async->op  = op;
++	async->actual_tag = actual_tag;
++	async->hash_addr = hash_addr;
++	async->authsize = authsize;
++	async->stat = ctx->stat;
++	async->bytes = req->cryptlen;
++	tx_id = (uint64_t)async;
+ 
+-	if (msg1 & 0x7ff80) {
+-		printk("\n Error: entry1 is %llx",msg1);
+-		err = -EIO;
+-		base->complete(base, err);
+-		return;
+-	}
+-	if (async->op){
+-		memcpy(async->actual_tag, async->hash_addr, async->authsize);
+-	}else{
+-		if(memcmp(async->actual_tag, async->hash_addr, async->authsize)){
+-			err = -EBADMSG;
+-			printk("TAG MISMATCH!!!\n");
+-		}
++	//construct pkt, send to engine and receive reply
++	err = nlm_hal_send_msg3(crypto_vc_base, 0 /*code */ , entry0, entry1, tx_id);
++	if(err){
++		return -EIO;
+ 	}
+-	crypto_stat[cpu].enc[enc]++;
+-	crypto_stat[cpu].auth[auth]++;	
+-	crypto_stat[cpu].enc_tbytes[enc] += async->bytes;
+-	crypto_stat[cpu].auth_tbytes[auth] += async->bytes;
+-	base->complete(base, err);
+-	return;
+-}
+ 
++	return -EINPROGRESS;
++}
+ 
+ static int aead_crypt_3des(struct aead_request *req, unsigned int op)
+ {
+@@ -848,10 +1463,10 @@ static int aead_crypt(struct aead_request *req, unsigned int op)
+ 		return -EIO;
+ 	}
+ 
+-
+ 	return -EINPROGRESS;
+ }
+ 
++
+ /*
+  *  All Encrypt Functions goes here.
+  */
+@@ -873,6 +1488,24 @@ xlp_des_cbc_encrypt(struct aead_request *req)
+ 	return aead_crypt(req, NETL_OP_ENCRYPT);
+ }
+ 
++static int
++xlp_aes_gcm_encrypt(struct aead_request *req)
++{
++	return aead_crypt_gcm(req, NETL_OP_ENCRYPT);
++}
++
++static int
++xlp_aes_ccm_encrypt(struct aead_request *req)
++{
++	return aead_crypt_ccm(req, NETL_OP_ENCRYPT);
++}
++
++
++static int 
++xlp_aes_ctr_encrypt(struct aead_request *req)
++{
++	return aead_crypt_ctr(req, NETL_OP_ENCRYPT);
++}
+ 
+ /*
+  *  All Decrypt Functions goes here.
+@@ -891,6 +1524,20 @@ static int xlp_des_cbc_decrypt(struct aead_request *req)
+ {
+ 	return aead_crypt(req, NETL_OP_DECRYPT);
+ }
++
++static int xlp_aes_gcm_decrypt(struct aead_request *req)
++{
++	return aead_crypt_gcm(req, NETL_OP_DECRYPT);
++}
++
++static int xlp_aes_ccm_decrypt(struct aead_request *req)
++{
++	return aead_crypt_ccm(req, NETL_OP_DECRYPT);
++}
++static int xlp_aes_ctr_decrypt(struct aead_request *req)
++{
++	return aead_crypt_ctr(req, NETL_OP_DECRYPT);
++} 
+ /*
+  *  All Givencrypt Functions goes here.
+  */
+@@ -933,6 +1580,62 @@ static int xlp_des_cbc_givencrypt(struct aead_givcrypt_request *req)
+ }
+ 
+ 
++static int xlp_aes_gcm_givencrypt(struct aead_givcrypt_request *req)
++{
++	struct crypto_aead *tfm = crypto_aead_reqtfm(&req->areq);
++	struct nlm_aead_ctx *nlm_ctx = (struct nlm_aead_ctx *)nlm_crypto_aead_ctx(tfm);
++	struct aead_request *areq = &req->areq;
++	char * req_iv = areq->iv;
++	int ret;
++
++	memcpy(req->giv, nlm_ctx->iv_buf + GCM_RFC4106_NONCE_SIZE,nlm_ctx->iv_len);
++	*(uint64_t *)req->giv += req->seq;
++
++	areq->iv = req->giv;
++	ret = xlp_aes_gcm_encrypt(&req->areq);
++	areq->iv = req_iv;
++	return ret;
++
++}
++
++static int xlp_aes_ccm_givencrypt(struct aead_givcrypt_request *req)
++{
++	struct crypto_aead *tfm = crypto_aead_reqtfm(&req->areq);
++	struct nlm_aead_ctx *nlm_ctx = (struct nlm_aead_ctx *)nlm_crypto_aead_ctx(tfm);
++	struct aead_request *areq = &req->areq;
++	char * req_iv = areq->iv;
++	int ret;
++
++	memcpy(req->giv, nlm_ctx->iv_buf + CCM_RFC4309_NONCE_SIZE, nlm_ctx->iv_len);
++	*(uint64_t *)req->giv += req->seq;
++
++	areq->iv = req->giv;
++	ret = xlp_aes_ccm_encrypt(&req->areq);
++	areq->iv = req_iv;
++	return ret;
++
++}
++
++int xlp_aes_ctr_givencrypt(struct aead_givcrypt_request *req)
++{
++	struct crypto_aead *tfm = crypto_aead_reqtfm(&req->areq);
++	struct nlm_aead_ctx *nlm_ctx = (struct nlm_aead_ctx *)nlm_crypto_aead_ctx(tfm);
++	void *iv = (uint8_t *)NLM_IV_OFFSET(aead_request_ctx(&req->areq));
++	memcpy(req->giv, nlm_ctx->iv_buf+CTR_RFC3686_NONCE_SIZE, nlm_ctx->iv_len);
++	*(uint64_t *)req->giv += req->seq;
++
++	memcpy(iv,  nlm_ctx->iv_buf, CTR_RFC3686_NONCE_SIZE);
++	iv += CTR_RFC3686_NONCE_SIZE;
++
++	 /*Copy IV*/
++	memcpy(iv, req->giv, CTR_RFC3686_IV_SIZE);
++	iv += CTR_RFC3686_IV_SIZE;
++
++	/*Set counter*/
++	*((uint32_t *)iv) = (uint32_t)1;
++	
++	return xlp_aes_ctr_encrypt(&req->areq);
++}
+ /* commented out to avoid the search time */
+ static struct crypto_alg xlp_aes_cbc_hmac_sha256_cipher_auth = {
+ 	/* AEAD algorithms.  These use a single-pass ipsec_esp descriptor */
+@@ -1209,11 +1912,147 @@ static struct crypto_alg xlp_des_cbc_hmac_sha1_cipher_auth = {
+                      }
+ };
+ 
++static struct crypto_alg xlp_aes_gcm_cipher_auth = {
++	/* AEAD algorithms.  These use a single-pass ipsec_esp descriptor */
++	.cra_name = "rfc4106(gcm(aes))",
++	.cra_driver_name = "rfc4106-gcm-aes-xlp",
++	.cra_priority = XLP_CRYPT_PRIORITY,
++	.cra_blocksize = AES_BLOCK_SIZE,
++	.cra_flags = CRYPTO_ALG_TYPE_AEAD | CRYPTO_ALG_ASYNC,
++	.cra_type = &crypto_aead_type,
++	.cra_exit = aead_session_cleanup,
++        .cra_ctxsize = CTRL_DESC_SIZE,
++        .cra_init = aead_cra_init_gcm,
++	.cra_aead = {
++		.setkey = aead_gcm_rfc4106_setkey,
++		.setauthsize = aead_setauthsize,
++		.encrypt = xlp_aes_gcm_encrypt,
++		.decrypt = xlp_aes_gcm_decrypt,
++		.givencrypt = xlp_aes_gcm_givencrypt,
++		.geniv = "<built-in>",
++		.ivsize = GCM_RFC4106_IV_SIZE,
++		.maxauthsize = GCM_RFC4106_DIGEST_SIZE,
++	}
++};
++
++static struct crypto_alg xlp_aes_ccm_cipher_auth = {
++	/* AEAD algorithms.  These use a single-pass ipsec_esp descriptor */
++	.cra_name = "rfc4309(ccm(aes))",
++	.cra_driver_name = "rfc4309-ccm-aes-xlp",
++	.cra_priority = XLP_CRYPT_PRIORITY,
++	.cra_blocksize = AES_BLOCK_SIZE,
++	.cra_flags = CRYPTO_ALG_TYPE_AEAD | CRYPTO_ALG_ASYNC,
++	.cra_type = &crypto_aead_type,
++        .cra_ctxsize = CTRL_DESC_SIZE,
++        .cra_init = aead_cra_init_ccm,
++	.cra_aead = {
++		.setkey = aead_ccm_rfc4309_setkey,
++		.setauthsize = aead_setauthsize,
++		.encrypt = xlp_aes_ccm_encrypt,
++		.decrypt = xlp_aes_ccm_decrypt,
++		.givencrypt = xlp_aes_ccm_givencrypt,
++		.geniv = "<built-in>",
++		.ivsize = CCM_RFC4309_IV_SIZE,
++		.maxauthsize = CCM_RFC4309_DIGEST_SIZE,
++	}
++};
++
++static struct crypto_alg xlp_aes_ctr_hmac_sha1_cipher_auth = {
++	/* AEAD algorithms.  These use a single-pass ipsec_esp descriptor */
++	.cra_name = "authenc(hmac(sha1),rfc3686(ctr(aes)))",
++	.cra_driver_name = "authenc-hmac-sha1-ctr-aes-xlp",
++	.cra_priority = XLP_CRYPT_PRIORITY,
++	.cra_blocksize = 1,
++	.cra_alignmask = 0,
++	.cra_flags = CRYPTO_ALG_TYPE_AEAD | CRYPTO_ALG_ASYNC ,
++	.cra_ctxsize = CTRL_DESC_SIZE,
++	.cra_type = &crypto_aead_type,
++	.cra_init = aead_cra_init,
++	.cra_exit = aead_session_cleanup,
++	.cra_aead = {
++		     .setkey = xlp_aes_ctr_hmac_sha1_setkey,
++		     .setauthsize = aead_setauthsize,
++		     .encrypt = xlp_aes_ctr_encrypt,
++		     .decrypt = xlp_aes_ctr_decrypt,
++		     .givencrypt = xlp_aes_ctr_givencrypt,
++		     .geniv = "seqiv", 
++		     .ivsize = CTR_RFC3686_IV_SIZE,
++		     .maxauthsize = SHA1_DIGEST_SIZE,
++		     }
++};
++
++static struct crypto_alg xlp_aes_ctr_hmac_sha256_cipher_auth = {
++	/* AEAD algorithms.  These use a single-pass ipsec_esp descriptor */
++	.cra_name = "authenc(hmac(sha256),rfc3686(ctr(aes)))",
++	.cra_driver_name = "authenc-hmac-sha256-ctr-aes-xlp",
++	.cra_priority = XLP_CRYPT_PRIORITY,
++	.cra_blocksize = 1,
++	.cra_alignmask = 0,
++	.cra_flags = CRYPTO_ALG_TYPE_AEAD | CRYPTO_ALG_ASYNC ,
++	.cra_ctxsize = CTRL_DESC_SIZE,
++	.cra_type = &crypto_aead_type,
++	.cra_init = aead_cra_init,
++	.cra_exit = aead_session_cleanup,
++	.cra_aead = {
++		     .setkey = xlp_aes_ctr_hmac_sha256_setkey,
++		     .setauthsize = aead_setauthsize,
++		     .encrypt = xlp_aes_ctr_encrypt,
++		     .decrypt = xlp_aes_ctr_decrypt,
++		     .givencrypt = xlp_aes_ctr_givencrypt,
++		     .geniv = "seqiv", 
++		     .ivsize = CTR_RFC3686_IV_SIZE,
++		     .maxauthsize = SHA256_DIGEST_SIZE,
++		     }
++};
++static struct crypto_alg xlp_aes_ctr_aes_xcbc_mac_cipher_auth = {
++	/* AEAD algorithms.  These use a single-pass ipsec_esp descriptor */
++	.cra_name = "authenc(xcbc(aes),rfc3686(ctr(aes)))",
++	.cra_driver_name = "authenc-aes-xcbc-mac-ctr-aes-xlp",
++	.cra_priority = XLP_CRYPT_PRIORITY,
++	.cra_blocksize = 1,
++	.cra_alignmask = 0,
++	.cra_flags = CRYPTO_ALG_TYPE_AEAD | CRYPTO_ALG_ASYNC ,
++	.cra_ctxsize = CTRL_DESC_SIZE,
++	.cra_type = &crypto_aead_type,
++	.cra_init = aead_cra_init,
++	.cra_aead = {
++		     .setkey = xlp_aes_ctr_aes_xcbc_mac_setkey,
++		     .setauthsize = aead_setauthsize,
++		     .encrypt = xlp_aes_ctr_encrypt,
++		     .decrypt = xlp_aes_ctr_decrypt,
++		     .givencrypt = xlp_aes_ctr_givencrypt,
++		     .geniv = "seqiv", 
++		     .ivsize = CTR_RFC3686_IV_SIZE,
++		     .maxauthsize = XCBC_DIGEST_SIZE,
++		     }
++};
++
++static struct crypto_alg xlp_aes_ctr_hmac_md5_cipher_auth = {
++	/* AEAD algorithms.  These use a single-pass ipsec_esp descriptor */
++	.cra_name = "authenc(hmac(md5),rfc3686(ctr(aes)))",
++	.cra_driver_name = "authenc-hmac-sha1-ctr-aes-xlp",
++	.cra_priority = XLP_CRYPT_PRIORITY,
++	.cra_blocksize = 1,
++	.cra_alignmask = 0,
++	.cra_flags = CRYPTO_ALG_TYPE_AEAD | CRYPTO_ALG_ASYNC ,
++	.cra_ctxsize = CTRL_DESC_SIZE,
++	.cra_type = &crypto_aead_type,
++	.cra_init = aead_cra_init,
++	.cra_aead = {
++		     .setkey = xlp_aes_ctr_hmac_md5_setkey,
++		     .setauthsize = aead_setauthsize,
++		     .encrypt = xlp_aes_ctr_encrypt,
++		     .decrypt = xlp_aes_ctr_decrypt,
++		     .givencrypt = xlp_aes_ctr_givencrypt,
++		     .geniv = "seqiv", 
++		     .ivsize = CTR_RFC3686_IV_SIZE,
++		     .maxauthsize = MD5_DIGEST_SIZE,
++		     }
++};
+ 
+ int xlp_aead_alg_init(void)
+ {
+ 	int ret = 0;
+-	int no_of_alg_registered = 0;
+ 	
+ 	if ((ret = crypto_register_alg(&xlp_aes_cbc_hmac_sha256_cipher_auth)))
+ 		goto end;
+@@ -1258,28 +2097,53 @@ int xlp_aead_alg_init(void)
+ 	if ((ret =  crypto_register_alg(&xlp_des_cbc_aes_xcbc_mac_cipher_auth)))
+ 		goto end;
+ 	no_of_alg_registered++;
++	if((ret = crypto_register_alg(&xlp_aes_gcm_cipher_auth)))
++		goto end;
++	no_of_alg_registered++;
++	if ((ret = crypto_register_alg(&xlp_aes_ccm_cipher_auth)))
++		goto end;
++	no_of_alg_registered++;
++
++	if ((ret = crypto_register_alg(&xlp_aes_ctr_hmac_sha1_cipher_auth)))
++		goto end;
++	no_of_alg_registered++;
++
++	if ((ret = crypto_register_alg(&xlp_aes_ctr_hmac_sha256_cipher_auth)))
++		goto end;
++	no_of_alg_registered++;
++
++	if ((ret = crypto_register_alg(&xlp_aes_ctr_aes_xcbc_mac_cipher_auth)))
++		goto end;
++	no_of_alg_registered++;
+ 
++	if ((ret = crypto_register_alg(&xlp_aes_ctr_hmac_md5_cipher_auth)))
++		goto end;
++	no_of_alg_registered++;
+ end:
+ 	return no_of_alg_registered;
+ } 
+ 
+-void
++	void
+ xlp_aead_alg_fini(void)
+ {
+-	
+-	crypto_unregister_alg(&xlp_aes_cbc_hmac_sha1_cipher_auth);
+-	crypto_unregister_alg(&xlp_aes_cbc_aes_xcbc_mac_cipher_auth);
+-	crypto_unregister_alg(&xlp_aes_cbc_hmac_md5_cipher_auth);
+-	crypto_unregister_alg(&xlp_3des_cbc_hmac_md5_cipher_auth);
+-	crypto_unregister_alg(&xlp_3des_cbc_hmac_sha256_cipher_auth);
+-	crypto_unregister_alg(&xlp_3des_cbc_hmac_sha1_cipher_auth);
+-	crypto_unregister_alg(&xlp_3des_cbc_aes_xcbc_mac_cipher_auth);
+-	crypto_unregister_alg(&xlp_des_cbc_hmac_md5_cipher_auth);
+-	crypto_unregister_alg(&xlp_des_cbc_hmac_sha256_cipher_auth);
++	crypto_unregister_alg(&xlp_aes_ctr_hmac_md5_cipher_auth);
++	crypto_unregister_alg(&xlp_aes_ctr_aes_xcbc_mac_cipher_auth);
++	crypto_unregister_alg(&xlp_aes_ctr_hmac_sha256_cipher_auth);
++	crypto_unregister_alg(&xlp_aes_ctr_hmac_sha1_cipher_auth);
++	crypto_unregister_alg(&xlp_aes_ccm_cipher_auth);
++	crypto_unregister_alg(&xlp_aes_gcm_cipher_auth);
++	crypto_unregister_alg(&xlp_des_cbc_aes_xcbc_mac_cipher_auth);
+ 	crypto_unregister_alg(&xlp_des_cbc_hmac_sha1_cipher_auth);
++	crypto_unregister_alg(&xlp_des_cbc_hmac_sha256_cipher_auth);
++	crypto_unregister_alg(&xlp_des_cbc_hmac_md5_cipher_auth);
++	crypto_unregister_alg(&xlp_3des_cbc_aes_xcbc_mac_cipher_auth);
++	crypto_unregister_alg(&xlp_3des_cbc_hmac_sha1_cipher_auth);
++	crypto_unregister_alg(&xlp_3des_cbc_hmac_sha256_cipher_auth);
++	crypto_unregister_alg(&xlp_3des_cbc_hmac_md5_cipher_auth);
++	crypto_unregister_alg(&xlp_aes_cbc_hmac_md5_cipher_auth);
++	crypto_unregister_alg(&xlp_aes_cbc_aes_xcbc_mac_cipher_auth);
++	crypto_unregister_alg(&xlp_aes_cbc_hmac_sha1_cipher_auth);
+ 	crypto_unregister_alg(&xlp_aes_cbc_hmac_sha256_cipher_auth);
+-	crypto_unregister_alg(&xlp_des_cbc_aes_xcbc_mac_cipher_auth);
+-	return;
+ }
+ 
+ EXPORT_SYMBOL(xlp_aead_alg_init);
+diff --git a/drivers/crypto/sae/nlm_async.h b/drivers/crypto/sae/nlm_async.h
+index 639805a..139a2db 100644
+--- a/drivers/crypto/sae/nlm_async.h
++++ b/drivers/crypto/sae/nlm_async.h
+@@ -28,20 +28,6 @@ struct nlm_async_crypto;
+ #define MAX_CPU 32
+ extern int crypto_get_fb_vc(void);
+ 
+-#define nlm_processor_id()                              \
+-        ({ int __res;                                   \
+-         __asm__ __volatile__(                          \
+-                 ".set\tmips32\n\t"                     \
+-                 "mfc0\t%0, $15, 1\n\t"                 \
+-                 "andi\t%0, 0x1f\n\t"                   \
+-                 ".set\tmips0\n\t"                      \
+-                 : "=r" (__res));                       \
+-         __res;                                         \
+-         })
+-
+-
+-
+-
+ struct nlm_async_crypto
+ {
+ 	void (*callback) (struct nlm_async_crypto *args, uint64_t entry1);
+@@ -60,6 +46,9 @@ enum enc_stat {
+ 	AES128_CBC_STAT ,
+ 	AES192_CBC_STAT ,
+ 	AES256_CBC_STAT, 
++	AES128_CTR_STAT,
++	AES192_CTR_STAT,
++	AES256_CTR_STAT,
+ 	ENC_MAX_STAT
+ };
+ enum {
+@@ -69,6 +58,8 @@ enum {
+ 	AES128_XCBC_STAT,
+ 	AES192_XCBC_STAT,
+ 	AES256_XCBC_STAT,
++	GCM_STAT,
++	CCM_STAT,
+ 	AUTH_MAX_STAT
+ };
+ 
+diff --git a/drivers/crypto/sae/nlm_auth.c b/drivers/crypto/sae/nlm_auth.c
+index db2fdf3..693e4cf 100644
+--- a/drivers/crypto/sae/nlm_auth.c
++++ b/drivers/crypto/sae/nlm_auth.c
+@@ -46,6 +46,7 @@ extern int auth_mode_key_len[NLM_HASH_MAX][NLM_HASH_MODE_MAX];
+ 
+ //#define SEC_DEBUG
+ 
++
+ #ifdef SEC_DEBUG
+ #ifdef __KERNEL__
+ #define debug_print(fmt, args...) printk(fmt, ##args)
+@@ -60,11 +61,16 @@ extern int auth_mode_key_len[NLM_HASH_MAX][NLM_HASH_MODE_MAX];
+ #define free kfree
+ #define NLM_AUTH_MAX_FRAGS	(20)
+ 
++#define MAX_AUTH_DATA 64000
++
+ 
+ struct nlm_auth_ctx
+ {
+ 	struct nlm_crypto_pkt_ctrl ctrl;
+ 	uint16_t stat;
++	uint8_t hashed_key[128];
++	struct crypto_shash * fallback_tfm;
++	uint8_t data[MAX_AUTH_DATA];
+ 	/*Don't change the order of this strucutre*/
+ };
+ 
+@@ -76,9 +82,11 @@ struct auth_pkt_desc
+ 	uint32_t curr_index;
+ 	uint32_t total_len;
+ 	uint8_t pad[56];
+-	//struct pkt_desc pkt_desc;
+ 	struct nlm_crypto_pkt_param pkt_param; 
+ 	uint16_t stat;
++	/*maintain shash_desc at the end*/
++	struct shash_desc fallback;
++	
+ };
+ 
+ #define PACKET_DESC_SIZE   (64+sizeof(struct auth_pkt_desc) + MAX_FRAGS*(2*64) + 64 + sizeof(struct nlm_async_crypto) + 64)
+@@ -94,6 +102,7 @@ extern void print_crypto_msg_desc(uint64_t entry1, uint64_t entry2, uint64_t ent
+ extern void print_pkt_desc(struct nlm_crypto_pkt_param * pkt_param, int index);
+ extern struct nlm_crypto_stat crypto_stat[MAX_CPU];
+ 
++
+ static inline void print_info(const char *func)
+ {
+ 	extern void dump_stack(void);
+@@ -137,30 +146,79 @@ static struct nlm_auth_ctx *pkt_ctrl_auth_ctx(struct shash_desc *desc)
+ {
+ 	return nlm_shash_auth_ctx(desc->tfm);
+ }
++
++static int
++xlp_cra_xcbc_init(struct crypto_tfm *tfm)
++{
++	struct crypto_shash * hash = __crypto_shash_cast(tfm);
++	struct nlm_auth_ctx * nlm_ctx = nlm_shash_auth_ctx(hash);
++	nlm_ctx->fallback_tfm = crypto_alloc_shash("xcbc(aes-generic)",CRYPTO_ALG_TYPE_SHASH ,0 );
++	hash->descsize += crypto_shash_descsize(nlm_ctx->fallback_tfm);
++	return 0;
++}
++
++static int
++xlp_cra_hmac_sha1_init(struct crypto_tfm *tfm)
++{
++	struct crypto_shash * hash = __crypto_shash_cast(tfm);
++	struct nlm_auth_ctx * nlm_ctx = nlm_shash_auth_ctx(hash);
++	nlm_ctx->fallback_tfm = crypto_alloc_shash("hmac(sha1-generic)",CRYPTO_ALG_TYPE_SHASH ,0 );
++	hash->descsize += crypto_shash_descsize(nlm_ctx->fallback_tfm);
++	return 0;
++}
++static int
++xlp_cra_hmac_sha256_init(struct crypto_tfm *tfm)
++{
++	struct crypto_shash * hash = __crypto_shash_cast(tfm);
++	struct nlm_auth_ctx * nlm_ctx = nlm_shash_auth_ctx(hash);
++	nlm_ctx->fallback_tfm = crypto_alloc_shash("hmac(sha256-generic)",CRYPTO_ALG_TYPE_SHASH ,0 );
++	hash->descsize += crypto_shash_descsize(nlm_ctx->fallback_tfm);
++	return 0;
++}
++
++static int
++xlp_cra_md5_init(struct crypto_tfm *tfm)
++{
++	struct crypto_shash * hash = __crypto_shash_cast(tfm);
++	struct nlm_auth_ctx * nlm_ctx = nlm_shash_auth_ctx(hash);
++	nlm_ctx->fallback_tfm = crypto_alloc_shash("hmac(md5-generic)",CRYPTO_ALG_TYPE_SHASH ,0 );
++	hash->descsize += crypto_shash_descsize(nlm_ctx->fallback_tfm);
++	
++	return 0;
++}
+ static int
+ xlp_auth_init(struct shash_desc *desc)
+ {
+ 	struct auth_pkt_desc *auth_pkt_desc = (struct auth_pkt_desc * )NLM_CRYPTO_PKT_PARAM_OFFSET(shash_desc_ctx(desc));
+-	//printk("[%s] [%p]\n",__FUNCTION__, pkt_desc);
+-	//printk("[%s] [%p]\n",__FUNCTION__, &pkt_desc->pkt_param.desc0);
+-	//printk("[%s] [%p]\n",__FUNCTION__, &pkt_desc->pkt_param);
++	struct nlm_auth_ctx * nlm_ctx = nlm_shash_auth_ctx(desc->tfm);
++	auth_pkt_desc->fallback.tfm = nlm_ctx->fallback_tfm;
++	auth_pkt_desc->fallback.flags = desc->flags & CRYPTO_TFM_REQ_MAY_SLEEP; 
++	crypto_shash_init(&auth_pkt_desc->fallback);
++
+ 	auth_pkt_desc->curr_index = 0;
+ 	auth_pkt_desc->total_len = 0;
+ 	return 0;
+ }
+-
+ static int
+ xlp_auth_update(struct shash_desc *desc,
+ 		const uint8_t * data, unsigned int length)
+ {
+ 	struct auth_pkt_desc *auth_pkt_desc = (struct auth_pkt_desc *)NLM_CRYPTO_PKT_PARAM_OFFSET(shash_desc_ctx(desc));
++	struct nlm_auth_ctx * nlm_ctx = nlm_shash_auth_ctx(desc->tfm);
+ 	int index = auth_pkt_desc->curr_index;
++	unsigned char * data_index = &nlm_ctx->data[auth_pkt_desc->total_len];
+ 	struct nlm_crypto_pkt_param  *pkt_param  = &(auth_pkt_desc->pkt_param);
+-	
+-	nlm_crypto_fill_src_seg(pkt_param, index, (unsigned char*)data, length);
+-	auth_pkt_desc->curr_index = nlm_crypto_fill_dst_seg(pkt_param, index , (unsigned char*)data, length);
++
++	crypto_shash_update(&auth_pkt_desc->fallback,data,length);
+ 	auth_pkt_desc->total_len += length;
+ 
++	if ( auth_pkt_desc->total_len > MAX_AUTH_DATA)
++		return 0;
++
++	memcpy(data_index,data,length);
++	nlm_crypto_fill_src_seg(pkt_param, index, data_index, length);
++	auth_pkt_desc->curr_index = nlm_crypto_fill_dst_seg(pkt_param, index , data_index, length);
++
+ 	return 0;
+ }
+ static int
+@@ -188,9 +246,14 @@ xlp_auth_final(struct shash_desc *desc, uint8_t *out)
+ 	struct nlm_crypto_pkt_ctrl *ctrl = &auth_ctx->ctrl;
+ 	uint32_t size,code,src;
+ 	uint16_t stat = auth_ctx->stat;
+-	int cpu = nlm_processor_id();
++	int cpu = hard_smp_processor_id();
+         extern int ipsec_sync_vc;
+ 
++	if ( (auth_pkt_desc->total_len == 0 ) ||  ( auth_pkt_desc->total_len > MAX_AUTH_DATA)){
++		crypto_shash_final(&auth_pkt_desc->fallback,out);
++		return 0;
++	}
++		
+ 	nlm_crypto_fill_auth_pkt_param(ctrl,pkt_param,
+ 			0,auth_pkt_desc->total_len,0,out); 
+ 
+@@ -230,11 +293,73 @@ xlp_auth_final(struct shash_desc *desc, uint8_t *out)
+ 	preempt_enable();
+  	return 0;
+ }
++static int xlp_auth_export(struct shash_desc *desc, void *out)
++{
++	struct auth_pkt_desc *auth_pkt_desc = (struct auth_pkt_desc *)NLM_CRYPTO_PKT_PARAM_OFFSET(shash_desc_ctx(desc));
++	return crypto_shash_export(&auth_pkt_desc->fallback,out);
++}
++
++static int xlp_auth_import(struct shash_desc *desc, const void *in) 
++{
++	struct auth_pkt_desc *auth_pkt_desc = (struct auth_pkt_desc *)NLM_CRYPTO_PKT_PARAM_OFFSET(shash_desc_ctx(desc));
++	return crypto_shash_import(&auth_pkt_desc->fallback, in);
++}
+ 
+ /*
+    All Setkey goes here.
+  */
+ 
++int hash_key(int alg, int mode, const uint8_t * key, unsigned int keylen, uint8_t * new_key)
++{
++
++	int fb_vc;
++	uint64_t entry0,entry1;
++	uint32_t size,code,src;
++        extern int ipsec_sync_vc;
++	uint64_t tx_id=0x12345678;
++	uint64_t  timeout = 0;
++	char * tmp = kmalloc(keylen + sizeof(struct nlm_crypto_pkt_ctrl) + sizeof( struct nlm_crypto_pkt_param ) 
++											+ 128, GFP_KERNEL);
++	struct nlm_crypto_pkt_ctrl * ctrl = (struct nlm_crypto_pkt_ctrl * ) ((((unsigned long)tmp + 63)) & ~(0x3f)); 
++	struct nlm_crypto_pkt_param * pkt_param = (struct nlm_crypto_pkt_param * )
++		(((unsigned long) ctrl + sizeof(struct nlm_crypto_pkt_ctrl) + 63) & ~(0x3f));
++	char *tmp_key = (char *)(((unsigned long) pkt_param + 
++			sizeof(struct nlm_crypto_pkt_param ) + 63)  & ~(0x3f));
++
++	memcpy(tmp_key,key,keylen);
++        nlm_crypto_fill_pkt_ctrl(ctrl,0,alg,mode,0,0,0,NULL,0,NULL,0);
++        nlm_crypto_fill_auth_pkt_param(ctrl,pkt_param,0,keylen,0,new_key);
++        nlm_crypto_fill_src_seg(pkt_param,0,tmp_key,keylen);
++        nlm_crypto_fill_dst_seg(pkt_param,0,tmp_key,keylen);
++
++	preempt_disable();
++
++        fb_vc = crypto_get_sync_fb_vc();
++        entry0 = nlm_crypto_form_pkt_fmn_entry0(fb_vc, 0, 0, 0, virt_to_phys(ctrl));
++        entry1 = nlm_crypto_form_pkt_fmn_entry1(0, 0, (32 + 16 ), virt_to_phys(pkt_param));
++
++
++#ifdef NLM_CRYPTO_DEBUG
++       print_crypto_msg_desc(entry0, entry1, tx_id);
++       print_cntl_instr(ctrl->desc0);
++       print_pkt_desc(pkt_param,1);
++#endif
++
++        //construct pkt, send to engine and receive reply
++        xlp_message_send_block_fast_3(0, crypto_vc_base, entry0, entry1, tx_id);
++        timeout = 0;
++        do {
++                timeout++;
++                nlm_hal_recv_msg2(ipsec_sync_vc, &src, &size, &code, &entry0, &entry1);
++        } while(entry0 != tx_id && timeout < 0xffffffff) ;
++	preempt_enable();
++	kfree(tmp);
++	return 0;
++
++	
++
++}
++
+ static int xlp_auth_aes_xcbc_setkey(struct crypto_shash *tfm, const u8 * key, unsigned int keylen)
+ {
+ 	struct nlm_auth_ctx * nlm_ctx = nlm_shash_auth_ctx(tfm);
+@@ -258,10 +383,13 @@ static int xlp_auth_aes_xcbc_setkey(struct crypto_shash *tfm, const u8 * key, un
+                        __FUNCTION__, keylen);
+ 	}
+ 
+-
+ 	/*setup ctrl descriptor*/
+ 	nlm_crypto_fill_pkt_ctrl(&nlm_ctx->ctrl,0,hash_alg,NLM_HASH_MODE_XCBC,
+ 		NLM_CIPHER_BYPASS,NLM_CIPHER_MODE_ECB,0,NULL,0,(unsigned char *)key,keylen);
++	
++	crypto_shash_setkey(nlm_ctx->fallback_tfm,key,keylen);
++
++	
+ 	return 0;
+ 	
+ }
+@@ -272,13 +400,22 @@ xlp_auth_hmac_sha256_setkey(struct crypto_shash *tfm, const u8 * key, unsigned i
+ {
+ 	struct nlm_auth_ctx * nlm_ctx = nlm_shash_auth_ctx(tfm);
+ 	struct nlm_crypto_pkt_ctrl * ctrl = &nlm_ctx->ctrl; 
++	
+ 	nlm_ctx->stat = H_SHA256_STAT;
++	if ( keylen > 64 ) {
++		hash_key(NLM_HASH_SHA,NLM_HASH_MODE_SHA256,key,keylen,&nlm_ctx->hashed_key[0]);
++		nlm_crypto_fill_pkt_ctrl(ctrl,1,NLM_HASH_SHA,NLM_HASH_MODE_SHA256,
++			NLM_CIPHER_BYPASS,NLM_CIPHER_MODE_ECB,0,NULL,0,(unsigned char*)nlm_ctx->hashed_key,64);
++		crypto_shash_setkey(nlm_ctx->fallback_tfm,nlm_ctx->hashed_key,64);
++		return 0;
++	}
+ 
+ 	/*setup ctrl descriptor*/
+ 	nlm_crypto_fill_pkt_ctrl(ctrl,1,NLM_HASH_SHA,NLM_HASH_MODE_SHA256,
+ 		NLM_CIPHER_BYPASS,NLM_CIPHER_MODE_ECB,0,NULL,0,(unsigned char*)key,keylen);
+ 	if ( ctrl->hashkeylen < auth_mode_key_len[NLM_HASH_SHA][NLM_HASH_MODE_SHA256]) 
+ 		ctrl->hashkeylen = auth_mode_key_len[NLM_HASH_SHA][NLM_HASH_MODE_SHA256];
++	crypto_shash_setkey(nlm_ctx->fallback_tfm,key,keylen);
+ 	return 0;
+ 	
+ }
+@@ -289,13 +426,22 @@ xlp_auth_hmac_md5_setkey(struct crypto_shash *tfm, const u8 * key, unsigned int
+ {
+ 	struct nlm_auth_ctx * nlm_ctx = nlm_shash_auth_ctx(tfm);
+ 	struct nlm_crypto_pkt_ctrl * ctrl = &nlm_ctx->ctrl; 
++
+ 	nlm_ctx->stat = MD5_STAT;
++	if ( keylen > 64 ) {
++		hash_key(NLM_HASH_MD5,NLM_HASH_MODE_SHA1,key,keylen,&nlm_ctx->hashed_key[0]);
++		nlm_crypto_fill_pkt_ctrl(ctrl,1,NLM_HASH_MD5,NLM_HASH_MODE_SHA1,
++			NLM_CIPHER_BYPASS,NLM_CIPHER_MODE_ECB,0,NULL,0,(unsigned char *)nlm_ctx->hashed_key,64);
++		crypto_shash_setkey(nlm_ctx->fallback_tfm,nlm_ctx->hashed_key,64);
++		return 0;
++	}
+ 
+ 	/*setup ctrl descriptor*/
+ 	nlm_crypto_fill_pkt_ctrl(ctrl,1,NLM_HASH_MD5,NLM_HASH_MODE_SHA1,
+ 		NLM_CIPHER_BYPASS,NLM_CIPHER_MODE_ECB,0,NULL,0,(unsigned char *)key,keylen);
+ 	if ( ctrl->hashkeylen < auth_mode_key_len[NLM_HASH_MD5][NLM_HASH_MODE_SHA1]) 
+ 		ctrl->hashkeylen = auth_mode_key_len[NLM_HASH_MD5][NLM_HASH_MODE_SHA1];
++	crypto_shash_setkey(nlm_ctx->fallback_tfm,key,keylen);
+ 	return 0;
+ 	
+ }
+@@ -305,13 +451,23 @@ xlp_auth_hmac_sha1_setkey(struct crypto_shash *tfm, const u8 * key, unsigned int
+ {
+ 	struct nlm_auth_ctx * nlm_ctx = nlm_shash_auth_ctx(tfm);
+ 	struct nlm_crypto_pkt_ctrl * ctrl = &nlm_ctx->ctrl; 
++
+ 	nlm_ctx->stat = H_SHA1_STAT;
++	if ( keylen > 64 ) {
++
++		hash_key(NLM_HASH_SHA,NLM_HASH_MODE_SHA1,key,keylen,&nlm_ctx->hashed_key[0]);
++		nlm_crypto_fill_pkt_ctrl(ctrl,1,NLM_HASH_SHA,NLM_HASH_MODE_SHA1,
++			NLM_CIPHER_BYPASS,NLM_CIPHER_MODE_ECB,0,NULL,0,(unsigned char *)nlm_ctx->hashed_key,64);
++		crypto_shash_setkey(nlm_ctx->fallback_tfm,nlm_ctx->hashed_key,64);
++		return 0;
++	}
+ 
+ 	/*setup ctrl descriptor*/
+ 	nlm_crypto_fill_pkt_ctrl(ctrl,1,NLM_HASH_SHA,NLM_HASH_MODE_SHA1,
+ 		NLM_CIPHER_BYPASS,NLM_CIPHER_MODE_ECB,0,NULL,0,(unsigned char *)key,keylen);
+ 	if ( ctrl->hashkeylen < auth_mode_key_len[NLM_HASH_SHA][NLM_HASH_MODE_SHA1]) 
+ 		ctrl->hashkeylen = auth_mode_key_len[NLM_HASH_SHA][NLM_HASH_MODE_SHA1];
++	crypto_shash_setkey(nlm_ctx->fallback_tfm,key,keylen);
+ 	return 0;
+ 	 
+ 	
+@@ -321,6 +477,8 @@ static struct shash_alg xcbc_mac_alg = {
+ 	.digestsize = XCBC_DIGEST_SIZE,
+ 	.init = xlp_auth_init,
+ 	.update = xlp_auth_update,
++	.export = xlp_auth_export,
++	.import = xlp_auth_import,
+ 	.final = xlp_auth_final,
+ 	.setkey = xlp_auth_aes_xcbc_setkey,
+ 	.descsize = PACKET_DESC_SIZE,
+@@ -332,6 +490,7 @@ static struct shash_alg xcbc_mac_alg = {
+ 		 .cra_blocksize = AES_BLOCK_SIZE,
+ 		 .cra_module = THIS_MODULE,
+ 		 .cra_ctxsize = CTRL_DESC_SIZE, 
++		 .cra_init = xlp_cra_xcbc_init,
+ 		 }
+ };
+ 
+@@ -339,6 +498,8 @@ static struct shash_alg sha256_hmac_alg = {
+ 	.digestsize = SHA256_DIGEST_SIZE,
+ 	.init = xlp_auth_init,
+ 	.update = xlp_auth_update,
++	.export = xlp_auth_export,
++	.import = xlp_auth_import,
+ 	.final = xlp_auth_final,
+ 	.setkey = xlp_auth_hmac_sha256_setkey,
+ 	.descsize = PACKET_DESC_SIZE,
+@@ -350,6 +511,7 @@ static struct shash_alg sha256_hmac_alg = {
+ 		 .cra_blocksize = SHA256_BLOCK_SIZE,
+ 		 .cra_module = THIS_MODULE,
+ 		 .cra_ctxsize = CTRL_DESC_SIZE, 
++		 .cra_init = xlp_cra_hmac_sha256_init,
+ 		 }
+ };
+ 
+@@ -358,6 +520,8 @@ static struct shash_alg md5_hmac_alg = {
+ 	.init = xlp_auth_init,
+ 	.update = xlp_auth_update,
+ 	.final = xlp_auth_final,
++	.export = xlp_auth_export,
++	.import = xlp_auth_import,
+ 	.setkey = xlp_auth_hmac_md5_setkey,
+ 	.descsize = PACKET_DESC_SIZE,
+ 	.base = {
+@@ -368,6 +532,7 @@ static struct shash_alg md5_hmac_alg = {
+ 		 .cra_blocksize = MD5_BLOCK_SIZE,
+ 		 .cra_module = THIS_MODULE,
+ 		 .cra_ctxsize = CTRL_DESC_SIZE, 
++		 .cra_init = xlp_cra_md5_init,
+ 		 }
+ };
+ static struct shash_alg sha1_hmac_alg = {
+@@ -375,6 +540,8 @@ static struct shash_alg sha1_hmac_alg = {
+ 	.init = xlp_auth_init,
+ 	.update = xlp_auth_update,
+ 	.final = xlp_auth_final,
++	.export = xlp_auth_export,
++	.import = xlp_auth_import,
+ 	.setkey = xlp_auth_hmac_sha1_setkey,
+ 	.descsize = PACKET_DESC_SIZE,
+ 	.base = {
+@@ -385,6 +552,7 @@ static struct shash_alg sha1_hmac_alg = {
+ 		 .cra_blocksize = SHA1_BLOCK_SIZE,
+ 		 .cra_module = THIS_MODULE,
+ 		 .cra_ctxsize = CTRL_DESC_SIZE, 
++		 .cra_init = xlp_cra_hmac_sha1_init,
+ 		 }
+ };
+ 
+@@ -409,7 +577,7 @@ xlp_auth_alg_init(void)
+ 	rc = crypto_register_shash(&xcbc_mac_alg);
+ 	if (rc)
+ 		goto out;
+-	no_of_alg_registered++;
++	no_of_alg_registered++; 
+ 	//printk("Some of the FIPS test failed as the maximum key length supported is 64 bytes.\n");
+ 
+ 	printk(KERN_NOTICE "Using XLP hardware for SHA/MD5 algorithms.\n");
+@@ -422,10 +590,10 @@ out:
+ void
+ xlp_auth_alg_fini(void)
+ {
+-	crypto_unregister_shash(&sha1_hmac_alg);
++	crypto_unregister_shash(&xcbc_mac_alg);
+ 	crypto_unregister_shash(&md5_hmac_alg);
+ 	crypto_unregister_shash(&sha256_hmac_alg);
+-	crypto_unregister_shash(&xcbc_mac_alg);
++	crypto_unregister_shash(&sha1_hmac_alg);
+ }
+ 
+ EXPORT_SYMBOL(xlp_auth_alg_init);
+diff --git a/drivers/crypto/sae/nlm_crypto.c b/drivers/crypto/sae/nlm_crypto.c
+index 4de3b8e..b9c263a 100644
+--- a/drivers/crypto/sae/nlm_crypto.c
++++ b/drivers/crypto/sae/nlm_crypto.c
+@@ -34,7 +34,6 @@ THE POSSIBILITY OF SUCH DAMAGE.
+ #include "nlmcrypto.h"
+ 
+ 
+-#define XLP_POLLING 1
+ #ifdef TRACING
+ #define TRACE_TEXT(str) printk(str);
+ #define TRACE_RET printk(")")
+@@ -44,14 +43,6 @@ THE POSSIBILITY OF SUCH DAMAGE.
+ #endif				/* TRACING */
+ #undef NLM_CRYPTO_DEBUG
+ 
+-#define DRIVER_NAME "nlmsae"
+-
+-#define NLM_CRYPTO_OP_IN_PROGRESS 0
+-#define NLM_CRYPTO_OP_DONE	  1
+-
+-/**
+- * @file_name crypto.c
+- */
+ 
+ /**
+  * @defgroup crypto Crypto API
+@@ -59,14 +50,9 @@ THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
+ #define printf(a, b...) printk(KERN_ERR a, ##b)
+-//#define printf(a, b...)
+-#define malloc(a) kmalloc(a, GFP_ATOMIC)
+-#define free kfree
+ 
+ #define xtract_bits(x, bitpos, numofbits) ((x) >> (bitpos) & ((1ULL << (numofbits)) - 1))
+ 
+-#define VC_MODE_ROUND_ROBIN 1
+-#define NUM_VC 16
+ 
+ extern struct proc_dir_entry *nlm_root_proc;
+ extern int xlp_aead_alg_init(void);
+@@ -491,8 +477,14 @@ nlm_crypto_read_stats_proc(char *page, char **start, off_t off, int count,
+ 	if (!proc_pos_check(&begin, &len, off, count))
+ 		goto out;
+ 
+-	len += sprintf(page + len,"AES192-CBC\t%lld\t\t%lld\nAES256-CBC\t%lld\t\t%lld\n",
+-		enc_tp[AES192_CBC_STAT],enc_tb[AES192_CBC_STAT],enc_tp[AES256_CBC_STAT],enc_tb[AES256_CBC_STAT]);
++	len += sprintf(page + len,"AES192-CBC\t%lld\t\t%lld\nAES256-CBC\t%lld\t\t%lld\nAES128-CTR\t%lld\t\t%lld\n",
++		enc_tp[AES192_CBC_STAT],enc_tb[AES192_CBC_STAT],enc_tp[AES256_CBC_STAT],enc_tb[AES256_CBC_STAT],
++		enc_tp[AES128_CTR_STAT],enc_tb[AES128_CTR_STAT]);
++	if (!proc_pos_check(&begin, &len, off, count))
++		goto out;
++
++	len += sprintf(page + len,"AES192-CTR\t%lld\t\t%lld\nAES256-CTR\t%lld\t\t%lld\n",
++		enc_tp[AES192_CTR_STAT],enc_tb[AES192_CTR_STAT],enc_tp[AES256_CTR_STAT],enc_tb[AES256_CTR_STAT]);
+ 	if (!proc_pos_check(&begin, &len, off, count))
+ 		goto out;
+ 
+@@ -516,6 +508,11 @@ nlm_crypto_read_stats_proc(char *page, char **start, off_t off, int count,
+ 	if (!proc_pos_check(&begin, &len, off, count))
+ 		 goto out;
+ 
++	len  += sprintf(page + len,"GCM\t\t%lld\t\t%lld\nCCM\t\t%lld\t\t%lld\n",auth_tp[GCM_STAT],auth_tb[GCM_STAT],auth_tp[CCM_STAT],auth_tb[CCM_STAT]);
++
++	if (!proc_pos_check(&begin, &len, off, count))
++		 goto out;
++
+         *eof = 1;
+ 
+       out:
+diff --git a/drivers/crypto/sae/nlm_enc.c b/drivers/crypto/sae/nlm_enc.c
+index 4eafea3..d08da35 100755
+--- a/drivers/crypto/sae/nlm_enc.c
++++ b/drivers/crypto/sae/nlm_enc.c
+@@ -23,10 +23,6 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
+ THE POSSIBILITY OF SUCH DAMAGE.
+ *****************************#NETL_2#********************************/
+ #include <crypto/scatterwalk.h>
+-/*#include <crypto/algapi.h>
+-#include <linux/module.h>
+-#include <linux/kernel.h>
+-*/
+ #include <linux/crypto.h>
+ #include <crypto/aes.h>
+ #include <crypto/des.h>
+@@ -35,10 +31,6 @@ THE POSSIBILITY OF SUCH DAMAGE.
+ #include <nlm_hal_fmn.h>
+ #include <asm/netlogic/hal/nlm_hal.h>
+ 
+-/*#include <linux/pci.h>
+-#include <linux/pci_ids.h>
+-#include <asm/io.h>
+-*/
+ #include "nlm_async.h"
+ #undef NLM_CRYPTO_DEBUG
+ 
+@@ -49,6 +41,7 @@ THE POSSIBILITY OF SUCH DAMAGE.
+ struct nlm_enc_ctx {
+ 	struct nlm_crypto_pkt_ctrl ctrl; 
+ 	uint16_t stat;
++	char nonce[4];
+ };
+ /* mem utilisation of CTX_SIZE */
+ #define MAX_FRAGS               18
+@@ -64,6 +57,9 @@ struct nlm_enc_ctx {
+ #define NLM_IV_OFFSET(addr)			((unsigned long)addr + (PACKET_DESC_SIZE - 64))
+ 
+ 
++static int no_of_alg_registered = 0;
++
++
+ 
+ extern uint32_t nlm_hal_send_msg3(uint32_t dst, uint32_t code, uint64_t data0, uint64_t data1, uint64_t data2);
+ extern __inline__ uint32_t nlm_hal_recv_msg2(uint32_t dst, uint32_t *src, uint32_t *size, uint32_t *code, uint64_t *data0, uint64_t *data1);
+@@ -78,10 +74,6 @@ extern struct nlm_crypto_stat crypto_stat[MAX_CPU];
+ 
+ 
+ 
+-//extern void print_cntl_instr(uint64_t cntl_desc);
+-static void enc_session_cleanup(struct crypto_tfm *tfm)
+-{
+-}
+ 
+ static int enc_cra_init(struct crypto_tfm *tfm)
+ { 
+@@ -94,7 +86,10 @@ static struct nlm_enc_ctx * nlm_crypto_ablkcipher_ctx(struct crypto_ablkcipher *
+ 	return (struct  nlm_enc_ctx *)(((unsigned long)((uint8_t *)crypto_ablkcipher_ctx(tfm) + 63 )) & ~(0x3f));
+ } 
+ 
+-
++static struct nlm_enc_ctx * nlm_crypto_ablkcipher_ctx_2(struct crypto_ablkcipher *tfm)
++{
++	return (struct  nlm_enc_ctx *)(( unsigned long )(( uint8_t *)nlm_crypto_ablkcipher_ctx(tfm) + CTRL_DESC_SIZE + 63) & ~(0x3f));
++}
+ 
+ static int
+ xlp_setkey(struct crypto_ablkcipher *tfm, const u8 * in_key, unsigned int len, uint32_t cipher_alg, uint32_t cipher_mode,uint16_t stat)
+@@ -108,10 +103,11 @@ xlp_setkey(struct crypto_ablkcipher *tfm, const u8 * in_key, unsigned int len, u
+ 	return 0;
+ 
+ }
++
+ static int
+ xlp_setkey_des3(struct crypto_ablkcipher *tfm, const u8 * in_key, unsigned int len, uint32_t cipher_alg, uint32_t cipher_mode, uint16_t stat)
+ {
+-	struct nlm_enc_ctx * nlm_ctx = (struct  nlm_enc_ctx *)(( unsigned long )(( uint8_t *)nlm_crypto_ablkcipher_ctx(tfm) + CTRL_DESC_SIZE + 63) & ~(0x3f)); 
++	struct nlm_enc_ctx * nlm_ctx = nlm_crypto_ablkcipher_ctx_2(tfm); 
+ 	uint64_t key[3] ;
+ 	
+ 	memcpy(key,&in_key[16],8);
+@@ -127,7 +123,6 @@ xlp_setkey_des3(struct crypto_ablkcipher *tfm, const u8 * in_key, unsigned int l
+ 
+ }
+ 
+-
+ static int
+ xlp_des3_setkey(struct crypto_ablkcipher *tfm, const u8 * in_key, unsigned int len)
+ {
+@@ -197,6 +192,9 @@ xlp_aes_setkey(struct crypto_ablkcipher *tfm, const u8 *in_key,
+ 		crypto_ablkcipher_set_flags(tfm,flags);
+ 		return -EINVAL;
+ 	}
++	if ( mode == NLM_CIPHER_MODE_CTR )
++		stat += 3;
++
+ 	return xlp_setkey(tfm, in_key, len, cipher_alg, mode, stat);
+ }
+ 
+@@ -206,6 +204,24 @@ static int xlp_cbc_aes_setkey(struct crypto_ablkcipher *tfm, const u8 *key,
+ 	return xlp_aes_setkey(tfm,key,keylen,NLM_CIPHER_MODE_CBC);
+ }
+ 
++static int xlp_ctr_rfc3686_setkey(struct crypto_ablkcipher *tfm, const u8 *key,
++                                 unsigned int keylen)
++{
++
++        int err;
++	struct nlm_enc_ctx  *nlm_ctx = ( struct nlm_enc_ctx  * )nlm_crypto_ablkcipher_ctx(tfm);
++	unsigned char  *nonce = &(nlm_ctx->nonce[0]); 
++
++        if (keylen < CTR_RFC3686_NONCE_SIZE)
++                return -EINVAL;
++        memcpy(nonce, key + (keylen - CTR_RFC3686_NONCE_SIZE),
++               CTR_RFC3686_NONCE_SIZE);
++        keylen -= CTR_RFC3686_NONCE_SIZE;
++        err = xlp_aes_setkey(tfm, key, keylen, NLM_CIPHER_MODE_CTR );
++
++        return err;
++}
++
+ void enc_request_callback(struct nlm_async_crypto *async, uint64_t msg1 )
+ {
+ 	struct crypto_async_request * base = (struct crypto_async_request *)async->args; 
+@@ -224,6 +240,7 @@ void enc_request_callback(struct nlm_async_crypto *async, uint64_t msg1 )
+ 	
+ 	base->complete(base, err);
+ }
++
+ static int
+ xlp_crypt(struct ablkcipher_request *req, unsigned int enc, int iv_size, struct nlm_crypto_pkt_ctrl *ctrl, uint16_t stat)
+ {
+@@ -235,11 +252,11 @@ xlp_crypt(struct ablkcipher_request *req, unsigned int enc, int iv_size, struct
+ 	uint8_t *virt;
+ 	int len;
+ 	int pktdescsize = 0;
++	int fb_vc;
+ 	
+ 	unsigned int cipher_len = req->nbytes;
+ 	struct nlm_crypto_pkt_param * pkt_param = (struct nlm_crypto_pkt_param *) NLM_CRYPTO_PKT_PARAM_OFFSET(ablkcipher_request_ctx(req));
+ 	struct nlm_async_crypto * async =  (struct nlm_async_crypto *)NLM_ASYNC_PTR_PARAM_OFFSET(ablkcipher_request_ctx(req));;
+-	int fb_vc;
+ 
+ 	nlm_crypto_fill_cipher_pkt_param(ctrl, pkt_param, enc,0,iv_size,iv_size ,req->nbytes); 
+ 
+@@ -306,7 +323,7 @@ xlp_crypt(struct ablkcipher_request *req, unsigned int enc, int iv_size, struct
+ #ifdef NLM_CRYPTO_DEBUG
+ 	print_crypto_msg_desc(msg0,msg1,0xdeadbeef);
+ 	print_pkt_desc(pkt_param,seg);
+-	print_cntl_instr(ctrl);
++	print_cntl_instr(ctrl->desc0);
+ #endif
+ 	async->callback = &enc_request_callback;
+ 	async->args = &req->base;
+@@ -322,7 +339,7 @@ static int
+ xlp_3des_cbc_decrypt( struct ablkcipher_request *req)
+ {
+       	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
+-	struct nlm_enc_ctx * nlm_ctx = (struct  nlm_enc_ctx *)(( unsigned long )(( uint8_t *)nlm_crypto_ablkcipher_ctx(tfm) + CTRL_DESC_SIZE + 63) & ~(0x3f)); 
++	struct nlm_enc_ctx * nlm_ctx = nlm_crypto_ablkcipher_ctx_2(tfm); 
+ 	return xlp_crypt(req, 0, DES3_EDE_BLOCK_SIZE,&nlm_ctx->ctrl,nlm_ctx->stat);
+ }
+ 
+@@ -352,6 +369,41 @@ xlp_cbc_encrypt( struct ablkcipher_request *req )
+ 	return xlp_crypt(req, 1, iv_size,&nlm_ctx->ctrl, nlm_ctx->stat);
+ }
+ 
++static int crypto_rfc3686_crypt(struct ablkcipher_request *req,
++		unsigned int enc )
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct nlm_enc_ctx  *nlm_ctx = ( struct nlm_enc_ctx  * )nlm_crypto_ablkcipher_ctx(tfm);
++	u8 *iv = (uint8_t *)NLM_IV_OFFSET(ablkcipher_request_ctx(req));
++	int ret = 0;
++
++	/*  uniqueness is maintained by the req->info */
++	u8 *info = req->info;
++	unsigned char * nonce = &(nlm_ctx->nonce[0]); 
++
++	memcpy(iv, nonce, CTR_RFC3686_NONCE_SIZE);
++	memcpy(iv + CTR_RFC3686_NONCE_SIZE, info, CTR_RFC3686_IV_SIZE);
++
++	*(__be32 *)(iv + CTR_RFC3686_NONCE_SIZE + CTR_RFC3686_IV_SIZE) =
++				cpu_to_be32(1);
++	req->info = iv;
++	ret = xlp_crypt(req, enc, 16,&nlm_ctx->ctrl, nlm_ctx->stat);
++	req->info = info;
++	return ret;
++}
++
++static int
++xlp_ctr_rfc3686_decrypt( struct ablkcipher_request *req)
++{
++	return crypto_rfc3686_crypt(req, 0);
++}
++
++static int
++xlp_ctr_rfc3686_encrypt(struct ablkcipher_request *req)
++{
++	return crypto_rfc3686_crypt(req,1);
++}
++
+ static struct crypto_alg xlp_cbc_aes_alg = {
+ 	.cra_name = "cbc(aes)",
+ 	.cra_driver_name = "cbc-aes-xlp",
+@@ -363,7 +415,6 @@ static struct crypto_alg xlp_cbc_aes_alg = {
+ 	.cra_type = &crypto_ablkcipher_type,
+ 	.cra_module = THIS_MODULE,
+ 	.cra_init = enc_cra_init,
+-	.cra_exit = enc_session_cleanup,
+ 	.cra_list = LIST_HEAD_INIT(xlp_cbc_aes_alg.cra_list),
+ 	.cra_u = {
+ 		.ablkcipher = {
+@@ -388,7 +439,6 @@ static struct crypto_alg xlp_cbc_des_alg = {
+ 	.cra_type = &crypto_ablkcipher_type,
+ 	.cra_module = THIS_MODULE,
+ 	.cra_init = enc_cra_init,
+-	.cra_exit = enc_session_cleanup,
+ 	.cra_list = LIST_HEAD_INIT(xlp_cbc_des_alg.cra_list),
+ 	.cra_u = {
+ 		.ablkcipher = {
+@@ -413,7 +463,6 @@ static struct crypto_alg xlp_cbc_des3_alg = {
+ 	.cra_type = &crypto_ablkcipher_type,
+ 	.cra_module = THIS_MODULE,
+ 	.cra_init = enc_cra_init,
+-	.cra_exit = enc_session_cleanup,
+ 	.cra_list = LIST_HEAD_INIT(xlp_cbc_des3_alg.cra_list),
+ 	.cra_u = {
+ 		.ablkcipher = {
+@@ -427,10 +476,34 @@ static struct crypto_alg xlp_cbc_des3_alg = {
+ 	}
+ };
+ 
++static struct crypto_alg xlp_ctr_aes_alg = {
++	.cra_name = "rfc3686(ctr(aes))",
++	.cra_driver_name = "rfc3686-ctr-aes-xlp",
++	.cra_priority = XLP_CRYPT_PRIORITY,
++	.cra_flags = CRYPTO_ALG_TYPE_ABLKCIPHER|CRYPTO_ALG_ASYNC,
++	.cra_blocksize = 1,
++	.cra_ctxsize = CTRL_DESC_SIZE,
++	.cra_alignmask = 0,
++	.cra_type = &crypto_ablkcipher_type,
++	.cra_module = THIS_MODULE,
++	.cra_init = enc_cra_init,
++	.cra_list = LIST_HEAD_INIT(xlp_ctr_aes_alg.cra_list),
++	.cra_u = {
++		.ablkcipher = {
++			.min_keysize = AES_MIN_KEY_SIZE,
++			.max_keysize = AES_MAX_KEY_SIZE,
++			.setkey = xlp_ctr_rfc3686_setkey,
++			.encrypt = xlp_ctr_rfc3686_encrypt,
++			.decrypt = xlp_ctr_rfc3686_decrypt,
++			.ivsize = CTR_RFC3686_IV_SIZE,
++			.geniv = "seqiv",
++		}
++	}
++};
++
+ int xlp_crypt_alg_init(void)
+ {
+ 	int ret = 0;
+-	int no_of_alg_registered = 0;
+ 	ret = crypto_register_alg(&xlp_cbc_des3_alg);
+ 	if (ret) {
+ 		goto end;
+@@ -446,6 +519,11 @@ int xlp_crypt_alg_init(void)
+ 		goto end;
+ 	}
+ 	no_of_alg_registered++;
++	ret = crypto_register_alg(&xlp_ctr_aes_alg);
++	if (ret) {
++		goto end;
++	}
++	no_of_alg_registered++;
+ 	printk(KERN_NOTICE "Using XLP hardware for AES, DES, 3DES algorithms.\n");
+ end:
+ 	return 0;
+@@ -456,6 +534,7 @@ xlp_crypt_alg_fini(void) {
+ 	crypto_unregister_alg(&xlp_cbc_des3_alg);
+ 	crypto_unregister_alg(&xlp_cbc_des_alg);
+ 	crypto_unregister_alg(&xlp_cbc_aes_alg);
++	crypto_unregister_alg(&xlp_ctr_aes_alg);
+ }
+ 
+ EXPORT_SYMBOL(xlp_crypt_alg_init);
+-- 
+1.9.1
+

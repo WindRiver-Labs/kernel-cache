@@ -1,0 +1,645 @@
+From 200f5967a54c3790a4834778fc0a87deb697843b Mon Sep 17 00:00:00 2001
+From: Vikas Gupta <vikasg@netlogicmicro.com>
+Date: Fri, 30 Sep 2011 21:53:18 +0530
+Subject: [PATCH 1079/1532] 1) 16K MTU support. 2) P2P formation at RX path. 3)
+ Clean up and organize the code 4) Egress path UDP checksum enabled 5) Fix for
+ P2D len in case of P2P. 6) Rx side FCS error handling.
+
+[Based on SDK 3.2]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ drivers/misc/netlogic/nae_jumbo/xlp_nae_jumbo.c | 394 ++++++++++--------------
+ 1 file changed, 160 insertions(+), 234 deletions(-)
+
+diff --git a/drivers/misc/netlogic/nae_jumbo/xlp_nae_jumbo.c b/drivers/misc/netlogic/nae_jumbo/xlp_nae_jumbo.c
+index 1096f4e..5c75c8e 100755
+--- a/drivers/misc/netlogic/nae_jumbo/xlp_nae_jumbo.c
++++ b/drivers/misc/netlogic/nae_jumbo/xlp_nae_jumbo.c
+@@ -110,7 +110,7 @@
+    7 buffers. We need 32 bytes for prepad and another cacheline for storing
+    s/w info
+  */
+-#define DEFAULT_JUMBO_MTU	9024
++#define DEFAULT_JUMBO_MTU	5568  // for mtu 16384
+ #define JUMBO_RX_OFFSET		64
+ #define PREPAD_LEN		0	
+ /* THIS MUST be multiple of cache line size */
+@@ -139,7 +139,8 @@ struct jumbo_rx_cookie {
+ };
+ 
+ jumbo_rx_info_t  jumbo_rx_buff[NR_CPUS];
+-static struct work_struct mac_frin_replenish_work[MAC_FRIN_WORK_NUM];
++static struct tasklet_struct mac_frin_replenish_task[MAC_FRIN_WORK_NUM];
++static void mac_frin_replenish(unsigned long arg /* ignored */);
+ 
+ #define MAX_PACKET_SZ_PER_MSG	16384
+ #define P2P_EXTRA_DESCS	      	((PAGE_SIZE / MAX_PACKET_SZ_PER_MSG) + 4)
+@@ -182,6 +183,21 @@ uint16_t tcp_pseuodo_chksum(uint16_t *ipsrc)
+ 	return (uint16_t)sum;
+ }
+ 
++uint16_t udp_pseuodo_chksum(uint16_t *ipsrc)
++{
++	uint32_t sum = 0;
++	sum += ipsrc[0];
++	sum += ipsrc[1];
++	sum += ipsrc[2];
++	sum += ipsrc[3];
++	sum += 0x11;
++	while(sum >> 16)
++		sum = (sum & 0xffff)  + (sum >> 16);
++	//      sum = ~sum;
++	return (uint16_t)sum;
++}
++
++
+ static __inline__ uint64_t nae_tso_desc0(
+ 		unsigned int type,
+ 		unsigned int subtype,
+@@ -339,8 +355,6 @@ static struct net_device_stats *nlm_xlp_mac_get_stats(struct net_device *dev);
+ static struct net_device *dev_mac[MAX_GMAC_PORT];
+ 
+ extern struct proc_dir_entry *nlm_root_proc;
+-static struct tasklet_struct mac_refill_task[MAX_GMAC_PORT];
+-static int mac_refill_frin_desc(unsigned long dev);
+ 
+ extern void nlm_xlp_mac_set_enable(struct dev_data *priv, int flag);
+ 
+@@ -443,14 +457,16 @@ static __inline__ int mac_send_fr(struct dev_data *priv, unsigned long addr, int
+ 	
+ }
+ 
+-void build_skb(struct sk_buff *skb, struct jumbo_rx_cookie *rx_cookie, 
++void build_skb(struct sk_buff *skb, uint64_t *rxp2d, uint32_t*p2d_len, int num_desc, 
+ 			uint32_t hlen, uint32_t length)
+ {
+-	struct skb_frag_struct *skb_frags;
++	int idx;
++	struct skb_shared_info *sp = skb_shinfo(skb);
++	struct jumbo_rx_cookie *rx_cookie = get_rx_cookie(rxp2d[0]);	
+ 	struct page *pg = rx_cookie->page;
+ 	int rx_offset =  JUMBO_RX_OFFSET;
+ 	uint8_t *va = page_address(pg) + rx_cookie->page_offset + rx_offset; 
+-	//printk("Build skb Virt addr alloc_page=0x%lx\n", (unsigned long)va);
++	skb_frag_t *fp = &sp->frags[0];
+ 
+ 	/* actual data starts IP header align */
+ 	skb_reserve(skb, 2);
+@@ -458,16 +474,28 @@ void build_skb(struct sk_buff *skb, struct jumbo_rx_cookie *rx_cookie,
+ 	skb->len = skb->data_len = length;
+ 	skb->truesize = length + sizeof(struct sk_buff);
+ 
+-	skb_frags = skb_shinfo(skb)->frags;
+-	skb_frags->page = pg;
+-	skb_frags->page_offset = rx_cookie->page_offset + rx_offset + hlen;
+-	skb_frags->size = length - hlen;
+-	skb_shinfo(skb)->nr_frags = 1;
+-
++	fp->page= pg; 
++	fp->page_offset = rx_cookie->page_offset + rx_offset + hlen;
++	fp->size = p2d_len[0]- hlen;
++	
+ 	skb_copy_to_linear_data(skb, va, hlen);
+ 	skb->data_len -= hlen;
+ 	skb->tail += hlen;
+ 
++	/*fill other frags*/
++	for(idx=1; idx<num_desc; idx++){
++		//printk("build_skb data_len=0x%x\n", skb->data_len);
++		fp = &sp->frags[idx];
++		rx_cookie = get_rx_cookie(rxp2d[idx]);	
++		pg = rx_cookie->page;
++		rx_offset =  JUMBO_RX_OFFSET;
++		va = page_address(pg) + rx_cookie->page_offset + rx_offset; 
++		fp->page= pg; 
++		fp->page_offset = rx_cookie->page_offset + rx_offset;
++		fp->size = p2d_len[idx];
++	}	
++	//printk("build_skb data_len=0x%x\n", skb->data_len);
++	skb_shinfo(skb)->nr_frags = num_desc;
+ }
+ 
+ /* assumes that buffer is setup correctly */
+@@ -536,25 +564,24 @@ static int mac_frin_replenish_one_normal_msg(struct net_device *dev)
+ 	return ret;
+ }
+ 
+-static void mac_frin_replenish_wq(struct work_struct *args /* ignored */);
+-static int mac_frin_replenish_one_msg(struct net_device *dev)
++static int mac_frin_replenish_msgs(struct net_device *dev, int num)
+ {
+ 	jumbo_rx_info_t *rx;
+ 	struct dev_data* priv = netdev_priv(dev);
+ 	int cpu = smp_processor_id();
+ 
+ 	rx = &jumbo_rx_buff[cpu];
+-	atomic_inc(&rx->alloc_fails[priv->port]);
++	atomic_add(num, &rx->alloc_fails[priv->port]);
+ 	//schedule_work(&mac_frin_replenish_work[cpu]);
+-	tasklet_schedule(&mac_frin_replenish_work[cpu]);
++	tasklet_schedule(&mac_frin_replenish_task[cpu]);
+ 	return 0;
+ }
+ 
+-static void mac_frin_replenish_wq(struct work_struct *args /* ignored */)
++static void mac_frin_replenish(unsigned long  arg/* ignored */)
+ {
+ 	jumbo_rx_info_t *rx;
+ 	int cpu = smp_processor_id();
+-	int done = 0, i;
++	int done = 0, i, j;
+ 
+ 	rx = &jumbo_rx_buff[cpu];
+ 
+@@ -566,6 +593,7 @@ static void mac_frin_replenish_wq(struct work_struct *args /* ignored */)
+ 			struct net_device *dev;
+ 			struct dev_data* priv;
+ 			atomic_t *frin_to_be_sent;
++			int num_fr_in=0;
+ 
+ 			dev = dev_mac[i];
+ 			if (dev == 0)
+@@ -573,6 +601,7 @@ static void mac_frin_replenish_wq(struct work_struct *args /* ignored */)
+ 
+ 			priv = netdev_priv(dev);
+ 			frin_to_be_sent = &rx->alloc_fails[i];
++			num_fr_in = atomic_read(frin_to_be_sent);
+ 
+ 			//if(!(MSGRNG_OWN(priv->cfg_flag)))
+ 			//	goto skip;
+@@ -587,9 +616,10 @@ static void mac_frin_replenish_wq(struct work_struct *args /* ignored */)
+ 			if (!atomic_read(frin_to_be_sent))
+ 				goto skip;
+ 
+-			mac_frin_replenish_one_normal_msg(dev);
++			for(j=0; j<num_fr_in; j++)
++				mac_frin_replenish_one_normal_msg(dev);
+ 
+-			atomic_dec(frin_to_be_sent);
++			atomic_sub(num_fr_in, frin_to_be_sent);
+ 
+ 			continue;
+ 		skip:
+@@ -696,9 +726,7 @@ static void nlm_xlp_nae_init(void)
+ 	p2p_desc_mem_init();
+ 		
+ 	for (i = 0; i < MAC_FRIN_WORK_NUM; i++) {
+-		//INIT_WORK(&mac_frin_replenish_work[i],
+-		//		  mac_frin_replenish_wq);
+-		tasklet_init(&mac_frin_replenish_work[i], mac_frin_replenish_wq, 0UL);		  
++		tasklet_init(&mac_frin_replenish_task[i], mac_frin_replenish, 0UL);		  
+ 	}
+ 
+ 	nae_fb_vc = nae_cfg.fb_vc;
+@@ -789,7 +817,7 @@ static int  nlm_xlp_nae_open (struct net_device *dev)
+ 	if (priv->inited) return 0;
+ 	tso_enable(dev, 1);
+ 	dev->features |= NETIF_F_FRAGLIST | NETIF_F_HIGHDMA | NETIF_F_SG;
+-	dev->features |= NETIF_F_IP_CSUM | NETIF_F_HW_CSUM;
++	//dev->features |= NETIF_F_IP_CSUM | NETIF_F_HW_CSUM;
+ 	
+ 	ret = mac_fill_rxfr(dev);
+ 	if (ret) goto out;
+@@ -904,7 +932,7 @@ static int p2p_desc_mem_init(void)
+ static inline void *alloc_p2p_desc_mem(int cpu)
+ {
+ 	void *buf;
+-    	unsigned long flags;
++    	//unsigned long flags;
+ 	buf = p2p_desc_mem[cpu].mem;
+     	//spin_lock_irqsave(&p2p_desc_mem[cpu].lock, flags);
+ 	if(buf) {
+@@ -949,183 +977,6 @@ static inline void create_last_p2p_desc(uint64_t *p2pmsg, struct sk_buff *skb, i
+ }
+ 
+ 
+-static void
+-xlp_poll_upper(int cpu)
+-{
+-	unsigned int status;
+-	uint64_t msg0 = 0, addr;
+-	uint32_t src_id, size, code, context, port;
+-	struct sk_buff* skb;
+-	struct dev_data *priv;
+-	uint64_t *p2pfbdesc;
+-
+-	while (1) {
+-			status = xlp_message_receive_1(nae_fb_vc, &src_id, &size, &code, &msg0);
+-			if(status) break;
+-			__sync();
+-
+-			/* Process Transmit Complete, addr is the skb pointer */
+-			addr = msg0 & 0xffffffffffULL;
+-
+-			if (drop_uboot_pkt) {
+-				if ( (addr >= (192<<20)) && (addr < (256 << 20)) ){
+-					printk("Dropping firmware TXC packet (addr=%llx)!\n", addr);
+-					//stats_uboot_pkts++;
+-					return;
+-				}
+-			}
+-
+-			/* context field is currently unused */
+-			context = (msg0 >> 40) & 0x3fff;
+-			port = cntx2port[context];
+-			p2pfbdesc = bus_to_virt(addr);
+-			skb = (struct sk_buff *)(p2pfbdesc[P2P_SKB_OFF]);
+-			free_p2p_desc_mem(cpu, p2pfbdesc);
+-			if(skb)
+-			{
+-				priv = netdev_priv(skb->dev);
+-				if (debug) {
+-					printk("[%s][TXC] addr=%llx, skb=%p, context=%d, port=%d\n",
+-								__func__, addr, skb, context, port);
+-				}
+-				dev_kfree_skb_any(skb);
+-				//priv->cpu_stats[cpu].txc_packets++;
+-			}
+-			else {
+-				printk("[%s]: [txc] Null skb? paddr = %llx (halting cpu!)\n", __func__, addr);
+-				cpu_halt();
+-			}
+-	} /* closing while (1) */
+-}
+-
+-
+-
+-/**********************************************************************
+- * nlm_xlp_nae_start_xmit -  transmit a packet from buffer
+- * @dev  -  this is per device based function
+- * @skb  -  data buffer to send
+- **********************************************************************/
+-#if 0
+-static int nlm_xlp_nae_start_xmit(struct sk_buff *skb, struct net_device *dev)
+-{
+-	struct dev_data *priv = netdev_priv(dev);
+-	unsigned long mflags = 0;
+-	int cpu = hard_smp_processor_id(), ret = 0;
+-	struct xlp_msg msg =  { {0, 0, 0, 0} };
+-	uint64_t eop, skb_data_len;
+-	int index;
+-	struct p2d *p2p;
+-	int nr_frags = skb_shinfo(skb)->nr_frags;
+-
+-	//printk("XMIT NR_FRAG 0x%x with skb len =0x%x\n", nr_frags, skb->len);
+-
+-	if(!skb)
+-	{
+-		printk("[%s] skb is NULL\n",__FUNCTION__);
+-		return -1;
+-	}
+-	if(skb->len == 0)
+-	{
+-		printk("[%s] skb empty packet\n",__FUNCTION__);
+-		return -1;
+-	}
+-
+-	p2p = alloc_p2d(priv);
+-	//printk("p2p alloc=%p \n",p2p);
+-	if(unlikely(p2p == NULL)) {
+-		printk("alloc_p2d failed\n");
+-		//mac_stats_add(priv->stats.tx_dropped, 1);
+-		STATS_INC(priv->stats.tx_dropped);
+-		/* TODO: Need to stop queue */
+-		return -1;
+-	}
+-#if 0	
+-	if(skb->ip_summed == CHECKSUM_PARTIAL) {
+-		if(skb_checksum_help(skb) != 0) {
+-			printk("Error in skb_checksum_help\n");
+-			free_p2d(priv, p2p);
+-			return -1;
+-		}
+-	}
+-#endif
+-	if(nr_frags) {
+-		skb_data_len = skb_headlen(skb);
+-		index = nlm_xlp_fill_frags(p2p, skb);
+-		eop = 0;
+-	}else {
+-		skb_data_len = skb->len;
+-		index = 1;
+-		eop = 1;
+-	}
+-	//p2p->frag[0] = ((uint64_t)eop << 63) | ((uint64_t)NULL_VFBID << 54) | (skb_data_len << 40) | 
+-	//					virt_to_phys(skb->data);
+-
+-	if(eop == 1)
+-		p2p->frag[0] = nae_tx_desc(P2D_EOP, 0, NULL_VFBID, skb_data_len, virt_to_phys(skb->data));	
+-	else
+-		p2p->frag[0] = nae_tx_desc(P2D_NEOP, 0, NULL_VFBID, skb_data_len, virt_to_phys(skb->data));	
+-			
+-	/* This is for the freeback of p2p and skb (indirectly) */
+-	p2p->frag[index] = ((uint64_t)1 << 63) | ((uint64_t)cpu << 54) | virt_to_phys(p2p);
+-	index++;
+-	
+-	p2p->frag[MAX_SKB_FRAGS+2] = (uint64_t)(unsigned long)skb;
+-
+-	eop = index;
+-	//eop = 1;
+-	
+-	//printk("p2p addr sent=0x%lx frag0=%p\n",(uint64_t)p2p, &p2p->frag[0]);
+-	msg.entry[0] = nae_tx_desc(P2P, 0, cpu, eop, virt_to_bus(p2p));
+-	msg.entry[1] = msg.entry[2] = msg.entry[3] = 0;
+-//#endif
+-
+-//#if 0
+-	msg.entry[0] = nae_tx_desc(P2D_NEOP, 0, cpu, 0, virt_to_bus(skb));
+-	msg.entry[1] = nae_tx_desc(P2D_EOP,
+-				   0,
+-				   NULL_VFBID,
+-				   skb->len,
+-				   virt_to_bus(skb->data));
+-
+-	msg.entry[2] = msg.entry[3] = 0;
+-
+-	DUMP_PKT(__func__, skb->data, skb->len);
+-
+-//#endif
+-
+-	__sync();
+-
+-	if (debug) {
+-		//printk("[%s]: tx_qid=%d, entry0=%llx, entry1=%llx\n", __func__,
+-		 //      priv->nae_tx_qid, msg.entry[0], msg.entry[1]);
+-		printk("[%s]: tx_qid=%d, entry0=%llx, \n", __func__,
+-		       priv->nae_tx_qid, msg.entry[0]);
+-	}
+-
+-	msgrng_access_enable(mflags);
+-// retry_send:
+-        if ( (ret = nlm_hal_send_msg2(priv->nae_tx_qid,
+-				      0,
+-				      msg.entry[0],
+-				      msg.entry[1])) )
+-        {
+-		print_fmn_send_error(__func__, ret);
+-		//printk("[%s] HACK ALERT! dropping packet(skb=%p)!\n", __func__, skb);
+-		dev_kfree_skb_any(skb);
+-		//goto retry_send;
+-        }
+-
+-	msgrng_access_disable(mflags);
+-	dev->trans_start = jiffies;
+-
+-	STATS_ADD(priv->stats.tx_bytes, skb->len);
+-	STATS_INC(priv->stats.tx_packets);
+-	priv->cpu_stats[cpu].tx_packets++;
+-
+-	return NETDEV_TX_OK;
+-}
+-#endif
+-//#if 0
+ static int nlm_xlp_nae_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	int mss  = 0, idx = 0, len, i ;
+@@ -1138,6 +989,7 @@ static int nlm_xlp_nae_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	int cpu = hard_smp_processor_id();
+ 	int  ret, retry_cnt = 0;
+ 	unsigned long mflags = 0;
++	
+ 
+ 	p2pdesc = alloc_p2p_desc_mem(cpu);
+ 	if(p2pdesc == NULL) {
+@@ -1145,10 +997,11 @@ static int nlm_xlp_nae_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		dev_kfree_skb_any(skb);
+ 		goto out_unlock;
+ 	}
+-	//printk("%s in gso_size %d nrfrags %d len %d p2pdesc %llx skb %llx headlen %d cpu=%d\n", __FUNCTION__,
++	//printk("%s ipchksum_part= %d in gso_size %d nrfrags %d len %d p2pdesc %llx skb %llx headlen %d cpu=%d\n", __FUNCTION__, skb->ip_summed,
+ 	//		sp->gso_size, sp->nr_frags, skb->len, (uint64_t)p2pdesc, (uint64_t)skb, skb_headlen(skb), cpu);
++
+ 	if (((mss = sp->gso_size) != 0) || (skb->ip_summed == CHECKSUM_PARTIAL)) {
+-		u32 iphdroff, tcphdroff, pyldoff, tcppcsum;
++		u32 iphdroff, tcphdroff, pyldoff, tcppcsum, udppcsum, l4hoff;
+ 
+ 		if (skb_header_cloned(skb) &&
+ 				pskb_expand_head(skb, 0, 0, GFP_ATOMIC)) {
+@@ -1159,25 +1012,38 @@ static int nlm_xlp_nae_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 
+ 		iph = ip_hdr(skb);
+ 		iphdroff = (char *)iph - (char *)skb->data;
+-		tcphdroff = iphdroff + ip_hdrlen(skb);
+-		pyldoff = iphdroff + ip_hdrlen(skb) + sizeof(struct tcphdr) + tcp_optlen(skb);
++		l4hoff = iphdroff + ip_hdrlen(skb);
++
++		if(ip_hdr(skb)->protocol == IPPROTO_UDP){
++			pyldoff = iphdroff + ip_hdrlen(skb) + sizeof(struct udphdr);	
++			udppcsum = udp_pseuodo_chksum((uint16_t *)((char *)iph + 12));
++			udp_hdr(skb)->check = 0;
++			//printk("iphdroff %d udphdroff %d pyldoff %d\n", iphdroff, l4hoff, pyldoff);
++		}else{
++			pyldoff = iphdroff + ip_hdrlen(skb) + sizeof(struct tcphdr) + tcp_optlen(skb);
++			tcppcsum = tcp_pseuodo_chksum((uint16_t *)((char *)iph + 12));
++			tcp_hdr(skb)->check = 0;
++			//printk("iphdroff %d tcphdroff %d pyldoff %d\n", iphdroff, l4hoff, pyldoff);
++		}
+ 
+-		//printk("iphdroff %d tcphdroff %d pyldoff %d\n", iphdroff, tcphdroff, pyldoff);
+-		tcppcsum = tcp_pseuodo_chksum((uint16_t *)((char *)iph + 12));
+-		tcp_hdr(skb)->check = 0;
+ 		if(mss) {
+ 			iph->check = 0;
+ 			iph->tot_len = 0;
+ 			mscmsg0 = nae_tso_desc0(MSC, 1, TSO_IP_TCP_CHKSUM,
+-				iphdroff, tcphdroff, (iphdroff + 10),
+-				tcppcsum, tcphdroff + 16, pyldoff);
++				iphdroff, l4hoff, (iphdroff + 10),
++				tcppcsum, l4hoff + 16, pyldoff);
+ 			mscmsg1 = nae_tso_desc1(MSC, 2, 0, mss, 0, 0);
+ 		} else {
+-			mscmsg0 = nae_tso_desc0(MSC, 0, TCP_CHKSUM,
+-				iphdroff, tcphdroff, (iphdroff + 10),
+-				tcppcsum, tcphdroff + 16, pyldoff);
++			if(ip_hdr(skb)->protocol == IPPROTO_UDP){
++				mscmsg0 = nae_tso_desc0(MSC, 0, UDP_CHKSUM,
++					iphdroff, l4hoff, (iphdroff + 10),
++					udppcsum, l4hoff + 6, pyldoff);
++			}else{
++				mscmsg0 = nae_tso_desc0(MSC, 0, TCP_CHKSUM,
++					iphdroff, l4hoff, (iphdroff + 10),
++					tcppcsum, l4hoff + 16, pyldoff);
++			}
+ 		}
+-
+ 	}
+ 
+ 
+@@ -1260,14 +1126,6 @@ static void xlp_mac_setup_hwaddr(struct dev_data *priv)
+ 
+         nlm_hal_write_mac_reg(priv->block, priv->index, MAC_FILTER_CONFIG, (1 << MAC_FILTER_BCAST_EN_POS) |
+ 						 (1 << MAC_FILTER_MCAST_EN_POS) | (1 << MAC_FILTER_ADDR0_VALID_POS) );
+-	if(priv->type == XAUI_IF){
+-		nlm_hal_write_mac_reg(priv->block, priv->index, XAUI_MAX_FRAME_LEN, 0x9002400);
+-		printk("MAX frame length  set=0x%x for XAUI intf %d \n", nlm_hal_read_mac_reg(priv->block, priv->index, XAUI_MAX_FRAME_LEN), priv->block);
+-	}
+-	if(priv->type == SGMII_IF){			
+-		nlm_hal_write_mac_reg(priv->block, priv->index, MAX_FRM, 0x2400);
+-		printk("MAX frame length set=0x%x for SGMII intf %d\n", nlm_hal_read_mac_reg(priv->block, priv->index, MAX_FRM), priv->index);
+-	}
+ 
+ }
+ 
+@@ -1296,14 +1154,26 @@ static int nlm_xlp_nae_change_mtu(struct net_device *dev, int new_mtu)
+ {
+ 	struct dev_data *priv = netdev_priv(dev);
+ 	unsigned long flags;
+-	printk("nlm_xlp_nae_change_mtu called \n");
++	unsigned long local_jumbo_mtu;
++	printk("Setting mtu %d bytes \n", new_mtu);
+ 
+-	if ((new_mtu > DEFAULT_JUMBO_MTU) || (new_mtu < MIN_ETH_FRAME_SIZE)) {
++	if ((new_mtu > (DEFAULT_JUMBO_MTU * MAX_SKB_FRAGS)) || (new_mtu < MIN_ETH_FRAME_SIZE)) {
+ 		return -EINVAL;
+ 	}
+ 
+ 	spin_lock_irqsave(&priv->lock, flags);
+ 
++	local_jumbo_mtu = new_mtu + ETH_HLEN + ETH_FCS_LEN;
++	local_jumbo_mtu = (local_jumbo_mtu + SMP_CACHE_BYTES) & ~(SMP_CACHE_BYTES - 1);
++	if(priv->type==SGMII_IF){
++		nlm_hal_write_mac_reg(priv->block, priv->index, MAX_FRM, local_jumbo_mtu);
++		printk("Max frame len set = %d bytes\n",  nlm_hal_read_mac_reg(priv->block, priv->index, MAX_FRM));
++	}
++	if(priv->type==XAUI_IF){
++		nlm_hal_write_mac_reg(priv->block, priv->index, XAUI_MAX_FRAME_LEN, (((local_jumbo_mtu/4)<<16) | local_jumbo_mtu));
++		printk("Max frmae len set = %d bytes\n", nlm_hal_read_mac_reg(priv->block, XGMAC, XAUI_MAX_FRAME_LEN) & (0xffff));
++	}
++
+ 	dev->mtu = new_mtu;
+ 
+ 	if (netif_running(dev)) {
+@@ -1407,7 +1277,7 @@ static void nlm_xlp_nae_msgring_handler(uint32_t vc, uint32_t src_id,
+         struct net_device *pdev;
+         struct dev_data *priv;
+ 	unsigned int len, hlen, port = 0, context;
+-        uint64_t addr , vaddr;
++        uint64_t addr , vaddr = 0;
+ 	struct sk_buff* skb;
+ 	struct jumbo_rx_cookie *rx_cookie = NULL;
+ 	int cpu = 0;
+@@ -1474,14 +1344,22 @@ static void nlm_xlp_nae_msgring_handler(uint32_t vc, uint32_t src_id,
+ 	else if(vc == nae_rx_vc && size == 2)
+ 	{
+ 		int bad_pkt = 0;
++		int is_p2p, num_p2d=0, tot_desc=0, idx;
+ 		int err = (msg1 >> 4) & 0x1;
+ 		int ip_csum_valid = (msg1 >> 3) & 0x1;
+ 		int tcp_csum_valid = (msg1 >> 2) & 0x1;
++		uint64_t p2d_addr[MAX_SKB_FRAGS];
++		uint32_t p2d_len[MAX_SKB_FRAGS];
+ 
+ 		/* Rx packet */
++		is_p2p  = msg1 & 0x1;	
+ 		addr	= msg1 & 0xffffffffe0ULL;
+ 		len	= (msg1 >> 40) & 0x3fff;
+ 		context = (msg1 >> 54) & 0x3ff;
++		if(is_p2p){
++			num_p2d = len;
++			//printk("P2p size=0x%x\n", len);
++		}	
+ 		//printk("[%s] src_id=%d vc = %d, size = %d, entry0=%llx entry1=%llx\n", __func__,
+                  //      src_id, vc, size, msg0, msg1);
+ 
+@@ -1495,6 +1373,7 @@ static void nlm_xlp_nae_msgring_handler(uint32_t vc, uint32_t src_id,
+ #endif
+ 		if (err) bad_pkt = 1;
+ 
++
+ 		if (drop_uboot_pkt) {
+ 			if ( (addr >= (192<<20)) && (addr < (256 << 20)) ) {
+ 				printk("Dropping firmware RX packet (addr=%llx)!\n", addr);
+@@ -1520,8 +1399,42 @@ static void nlm_xlp_nae_msgring_handler(uint32_t vc, uint32_t src_id,
+ 		}
+ 		priv = netdev_priv(pdev);
+ 
+-		vaddr = (uint64_t)bus_to_virt(addr);
+-		rx_cookie = get_rx_cookie(addr);
++		/*check what kind of desc we received*/
++		if(is_p2p){
++			uint64_t p2d;
++			int idx;
++			struct page *pg;
++			//printk("Total p2d in p2p desc are = 0x%x\n", len);
++			num_p2d = len;
++			len = 0;
++			rx_cookie = get_rx_cookie(addr);
++			pg = rx_cookie->page;
++			/*free page count for P2P desc as it is not going to network stack */
++			put_page(pg);
++			/*Get actual length*/
++			for(idx=0; idx<num_p2d; idx++){
++				vaddr = (uint64_t)bus_to_virt(addr + (8*idx)); //got p2d virt addr
++				p2d = *(uint64_t*)vaddr;
++				p2d_addr[idx] = p2d & 0xffffffffe0ULL;
++				p2d_len[idx] = (p2d >> 40) & 0x3fff;
++				bad_pkt = (p2d >> 4) & 0x1;
++				len += (p2d >> 40) & 0x3fff;
++				//printk("P2D is at = 0x%lx physbuff= 0x%lx len= 0x%x\n", vaddr, p2d_addr[idx],  p2d_len[idx] );
++			}
++			p2d_len[idx-1] = p2d_len[idx-1] - MAC_CRC_LEN;
++			len = len - MAC_CRC_LEN;
++			tot_desc = num_p2d +1; //p2ds + p2p
++			//printk("Total packet length is = 0x%x and desc = 0x%x\n", len, tot_desc);
++		}else{ /*only one P2Dl_skb*/
++			vaddr = (uint64_t)bus_to_virt(addr);
++			p2d_addr[0] = addr;
++			p2d_len[0] = len - MAC_CRC_LEN; 
++			len = len - MAC_CRC_LEN;
++			rx_cookie = get_rx_cookie(addr);
++			num_p2d = 1;
++			tot_desc = 1;
++			//printk("P2D  len = %d\n", len);
++		}
+ 
+ 		if (debug) {
+ 			printk("[%s][RX] addr=%llx, len=%d, context=%d, port=%d, vaddr=%llx\n",
+@@ -1529,8 +1442,22 @@ static void nlm_xlp_nae_msgring_handler(uint32_t vc, uint32_t src_id,
+ 		}
+ 
+ 		DUMP_PKT("RX Packet: ", (unsigned char *)vaddr, len);
++		if (bad_pkt) {
++			struct page *pg;
++			int rx_offset;
++			STATS_INC(priv->stats.rx_errors);
++			STATS_INC(priv->stats.rx_dropped);
++			/*increase free count for used pages*/
++			for(idx=0; idx<num_p2d; idx++){
++				rx_cookie = get_rx_cookie(p2d_addr[idx]);	
++				rx_offset =  JUMBO_RX_OFFSET;
++				pg = rx_cookie->page;
++				put_page(pg);
++			}
++			mac_frin_replenish_msgs(dev_mac[port], tot_desc);
++			return;
++		}
+ 
+-		len = len - MAC_CRC_LEN;
+ 		/* allocate an skb for header */
+ 		skb = netdev_alloc_skb(pdev, NETL_JUMBO_SKB_HDR_LEN + 16);
+ 		if(skb == NULL) {
+@@ -1543,9 +1470,8 @@ static void nlm_xlp_nae_msgring_handler(uint32_t vc, uint32_t src_id,
+ 		skb->dev = dev_mac[port];
+ 		hlen = (len > NETL_JUMBO_SKB_HDR_LEN) ? 
+ 				NETL_JUMBO_SKB_HDR_LEN: len;
+-		//mac_frin_replenish_one_msg(skb->dev);
+ 		/* after this call, skb->data is pointing to start of MAChdr */
+-		build_skb(skb, rx_cookie, hlen, len);
++		build_skb(skb, &p2d_addr[0], &p2d_len[0], num_p2d, hlen, len);
+ 		if (hlen == len) {
+ 			put_page(skb_shinfo(skb)->frags[0].page);
+ 			skb_shinfo(skb)->nr_frags = 0;
+@@ -1554,8 +1480,8 @@ static void nlm_xlp_nae_msgring_handler(uint32_t vc, uint32_t src_id,
+ 		skb->protocol = eth_type_trans(skb, skb->dev);
+ 		skb->dev->last_rx = jiffies;
+ 		//netif_receive_skb(skb);
+-		netif_rx(skb);	
+-		mac_frin_replenish_one_msg(dev_mac[port]);
++		netif_rx(skb);
++		mac_frin_replenish_msgs(dev_mac[port], tot_desc);
+ 		/* Update Stats */
+ 		STATS_ADD(priv->stats.rx_bytes, len);
+ 		STATS_INC(priv->stats.rx_packets);
+-- 
+1.9.1
+
