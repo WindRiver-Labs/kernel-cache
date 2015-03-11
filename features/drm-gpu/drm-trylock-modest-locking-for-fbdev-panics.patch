@@ -1,0 +1,193 @@
+From 611d184b4932f549b17ef322a9a3867b54878247 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Sun, 27 Jul 2014 19:09:33 +0200
+Subject: [PATCH 1033/1369] drm: trylock modest locking for fbdev panics
+
+commit cb597bb3a2fbfc871cc1c703fb330d247bd21394 upstream.
+
+In the fbdev code we want to do trylocks only to avoid deadlocks and
+other ugly issues. Thus far we've only grabbed the overall modeset
+lock, but that already failed to exclude a pile of potential
+concurrent operations. With proper atomic support this will be worse.
+
+So add a trylock mode to the modeset locking code which attempts all
+locks only with trylocks, if possible. We need to track this in the
+locking functions themselves and can't restrict this to drivers since
+driver-private w/w mutexes must be treated the same way.
+
+There's still the issue that other driver private locks aren't handled
+here at all, but well can't have everything. With this we will at
+least not regress, even once atomic allows lots of concurrent kms
+activity.
+
+Aside: We should move the acquire context to stack-based allocation in
+the callers to get rid of that awful WARN_ON(kmalloc_failed) control
+flow which just blows up when memory is short. But that's material for
+separate patches.
+
+v2:
+- Fix logic inversion fumble in the fb helper.
+- Add proper kerneldoc.
+
+Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/gpu/drm/drm_fb_helper.c    |   10 +++---
+ drivers/gpu/drm/drm_modeset_lock.c |   56 ++++++++++++++++++++++++++++--------
+ include/drm/drm_modeset_lock.h     |    6 ++++
+ 3 files changed, 55 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_fb_helper.c b/drivers/gpu/drm/drm_fb_helper.c
+index 9a91ee6..44da703 100644
+--- a/drivers/gpu/drm/drm_fb_helper.c
++++ b/drivers/gpu/drm/drm_fb_helper.c
+@@ -372,11 +372,11 @@ static bool drm_fb_helper_force_kernel_mode(void)
+ 		if (dev->switch_power_state == DRM_SWITCH_POWER_OFF)
+ 			continue;
+ 
+-		/* NOTE: we use lockless flag below to avoid grabbing other
+-		 * modeset locks.  So just trylock the underlying mutex
+-		 * directly:
++		/*
++		 * NOTE: Use trylock mode to avoid deadlocks and sleeping in
++		 * panic context.
+ 		 */
+-		if (!mutex_trylock(&dev->mode_config.mutex)) {
++		if (__drm_modeset_lock_all(dev, true) != 0) {
+ 			error = true;
+ 			continue;
+ 		}
+@@ -385,7 +385,7 @@ static bool drm_fb_helper_force_kernel_mode(void)
+ 		if (ret)
+ 			error = true;
+ 
+-		mutex_unlock(&dev->mode_config.mutex);
++		drm_modeset_unlock_all(dev);
+ 	}
+ 	return error;
+ }
+diff --git a/drivers/gpu/drm/drm_modeset_lock.c b/drivers/gpu/drm/drm_modeset_lock.c
+index 4753c8b..5280b64 100644
+--- a/drivers/gpu/drm/drm_modeset_lock.c
++++ b/drivers/gpu/drm/drm_modeset_lock.c
+@@ -57,26 +57,37 @@
+ 
+ 
+ /**
+- * drm_modeset_lock_all - take all modeset locks
+- * @dev: drm device
++ * __drm_modeset_lock_all - internal helper to grab all modeset locks
++ * @dev: DRM device
++ * @trylock: trylock mode for atomic contexts
+  *
+- * This function takes all modeset locks, suitable where a more fine-grained
+- * scheme isn't (yet) implemented. Locks must be dropped with
+- * drm_modeset_unlock_all.
++ * This is a special version of drm_modeset_lock_all() which can also be used in
++ * atomic contexts. Then @trylock must be set to true.
++ *
++ * Returns:
++ * 0 on success or negative error code on failure.
+  */
+-void drm_modeset_lock_all(struct drm_device *dev)
++int __drm_modeset_lock_all(struct drm_device *dev,
++			   bool trylock)
+ {
+ 	struct drm_mode_config *config = &dev->mode_config;
+ 	struct drm_modeset_acquire_ctx *ctx;
+ 	int ret;
+ 
+-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+-	if (WARN_ON(!ctx))
+-		return;
++	ctx = kzalloc(sizeof(*ctx),
++		      trylock ? GFP_ATOMIC : GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
+ 
+-	mutex_lock(&config->mutex);
++	if (trylock) {
++		if (!mutex_trylock(&config->mutex))
++			return -EBUSY;
++	} else {
++		mutex_lock(&config->mutex);
++	}
+ 
+ 	drm_modeset_acquire_init(ctx, 0);
++	ctx->trylock_only = trylock;
+ 
+ retry:
+ 	ret = drm_modeset_lock(&config->connection_mutex, ctx);
+@@ -95,13 +106,29 @@ retry:
+ 
+ 	drm_warn_on_modeset_not_all_locked(dev);
+ 
+-	return;
++	return 0;
+ 
+ fail:
+ 	if (ret == -EDEADLK) {
+ 		drm_modeset_backoff(ctx);
+ 		goto retry;
+ 	}
++
++	return ret;
++}
++EXPORT_SYMBOL(__drm_modeset_lock_all);
++
++/**
++ * drm_modeset_lock_all - take all modeset locks
++ * @dev: drm device
++ *
++ * This function takes all modeset locks, suitable where a more fine-grained
++ * scheme isn't (yet) implemented. Locks must be dropped with
++ * drm_modeset_unlock_all.
++ */
++void drm_modeset_lock_all(struct drm_device *dev)
++{
++	WARN_ON(__drm_modeset_lock_all(dev, false) != 0);
+ }
+ EXPORT_SYMBOL(drm_modeset_lock_all);
+ 
+@@ -287,7 +314,12 @@ static inline int modeset_lock(struct drm_modeset_lock *lock,
+ 
+ 	WARN_ON(ctx->contended);
+ 
+-	if (interruptible && slow) {
++	if (ctx->trylock_only) {
++		if (!ww_mutex_trylock(&lock->mutex))
++			return -EBUSY;
++		else
++			return 0;
++	} else if (interruptible && slow) {
+ 		ret = ww_mutex_lock_slow_interruptible(&lock->mutex, &ctx->ww_ctx);
+ 	} else if (interruptible) {
+ 		ret = ww_mutex_lock_interruptible(&lock->mutex, &ctx->ww_ctx);
+diff --git a/include/drm/drm_modeset_lock.h b/include/drm/drm_modeset_lock.h
+index d38e150..a3f736d 100644
+--- a/include/drm/drm_modeset_lock.h
++++ b/include/drm/drm_modeset_lock.h
+@@ -53,6 +53,11 @@ struct drm_modeset_acquire_ctx {
+ 	 * list of held locks (drm_modeset_lock)
+ 	 */
+ 	struct list_head locked;
++
++	/**
++	 * Trylock mode, use only for panic handlers!
++	 */
++	bool trylock_only;
+ };
+ 
+ /**
+@@ -123,6 +128,7 @@ struct drm_device;
+ struct drm_crtc;
+ 
+ void drm_modeset_lock_all(struct drm_device *dev);
++int __drm_modeset_lock_all(struct drm_device *dev, bool trylock);
+ void drm_modeset_unlock_all(struct drm_device *dev);
+ void drm_modeset_lock_crtc(struct drm_crtc *crtc);
+ void drm_modeset_unlock_crtc(struct drm_crtc *crtc);
+-- 
+1.7.5.4
+

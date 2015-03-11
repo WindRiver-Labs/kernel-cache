@@ -1,0 +1,336 @@
+From fd5795574c87d135deb42a9b1d0a863e19aae84e Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Fri, 11 Jul 2014 10:30:16 -0700
+Subject: [PATCH 0862/1369] drm/i915: Fix up PSR frontbuffer tracking
+
+commit 9ca153017e00550dbeda2718cfd69ca37de9c523 upstream.
+
+I've tried to split this up, but all the changes are so tightly
+related that I didn't find a good way to do this without breaking
+bisecting. Essentially this completely changes how psr is glued into
+the overall driver, and there's not much you can do to soften such a
+paradigm change.
+
+- Use frontbuffer tracking bits stuff to separate disable and
+  re-enable.
+
+- Don't re-check everything in the psr work. We have now accurate
+  tracking for everything, so no need to check for sprites or tiling
+  really. Allows us to ditch tons of locks.
+
+- That in turn allows us to properly cancel the work in the disable
+  function - no more deadlocks.
+
+- Add a check for HSW sprites and force a flush. Apparently the
+  hardware doesn't forward the flushing when updating the sprite base
+  address. We can do the same trick everywhere else we have such
+  issues, e.g. on baytrail with ... everything.
+
+- Don't re-enable psr with a delay in psr_exit. It really must be
+  turned off forever if we detect a gtt write. At least with the
+  current frontbuffer render tracking. Userspace can do a busy ioctl
+  call or no-op pageflip to re-enable psr.
+
+- Drop redundant checks for crtc and crtc->active - now that they're
+  only called from enable this is guaranteed.
+
+- Fix up the hsw port check. eDP can also happen on port D, but the
+  issue is exactly that it doesn't work there. So an || check is
+  wrong.
+
+- We still schedule the psr work with a delay. The frontbuffer
+  flushing interface mandates that we upload the next full frame, so
+  need to wait a bit. Once we have single-shot frame uploads we can do
+  better here.
+
+v2: Don't enable psr initially, rely upon the fb flush of the initial
+plane setup for that. Gives us more unified code flow and makes the
+crtc enable sequence less a special case.
+
+v3: s/psr_exit/psr_invalidate/ for consistency
+
+v4: Fixup whitespace.
+
+v5: Correctly bail out of psr_invalidate/flush when
+dev_priv->psr.enabled is NULL. Spotted by Rodrigo.
+
+v6:
+- Only schedule work when there's work to do. Fixes WARNINGs reported
+  by Rodrigo.
+- Comments Chris requested to clarify the code.
+
+v7: Fix conflict on rebase (Rodrigo)
+
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch> (v6)
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    1 +
+ drivers/gpu/drm/i915/intel_display.c |    4 +-
+ drivers/gpu/drm/i915/intel_dp.c      |  125 +++++++++++++++++++++-------------
+ drivers/gpu/drm/i915/intel_drv.h     |    5 +-
+ 4 files changed, 85 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index efa3572..df348f2 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -666,6 +666,7 @@ struct i915_psr {
+ 	struct intel_dp *enabled;
+ 	bool active;
+ 	struct delayed_work work;
++	unsigned busy_frontbuffer_bits;
+ };
+ 
+ enum intel_pch {
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index e58052f..854f82d 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -8973,7 +8973,7 @@ void intel_fb_obj_invalidate(struct drm_i915_gem_object *obj,
+ 
+ 	intel_mark_fb_busy(dev, obj->frontbuffer_bits, ring);
+ 
+-	intel_edp_psr_exit(dev);
++	intel_edp_psr_invalidate(dev, obj->frontbuffer_bits);
+ }
+ 
+ /**
+@@ -8999,7 +8999,7 @@ void intel_frontbuffer_flush(struct drm_device *dev,
+ 
+ 	intel_mark_fb_busy(dev, frontbuffer_bits, NULL);
+ 
+-	intel_edp_psr_exit(dev);
++	intel_edp_psr_flush(dev, frontbuffer_bits);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index a5eb527..a9b1e7a 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -1797,8 +1797,6 @@ static bool intel_edp_psr_match_conditions(struct intel_dp *intel_dp)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_crtc *crtc;
+ 	struct intel_crtc *intel_crtc;
+-	struct drm_i915_gem_object *obj;
+-	struct intel_encoder *intel_encoder = &dp_to_dig_port(intel_dp)->base;
+ 
+ 	lockdep_assert_held(&dev_priv->psr.lock);
+ 	lockdep_assert_held(&dev->struct_mutex);
+@@ -1812,8 +1810,7 @@ static bool intel_edp_psr_match_conditions(struct intel_dp *intel_dp)
+ 		return false;
+ 	}
+ 
+-	if (IS_HASWELL(dev) && (intel_encoder->type != INTEL_OUTPUT_EDP ||
+-				dig_port->port != PORT_A)) {
++	if (IS_HASWELL(dev) && dig_port->port != PORT_A) {
+ 		DRM_DEBUG_KMS("HSW ties PSR to DDI A (eDP)\n");
+ 		return false;
+ 	}
+@@ -1823,34 +1820,10 @@ static bool intel_edp_psr_match_conditions(struct intel_dp *intel_dp)
+ 		return false;
+ 	}
+ 
+-	crtc = dig_port->base.base.crtc;
+-	if (crtc == NULL) {
+-		DRM_DEBUG_KMS("crtc not active for PSR\n");
+-		return false;
+-	}
+-
+-	intel_crtc = to_intel_crtc(crtc);
+-	if (!intel_crtc_active(crtc)) {
+-		DRM_DEBUG_KMS("crtc not active for PSR\n");
+-		return false;
+-	}
+-
+-	obj = intel_fb_obj(crtc->primary->fb);
+-	if (obj->tiling_mode != I915_TILING_X ||
+-	    obj->fence_reg == I915_FENCE_REG_NONE) {
+-		DRM_DEBUG_KMS("PSR condition failed: fb not tiled or fenced\n");
+-		return false;
+-	}
+-
+ 	/* Below limitations aren't valid for Broadwell */
+ 	if (IS_BROADWELL(dev))
+ 		goto out;
+ 
+-	if (I915_READ(SPRCTL(intel_crtc->pipe)) & SPRITE_ENABLE) {
+-		DRM_DEBUG_KMS("PSR condition failed: Sprite is Enabled\n");
+-		return false;
+-	}
+-
+ 	if (I915_READ(HSW_STEREO_3D_CTL(intel_crtc->config.cpu_transcoder)) &
+ 	    S3D_ENABLE) {
+ 		DRM_DEBUG_KMS("PSR condition failed: Stereo 3D is Enabled\n");
+@@ -1883,7 +1856,6 @@ static void intel_edp_psr_do_enable(struct intel_dp *intel_dp)
+ 	/* Enable PSR on the host */
+ 	intel_edp_psr_enable_source(intel_dp);
+ 
+-	dev_priv->psr.enabled = intel_dp;
+ 	dev_priv->psr.active = true;
+ }
+ 
+@@ -1909,11 +1881,13 @@ void intel_edp_psr_enable(struct intel_dp *intel_dp)
+ 		return;
+ 	}
+ 
++	dev_priv->psr.busy_frontbuffer_bits = 0;
++
+ 	/* Setup PSR once */
+ 	intel_edp_psr_setup(intel_dp);
+ 
+ 	if (intel_edp_psr_match_conditions(intel_dp))
+-		intel_edp_psr_do_enable(intel_dp);
++		dev_priv->psr.enabled = intel_dp;
+ 	mutex_unlock(&dev_priv->psr.lock);
+ }
+ 
+@@ -1947,42 +1921,39 @@ void intel_edp_psr_disable(struct intel_dp *intel_dp)
+ 
+ 	dev_priv->psr.enabled = NULL;
+ 	mutex_unlock(&dev_priv->psr.lock);
++
++	cancel_delayed_work_sync(&dev_priv->psr.work);
+ }
+ 
+ static void intel_edp_psr_work(struct work_struct *work)
+ {
+ 	struct drm_i915_private *dev_priv =
+ 		container_of(work, typeof(*dev_priv), psr.work.work);
+-	struct drm_device *dev = dev_priv->dev;
+ 	struct intel_dp *intel_dp = dev_priv->psr.enabled;
+ 
+-	drm_modeset_lock_all(dev);
+-	mutex_lock(&dev->struct_mutex);
+ 	mutex_lock(&dev_priv->psr.lock);
+ 	intel_dp = dev_priv->psr.enabled;
+ 
+ 	if (!intel_dp)
+ 		goto unlock;
+ 
+-	if (intel_edp_psr_match_conditions(intel_dp))
+-		intel_edp_psr_do_enable(intel_dp);
++	/*
++	 * The delayed work can race with an invalidate hence we need to
++	 * recheck. Since psr_flush first clears this and then reschedules we
++	 * won't ever miss a flush when bailing out here.
++	 */
++	if (dev_priv->psr.busy_frontbuffer_bits)
++		goto unlock;
++
++	intel_edp_psr_do_enable(intel_dp);
+ unlock:
+ 	mutex_unlock(&dev_priv->psr.lock);
+-	mutex_unlock(&dev->struct_mutex);
+-	drm_modeset_unlock_all(dev);
+ }
+ 
+-void intel_edp_psr_exit(struct drm_device *dev)
++static void intel_edp_psr_do_exit(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+-	if (!HAS_PSR(dev))
+-		return;
+-
+-	if (!dev_priv->psr.enabled)
+-		return;
+-
+-	mutex_lock(&dev_priv->psr.lock);
+ 	if (dev_priv->psr.active) {
+ 		u32 val = I915_READ(EDP_PSR_CTL(dev));
+ 
+@@ -1993,8 +1964,68 @@ void intel_edp_psr_exit(struct drm_device *dev)
+ 		dev_priv->psr.active = false;
+ 	}
+ 
+-	schedule_delayed_work(&dev_priv->psr.work,
+-			      msecs_to_jiffies(100));
++}
++
++void intel_edp_psr_invalidate(struct drm_device *dev,
++			      unsigned frontbuffer_bits)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_crtc *crtc;
++	enum pipe pipe;
++
++	if (!HAS_PSR(dev))
++		return;
++
++	mutex_lock(&dev_priv->psr.lock);
++	if (!dev_priv->psr.enabled) {
++		mutex_unlock(&dev_priv->psr.lock);
++		return;
++	}
++
++	crtc = dp_to_dig_port(dev_priv->psr.enabled)->base.base.crtc;
++	pipe = to_intel_crtc(crtc)->pipe;
++
++	intel_edp_psr_do_exit(dev);
++
++	frontbuffer_bits &= INTEL_FRONTBUFFER_ALL_MASK(pipe);
++
++	dev_priv->psr.busy_frontbuffer_bits |= frontbuffer_bits;
++	mutex_unlock(&dev_priv->psr.lock);
++}
++
++void intel_edp_psr_flush(struct drm_device *dev,
++			 unsigned frontbuffer_bits)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_crtc *crtc;
++	enum pipe pipe;
++
++	if (!HAS_PSR(dev))
++		return;
++
++	mutex_lock(&dev_priv->psr.lock);
++	if (!dev_priv->psr.enabled) {
++		mutex_unlock(&dev_priv->psr.lock);
++		return;
++	}
++
++	crtc = dp_to_dig_port(dev_priv->psr.enabled)->base.base.crtc;
++	pipe = to_intel_crtc(crtc)->pipe;
++	dev_priv->psr.busy_frontbuffer_bits &= ~frontbuffer_bits;
++
++	/*
++	 * On Haswell sprite plane updates don't result in a psr invalidating
++	 * signal in the hardware. Which means we need to manually fake this in
++	 * software for all flushes, not just when we've seen a preceding
++	 * invalidation through frontbuffer rendering.
++	 */
++	if (IS_HASWELL(dev) &&
++	    (frontbuffer_bits & INTEL_FRONTBUFFER_SPRITE(pipe)))
++		intel_edp_psr_do_exit(dev);
++
++	if (!dev_priv->psr.active && !dev_priv->psr.busy_frontbuffer_bits)
++		schedule_delayed_work(&dev_priv->psr.work,
++				      msecs_to_jiffies(100));
+ 	mutex_unlock(&dev_priv->psr.lock);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 32971b0..d3e6188 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -903,7 +903,10 @@ void intel_edp_panel_off(struct intel_dp *intel_dp);
+ void intel_edp_psr_enable(struct intel_dp *intel_dp);
+ void intel_edp_psr_disable(struct intel_dp *intel_dp);
+ void intel_dp_set_drrs_state(struct drm_device *dev, int refresh_rate);
+-void intel_edp_psr_exit(struct drm_device *dev);
++void intel_edp_psr_invalidate(struct drm_device *dev,
++			      unsigned frontbuffer_bits);
++void intel_edp_psr_flush(struct drm_device *dev,
++			 unsigned frontbuffer_bits);
+ void intel_edp_psr_init(struct drm_device *dev);
+ 
+ int intel_dp_handle_hpd_irq(struct intel_digital_port *digport, bool long_hpd);
+-- 
+1.7.5.4
+

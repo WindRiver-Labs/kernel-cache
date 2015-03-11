@@ -1,0 +1,456 @@
+From cc33bf5b5b28ca0e8bf1c09076497090d8c3e979 Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <ben@bwidawsk.net>
+Date: Mon, 30 Jun 2014 09:53:37 -0700
+Subject: [PATCH 0731/1369] drm/i915/bdw: implement semaphore signal
+
+commit 3e78998a588c64d6447849deabf630e837505a24 upstream.
+
+Semaphore signalling works similarly to previous GENs with the exception
+that the per ring mailboxes no longer exist. Instead you must define
+your own space, somewhere in the GTT.
+
+The comments in the code define the layout I've opted for, which should
+be fairly future proof. Ie. I tried to define offsets in abstract terms
+(NUM_RINGS, seqno size, etc).
+
+NOTE: If one wanted to move this to the HWSP they could. I've decided
+one 4k object would be easier to deal with, and provide potential wins
+with cache locality, but that's all speculative.
+
+v2: Update the macro to not need the other ring's ring->id (Chris)
+Update the comment to use the correct formula (Chris)
+
+v3: Move the macros the ringbuffer.h to prevent churn in next patch
+(Ville)
+
+v4: Fixed compilation rebase conflict
+commit 1ec9e26ddab06459e89a890431b2de064c5d1056
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Fri Feb 14 14:01:11 2014 +0100
+
+    drm/i915: Consolidate binding parameters into flags
+
+v5: VCS2 rebase
+Replace hweight_long with hweight32
+
+v6 (Rodrigo): * Add missed VC2 gen8 ring signal init
+   	      * fixing conflicst on rebase
+    	      * minor fixes on address table
+	      * remove WARN_ON
+
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+[danvet: s/BUG_ON/WARN_ON/]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    1 +
+ drivers/gpu/drm/i915/i915_reg.h         |    5 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |  185 +++++++++++++++++++------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |   78 ++++++++++++-
+ 4 files changed, 189 insertions(+), 80 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 3c42ffd..b5f7eda 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1376,6 +1376,7 @@ struct drm_i915_private {
+ 
+ 	struct pci_dev *bridge_dev;
+ 	struct intel_engine_cs ring[I915_NUM_RINGS];
++	struct drm_i915_gem_object *semaphore_obj;
+ 	uint32_t last_seqno, next_seqno;
+ 
+ 	drm_dma_handle_t *status_page_dmah;
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index bbdd33a..7c4675a 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -240,7 +240,7 @@
+ #define   MI_DISPLAY_FLIP_IVB_SPRITE_B (3 << 19)
+ #define   MI_DISPLAY_FLIP_IVB_PLANE_C  (4 << 19)
+ #define   MI_DISPLAY_FLIP_IVB_SPRITE_C (5 << 19)
+-#define MI_SEMAPHORE_MBOX	MI_INSTR(0x16, 1) /* gen6+ */
++#define MI_SEMAPHORE_MBOX	MI_INSTR(0x16, 1) /* gen6, gen7 */
+ #define   MI_SEMAPHORE_GLOBAL_GTT    (1<<22)
+ #define   MI_SEMAPHORE_UPDATE	    (1<<21)
+ #define   MI_SEMAPHORE_COMPARE	    (1<<20)
+@@ -266,6 +266,8 @@
+ #define   MI_RESTORE_EXT_STATE_EN	(1<<2)
+ #define   MI_FORCE_RESTORE		(1<<1)
+ #define   MI_RESTORE_INHIBIT		(1<<0)
++#define MI_SEMAPHORE_SIGNAL	MI_INSTR(0x1b, 0) /* GEN8+ */
++#define   MI_SEMAPHORE_TARGET(engine)	((engine)<<15)
+ #define MI_STORE_DWORD_IMM	MI_INSTR(0x20, 1)
+ #define   MI_MEM_VIRTUAL	(1 << 22) /* 965+ only */
+ #define MI_STORE_DWORD_INDEX	MI_INSTR(0x21, 1)
+@@ -360,6 +362,7 @@
+ #define   PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE		(1<<10) /* GM45+ only */
+ #define   PIPE_CONTROL_INDIRECT_STATE_DISABLE		(1<<9)
+ #define   PIPE_CONTROL_NOTIFY				(1<<8)
++#define   PIPE_CONTROL_FLUSH_ENABLE			(1<<7) /* gen7+ */
+ #define   PIPE_CONTROL_VF_CACHE_INVALIDATE		(1<<4)
+ #define   PIPE_CONTROL_CONST_CACHE_INVALIDATE		(1<<3)
+ #define   PIPE_CONTROL_STATE_CACHE_INVALIDATE		(1<<2)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index e6bb84a..fee3e90 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -663,6 +663,13 @@ static int init_render_ring(struct intel_engine_cs *ring)
+ static void render_ring_cleanup(struct intel_engine_cs *ring)
+ {
+ 	struct drm_device *dev = ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (dev_priv->semaphore_obj) {
++		i915_gem_object_ggtt_unpin(dev_priv->semaphore_obj);
++		drm_gem_object_unreference(&dev_priv->semaphore_obj->base);
++		dev_priv->semaphore_obj = NULL;
++	}
+ 
+ 	if (ring->scratch.obj == NULL)
+ 		return;
+@@ -676,6 +683,80 @@ static void render_ring_cleanup(struct intel_engine_cs *ring)
+ 	ring->scratch.obj = NULL;
+ }
+ 
++static int gen8_rcs_signal(struct intel_engine_cs *signaller,
++			   unsigned int num_dwords)
++{
++#define MBOX_UPDATE_DWORDS 8
++	struct drm_device *dev = signaller->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_engine_cs *waiter;
++	int i, ret, num_rings;
++
++	num_rings = hweight32(INTEL_INFO(dev)->ring_mask);
++	num_dwords += (num_rings-1) * MBOX_UPDATE_DWORDS;
++#undef MBOX_UPDATE_DWORDS
++
++	ret = intel_ring_begin(signaller, num_dwords);
++	if (ret)
++		return ret;
++
++	for_each_ring(waiter, dev_priv, i) {
++		u64 gtt_offset = signaller->semaphore.signal_ggtt[i];
++		if (gtt_offset == MI_SEMAPHORE_SYNC_INVALID)
++			continue;
++
++		intel_ring_emit(signaller, GFX_OP_PIPE_CONTROL(6));
++		intel_ring_emit(signaller, PIPE_CONTROL_GLOBAL_GTT_IVB |
++					   PIPE_CONTROL_QW_WRITE |
++					   PIPE_CONTROL_FLUSH_ENABLE);
++		intel_ring_emit(signaller, lower_32_bits(gtt_offset));
++		intel_ring_emit(signaller, upper_32_bits(gtt_offset));
++		intel_ring_emit(signaller, signaller->outstanding_lazy_seqno);
++		intel_ring_emit(signaller, 0);
++		intel_ring_emit(signaller, MI_SEMAPHORE_SIGNAL |
++					   MI_SEMAPHORE_TARGET(waiter->id));
++		intel_ring_emit(signaller, 0);
++	}
++
++	return 0;
++}
++
++static int gen8_xcs_signal(struct intel_engine_cs *signaller,
++			   unsigned int num_dwords)
++{
++#define MBOX_UPDATE_DWORDS 6
++	struct drm_device *dev = signaller->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_engine_cs *waiter;
++	int i, ret, num_rings;
++
++	num_rings = hweight32(INTEL_INFO(dev)->ring_mask);
++	num_dwords += (num_rings-1) * MBOX_UPDATE_DWORDS;
++#undef MBOX_UPDATE_DWORDS
++
++	ret = intel_ring_begin(signaller, num_dwords);
++	if (ret)
++		return ret;
++
++	for_each_ring(waiter, dev_priv, i) {
++		u64 gtt_offset = signaller->semaphore.signal_ggtt[i];
++		if (gtt_offset == MI_SEMAPHORE_SYNC_INVALID)
++			continue;
++
++		intel_ring_emit(signaller, (MI_FLUSH_DW + 1) |
++					   MI_FLUSH_DW_OP_STOREDW);
++		intel_ring_emit(signaller, lower_32_bits(gtt_offset) |
++					   MI_FLUSH_DW_USE_GTT);
++		intel_ring_emit(signaller, upper_32_bits(gtt_offset));
++		intel_ring_emit(signaller, signaller->outstanding_lazy_seqno);
++		intel_ring_emit(signaller, MI_SEMAPHORE_SIGNAL |
++					   MI_SEMAPHORE_TARGET(waiter->id));
++		intel_ring_emit(signaller, 0);
++	}
++
++	return 0;
++}
++
+ static int gen6_signal(struct intel_engine_cs *signaller,
+ 		       unsigned int num_dwords)
+ {
+@@ -1945,12 +2026,30 @@ int intel_init_render_ring_buffer(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_engine_cs *ring = &dev_priv->ring[RCS];
++	struct drm_i915_gem_object *obj;
++	int ret;
+ 
+ 	ring->name = "render ring";
+ 	ring->id = RCS;
+ 	ring->mmio_base = RENDER_RING_BASE;
+ 
+ 	if (INTEL_INFO(dev)->gen >= 8) {
++		if (i915_semaphore_is_enabled(dev)) {
++			obj = i915_gem_alloc_object(dev, 4096);
++			if (obj == NULL) {
++				DRM_ERROR("Failed to allocate semaphore bo. Disabling semaphores\n");
++				i915.semaphores = 0;
++			} else {
++				i915_gem_object_set_cache_level(obj, I915_CACHE_LLC);
++				ret = i915_gem_obj_ggtt_pin(obj, 0, PIN_NONBLOCK);
++				if (ret != 0) {
++					drm_gem_object_unreference(&obj->base);
++					DRM_ERROR("Failed to pin semaphore bo. Disabling semaphores\n");
++					i915.semaphores = 0;
++				} else
++					dev_priv->semaphore_obj = obj;
++			}
++		}
+ 		ring->add_request = gen6_add_request;
+ 		ring->flush = gen8_render_ring_flush;
+ 		ring->irq_get = gen8_ring_get_irq;
+@@ -1959,18 +2058,10 @@ int intel_init_render_ring_buffer(struct drm_device *dev)
+ 		ring->get_seqno = gen6_ring_get_seqno;
+ 		ring->set_seqno = ring_set_seqno;
+ 		if (i915_semaphore_is_enabled(dev)) {
++			WARN_ON(!dev_priv->semaphore_obj);
+ 			ring->semaphore.sync_to = gen6_ring_sync;
+-			ring->semaphore.signal = gen6_signal;
+-			ring->semaphore.mbox.wait[RCS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[VCS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[BCS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[VECS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[VCS2] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.signal[RCS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[VCS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[BCS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[VECS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[VCS2] = GEN6_NOSYNC;
++			ring->semaphore.signal = gen8_rcs_signal;
++			GEN8_RING_SEMAPHORE_INIT;
+ 		}
+ 	} else if (INTEL_INFO(dev)->gen >= 6) {
+ 		ring->add_request = gen6_add_request;
+@@ -2048,9 +2139,6 @@ int intel_init_render_ring_buffer(struct drm_device *dev)
+ 
+ 	/* Workaround batchbuffer to combat CS tlb bug. */
+ 	if (HAS_BROKEN_CS_TLB(dev)) {
+-		struct drm_i915_gem_object *obj;
+-		int ret;
+-
+ 		obj = i915_gem_alloc_object(dev, I830_BATCH_LIMIT);
+ 		if (obj == NULL) {
+ 			DRM_ERROR("Failed to allocate batch bo\n");
+@@ -2183,25 +2271,8 @@ int intel_init_bsd_ring_buffer(struct drm_device *dev)
+ 				gen8_ring_dispatch_execbuffer;
+ 			if (i915_semaphore_is_enabled(dev)) {
+ 				ring->semaphore.sync_to = gen6_ring_sync;
+-				ring->semaphore.signal = gen6_signal;
+-				/*
+-				 * The current semaphore is only applied on
+-				 * pre-gen8 platform.  And there is no VCS2 ring
+-				 * on the pre-gen8 platform. So the semaphore
+-				 * between VCS and VCS2 is initialized as
+-				 * INVALID.  Gen8 will initialize the sema
+-				 * between VCS2 and VCS later.
+-				 */
+-				ring->semaphore.mbox.wait[RCS] = MI_SEMAPHORE_SYNC_INVALID;
+-				ring->semaphore.mbox.wait[VCS] = MI_SEMAPHORE_SYNC_INVALID;
+-				ring->semaphore.mbox.wait[BCS] = MI_SEMAPHORE_SYNC_INVALID;
+-				ring->semaphore.mbox.wait[VECS] = MI_SEMAPHORE_SYNC_INVALID;
+-				ring->semaphore.mbox.wait[VCS2] = MI_SEMAPHORE_SYNC_INVALID;
+-				ring->semaphore.mbox.signal[RCS] = GEN6_NOSYNC;
+-				ring->semaphore.mbox.signal[VCS] = GEN6_NOSYNC;
+-				ring->semaphore.mbox.signal[BCS] = GEN6_NOSYNC;
+-				ring->semaphore.mbox.signal[VECS] = GEN6_NOSYNC;
+-				ring->semaphore.mbox.signal[VCS2] = GEN6_NOSYNC;
++				ring->semaphore.signal = gen8_xcs_signal;
++				GEN8_RING_SEMAPHORE_INIT;
+ 			}
+ 		} else {
+ 			ring->irq_enable_mask = GT_BSD_USER_INTERRUPT;
+@@ -2276,24 +2347,10 @@ int intel_init_bsd2_ring_buffer(struct drm_device *dev)
+ 	ring->dispatch_execbuffer =
+ 			gen8_ring_dispatch_execbuffer;
+ 	ring->semaphore.sync_to = gen6_ring_sync;
+-	ring->semaphore.signal = gen6_signal;
+-	/*
+-	 * The current semaphore is only applied on the pre-gen8. And there
+-	 * is no bsd2 ring on the pre-gen8. So now the semaphore_register
+-	 * between VCS2 and other ring is initialized as invalid.
+-	 * Gen8 will initialize the sema between VCS2 and other ring later.
+-	 */
+-	ring->semaphore.mbox.wait[RCS] = MI_SEMAPHORE_SYNC_INVALID;
+-	ring->semaphore.mbox.wait[VCS] = MI_SEMAPHORE_SYNC_INVALID;
+-	ring->semaphore.mbox.wait[BCS] = MI_SEMAPHORE_SYNC_INVALID;
+-	ring->semaphore.mbox.wait[VECS] = MI_SEMAPHORE_SYNC_INVALID;
+-	ring->semaphore.mbox.wait[VCS2] = MI_SEMAPHORE_SYNC_INVALID;
+-	ring->semaphore.mbox.signal[RCS] = GEN6_NOSYNC;
+-	ring->semaphore.mbox.signal[VCS] = GEN6_NOSYNC;
+-	ring->semaphore.mbox.signal[BCS] = GEN6_NOSYNC;
+-	ring->semaphore.mbox.signal[VECS] = GEN6_NOSYNC;
+-	ring->semaphore.mbox.signal[VCS2] = GEN6_NOSYNC;
+-
++	if (i915_semaphore_is_enabled(dev)) {
++		ring->semaphore.signal = gen8_xcs_signal;
++		GEN8_RING_SEMAPHORE_INIT;
++	}
+ 	ring->init = init_ring_common;
+ 
+ 	return intel_init_ring_buffer(dev, ring);
+@@ -2321,17 +2378,8 @@ int intel_init_blt_ring_buffer(struct drm_device *dev)
+ 		ring->dispatch_execbuffer = gen8_ring_dispatch_execbuffer;
+ 		if (i915_semaphore_is_enabled(dev)) {
+ 			ring->semaphore.sync_to = gen6_ring_sync;
+-			ring->semaphore.signal = gen6_signal;
+-			ring->semaphore.mbox.wait[RCS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[VCS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[BCS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[VECS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[VCS2] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.signal[RCS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[VCS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[BCS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[VECS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[VCS2] = GEN6_NOSYNC;
++			ring->semaphore.signal = gen8_xcs_signal;
++			GEN8_RING_SEMAPHORE_INIT;
+ 		}
+ 	} else {
+ 		ring->irq_enable_mask = GT_BLT_USER_INTERRUPT;
+@@ -2388,17 +2436,8 @@ int intel_init_vebox_ring_buffer(struct drm_device *dev)
+ 		ring->dispatch_execbuffer = gen8_ring_dispatch_execbuffer;
+ 		if (i915_semaphore_is_enabled(dev)) {
+ 			ring->semaphore.sync_to = gen6_ring_sync;
+-			ring->semaphore.signal = gen6_signal;
+-			ring->semaphore.mbox.wait[RCS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[VCS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[BCS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[VECS] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.wait[VCS2] = MI_SEMAPHORE_SYNC_INVALID;
+-			ring->semaphore.mbox.signal[RCS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[VCS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[BCS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[VECS] = GEN6_NOSYNC;
+-			ring->semaphore.mbox.signal[VCS2] = GEN6_NOSYNC;
++			ring->semaphore.signal = gen8_xcs_signal;
++			GEN8_RING_SEMAPHORE_INIT;
+ 		}
+ 	} else {
+ 		ring->irq_enable_mask = PM_VEBOX_USER_INTERRUPT;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 2e8b516..17ef9cd 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -40,6 +40,32 @@ struct  intel_hw_status_page {
+ #define I915_READ_MODE(ring) I915_READ(RING_MI_MODE((ring)->mmio_base))
+ #define I915_WRITE_MODE(ring, val) I915_WRITE(RING_MI_MODE((ring)->mmio_base), val)
+ 
++/* seqno size is actually only a uint32, but since we plan to use MI_FLUSH_DW to
++ * do the writes, and that must have qw aligned offsets, simply pretend it's 8b.
++ */
++#define i915_semaphore_seqno_size sizeof(uint64_t)
++#define GEN8_SIGNAL_OFFSET(__ring, to)			     \
++	(i915_gem_obj_ggtt_offset(dev_priv->semaphore_obj) + \
++	((__ring)->id * I915_NUM_RINGS * i915_semaphore_seqno_size) +	\
++	(i915_semaphore_seqno_size * (to)))
++
++#define GEN8_WAIT_OFFSET(__ring, from)			     \
++	(i915_gem_obj_ggtt_offset(dev_priv->semaphore_obj) + \
++	((from) * I915_NUM_RINGS * i915_semaphore_seqno_size) + \
++	(i915_semaphore_seqno_size * (__ring)->id))
++
++#define GEN8_RING_SEMAPHORE_INIT do { \
++	if (!dev_priv->semaphore_obj) { \
++		break; \
++	} \
++	ring->semaphore.signal_ggtt[RCS] = GEN8_SIGNAL_OFFSET(ring, RCS); \
++	ring->semaphore.signal_ggtt[VCS] = GEN8_SIGNAL_OFFSET(ring, VCS); \
++	ring->semaphore.signal_ggtt[BCS] = GEN8_SIGNAL_OFFSET(ring, BCS); \
++	ring->semaphore.signal_ggtt[VECS] = GEN8_SIGNAL_OFFSET(ring, VECS); \
++	ring->semaphore.signal_ggtt[VCS2] = GEN8_SIGNAL_OFFSET(ring, VCS2); \
++	ring->semaphore.signal_ggtt[ring->id] = MI_SEMAPHORE_SYNC_INVALID; \
++	} while(0)
++
+ enum intel_ring_hangcheck_action {
+ 	HANGCHECK_IDLE = 0,
+ 	HANGCHECK_WAIT,
+@@ -127,15 +153,55 @@ struct  intel_engine_cs {
+ #define I915_DISPATCH_PINNED 0x2
+ 	void		(*cleanup)(struct intel_engine_cs *ring);
+ 
++	/* GEN8 signal/wait table - never trust comments!
++	 *	  signal to	signal to    signal to   signal to      signal to
++	 *	    RCS		   VCS          BCS        VECS		 VCS2
++	 *      --------------------------------------------------------------------
++	 *  RCS | NOP (0x00) | VCS (0x08) | BCS (0x10) | VECS (0x18) | VCS2 (0x20) |
++	 *	|-------------------------------------------------------------------
++	 *  VCS | RCS (0x28) | NOP (0x30) | BCS (0x38) | VECS (0x40) | VCS2 (0x48) |
++	 *	|-------------------------------------------------------------------
++	 *  BCS | RCS (0x50) | VCS (0x58) | NOP (0x60) | VECS (0x68) | VCS2 (0x70) |
++	 *	|-------------------------------------------------------------------
++	 * VECS | RCS (0x78) | VCS (0x80) | BCS (0x88) |  NOP (0x90) | VCS2 (0x98) |
++	 *	|-------------------------------------------------------------------
++	 * VCS2 | RCS (0xa0) | VCS (0xa8) | BCS (0xb0) | VECS (0xb8) | NOP  (0xc0) |
++	 *	|-------------------------------------------------------------------
++	 *
++	 * Generalization:
++	 *  f(x, y) := (x->id * NUM_RINGS * seqno_size) + (seqno_size * y->id)
++	 *  ie. transpose of g(x, y)
++	 *
++	 *	 sync from	sync from    sync from    sync from	sync from
++	 *	    RCS		   VCS          BCS        VECS		 VCS2
++	 *      --------------------------------------------------------------------
++	 *  RCS | NOP (0x00) | VCS (0x28) | BCS (0x50) | VECS (0x78) | VCS2 (0xa0) |
++	 *	|-------------------------------------------------------------------
++	 *  VCS | RCS (0x08) | NOP (0x30) | BCS (0x58) | VECS (0x80) | VCS2 (0xa8) |
++	 *	|-------------------------------------------------------------------
++	 *  BCS | RCS (0x10) | VCS (0x38) | NOP (0x60) | VECS (0x88) | VCS2 (0xb0) |
++	 *	|-------------------------------------------------------------------
++	 * VECS | RCS (0x18) | VCS (0x40) | BCS (0x68) |  NOP (0x90) | VCS2 (0xb8) |
++	 *	|-------------------------------------------------------------------
++	 * VCS2 | RCS (0x20) | VCS (0x48) | BCS (0x70) | VECS (0x98) |  NOP (0xc0) |
++	 *	|-------------------------------------------------------------------
++	 *
++	 * Generalization:
++	 *  g(x, y) := (y->id * NUM_RINGS * seqno_size) + (seqno_size * x->id)
++	 *  ie. transpose of f(x, y)
++	 */
+ 	struct {
+ 		u32	sync_seqno[I915_NUM_RINGS-1];
+ 
+-		struct {
+-			/* our mbox written by others */
+-			u32		wait[I915_NUM_RINGS];
+-			/* mboxes this ring signals to */
+-			u32		signal[I915_NUM_RINGS];
+-		} mbox;
++		union {
++			struct {
++				/* our mbox written by others */
++				u32		wait[I915_NUM_RINGS];
++				/* mboxes this ring signals to */
++				u32		signal[I915_NUM_RINGS];
++			} mbox;
++			u64		signal_ggtt[I915_NUM_RINGS];
++		};
+ 
+ 		/* AKA wait() */
+ 		int	(*sync_to)(struct intel_engine_cs *ring,
+-- 
+1.7.5.4
+

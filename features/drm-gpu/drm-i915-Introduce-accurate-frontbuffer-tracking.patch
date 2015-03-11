@@ -1,0 +1,483 @@
+From 4403402cca2dbba2bc15094e8521f2139e0b5d56 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Wed, 18 Jun 2014 23:28:09 +0200
+Subject: [PATCH 0678/1369] drm/i915: Introduce accurate frontbuffer tracking
+
+commit a071fa00647bc9a3c53f917b236fff9aea175e3a upstream.
+
+So from just a quick look we seem to have enough information to
+accurately figure out whether a given gem bo is used as a frontbuffer
+and where exactly: We have obj->pin_count as a first check with no
+false negatives and only negligible false positives. And then we can
+just walk the modeset objects and figure out where exactly a buffer is
+used as scanout.
+
+Except that we can't due to locking order: If we already hold
+dev->struct_mutex we can't acquire any modeset locks, so could
+potential chase freed pointers and other evil stuff.
+
+So we need something else. For that introduce a new set of bits
+obj->frontbuffer_bits to track where a buffer object is used. That we
+can then chase without grabbing any modeset locks.
+
+Of course the consumers of this (DRRS, PSR, FBC, ...) still need to be
+able to do their magic both when called from modeset and from gem
+code. But that can be easily achieved by adding locks for these
+specific subsystems which always nest within either kms or gem
+locking.
+
+This patch just adds the relevant update code to all places.
+
+Note that if we ever support multi-planar scanout targets then we need
+one frontbuffer tracking bit per attachment point that we expose to
+userspace.
+
+v2:
+- Fix more oopsen. Oops.
+- WARN if we leak obj->frontbuffer_bits when freeing a gem buffer. Fix
+  the bugs this brought to light.
+- s/update_frontbuffer_bits/update_fb_bits/. More consistent with the
+  fb tracking functions (fb for gem object, frontbuffer for raw bits).
+  And the function name was way too long.
+
+v3: Size obj->frontbuffer_bits correctly so that all pipes fit in.
+
+v4: Don't update fb bits in set_base on failure. Noticed by Chris.
+
+v5: s/i915_gem_update_fb_bits/i915_gem_track_fb/ Also remove a few
+local enum pipe variables which are now no longer needed to make the
+function arguments no drop over the 80 char limit.
+
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |   26 ++++++++++++
+ drivers/gpu/drm/i915/i915_gem.c      |   19 +++++++++
+ drivers/gpu/drm/i915/intel_display.c |   75 ++++++++++++++++++++++++---------
+ drivers/gpu/drm/i915/intel_overlay.c |   10 ++++-
+ drivers/gpu/drm/i915/intel_sprite.c  |    7 +++
+ 5 files changed, 115 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index c0d1777..4162775 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1594,6 +1594,26 @@ struct drm_i915_gem_object_ops {
+ 	void (*release)(struct drm_i915_gem_object *);
+ };
+ 
++/*
++ * Frontbuffer tracking bits. Set in obj->frontbuffer_bits while a gem bo is
++ * considered to be the frontbuffer for the given plane interface-vise. This
++ * doesn't mean that the hw necessarily already scans it out, but that any
++ * rendering (by the cpu or gpu) will land in the frontbuffer eventually.
++ *
++ * We have one bit per pipe and per scanout plane type.
++ */
++#define INTEL_FRONTBUFFER_BITS_PER_PIPE 4
++#define INTEL_FRONTBUFFER_BITS \
++	(INTEL_FRONTBUFFER_BITS_PER_PIPE * I915_MAX_PIPES)
++#define INTEL_FRONTBUFFER_PRIMARY(pipe) \
++	(1 << (INTEL_FRONTBUFFER_BITS_PER_PIPE * (pipe)))
++#define INTEL_FRONTBUFFER_CURSOR(pipe) \
++	(1 << (1 +(INTEL_FRONTBUFFER_BITS_PER_PIPE * (pipe))))
++#define INTEL_FRONTBUFFER_SPRITE(pipe) \
++	(1 << (2 +(INTEL_FRONTBUFFER_BITS_PER_PIPE * (pipe))))
++#define INTEL_FRONTBUFFER_OVERLAY(pipe) \
++	(1 << (3 +(INTEL_FRONTBUFFER_BITS_PER_PIPE * (pipe))))
++
+ struct drm_i915_gem_object {
+ 	struct drm_gem_object base;
+ 
+@@ -1681,6 +1701,8 @@ struct drm_i915_gem_object {
+ 	unsigned int has_global_gtt_mapping:1;
+ 	unsigned int has_dma_mapping:1;
+ 
++	unsigned int frontbuffer_bits:INTEL_FRONTBUFFER_BITS;
++
+ 	struct sg_table *pages;
+ 	int pages_pin_count;
+ 
+@@ -1727,6 +1749,10 @@ struct drm_i915_gem_object {
+ };
+ #define to_intel_bo(x) container_of(x, struct drm_i915_gem_object, base)
+ 
++void i915_gem_track_fb(struct drm_i915_gem_object *old,
++		       struct drm_i915_gem_object *new,
++		       unsigned frontbuffer_bits);
++
+ /**
+  * Request queue structure.
+  *
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 44b52ba..dd28247 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4455,6 +4455,8 @@ void i915_gem_free_object(struct drm_gem_object *gem_obj)
+ 	if (obj->stolen)
+ 		i915_gem_object_unpin_pages(obj);
+ 
++	WARN_ON(obj->frontbuffer_bits);
++
+ 	if (WARN_ON(obj->pages_pin_count))
+ 		obj->pages_pin_count = 0;
+ 	if (discard_backing_storage(obj))
+@@ -4999,6 +5001,23 @@ int i915_gem_open(struct drm_device *dev, struct drm_file *file)
+ 	return ret;
+ }
+ 
++void i915_gem_track_fb(struct drm_i915_gem_object *old,
++		       struct drm_i915_gem_object *new,
++		       unsigned frontbuffer_bits)
++{
++	if (old) {
++		WARN_ON(!mutex_is_locked(&old->base.dev->struct_mutex));
++		WARN_ON(!(old->frontbuffer_bits & frontbuffer_bits));
++		old->frontbuffer_bits &= ~frontbuffer_bits;
++	}
++
++	if (new) {
++		WARN_ON(!mutex_is_locked(&new->base.dev->struct_mutex));
++		WARN_ON(new->frontbuffer_bits & frontbuffer_bits);
++		new->frontbuffer_bits |= frontbuffer_bits;
++	}
++}
++
+ static bool mutex_is_locked_by(struct mutex *mutex, struct task_struct *task)
+ {
+ 	if (!mutex_is_locked(mutex))
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index d914f6e..44c3185 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2351,6 +2351,7 @@ static bool intel_alloc_plane_obj(struct intel_crtc *crtc,
+ 		goto out_unref_obj;
+ 	}
+ 
++	obj->frontbuffer_bits = INTEL_FRONTBUFFER_PRIMARY(crtc->pipe);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	DRM_DEBUG_KMS("plane fb obj %p\n", obj);
+@@ -2396,6 +2397,7 @@ static void intel_find_plane_obj(struct intel_crtc *intel_crtc,
+ 		if (i915_gem_obj_ggtt_offset(fb->obj) == plane_config->base) {
+ 			drm_framebuffer_reference(c->primary->fb);
+ 			intel_crtc->base.primary->fb = c->primary->fb;
++			fb->obj->frontbuffer_bits |= INTEL_FRONTBUFFER_PRIMARY(intel_crtc->pipe);
+ 			break;
+ 		}
+ 	}
+@@ -2684,7 +2686,9 @@ intel_pipe_set_base(struct drm_crtc *crtc, int x, int y,
+ 	struct drm_device *dev = crtc->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++	enum pipe pipe = intel_crtc->pipe;
+ 	struct drm_framebuffer *old_fb;
++	struct drm_i915_gem_object *obj = to_intel_framebuffer(fb)->obj;
+ 	int ret;
+ 
+ 	if (intel_crtc_has_pending_flip(crtc)) {
+@@ -2705,10 +2709,13 @@ intel_pipe_set_base(struct drm_crtc *crtc, int x, int y,
+ 		return -EINVAL;
+ 	}
+ 
++	old_fb = crtc->primary->fb;
++
+ 	mutex_lock(&dev->struct_mutex);
+-	ret = intel_pin_and_fence_fb_obj(dev,
+-					 to_intel_framebuffer(fb)->obj,
+-					 NULL);
++	ret = intel_pin_and_fence_fb_obj(dev, obj, NULL);
++	if (ret == 0)
++		i915_gem_track_fb(to_intel_framebuffer(old_fb)->obj, obj,
++				  INTEL_FRONTBUFFER_PRIMARY(pipe));
+ 	mutex_unlock(&dev->struct_mutex);
+ 	if (ret != 0) {
+ 		DRM_ERROR("pin & fence failed\n");
+@@ -2748,7 +2755,6 @@ intel_pipe_set_base(struct drm_crtc *crtc, int x, int y,
+ 
+ 	dev_priv->display.update_primary_plane(crtc, fb, x, y);
+ 
+-	old_fb = crtc->primary->fb;
+ 	crtc->primary->fb = fb;
+ 	crtc->x = x;
+ 	crtc->y = y;
+@@ -4920,6 +4926,8 @@ static void intel_crtc_disable(struct drm_crtc *crtc)
+ 	struct drm_device *dev = crtc->dev;
+ 	struct drm_connector *connector;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_i915_gem_object *old_obj;
++	enum pipe pipe = to_intel_crtc(crtc)->pipe;
+ 
+ 	/* crtc should still be enabled when we disable it. */
+ 	WARN_ON(!crtc->enabled);
+@@ -4929,12 +4937,15 @@ static void intel_crtc_disable(struct drm_crtc *crtc)
+ 	dev_priv->display.off(crtc);
+ 
+ 	assert_plane_disabled(dev->dev_private, to_intel_crtc(crtc)->plane);
+-	assert_cursor_disabled(dev_priv, to_intel_crtc(crtc)->pipe);
+-	assert_pipe_disabled(dev->dev_private, to_intel_crtc(crtc)->pipe);
++	assert_cursor_disabled(dev_priv, pipe);
++	assert_pipe_disabled(dev->dev_private, pipe);
+ 
+ 	if (crtc->primary->fb) {
++		old_obj = to_intel_framebuffer(crtc->primary->fb)->obj;
+ 		mutex_lock(&dev->struct_mutex);
+-		intel_unpin_fb_obj(to_intel_framebuffer(crtc->primary->fb)->obj);
++		intel_unpin_fb_obj(old_obj);
++		i915_gem_track_fb(old_obj, NULL,
++				  INTEL_FRONTBUFFER_PRIMARY(pipe));
+ 		mutex_unlock(&dev->struct_mutex);
+ 		crtc->primary->fb = NULL;
+ 	}
+@@ -8101,6 +8112,7 @@ static int intel_crtc_cursor_set_obj(struct drm_crtc *crtc,
+ 	struct drm_device *dev = crtc->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++	enum pipe pipe = intel_crtc->pipe;
+ 	unsigned old_width;
+ 	uint32_t addr;
+ 	int ret;
+@@ -8180,6 +8192,8 @@ static int intel_crtc_cursor_set_obj(struct drm_crtc *crtc,
+ 			i915_gem_object_unpin_from_display_plane(intel_crtc->cursor_bo);
+ 	}
+ 
++	i915_gem_track_fb(intel_crtc->cursor_bo, obj,
++			  INTEL_FRONTBUFFER_CURSOR(pipe));
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	old_width = intel_crtc->cursor_width;
+@@ -9402,6 +9416,7 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 	struct drm_framebuffer *old_fb = crtc->primary->fb;
+ 	struct drm_i915_gem_object *obj = to_intel_framebuffer(fb)->obj;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++	enum pipe pipe = intel_crtc->pipe;
+ 	struct intel_unpin_work *work;
+ 	struct intel_engine_cs *ring;
+ 	unsigned long flags;
+@@ -9473,7 +9488,7 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 	intel_crtc->reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
+ 
+ 	if (INTEL_INFO(dev)->gen >= 5 || IS_G4X(dev))
+-		work->flip_count = I915_READ(PIPE_FLIPCOUNT_GM45(intel_crtc->pipe)) + 1;
++		work->flip_count = I915_READ(PIPE_FLIPCOUNT_GM45(pipe)) + 1;
+ 
+ 	if (IS_VALLEYVIEW(dev)) {
+ 		ring = &dev_priv->ring[BCS];
+@@ -9501,6 +9516,9 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 	if (ret)
+ 		goto cleanup_unpin;
+ 
++	i915_gem_track_fb(work->old_fb_obj, obj,
++			  INTEL_FRONTBUFFER_PRIMARY(pipe));
++
+ 	intel_disable_fbc(dev);
+ 	intel_mark_fb_busy(obj, NULL);
+ 	mutex_unlock(&dev->struct_mutex);
+@@ -9532,7 +9550,7 @@ out_hang:
+ 		intel_crtc_wait_for_pending_flips(crtc);
+ 		ret = intel_pipe_set_base(crtc, crtc->x, crtc->y, fb);
+ 		if (ret == 0 && event)
+-			drm_send_vblank_event(dev, intel_crtc->pipe, event);
++			drm_send_vblank_event(dev, pipe, event);
+ 	}
+ 	return ret;
+ }
+@@ -10567,10 +10585,13 @@ static int __intel_set_mode(struct drm_crtc *crtc,
+ 	 */
+ 	for_each_intel_crtc_masked(dev, modeset_pipes, intel_crtc) {
+ 		struct drm_framebuffer *old_fb;
++		struct drm_i915_gem_object *old_obj = NULL;
++		struct drm_i915_gem_object *obj =
++			to_intel_framebuffer(fb)->obj;
+ 
+ 		mutex_lock(&dev->struct_mutex);
+ 		ret = intel_pin_and_fence_fb_obj(dev,
+-						 to_intel_framebuffer(fb)->obj,
++						 obj,
+ 						 NULL);
+ 		if (ret != 0) {
+ 			DRM_ERROR("pin & fence failed\n");
+@@ -10578,8 +10599,12 @@ static int __intel_set_mode(struct drm_crtc *crtc,
+ 			goto done;
+ 		}
+ 		old_fb = crtc->primary->fb;
+-		if (old_fb)
+-			intel_unpin_fb_obj(to_intel_framebuffer(old_fb)->obj);
++		if (old_fb) {
++			old_obj = to_intel_framebuffer(old_fb)->obj;
++			intel_unpin_fb_obj(old_obj);
++		}
++		i915_gem_track_fb(old_obj, obj,
++				  INTEL_FRONTBUFFER_PRIMARY(intel_crtc->pipe));
+ 		mutex_unlock(&dev->struct_mutex);
+ 
+ 		crtc->primary->fb = fb;
+@@ -11194,8 +11219,9 @@ intel_primary_plane_disable(struct drm_plane *plane)
+ 	intel_crtc_wait_for_pending_flips(plane->crtc);
+ 	intel_disable_primary_hw_plane(dev_priv, intel_plane->plane,
+ 				       intel_plane->pipe);
+-
+ disable_unpin:
++	i915_gem_track_fb(to_intel_framebuffer(plane->fb)->obj, NULL,
++			  INTEL_FRONTBUFFER_PRIMARY(intel_crtc->pipe));
+ 	intel_unpin_fb_obj(to_intel_framebuffer(plane->fb)->obj);
+ 	plane->fb = NULL;
+ 
+@@ -11213,6 +11239,7 @@ intel_primary_plane_setplane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 	struct intel_plane *intel_plane = to_intel_plane(plane);
++	struct drm_i915_gem_object *obj, *old_obj = NULL;
+ 	struct drm_rect dest = {
+ 		/* integer pixels */
+ 		.x1 = crtc_x,
+@@ -11244,6 +11271,10 @@ intel_primary_plane_setplane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 	if (ret)
+ 		return ret;
+ 
++	if (plane->fb)
++		old_obj = to_intel_framebuffer(plane->fb)->obj;
++	obj = to_intel_framebuffer(fb)->obj;
++
+ 	/*
+ 	 * If the CRTC isn't enabled, we're just pinning the framebuffer,
+ 	 * updating the fb pointer, and returning without touching the
+@@ -11256,12 +11287,13 @@ intel_primary_plane_setplane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 		 * we may have an fb pinned; unpin it.
+ 		 */
+ 		if (plane->fb)
+-			intel_unpin_fb_obj(to_intel_framebuffer(plane->fb)->obj);
++			intel_unpin_fb_obj(old_obj);
++
++		i915_gem_track_fb(old_obj, obj,
++				  INTEL_FRONTBUFFER_PRIMARY(intel_crtc->pipe));
+ 
+ 		/* Pin and return without programming hardware */
+-		return intel_pin_and_fence_fb_obj(dev,
+-						  to_intel_framebuffer(fb)->obj,
+-						  NULL);
++		return intel_pin_and_fence_fb_obj(dev, obj, NULL);
+ 	}
+ 
+ 	intel_crtc_wait_for_pending_flips(crtc);
+@@ -11278,13 +11310,14 @@ intel_primary_plane_setplane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 		 * fail.
+ 		 */
+ 		if (plane->fb != fb) {
+-			ret = intel_pin_and_fence_fb_obj(dev,
+-							 to_intel_framebuffer(fb)->obj,
+-							 NULL);
++			ret = intel_pin_and_fence_fb_obj(dev, obj, NULL);
+ 			if (ret)
+ 				return ret;
+ 		}
+ 
++		i915_gem_track_fb(old_obj, obj,
++				  INTEL_FRONTBUFFER_PRIMARY(intel_crtc->pipe));
++
+ 		if (intel_crtc->primary_enabled)
+ 			intel_disable_primary_hw_plane(dev_priv,
+ 						       intel_plane->plane,
+@@ -11293,7 +11326,7 @@ intel_primary_plane_setplane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 
+ 		if (plane->fb != fb)
+ 			if (plane->fb)
+-				intel_unpin_fb_obj(to_intel_framebuffer(plane->fb)->obj);
++				intel_unpin_fb_obj(old_obj);
+ 
+ 		return 0;
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_overlay.c b/drivers/gpu/drm/i915/intel_overlay.c
+index daa1189..99b6c14 100644
+--- a/drivers/gpu/drm/i915/intel_overlay.c
++++ b/drivers/gpu/drm/i915/intel_overlay.c
+@@ -415,6 +415,10 @@ static int intel_overlay_release_old_vid(struct intel_overlay *overlay)
+ 	}
+ 
+ 	intel_overlay_release_old_vid_tail(overlay);
++
++
++	i915_gem_track_fb(overlay->old_vid_bo, NULL,
++			  INTEL_FRONTBUFFER_OVERLAY(overlay->crtc->pipe));
+ 	return 0;
+ }
+ 
+@@ -686,6 +690,7 @@ static int intel_overlay_do_put_image(struct intel_overlay *overlay,
+ 	bool scale_changed = false;
+ 	struct drm_device *dev = overlay->dev;
+ 	u32 swidth, swidthsw, sheight, ostride;
++	enum pipe pipe = overlay->crtc->pipe;
+ 
+ 	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
+ 	BUG_ON(!drm_modeset_is_locked(&dev->mode_config.connection_mutex));
+@@ -713,7 +718,7 @@ static int intel_overlay_do_put_image(struct intel_overlay *overlay,
+ 		oconfig = OCONF_CC_OUT_8BIT;
+ 		if (IS_GEN4(overlay->dev))
+ 			oconfig |= OCONF_CSC_MODE_BT709;
+-		oconfig |= overlay->crtc->pipe == 0 ?
++		oconfig |= pipe == 0 ?
+ 			OCONF_PIPE_A : OCONF_PIPE_B;
+ 		iowrite32(oconfig, &regs->OCONFIG);
+ 		intel_overlay_unmap_regs(overlay, regs);
+@@ -776,6 +781,9 @@ static int intel_overlay_do_put_image(struct intel_overlay *overlay,
+ 	if (ret)
+ 		goto out_unpin;
+ 
++	i915_gem_track_fb(overlay->vid_bo, new_bo,
++			  INTEL_FRONTBUFFER_OVERLAY(pipe));
++
+ 	overlay->old_vid_bo = overlay->vid_bo;
+ 	overlay->vid_bo = new_bo;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index 9038e2a..140bd83 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -811,6 +811,7 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 	struct drm_device *dev = plane->dev;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 	struct intel_plane *intel_plane = to_intel_plane(plane);
++	enum pipe pipe = intel_crtc->pipe;
+ 	struct intel_framebuffer *intel_fb = to_intel_framebuffer(fb);
+ 	struct drm_i915_gem_object *obj = intel_fb->obj;
+ 	struct drm_i915_gem_object *old_obj = intel_plane->obj;
+@@ -998,6 +999,8 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 	 */
+ 	ret = intel_pin_and_fence_fb_obj(dev, obj, NULL);
+ 
++	i915_gem_track_fb(old_obj, obj,
++			  INTEL_FRONTBUFFER_SPRITE(pipe));
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	if (ret)
+@@ -1062,6 +1065,7 @@ intel_disable_plane(struct drm_plane *plane)
+ 	struct drm_device *dev = plane->dev;
+ 	struct intel_plane *intel_plane = to_intel_plane(plane);
+ 	struct intel_crtc *intel_crtc;
++	enum pipe pipe;
+ 
+ 	if (!plane->fb)
+ 		return 0;
+@@ -1070,6 +1074,7 @@ intel_disable_plane(struct drm_plane *plane)
+ 		return -EINVAL;
+ 
+ 	intel_crtc = to_intel_crtc(plane->crtc);
++	pipe = intel_crtc->pipe;
+ 
+ 	if (intel_crtc->active) {
+ 		bool primary_was_enabled = intel_crtc->primary_enabled;
+@@ -1088,6 +1093,8 @@ intel_disable_plane(struct drm_plane *plane)
+ 
+ 		mutex_lock(&dev->struct_mutex);
+ 		intel_unpin_fb_obj(intel_plane->obj);
++		i915_gem_track_fb(intel_plane->obj, NULL,
++				  INTEL_FRONTBUFFER_SPRITE(pipe));
+ 		mutex_unlock(&dev->struct_mutex);
+ 
+ 		intel_plane->obj = NULL;
+-- 
+1.7.5.4
+
