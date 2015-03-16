@@ -1,0 +1,1248 @@
+From 6ce2d87a9440eb3d1f462468834b1143bba6d332 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@gmail.com>
+Date: Tue, 19 Nov 2013 12:10:12 -0500
+Subject: [PATCH 0539/1369] drm: convert crtc and connection_mutex to ww_mutex
+ (v5)
+
+commit 51fd371bbaf94018a1223b4e2cf20b9880fd92d4 upstream.
+
+For atomic, it will be quite necessary to not need to care so much
+about locking order.  And 'state' gives us a convenient place to stash a
+ww_ctx for any sort of update that needs to grab multiple crtc locks.
+
+Because we will want to eventually make locking even more fine grained
+(giving locks to planes, connectors, etc), split out drm_modeset_lock
+and drm_modeset_acquire_ctx to track acquired locks.
+
+Atomic will use this to keep track of which locks have been acquired
+in a transaction.
+
+v1: original
+v2: remove a few things not needed until atomic, for now
+v3: update for v3 of connection_mutex patch..
+v4: squash in docbook
+v5: doc tweaks/fixes
+
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ Documentation/DocBook/drm.tmpl        |    6 +
+ drivers/gpu/drm/Makefile              |    3 +-
+ drivers/gpu/drm/drm_crtc.c            |   85 +++++++++---
+ drivers/gpu/drm/drm_crtc_helper.c     |    2 +-
+ drivers/gpu/drm/drm_fb_helper.c       |    4 +
+ drivers/gpu/drm/drm_modeset_lock.c    |  247 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/drm_plane_helper.c    |    2 +-
+ drivers/gpu/drm/i915/intel_crt.c      |    5 +-
+ drivers/gpu/drm/i915/intel_display.c  |   56 +++++---
+ drivers/gpu/drm/i915/intel_dp.c       |   14 +-
+ drivers/gpu/drm/i915/intel_drv.h      |    6 +-
+ drivers/gpu/drm/i915/intel_opregion.c |    4 +-
+ drivers/gpu/drm/i915/intel_overlay.c  |    4 +-
+ drivers/gpu/drm/i915/intel_panel.c    |    8 +-
+ drivers/gpu/drm/i915/intel_sprite.c   |    2 +-
+ drivers/gpu/drm/i915/intel_tv.c       |    5 +-
+ drivers/gpu/drm/omapdrm/omap_crtc.c   |   10 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c   |    8 +-
+ include/drm/drmP.h                    |    5 -
+ include/drm/drm_crtc.h                |   15 ++-
+ include/drm/drm_modeset_lock.h        |  126 +++++++++++++++++
+ 21 files changed, 531 insertions(+), 86 deletions(-)
+ create mode 100644 drivers/gpu/drm/drm_modeset_lock.c
+ create mode 100644 include/drm/drm_modeset_lock.h
+
+diff --git a/Documentation/DocBook/drm.tmpl b/Documentation/DocBook/drm.tmpl
+index 8064137..109d211 100644
+--- a/Documentation/DocBook/drm.tmpl
++++ b/Documentation/DocBook/drm.tmpl
+@@ -1704,6 +1704,12 @@ void intel_crt_init(struct drm_device *dev)
+       <title>KMS API Functions</title>
+ !Edrivers/gpu/drm/drm_crtc.c
+     </sect2>
++    <sect2>
++      <title>KMS Locking</title>
++!Pdrivers/gpu/drm/drm_modeset_lock.c kms locking
++!Iinclude/drm/drm_modeset_lock.h
++!Edrivers/gpu/drm/drm_modeset_lock.c
++    </sect2>
+   </sect1>
+ 
+   <!-- Internals: kms helper functions -->
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index 863db84..dd2ba42 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -13,7 +13,8 @@ drm-y       :=	drm_auth.o drm_buffer.o drm_bufs.o drm_cache.o \
+ 		drm_crtc.o drm_modes.o drm_edid.o \
+ 		drm_info.o drm_debugfs.o drm_encoder_slave.o \
+ 		drm_trace_points.o drm_global.o drm_prime.o \
+-		drm_rect.o drm_vma_manager.o drm_flip_work.o
++		drm_rect.o drm_vma_manager.o drm_flip_work.o \
++		drm_modeset_lock.o
+ 
+ drm-$(CONFIG_COMPAT) += drm_ioc32.o
+ drm-$(CONFIG_DRM_GEM_CMA_HELPER) += drm_gem_cma_helper.o
+diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
+index f3b98d4..43735f3 100644
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -37,6 +37,7 @@
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_fourcc.h>
++#include <drm/drm_modeset_lock.h>
+ 
+ #include "drm_crtc_internal.h"
+ 
+@@ -50,14 +51,42 @@
+  */
+ void drm_modeset_lock_all(struct drm_device *dev)
+ {
+-	struct drm_crtc *crtc;
++	struct drm_mode_config *config = &dev->mode_config;
++	struct drm_modeset_acquire_ctx *ctx;
++	int ret;
+ 
+-	mutex_lock(&dev->mode_config.mutex);
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (WARN_ON(!ctx))
++		return;
+ 
+-	mutex_lock(&dev->mode_config.connection_mutex);
++	mutex_lock(&config->mutex);
+ 
+-	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head)
+-		mutex_lock_nest_lock(&crtc->mutex, &dev->mode_config.mutex);
++	drm_modeset_acquire_init(ctx, 0);
++
++retry:
++	ret = drm_modeset_lock(&config->connection_mutex, ctx);
++	if (ret)
++		goto fail;
++	ret = drm_modeset_lock_all_crtcs(dev, ctx);
++	if (ret)
++		goto fail;
++
++	WARN_ON(config->acquire_ctx);
++
++	/* now we hold the locks, so now that it is safe, stash the
++	 * ctx for drm_modeset_unlock_all():
++	 */
++	config->acquire_ctx = ctx;
++
++	drm_warn_on_modeset_not_all_locked(dev);
++
++	return;
++
++fail:
++	if (ret == -EDEADLK) {
++		drm_modeset_backoff(ctx);
++		goto retry;
++	}
+ }
+ EXPORT_SYMBOL(drm_modeset_lock_all);
+ 
+@@ -69,12 +98,17 @@ EXPORT_SYMBOL(drm_modeset_lock_all);
+  */
+ void drm_modeset_unlock_all(struct drm_device *dev)
+ {
+-	struct drm_crtc *crtc;
++	struct drm_mode_config *config = &dev->mode_config;
++	struct drm_modeset_acquire_ctx *ctx = config->acquire_ctx;
+ 
+-	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head)
+-		mutex_unlock(&crtc->mutex);
++	if (WARN_ON(!ctx))
++		return;
++
++	config->acquire_ctx = NULL;
++	drm_modeset_drop_locks(ctx);
++	drm_modeset_acquire_fini(ctx);
+ 
+-	mutex_unlock(&dev->mode_config.connection_mutex);
++	kfree(ctx);
+ 
+ 	mutex_unlock(&dev->mode_config.mutex);
+ }
+@@ -95,9 +129,9 @@ void drm_warn_on_modeset_not_all_locked(struct drm_device *dev)
+ 		return;
+ 
+ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head)
+-		WARN_ON(!mutex_is_locked(&crtc->mutex));
++		WARN_ON(!drm_modeset_is_locked(&crtc->mutex));
+ 
+-	WARN_ON(!mutex_is_locked(&dev->mode_config.connection_mutex));
++	WARN_ON(!drm_modeset_is_locked(&dev->mode_config.connection_mutex));
+ 	WARN_ON(!mutex_is_locked(&dev->mode_config.mutex));
+ }
+ EXPORT_SYMBOL(drm_warn_on_modeset_not_all_locked);
+@@ -671,6 +705,8 @@ void drm_framebuffer_remove(struct drm_framebuffer *fb)
+ }
+ EXPORT_SYMBOL(drm_framebuffer_remove);
+ 
++DEFINE_WW_CLASS(crtc_ww_class);
++
+ /**
+  * drm_crtc_init_with_planes - Initialise a new CRTC object with
+  *    specified primary and cursor planes.
+@@ -690,6 +726,7 @@ int drm_crtc_init_with_planes(struct drm_device *dev, struct drm_crtc *crtc,
+ 			      void *cursor,
+ 			      const struct drm_crtc_funcs *funcs)
+ {
++	struct drm_mode_config *config = &dev->mode_config;
+ 	int ret;
+ 
+ 	crtc->dev = dev;
+@@ -697,8 +734,9 @@ int drm_crtc_init_with_planes(struct drm_device *dev, struct drm_crtc *crtc,
+ 	crtc->invert_dimensions = false;
+ 
+ 	drm_modeset_lock_all(dev);
+-	mutex_init(&crtc->mutex);
+-	mutex_lock_nest_lock(&crtc->mutex, &dev->mode_config.mutex);
++	drm_modeset_lock_init(&crtc->mutex);
++	/* dropped by _unlock_all(): */
++	drm_modeset_lock(&crtc->mutex, config->acquire_ctx);
+ 
+ 	ret = drm_mode_object_get(dev, &crtc->base, DRM_MODE_OBJECT_CRTC);
+ 	if (ret)
+@@ -706,8 +744,8 @@ int drm_crtc_init_with_planes(struct drm_device *dev, struct drm_crtc *crtc,
+ 
+ 	crtc->base.properties = &crtc->properties;
+ 
+-	list_add_tail(&crtc->head, &dev->mode_config.crtc_list);
+-	dev->mode_config.num_crtc++;
++	list_add_tail(&crtc->head, &config->crtc_list);
++	config->num_crtc++;
+ 
+ 	crtc->primary = primary;
+ 	if (primary)
+@@ -735,6 +773,8 @@ void drm_crtc_cleanup(struct drm_crtc *crtc)
+ 	kfree(crtc->gamma_store);
+ 	crtc->gamma_store = NULL;
+ 
++	drm_modeset_lock_fini(&crtc->mutex);
++
+ 	drm_mode_object_put(dev, &crtc->base);
+ 	list_del(&crtc->head);
+ 	dev->mode_config.num_crtc--;
+@@ -1798,7 +1838,7 @@ int drm_mode_getconnector(struct drm_device *dev, void *data,
+ 	DRM_DEBUG_KMS("[CONNECTOR:%d:?]\n", out_resp->connector_id);
+ 
+ 	mutex_lock(&dev->mode_config.mutex);
+-	mutex_lock(&dev->mode_config.connection_mutex);
++	drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
+ 
+ 	connector = drm_connector_find(dev, out_resp->connector_id);
+ 	if (!connector) {
+@@ -1897,7 +1937,7 @@ int drm_mode_getconnector(struct drm_device *dev, void *data,
+ 	out_resp->count_encoders = encoders_count;
+ 
+ out:
+-	mutex_unlock(&dev->mode_config.connection_mutex);
++	drm_modeset_unlock(&dev->mode_config.connection_mutex);
+ 	mutex_unlock(&dev->mode_config.mutex);
+ 
+ 	return ret;
+@@ -2481,7 +2521,7 @@ static int drm_mode_cursor_common(struct drm_device *dev,
+ 		return -ENOENT;
+ 	}
+ 
+-	mutex_lock(&crtc->mutex);
++	drm_modeset_lock(&crtc->mutex, NULL);
+ 	if (req->flags & DRM_MODE_CURSOR_BO) {
+ 		if (!crtc->funcs->cursor_set && !crtc->funcs->cursor_set2) {
+ 			ret = -ENXIO;
+@@ -2505,7 +2545,7 @@ static int drm_mode_cursor_common(struct drm_device *dev,
+ 		}
+ 	}
+ out:
+-	mutex_unlock(&crtc->mutex);
++	drm_modeset_unlock(&crtc->mutex);
+ 
+ 	return ret;
+ 
+@@ -4198,7 +4238,7 @@ int drm_mode_page_flip_ioctl(struct drm_device *dev,
+ 	if (!crtc)
+ 		return -ENOENT;
+ 
+-	mutex_lock(&crtc->mutex);
++	drm_modeset_lock(&crtc->mutex, NULL);
+ 	if (crtc->primary->fb == NULL) {
+ 		/* The framebuffer is currently unbound, presumably
+ 		 * due to a hotplug event, that userspace has not
+@@ -4282,7 +4322,7 @@ out:
+ 		drm_framebuffer_unreference(fb);
+ 	if (old_fb)
+ 		drm_framebuffer_unreference(old_fb);
+-	mutex_unlock(&crtc->mutex);
++	drm_modeset_unlock(&crtc->mutex);
+ 
+ 	return ret;
+ }
+@@ -4647,7 +4687,7 @@ EXPORT_SYMBOL(drm_format_vert_chroma_subsampling);
+ void drm_mode_config_init(struct drm_device *dev)
+ {
+ 	mutex_init(&dev->mode_config.mutex);
+-	mutex_init(&dev->mode_config.connection_mutex);
++	drm_modeset_lock_init(&dev->mode_config.connection_mutex);
+ 	mutex_init(&dev->mode_config.idr_mutex);
+ 	mutex_init(&dev->mode_config.fb_lock);
+ 	INIT_LIST_HEAD(&dev->mode_config.fb_list);
+@@ -4747,5 +4787,6 @@ void drm_mode_config_cleanup(struct drm_device *dev)
+ 	}
+ 
+ 	idr_destroy(&dev->mode_config.crtc_idr);
++	drm_modeset_lock_fini(&dev->mode_config.connection_mutex);
+ }
+ EXPORT_SYMBOL(drm_mode_config_cleanup);
+diff --git a/drivers/gpu/drm/drm_crtc_helper.c b/drivers/gpu/drm/drm_crtc_helper.c
+index 0585871..78b37f3 100644
+--- a/drivers/gpu/drm/drm_crtc_helper.c
++++ b/drivers/gpu/drm/drm_crtc_helper.c
+@@ -95,7 +95,7 @@ bool drm_helper_encoder_in_use(struct drm_encoder *encoder)
+ 	 */
+ 	if (!oops_in_progress) {
+ 		WARN_ON(!mutex_is_locked(&dev->mode_config.mutex));
+-		WARN_ON(!mutex_is_locked(&dev->mode_config.connection_mutex));
++		WARN_ON(!drm_modeset_is_locked(&dev->mode_config.connection_mutex));
+ 	}
+ 
+ 	list_for_each_entry(connector, &dev->mode_config.connector_list, head)
+diff --git a/drivers/gpu/drm/drm_fb_helper.c b/drivers/gpu/drm/drm_fb_helper.c
+index 1ddc174..43329ce 100644
+--- a/drivers/gpu/drm/drm_fb_helper.c
++++ b/drivers/gpu/drm/drm_fb_helper.c
+@@ -331,6 +331,10 @@ static bool drm_fb_helper_force_kernel_mode(void)
+ 		if (dev->switch_power_state == DRM_SWITCH_POWER_OFF)
+ 			continue;
+ 
++		/* NOTE: we use lockless flag below to avoid grabbing other
++		 * modeset locks.  So just trylock the underlying mutex
++		 * directly:
++		 */
+ 		if (!mutex_trylock(&dev->mode_config.mutex)) {
+ 			error = true;
+ 			continue;
+diff --git a/drivers/gpu/drm/drm_modeset_lock.c b/drivers/gpu/drm/drm_modeset_lock.c
+new file mode 100644
+index 0000000..7c2497d
+--- /dev/null
++++ b/drivers/gpu/drm/drm_modeset_lock.c
+@@ -0,0 +1,247 @@
++/*
++ * Copyright (C) 2014 Red Hat
++ * Author: Rob Clark <robdclark@gmail.com>
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include <drm/drmP.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_modeset_lock.h>
++
++/**
++ * DOC: kms locking
++ *
++ * As KMS moves toward more fine grained locking, and atomic ioctl where
++ * userspace can indirectly control locking order, it becomes necessary
++ * to use ww_mutex and acquire-contexts to avoid deadlocks.  But because
++ * the locking is more distributed around the driver code, we want a bit
++ * of extra utility/tracking out of our acquire-ctx.  This is provided
++ * by drm_modeset_lock / drm_modeset_acquire_ctx.
++ *
++ * For basic principles of ww_mutex, see: Documentation/ww-mutex-design.txt
++ *
++ * The basic usage pattern is to:
++ *
++ *     drm_modeset_acquire_init(&ctx)
++ *   retry:
++ *     foreach (lock in random_ordered_set_of_locks) {
++ *       ret = drm_modeset_lock(lock, &ctx)
++ *       if (ret == -EDEADLK) {
++ *          drm_modeset_backoff(&ctx);
++ *          goto retry;
++ *       }
++ *     }
++ *
++ *     ... do stuff ...
++ *
++ *     drm_modeset_drop_locks(&ctx);
++ *     drm_modeset_acquire_fini(&ctx);
++ */
++
++
++/**
++ * drm_modeset_acquire_init - initialize acquire context
++ * @ctx: the acquire context
++ * @flags: for future
++ */
++void drm_modeset_acquire_init(struct drm_modeset_acquire_ctx *ctx,
++		uint32_t flags)
++{
++	ww_acquire_init(&ctx->ww_ctx, &crtc_ww_class);
++	INIT_LIST_HEAD(&ctx->locked);
++}
++EXPORT_SYMBOL(drm_modeset_acquire_init);
++
++/**
++ * drm_modeset_acquire_fini - cleanup acquire context
++ * @ctx: the acquire context
++ */
++void drm_modeset_acquire_fini(struct drm_modeset_acquire_ctx *ctx)
++{
++	ww_acquire_fini(&ctx->ww_ctx);
++}
++EXPORT_SYMBOL(drm_modeset_acquire_fini);
++
++/**
++ * drm_modeset_drop_locks - drop all locks
++ * @ctx: the acquire context
++ *
++ * Drop all locks currently held against this acquire context.
++ */
++void drm_modeset_drop_locks(struct drm_modeset_acquire_ctx *ctx)
++{
++	WARN_ON(ctx->contended);
++	while (!list_empty(&ctx->locked)) {
++		struct drm_modeset_lock *lock;
++
++		lock = list_first_entry(&ctx->locked,
++				struct drm_modeset_lock, head);
++
++		drm_modeset_unlock(lock);
++	}
++}
++EXPORT_SYMBOL(drm_modeset_drop_locks);
++
++static inline int modeset_lock(struct drm_modeset_lock *lock,
++		struct drm_modeset_acquire_ctx *ctx,
++		bool interruptible, bool slow)
++{
++	int ret;
++
++	WARN_ON(ctx->contended);
++
++	if (interruptible && slow) {
++		ret = ww_mutex_lock_slow_interruptible(&lock->mutex, &ctx->ww_ctx);
++	} else if (interruptible) {
++		ret = ww_mutex_lock_interruptible(&lock->mutex, &ctx->ww_ctx);
++	} else if (slow) {
++		ww_mutex_lock_slow(&lock->mutex, &ctx->ww_ctx);
++		ret = 0;
++	} else {
++		ret = ww_mutex_lock(&lock->mutex, &ctx->ww_ctx);
++	}
++	if (!ret) {
++		WARN_ON(!list_empty(&lock->head));
++		list_add(&lock->head, &ctx->locked);
++	} else if (ret == -EALREADY) {
++		/* we already hold the lock.. this is fine.  For atomic
++		 * we will need to be able to drm_modeset_lock() things
++		 * without having to keep track of what is already locked
++		 * or not.
++		 */
++		ret = 0;
++	} else if (ret == -EDEADLK) {
++		ctx->contended = lock;
++	}
++
++	return ret;
++}
++
++static int modeset_backoff(struct drm_modeset_acquire_ctx *ctx,
++		bool interruptible)
++{
++	struct drm_modeset_lock *contended = ctx->contended;
++
++	ctx->contended = NULL;
++
++	if (WARN_ON(!contended))
++		return 0;
++
++	drm_modeset_drop_locks(ctx);
++
++	return modeset_lock(contended, ctx, interruptible, true);
++}
++
++/**
++ * drm_modeset_backoff - deadlock avoidance backoff
++ * @ctx: the acquire context
++ *
++ * If deadlock is detected (ie. drm_modeset_lock() returns -EDEADLK),
++ * you must call this function to drop all currently held locks and
++ * block until the contended lock becomes available.
++ */
++void drm_modeset_backoff(struct drm_modeset_acquire_ctx *ctx)
++{
++	modeset_backoff(ctx, false);
++}
++EXPORT_SYMBOL(drm_modeset_backoff);
++
++/**
++ * drm_modeset_backoff_interruptible - deadlock avoidance backoff
++ * @ctx: the acquire context
++ *
++ * Interruptible version of drm_modeset_backoff()
++ */
++int drm_modeset_backoff_interruptible(struct drm_modeset_acquire_ctx *ctx)
++{
++	return modeset_backoff(ctx, true);
++}
++EXPORT_SYMBOL(drm_modeset_backoff_interruptible);
++
++/**
++ * drm_modeset_lock - take modeset lock
++ * @lock: lock to take
++ * @ctx: acquire ctx
++ *
++ * If ctx is not NULL, then its ww acquire context is used and the
++ * lock will be tracked by the context and can be released by calling
++ * drm_modeset_drop_locks().  If -EDEADLK is returned, this means a
++ * deadlock scenario has been detected and it is an error to attempt
++ * to take any more locks without first calling drm_modeset_backoff().
++ */
++int drm_modeset_lock(struct drm_modeset_lock *lock,
++		struct drm_modeset_acquire_ctx *ctx)
++{
++	if (ctx)
++		return modeset_lock(lock, ctx, false, false);
++
++	ww_mutex_lock(&lock->mutex, NULL);
++	return 0;
++}
++EXPORT_SYMBOL(drm_modeset_lock);
++
++/**
++ * drm_modeset_lock_interruptible - take modeset lock
++ * @lock: lock to take
++ * @ctx: acquire ctx
++ *
++ * Interruptible version of drm_modeset_lock()
++ */
++int drm_modeset_lock_interruptible(struct drm_modeset_lock *lock,
++		struct drm_modeset_acquire_ctx *ctx)
++{
++	if (ctx)
++		return modeset_lock(lock, ctx, true, false);
++
++	return ww_mutex_lock_interruptible(&lock->mutex, NULL);
++}
++EXPORT_SYMBOL(drm_modeset_lock_interruptible);
++
++/**
++ * drm_modeset_unlock - drop modeset lock
++ * @lock: lock to release
++ */
++void drm_modeset_unlock(struct drm_modeset_lock *lock)
++{
++	list_del_init(&lock->head);
++	ww_mutex_unlock(&lock->mutex);
++}
++EXPORT_SYMBOL(drm_modeset_unlock);
++
++/* Temporary.. until we have sufficiently fine grained locking, there
++ * are a couple scenarios where it is convenient to grab all crtc locks.
++ * It is planned to remove this:
++ */
++int drm_modeset_lock_all_crtcs(struct drm_device *dev,
++		struct drm_modeset_acquire_ctx *ctx)
++{
++	struct drm_mode_config *config = &dev->mode_config;
++	struct drm_crtc *crtc;
++	int ret = 0;
++
++	list_for_each_entry(crtc, &config->crtc_list, head) {
++		ret = drm_modeset_lock(&crtc->mutex, ctx);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(drm_modeset_lock_all_crtcs);
+diff --git a/drivers/gpu/drm/drm_plane_helper.c b/drivers/gpu/drm/drm_plane_helper.c
+index f3e0a23..1b15643 100644
+--- a/drivers/gpu/drm/drm_plane_helper.c
++++ b/drivers/gpu/drm/drm_plane_helper.c
+@@ -60,7 +60,7 @@ static int get_connectors_for_crtc(struct drm_crtc *crtc,
+ 	 * need to grab the connection_mutex here to be able to make these
+ 	 * checks.
+ 	 */
+-	WARN_ON(!mutex_is_locked(&dev->mode_config.connection_mutex));
++	WARN_ON(!drm_modeset_is_locked(&dev->mode_config.connection_mutex));
+ 
+ 	list_for_each_entry(connector, &dev->mode_config.connector_list, head)
+ 		if (connector->encoder && connector->encoder->crtc == crtc) {
+diff --git a/drivers/gpu/drm/i915/intel_crt.c b/drivers/gpu/drm/i915/intel_crt.c
+index cd9d2c8..ec5e1a4f 100644
+--- a/drivers/gpu/drm/i915/intel_crt.c
++++ b/drivers/gpu/drm/i915/intel_crt.c
+@@ -630,6 +630,7 @@ intel_crt_detect(struct drm_connector *connector, bool force)
+ 	enum intel_display_power_domain power_domain;
+ 	enum drm_connector_status status;
+ 	struct intel_load_detect_pipe tmp;
++	struct drm_modeset_acquire_ctx ctx;
+ 
+ 	intel_runtime_pm_get(dev_priv);
+ 
+@@ -673,12 +674,12 @@ intel_crt_detect(struct drm_connector *connector, bool force)
+ 	}
+ 
+ 	/* for pre-945g platforms use load detect */
+-	if (intel_get_load_detect_pipe(connector, NULL, &tmp)) {
++	if (intel_get_load_detect_pipe(connector, NULL, &tmp, &ctx)) {
+ 		if (intel_crt_detect_ddc(connector))
+ 			status = connector_status_connected;
+ 		else
+ 			status = intel_crt_load_detect(crt);
+-		intel_release_load_detect_pipe(connector, &tmp);
++		intel_release_load_detect_pipe(connector, &tmp, &ctx);
+ 	} else
+ 		status = connector_status_unknown;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 0f230b5..7072e54 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2576,7 +2576,7 @@ void intel_display_handle_reset(struct drm_device *dev)
+ 	for_each_crtc(dev, crtc) {
+ 		struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 
+-		mutex_lock(&crtc->mutex);
++		drm_modeset_lock(&crtc->mutex, NULL);
+ 		/*
+ 		 * FIXME: Once we have proper support for primary planes (and
+ 		 * disabling them without disabling the entire crtc) allow again
+@@ -2587,7 +2587,7 @@ void intel_display_handle_reset(struct drm_device *dev)
+ 							       crtc->primary->fb,
+ 							       crtc->x,
+ 							       crtc->y);
+-		mutex_unlock(&crtc->mutex);
++		drm_modeset_unlock(&crtc->mutex);
+ 	}
+ }
+ 
+@@ -8300,7 +8300,8 @@ mode_fits_in_fbdev(struct drm_device *dev,
+ 
+ bool intel_get_load_detect_pipe(struct drm_connector *connector,
+ 				struct drm_display_mode *mode,
+-				struct intel_load_detect_pipe *old)
++				struct intel_load_detect_pipe *old,
++				struct drm_modeset_acquire_ctx *ctx)
+ {
+ 	struct intel_crtc *intel_crtc;
+ 	struct intel_encoder *intel_encoder =
+@@ -8310,13 +8311,19 @@ bool intel_get_load_detect_pipe(struct drm_connector *connector,
+ 	struct drm_crtc *crtc = NULL;
+ 	struct drm_device *dev = encoder->dev;
+ 	struct drm_framebuffer *fb;
+-	int i = -1;
++	struct drm_mode_config *config = &dev->mode_config;
++	int ret, i = -1;
+ 
+ 	DRM_DEBUG_KMS("[CONNECTOR:%d:%s], [ENCODER:%d:%s]\n",
+ 		      connector->base.id, connector->name,
+ 		      encoder->base.id, encoder->name);
+ 
+-	mutex_lock(&dev->mode_config.connection_mutex);
++	drm_modeset_acquire_init(ctx, 0);
++
++retry:
++	ret = drm_modeset_lock(&config->connection_mutex, ctx);
++	if (ret)
++		goto fail_unlock;
+ 
+ 	/*
+ 	 * Algorithm gets a little messy:
+@@ -8332,7 +8339,9 @@ bool intel_get_load_detect_pipe(struct drm_connector *connector,
+ 	if (encoder->crtc) {
+ 		crtc = encoder->crtc;
+ 
+-		mutex_lock(&crtc->mutex);
++		ret = drm_modeset_lock(&crtc->mutex, ctx);
++		if (ret)
++			goto fail_unlock;
+ 
+ 		old->dpms_mode = connector->dpms;
+ 		old->load_detect_temp = false;
+@@ -8360,10 +8369,12 @@ bool intel_get_load_detect_pipe(struct drm_connector *connector,
+ 	 */
+ 	if (!crtc) {
+ 		DRM_DEBUG_KMS("no pipe available for load-detect\n");
+-		goto fail_unlock_connector;
++		goto fail_unlock;
+ 	}
+ 
+-	mutex_lock(&crtc->mutex);
++	ret = drm_modeset_lock(&crtc->mutex, ctx);
++	if (ret)
++		goto fail_unlock;
+ 	intel_encoder->new_crtc = to_intel_crtc(crtc);
+ 	to_intel_connector(connector)->new_encoder = intel_encoder;
+ 
+@@ -8413,15 +8424,21 @@ bool intel_get_load_detect_pipe(struct drm_connector *connector,
+ 		intel_crtc->new_config = &intel_crtc->config;
+ 	else
+ 		intel_crtc->new_config = NULL;
+-	mutex_unlock(&crtc->mutex);
+-fail_unlock_connector:
+-	mutex_unlock(&dev->mode_config.connection_mutex);
++fail_unlock:
++	if (ret == -EDEADLK) {
++		drm_modeset_backoff(ctx);
++		goto retry;
++	}
++
++	drm_modeset_drop_locks(ctx);
++	drm_modeset_acquire_fini(ctx);
+ 
+ 	return false;
+ }
+ 
+ void intel_release_load_detect_pipe(struct drm_connector *connector,
+-				    struct intel_load_detect_pipe *old)
++				    struct intel_load_detect_pipe *old,
++				    struct drm_modeset_acquire_ctx *ctx)
+ {
+ 	struct intel_encoder *intel_encoder =
+ 		intel_attached_encoder(connector);
+@@ -8445,8 +8462,7 @@ void intel_release_load_detect_pipe(struct drm_connector *connector,
+ 			drm_framebuffer_unreference(old->release_fb);
+ 		}
+ 
+-		mutex_unlock(&crtc->mutex);
+-		mutex_unlock(&connector->dev->mode_config.connection_mutex);
++		goto unlock;
+ 		return;
+ 	}
+ 
+@@ -8454,8 +8470,9 @@ void intel_release_load_detect_pipe(struct drm_connector *connector,
+ 	if (old->dpms_mode != DRM_MODE_DPMS_ON)
+ 		connector->funcs->dpms(connector, old->dpms_mode);
+ 
+-	mutex_unlock(&crtc->mutex);
+-	mutex_unlock(&connector->dev->mode_config.connection_mutex);
++unlock:
++	drm_modeset_drop_locks(ctx);
++	drm_modeset_acquire_fini(ctx);
+ }
+ 
+ static int i9xx_pll_refclk(struct drm_device *dev,
+@@ -10988,7 +11005,7 @@ enum pipe intel_get_pipe_from_connector(struct intel_connector *connector)
+ 	struct drm_encoder *encoder = connector->base.encoder;
+ 	struct drm_device *dev = connector->base.dev;
+ 
+-	WARN_ON(!mutex_is_locked(&dev->mode_config.connection_mutex));
++	WARN_ON(!drm_modeset_is_locked(&dev->mode_config.connection_mutex));
+ 
+ 	if (!encoder)
+ 		return INVALID_PIPE;
+@@ -11805,6 +11822,7 @@ static void intel_enable_pipe_a(struct drm_device *dev)
+ 	struct intel_connector *connector;
+ 	struct drm_connector *crt = NULL;
+ 	struct intel_load_detect_pipe load_detect_temp;
++	struct drm_modeset_acquire_ctx ctx;
+ 
+ 	/* We can't just switch on the pipe A, we need to set things up with a
+ 	 * proper mode and output configuration. As a gross hack, enable pipe A
+@@ -11821,8 +11839,8 @@ static void intel_enable_pipe_a(struct drm_device *dev)
+ 	if (!crt)
+ 		return;
+ 
+-	if (intel_get_load_detect_pipe(crt, NULL, &load_detect_temp))
+-		intel_release_load_detect_pipe(crt, &load_detect_temp);
++	if (intel_get_load_detect_pipe(crt, NULL, &load_detect_temp, &ctx))
++		intel_release_load_detect_pipe(crt, &load_detect_temp, &ctx);
+ 
+ 
+ }
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 323b588..ceaebb9 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -1192,7 +1192,7 @@ static void edp_panel_vdd_off_sync(struct intel_dp *intel_dp)
+ 	u32 pp;
+ 	u32 pp_stat_reg, pp_ctrl_reg;
+ 
+-	WARN_ON(!mutex_is_locked(&dev->mode_config.connection_mutex));
++	WARN_ON(!drm_modeset_is_locked(&dev->mode_config.connection_mutex));
+ 
+ 	if (!intel_dp->want_panel_vdd && edp_have_panel_vdd(intel_dp)) {
+ 		struct intel_digital_port *intel_dig_port =
+@@ -1229,9 +1229,9 @@ static void edp_panel_vdd_work(struct work_struct *__work)
+ 						 struct intel_dp, panel_vdd_work);
+ 	struct drm_device *dev = intel_dp_to_dev(intel_dp);
+ 
+-	mutex_lock(&dev->mode_config.connection_mutex);
++	drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
+ 	edp_panel_vdd_off_sync(intel_dp);
+-	mutex_unlock(&dev->mode_config.connection_mutex);
++	drm_modeset_unlock(&dev->mode_config.connection_mutex);
+ }
+ 
+ static void edp_panel_vdd_off(struct intel_dp *intel_dp, bool sync)
+@@ -3705,9 +3705,9 @@ void intel_dp_encoder_destroy(struct drm_encoder *encoder)
+ 	drm_encoder_cleanup(encoder);
+ 	if (is_edp(intel_dp)) {
+ 		cancel_delayed_work_sync(&intel_dp->panel_vdd_work);
+-		mutex_lock(&dev->mode_config.connection_mutex);
++		drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
+ 		edp_panel_vdd_off_sync(intel_dp);
+-		mutex_unlock(&dev->mode_config.connection_mutex);
++		drm_modeset_unlock(&dev->mode_config.connection_mutex);
+ 	}
+ 	kfree(intel_dig_port);
+ }
+@@ -4286,9 +4286,9 @@ intel_dp_init_connector(struct intel_digital_port *intel_dig_port,
+ 		drm_dp_aux_unregister(&intel_dp->aux);
+ 		if (is_edp(intel_dp)) {
+ 			cancel_delayed_work_sync(&intel_dp->panel_vdd_work);
+-			mutex_lock(&dev->mode_config.connection_mutex);
++			drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
+ 			edp_panel_vdd_off_sync(intel_dp);
+-			mutex_unlock(&dev->mode_config.connection_mutex);
++			drm_modeset_unlock(&dev->mode_config.connection_mutex);
+ 		}
+ 		drm_sysfs_connector_remove(connector);
+ 		drm_connector_cleanup(connector);
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index f1d5897..0de0498 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -748,9 +748,11 @@ void vlv_wait_port_ready(struct drm_i915_private *dev_priv,
+ 			 struct intel_digital_port *dport);
+ bool intel_get_load_detect_pipe(struct drm_connector *connector,
+ 				struct drm_display_mode *mode,
+-				struct intel_load_detect_pipe *old);
++				struct intel_load_detect_pipe *old,
++				struct drm_modeset_acquire_ctx *ctx);
+ void intel_release_load_detect_pipe(struct drm_connector *connector,
+-				    struct intel_load_detect_pipe *old);
++				    struct intel_load_detect_pipe *old,
++				    struct drm_modeset_acquire_ctx *ctx);
+ int intel_pin_and_fence_fb_obj(struct drm_device *dev,
+ 			       struct drm_i915_gem_object *obj,
+ 			       struct intel_engine_cs *pipelined);
+diff --git a/drivers/gpu/drm/i915/intel_opregion.c b/drivers/gpu/drm/i915/intel_opregion.c
+index b812e9d..2e2c71f 100644
+--- a/drivers/gpu/drm/i915/intel_opregion.c
++++ b/drivers/gpu/drm/i915/intel_opregion.c
+@@ -410,7 +410,7 @@ static u32 asle_set_backlight(struct drm_device *dev, u32 bclp)
+ 	if (bclp > 255)
+ 		return ASLC_BACKLIGHT_FAILED;
+ 
+-	mutex_lock(&dev->mode_config.connection_mutex);
++	drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
+ 
+ 	/*
+ 	 * Update backlight on all connectors that support backlight (usually
+@@ -421,7 +421,7 @@ static u32 asle_set_backlight(struct drm_device *dev, u32 bclp)
+ 		intel_panel_set_backlight(intel_connector, bclp, 255);
+ 	iowrite32(DIV_ROUND_UP(bclp * 100, 255) | ASLE_CBLV_VALID, &asle->cblv);
+ 
+-	mutex_unlock(&dev->mode_config.connection_mutex);
++	drm_modeset_unlock(&dev->mode_config.connection_mutex);
+ 
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/intel_overlay.c b/drivers/gpu/drm/i915/intel_overlay.c
+index 784dbd7..daa1189 100644
+--- a/drivers/gpu/drm/i915/intel_overlay.c
++++ b/drivers/gpu/drm/i915/intel_overlay.c
+@@ -688,7 +688,7 @@ static int intel_overlay_do_put_image(struct intel_overlay *overlay,
+ 	u32 swidth, swidthsw, sheight, ostride;
+ 
+ 	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
+-	BUG_ON(!mutex_is_locked(&dev->mode_config.connection_mutex));
++	BUG_ON(!drm_modeset_is_locked(&dev->mode_config.connection_mutex));
+ 	BUG_ON(!overlay);
+ 
+ 	ret = intel_overlay_release_old_vid(overlay);
+@@ -793,7 +793,7 @@ int intel_overlay_switch_off(struct intel_overlay *overlay)
+ 	int ret;
+ 
+ 	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
+-	BUG_ON(!mutex_is_locked(&dev->mode_config.connection_mutex));
++	BUG_ON(!drm_modeset_is_locked(&dev->mode_config.connection_mutex));
+ 
+ 	ret = intel_overlay_recover_from_interrupt(overlay);
+ 	if (ret != 0)
+diff --git a/drivers/gpu/drm/i915/intel_panel.c b/drivers/gpu/drm/i915/intel_panel.c
+index 2743656..b7b86321 100644
+--- a/drivers/gpu/drm/i915/intel_panel.c
++++ b/drivers/gpu/drm/i915/intel_panel.c
+@@ -879,12 +879,12 @@ static int intel_backlight_device_update_status(struct backlight_device *bd)
+ 	struct intel_connector *connector = bl_get_data(bd);
+ 	struct drm_device *dev = connector->base.dev;
+ 
+-	mutex_lock(&dev->mode_config.connection_mutex);
++	drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
+ 	DRM_DEBUG_KMS("updating intel_backlight, brightness=%d/%d\n",
+ 		      bd->props.brightness, bd->props.max_brightness);
+ 	intel_panel_set_backlight(connector, bd->props.brightness,
+ 				  bd->props.max_brightness);
+-	mutex_unlock(&dev->mode_config.connection_mutex);
++	drm_modeset_unlock(&dev->mode_config.connection_mutex);
+ 	return 0;
+ }
+ 
+@@ -896,9 +896,9 @@ static int intel_backlight_device_get_brightness(struct backlight_device *bd)
+ 	int ret;
+ 
+ 	intel_runtime_pm_get(dev_priv);
+-	mutex_lock(&dev->mode_config.connection_mutex);
++	drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
+ 	ret = intel_panel_get_backlight(connector);
+-	mutex_unlock(&dev->mode_config.connection_mutex);
++	drm_modeset_unlock(&dev->mode_config.connection_mutex);
+ 	intel_runtime_pm_put(dev_priv);
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index d6acd6b..1b66ddc 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -55,7 +55,7 @@ static bool intel_pipe_update_start(struct intel_crtc *crtc, uint32_t *start_vbl
+ 	int scanline, min, max, vblank_start;
+ 	DEFINE_WAIT(wait);
+ 
+-	WARN_ON(!mutex_is_locked(&crtc->base.mutex));
++	WARN_ON(!drm_modeset_is_locked(&crtc->base.mutex));
+ 
+ 	vblank_start = mode->crtc_vblank_start;
+ 	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
+diff --git a/drivers/gpu/drm/i915/intel_tv.c b/drivers/gpu/drm/i915/intel_tv.c
+index f9f8933..a40f4c2 100644
+--- a/drivers/gpu/drm/i915/intel_tv.c
++++ b/drivers/gpu/drm/i915/intel_tv.c
+@@ -1325,10 +1325,11 @@ intel_tv_detect(struct drm_connector *connector, bool force)
+ 
+ 	if (force) {
+ 		struct intel_load_detect_pipe tmp;
++		struct drm_modeset_acquire_ctx ctx;
+ 
+-		if (intel_get_load_detect_pipe(connector, &mode, &tmp)) {
++		if (intel_get_load_detect_pipe(connector, &mode, &tmp, &ctx)) {
+ 			type = intel_tv_detect_type(intel_tv, connector);
+-			intel_release_load_detect_pipe(connector, &tmp);
++			intel_release_load_detect_pipe(connector, &tmp, &ctx);
+ 		} else
+ 			return connector_status_unknown;
+ 	} else
+diff --git a/drivers/gpu/drm/omapdrm/omap_crtc.c b/drivers/gpu/drm/omapdrm/omap_crtc.c
+index 355157e..f28b669 100644
+--- a/drivers/gpu/drm/omapdrm/omap_crtc.c
++++ b/drivers/gpu/drm/omapdrm/omap_crtc.c
+@@ -307,13 +307,13 @@ static void page_flip_worker(struct work_struct *work)
+ 	struct drm_display_mode *mode = &crtc->mode;
+ 	struct drm_gem_object *bo;
+ 
+-	mutex_lock(&crtc->mutex);
++	drm_modeset_lock(&crtc->mutex, NULL);
+ 	omap_plane_mode_set(omap_crtc->plane, crtc, crtc->primary->fb,
+ 			0, 0, mode->hdisplay, mode->vdisplay,
+ 			crtc->x << 16, crtc->y << 16,
+ 			mode->hdisplay << 16, mode->vdisplay << 16,
+ 			vblank_cb, crtc);
+-	mutex_unlock(&crtc->mutex);
++	drm_modeset_unlock(&crtc->mutex);
+ 
+ 	bo = omap_framebuffer_bo(crtc->primary->fb, 0);
+ 	drm_gem_object_unreference_unlocked(bo);
+@@ -447,7 +447,7 @@ static void apply_worker(struct work_struct *work)
+ 	 * the callbacks and list modification all serialized
+ 	 * with respect to modesetting ioctls from userspace.
+ 	 */
+-	mutex_lock(&crtc->mutex);
++	drm_modeset_lock(&crtc->mutex, NULL);
+ 	dispc_runtime_get();
+ 
+ 	/*
+@@ -492,7 +492,7 @@ static void apply_worker(struct work_struct *work)
+ 
+ out:
+ 	dispc_runtime_put();
+-	mutex_unlock(&crtc->mutex);
++	drm_modeset_unlock(&crtc->mutex);
+ }
+ 
+ int omap_crtc_apply(struct drm_crtc *crtc,
+@@ -500,7 +500,7 @@ int omap_crtc_apply(struct drm_crtc *crtc,
+ {
+ 	struct omap_crtc *omap_crtc = to_omap_crtc(crtc);
+ 
+-	WARN_ON(!mutex_is_locked(&crtc->mutex));
++	WARN_ON(!drm_modeset_is_locked(&crtc->mutex));
+ 
+ 	/* no need to queue it again if it is already queued: */
+ 	if (apply->queued)
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index 5cf1318..b0572ca 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -187,7 +187,7 @@ int vmw_du_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
+ 	 * can do this since the caller in the drm core doesn't check anything
+ 	 * which is protected by any looks.
+ 	 */
+-	mutex_unlock(&crtc->mutex);
++	drm_modeset_unlock(&crtc->mutex);
+ 	drm_modeset_lock_all(dev_priv->dev);
+ 
+ 	/* A lot of the code assumes this */
+@@ -252,7 +252,7 @@ int vmw_du_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
+ 	ret = 0;
+ out:
+ 	drm_modeset_unlock_all(dev_priv->dev);
+-	mutex_lock(&crtc->mutex);
++	drm_modeset_lock(&crtc->mutex, NULL);
+ 
+ 	return ret;
+ }
+@@ -273,7 +273,7 @@ int vmw_du_crtc_cursor_move(struct drm_crtc *crtc, int x, int y)
+ 	 * can do this since the caller in the drm core doesn't check anything
+ 	 * which is protected by any looks.
+ 	 */
+-	mutex_unlock(&crtc->mutex);
++	drm_modeset_unlock(&crtc->mutex);
+ 	drm_modeset_lock_all(dev_priv->dev);
+ 
+ 	vmw_cursor_update_position(dev_priv, shown,
+@@ -281,7 +281,7 @@ int vmw_du_crtc_cursor_move(struct drm_crtc *crtc, int x, int y)
+ 				   du->cursor_y + du->hotspot_y);
+ 
+ 	drm_modeset_unlock_all(dev_priv->dev);
+-	mutex_lock(&crtc->mutex);
++	drm_modeset_lock(&crtc->mutex, NULL);
+ 
+ 	return 0;
+ }
+diff --git a/include/drm/drmP.h b/include/drm/drmP.h
+index 79b1009..da206cc 100644
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -1186,11 +1186,6 @@ static inline int drm_device_is_unplugged(struct drm_device *dev)
+ 	return ret;
+ }
+ 
+-static inline bool drm_modeset_is_locked(struct drm_device *dev)
+-{
+-	return mutex_is_locked(&dev->mode_config.mutex);
+-}
+-
+ static inline bool drm_is_render_client(const struct drm_file *file_priv)
+ {
+ 	return file_priv->minor->type == DRM_MINOR_RENDER;
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index 6c295df..a7fac56 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -33,6 +33,7 @@
+ #include <linux/hdmi.h>
+ #include <drm/drm_mode.h>
+ #include <drm/drm_fourcc.h>
++#include <drm/drm_modeset_lock.h>
+ 
+ struct drm_device;
+ struct drm_mode_set;
+@@ -205,6 +206,10 @@ struct drm_property {
+ 	struct list_head enum_blob_list;
+ };
+ 
++void drm_modeset_lock_all(struct drm_device *dev);
++void drm_modeset_unlock_all(struct drm_device *dev);
++void drm_warn_on_modeset_not_all_locked(struct drm_device *dev);
++
+ struct drm_crtc;
+ struct drm_connector;
+ struct drm_encoder;
+@@ -280,6 +285,7 @@ struct drm_crtc_funcs {
+  * drm_crtc - central CRTC control structure
+  * @dev: parent DRM device
+  * @head: list management
++ * @mutex: per-CRTC locking
+  * @base: base KMS object for ID tracking etc.
+  * @primary: primary plane for this CRTC
+  * @cursor: cursor plane for this CRTC
+@@ -314,7 +320,7 @@ struct drm_crtc {
+ 	 * state, ...) and a write lock for everything which can be update
+ 	 * without a full modeset (fb, cursor data, ...)
+ 	 */
+-	struct mutex mutex;
++	struct drm_modeset_lock mutex;
+ 
+ 	struct drm_mode_object base;
+ 
+@@ -738,7 +744,8 @@ struct drm_mode_group {
+  */
+ struct drm_mode_config {
+ 	struct mutex mutex; /* protects configuration (mode lists etc.) */
+-	struct mutex connection_mutex; /* protects connector->encoder and encoder->crtc links */
++	struct drm_modeset_lock connection_mutex; /* protects connector->encoder and encoder->crtc links */
++	struct drm_modeset_acquire_ctx *acquire_ctx; /* for legacy _lock_all() / _unlock_all() */
+ 	struct mutex idr_mutex; /* for IDR management */
+ 	struct idr crtc_idr; /* use this idr for all IDs, fb, crtc, connector, modes - just makes life easier */
+ 	/* this is limited to one for now */
+@@ -839,10 +846,6 @@ struct drm_prop_enum_list {
+ 	char *name;
+ };
+ 
+-extern void drm_modeset_lock_all(struct drm_device *dev);
+-extern void drm_modeset_unlock_all(struct drm_device *dev);
+-extern void drm_warn_on_modeset_not_all_locked(struct drm_device *dev);
+-
+ extern int drm_crtc_init_with_planes(struct drm_device *dev,
+ 				     struct drm_crtc *crtc,
+ 				     struct drm_plane *primary,
+diff --git a/include/drm/drm_modeset_lock.h b/include/drm/drm_modeset_lock.h
+new file mode 100644
+index 0000000..402aa7a
+--- /dev/null
++++ b/include/drm/drm_modeset_lock.h
+@@ -0,0 +1,126 @@
++/*
++ * Copyright (C) 2014 Red Hat
++ * Author: Rob Clark <robdclark@gmail.com>
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#ifndef DRM_MODESET_LOCK_H_
++#define DRM_MODESET_LOCK_H_
++
++#include <linux/ww_mutex.h>
++
++struct drm_modeset_lock;
++
++/**
++ * drm_modeset_acquire_ctx - locking context (see ww_acquire_ctx)
++ * @ww_ctx: base acquire ctx
++ * @contended: used internally for -EDEADLK handling
++ * @locked: list of held locks
++ *
++ * Each thread competing for a set of locks must use one acquire
++ * ctx.  And if any lock fxn returns -EDEADLK, it must backoff and
++ * retry.
++ */
++struct drm_modeset_acquire_ctx {
++
++	struct ww_acquire_ctx ww_ctx;
++
++	/**
++	 * Contended lock: if a lock is contended you should only call
++	 * drm_modeset_backoff() which drops locks and slow-locks the
++	 * contended lock.
++	 */
++	struct drm_modeset_lock *contended;
++
++	/**
++	 * list of held locks (drm_modeset_lock)
++	 */
++	struct list_head locked;
++};
++
++/**
++ * drm_modeset_lock - used for locking modeset resources.
++ * @mutex: resource locking
++ * @head: used to hold it's place on state->locked list when
++ *    part of an atomic update
++ *
++ * Used for locking CRTCs and other modeset resources.
++ */
++struct drm_modeset_lock {
++	/**
++	 * modeset lock
++	 */
++	struct ww_mutex mutex;
++
++	/**
++	 * Resources that are locked as part of an atomic update are added
++	 * to a list (so we know what to unlock at the end).
++	 */
++	struct list_head head;
++};
++
++extern struct ww_class crtc_ww_class;
++
++void drm_modeset_acquire_init(struct drm_modeset_acquire_ctx *ctx,
++		uint32_t flags);
++void drm_modeset_acquire_fini(struct drm_modeset_acquire_ctx *ctx);
++void drm_modeset_drop_locks(struct drm_modeset_acquire_ctx *ctx);
++void drm_modeset_backoff(struct drm_modeset_acquire_ctx *ctx);
++int drm_modeset_backoff_interruptible(struct drm_modeset_acquire_ctx *ctx);
++
++/**
++ * drm_modeset_lock_init - initialize lock
++ * @lock: lock to init
++ */
++static inline void drm_modeset_lock_init(struct drm_modeset_lock *lock)
++{
++	ww_mutex_init(&lock->mutex, &crtc_ww_class);
++	INIT_LIST_HEAD(&lock->head);
++}
++
++/**
++ * drm_modeset_lock_fini - cleanup lock
++ * @lock: lock to cleanup
++ */
++static inline void drm_modeset_lock_fini(struct drm_modeset_lock *lock)
++{
++	WARN_ON(!list_empty(&lock->head));
++}
++
++/**
++ * drm_modeset_is_locked - equivalent to mutex_is_locked()
++ * @lock: lock to check
++ */
++static inline bool drm_modeset_is_locked(struct drm_modeset_lock *lock)
++{
++	return ww_mutex_is_locked(&lock->mutex);
++}
++
++int drm_modeset_lock(struct drm_modeset_lock *lock,
++		struct drm_modeset_acquire_ctx *ctx);
++int drm_modeset_lock_interruptible(struct drm_modeset_lock *lock,
++		struct drm_modeset_acquire_ctx *ctx);
++void drm_modeset_unlock(struct drm_modeset_lock *lock);
++
++struct drm_device;
++int drm_modeset_lock_all_crtcs(struct drm_device *dev,
++		struct drm_modeset_acquire_ctx *ctx);
++
++#endif /* DRM_MODESET_LOCK_H_ */
+-- 
+1.7.5.4
+
