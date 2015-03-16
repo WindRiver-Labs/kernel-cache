@@ -1,0 +1,214 @@
+From 7c7b5adf2a669ead640eb8a7a61476843a8decc9 Mon Sep 17 00:00:00 2001
+From: Matt Roper <matthew.d.roper@intel.com>
+Date: Tue, 10 Jun 2014 08:28:10 -0700
+Subject: [PATCH 0631/1369] drm: Support legacy cursor ioctls via universal
+ planes when possible (v4)
+
+commit 161d0dc1dccb17ff7a38f462c7c0d4ef8bcc5662 upstream.
+
+If drivers support universal planes and have registered a cursor plane
+with the DRM core, we should use that universal plane support when
+handling legacy cursor ioctls.  Drivers that transition to universal
+planes won't have to maintain separate legacy ioctl handling; drivers
+that don't transition to universal planes will continue to operate
+without any change to behavior.
+
+Note that there's a bit of a mismatch between the legacy cursor ioctls
+and the universal plane API's --- legacy ioctl's use driver buffer
+handles directly whereas the universal plane API takes drm_framebuffers.
+Since there's no way to recover the driver handle from a
+drm_framebuffer, we can implement legacy ioctl's in terms of universal
+plane interfaces, but cannot implement universal plane interfaces in
+terms of legacy ioctls.  Specifically, there's no way to create a
+general cursor helper in the way we previously created a primary plane
+helper.
+
+It's important to land this patch before any patches that add universal
+cursor support to individual drivers so that drivers don't have to worry
+about juggling two different styles of reference counting for cursor
+buffers when userspace mixes and matches legacy and universal cursor
+calls.  With this patch, a driver that switches to universal cursor
+support may assume that all cursor buffers are wrapped in a
+drm_framebuffer and can rely on framebuffer reference counting for all
+cursor operations.
+
+v4:
+ - Add comments pointing out setplane_internal's reference-eating
+   semantics.
+v3:
+ - Drop drm_mode_rmfb() call that is no longer needed now that we're
+   using setplane_internal(), which takes care of deref'ing the
+   appropriate framebuffer.
+v2:
+ - Use new add_framebuffer_internal() function to create framebuffer
+   rather than trying to call directly into the ioctl interface and
+   look up the handle returned.
+ - Use new setplane_internal() function to update the cursor plane
+   rather than calling through the ioctl interface.  Note that since
+   we're no longer looking up an fb_id, no extra reference will be
+   taken here.
+ - Grab extra reference to fb under lock in !BO case to avoid issues
+   where racing userspace could cause the fb to be destroyed out from
+   under us after we grab the fb pointer.
+
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Reviewed-by: Pallavi G<pallavi.g@intel.com>
+Acked-by: Dave Airlie <airlied@linux.ie>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/gpu/drm/drm_crtc.c |  107 ++++++++++++++++++++++++++++++++++++++++++++
+ include/drm/drm_crtc.h     |    4 ++
+ 2 files changed, 111 insertions(+), 0 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
+index 27eae03..b5bce5b 100644
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -2288,6 +2288,10 @@ int drm_mode_setplane(struct drm_device *dev, void *data,
+ 		crtc = obj_to_crtc(obj);
+ 	}
+ 
++	/*
++	 * setplane_internal will take care of deref'ing either the old or new
++	 * framebuffer depending on success.
++	 */
+ 	return setplane_internal(crtc, plane, fb,
+ 				 plane_req->crtc_x, plane_req->crtc_y,
+ 				 plane_req->crtc_w, plane_req->crtc_h,
+@@ -2541,6 +2545,102 @@ out:
+ 	return ret;
+ }
+ 
++/**
++ * drm_mode_cursor_universal - translate legacy cursor ioctl call into a
++ *     universal plane handler call
++ * @crtc: crtc to update cursor for
++ * @req: data pointer for the ioctl
++ * @file_priv: drm file for the ioctl call
++ *
++ * Legacy cursor ioctl's work directly with driver buffer handles.  To
++ * translate legacy ioctl calls into universal plane handler calls, we need to
++ * wrap the native buffer handle in a drm_framebuffer.
++ *
++ * Note that we assume any handle passed to the legacy ioctls was a 32-bit ARGB
++ * buffer with a pitch of 4*width; the universal plane interface should be used
++ * directly in cases where the hardware can support other buffer settings and
++ * userspace wants to make use of these capabilities.
++ *
++ * Returns:
++ * Zero on success, errno on failure.
++ */
++static int drm_mode_cursor_universal(struct drm_crtc *crtc,
++				     struct drm_mode_cursor2 *req,
++				     struct drm_file *file_priv)
++{
++	struct drm_device *dev = crtc->dev;
++	struct drm_framebuffer *fb = NULL;
++	struct drm_mode_fb_cmd2 fbreq = {
++		.width = req->width,
++		.height = req->height,
++		.pixel_format = DRM_FORMAT_ARGB8888,
++		.pitches = { req->width * 4 },
++		.handles = { req->handle },
++	};
++	int32_t crtc_x, crtc_y;
++	uint32_t crtc_w = 0, crtc_h = 0;
++	uint32_t src_w = 0, src_h = 0;
++	int ret = 0;
++
++	BUG_ON(!crtc->cursor);
++
++	/*
++	 * Obtain fb we'll be using (either new or existing) and take an extra
++	 * reference to it if fb != null.  setplane will take care of dropping
++	 * the reference if the plane update fails.
++	 */
++	if (req->flags & DRM_MODE_CURSOR_BO) {
++		if (req->handle) {
++			fb = add_framebuffer_internal(dev, &fbreq, file_priv);
++			if (IS_ERR(fb)) {
++				DRM_DEBUG_KMS("failed to wrap cursor buffer in drm framebuffer\n");
++				return PTR_ERR(fb);
++			}
++
++			drm_framebuffer_reference(fb);
++		} else {
++			fb = NULL;
++		}
++	} else {
++		mutex_lock(&dev->mode_config.mutex);
++		fb = crtc->cursor->fb;
++		if (fb)
++			drm_framebuffer_reference(fb);
++		mutex_unlock(&dev->mode_config.mutex);
++	}
++
++	if (req->flags & DRM_MODE_CURSOR_MOVE) {
++		crtc_x = req->x;
++		crtc_y = req->y;
++	} else {
++		crtc_x = crtc->cursor_x;
++		crtc_y = crtc->cursor_y;
++	}
++
++	if (fb) {
++		crtc_w = fb->width;
++		crtc_h = fb->height;
++		src_w = fb->width << 16;
++		src_h = fb->height << 16;
++	}
++
++	/*
++	 * setplane_internal will take care of deref'ing either the old or new
++	 * framebuffer depending on success.
++	 */
++	ret = setplane_internal(crtc, crtc->cursor, fb,
++				crtc_x, crtc_y, crtc_w, crtc_h,
++				0, 0, src_w, src_h);
++
++	/* Update successful; save new cursor position, if necessary */
++	if (ret == 0 && req->flags & DRM_MODE_CURSOR_MOVE) {
++		crtc->cursor_x = req->x;
++		crtc->cursor_y = req->y;
++	}
++
++	return ret;
++}
++
+ static int drm_mode_cursor_common(struct drm_device *dev,
+ 				  struct drm_mode_cursor2 *req,
+ 				  struct drm_file *file_priv)
+@@ -2560,6 +2660,13 @@ static int drm_mode_cursor_common(struct drm_device *dev,
+ 		return -ENOENT;
+ 	}
+ 
++	/*
++	 * If this crtc has a universal cursor plane, call that plane's update
++	 * handler rather than using legacy cursor handlers.
++	 */
++	if (crtc->cursor)
++		return drm_mode_cursor_universal(crtc, req, file_priv);
++
+ 	drm_modeset_lock(&crtc->mutex, NULL);
+ 	if (req->flags & DRM_MODE_CURSOR_BO) {
+ 		if (!crtc->funcs->cursor_set && !crtc->funcs->cursor_set2) {
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index 251b75e..b8c7a9a 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -331,6 +331,10 @@ struct drm_crtc {
+ 	struct drm_plane *primary;
+ 	struct drm_plane *cursor;
+ 
++	/* position of cursor plane on crtc */
++	int cursor_x;
++	int cursor_y;
++
+ 	/* Temporary tracking of the old fb while a modeset is ongoing. Used
+ 	 * by drm_mode_set_config_internal to implement correct refcounting. */
+ 	struct drm_framebuffer *old_fb;
+-- 
+1.7.5.4
+

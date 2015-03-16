@@ -1,0 +1,362 @@
+From f08d7ec8af5948bb05e64ad6feb3db99215ff747 Mon Sep 17 00:00:00 2001
+From: Brad Volkin <bradley.d.volkin@intel.com>
+Date: Sat, 10 May 2014 14:10:43 -0700
+Subject: [PATCH 0343/1369] drm/i915: Use hash tables for the command parser
+
+commit 44e895a8a2e2c0512730d756f003a53835c8f7bf upstream.
+
+For clients that submit large batch buffers the command parser has
+a substantial impact on performance. On my HSW ULT system performance
+drops as much as ~20% on some tests. Most of the time is spent in the
+command lookup code. Converting that from the current naive search to
+a hash table lookup reduces the performance drop to ~10%.
+
+The choice of value for I915_CMD_HASH_ORDER allows all commands
+currently used in the parser tables to hash to their own bucket (except
+for one collision on the render ring). The tradeoff is that it wastes
+memory. Because the opcodes for the commands in the tables are not
+particularly well distributed, reducing the order still leaves many
+buckets empty. The increased collisions don't seem to have a huge
+impact on the performance gain, but for now anyhow, the parser trades
+memory for performance.
+
+NB: Ville noticed that the error paths through the ring init code
+will leak memory. I've not addressed that here. We can do a follow
+up pass to handle all of the leaks.
+
+v2: improved comment describing selection of hash key mask (Damien)
+replace a BUG_ON() with an error return (Tvrtko, Ville)
+commit message improvements
+
+Signed-off-by: Brad Volkin <bradley.d.volkin@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/gpu/drm/i915/i915_cmd_parser.c  |  158 ++++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/i915_drv.h         |    3 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    6 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.h |   11 ++-
+ 4 files changed, 140 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_cmd_parser.c b/drivers/gpu/drm/i915/i915_cmd_parser.c
+index ddf7c3e..bad3fb5 100644
+--- a/drivers/gpu/drm/i915/i915_cmd_parser.c
++++ b/drivers/gpu/drm/i915/i915_cmd_parser.c
+@@ -498,16 +498,18 @@ static u32 gen7_blt_get_cmd_length_mask(u32 cmd_header)
+ 	return 0;
+ }
+ 
+-static bool validate_cmds_sorted(struct intel_ring_buffer *ring)
++static bool validate_cmds_sorted(struct intel_ring_buffer *ring,
++				 const struct drm_i915_cmd_table *cmd_tables,
++				 int cmd_table_count)
+ {
+ 	int i;
+ 	bool ret = true;
+ 
+-	if (!ring->cmd_tables || ring->cmd_table_count == 0)
++	if (!cmd_tables || cmd_table_count == 0)
+ 		return true;
+ 
+-	for (i = 0; i < ring->cmd_table_count; i++) {
+-		const struct drm_i915_cmd_table *table = &ring->cmd_tables[i];
++	for (i = 0; i < cmd_table_count; i++) {
++		const struct drm_i915_cmd_table *table = &cmd_tables[i];
+ 		u32 previous = 0;
+ 		int j;
+ 
+@@ -557,6 +559,68 @@ static bool validate_regs_sorted(struct intel_ring_buffer *ring)
+ 			     ring->master_reg_count);
+ }
+ 
++struct cmd_node {
++	const struct drm_i915_cmd_descriptor *desc;
++	struct hlist_node node;
++};
++
++/*
++ * Different command ranges have different numbers of bits for the opcode. For
++ * example, MI commands use bits 31:23 while 3D commands use bits 31:16. The
++ * problem is that, for example, MI commands use bits 22:16 for other fields
++ * such as GGTT vs PPGTT bits. If we include those bits in the mask then when
++ * we mask a command from a batch it could hash to the wrong bucket due to
++ * non-opcode bits being set. But if we don't include those bits, some 3D
++ * commands may hash to the same bucket due to not including opcode bits that
++ * make the command unique. For now, we will risk hashing to the same bucket.
++ *
++ * If we attempt to generate a perfect hash, we should be able to look at bits
++ * 31:29 of a command from a batch buffer and use the full mask for that
++ * client. The existing INSTR_CLIENT_MASK/SHIFT defines can be used for this.
++ */
++#define CMD_HASH_MASK STD_MI_OPCODE_MASK
++
++static int init_hash_table(struct intel_ring_buffer *ring,
++			   const struct drm_i915_cmd_table *cmd_tables,
++			   int cmd_table_count)
++{
++	int i, j;
++
++	hash_init(ring->cmd_hash);
++
++	for (i = 0; i < cmd_table_count; i++) {
++		const struct drm_i915_cmd_table *table = &cmd_tables[i];
++
++		for (j = 0; j < table->count; j++) {
++			const struct drm_i915_cmd_descriptor *desc =
++				&table->table[j];
++			struct cmd_node *desc_node =
++				kmalloc(sizeof(*desc_node), GFP_KERNEL);
++
++			if (!desc_node)
++				return -ENOMEM;
++
++			desc_node->desc = desc;
++			hash_add(ring->cmd_hash, &desc_node->node,
++				 desc->cmd.value & CMD_HASH_MASK);
++		}
++	}
++
++	return 0;
++}
++
++static void fini_hash_table(struct intel_ring_buffer *ring)
++{
++	struct hlist_node *tmp;
++	struct cmd_node *desc_node;
++	int i;
++
++	hash_for_each_safe(ring->cmd_hash, i, tmp, desc_node, node) {
++		hash_del(&desc_node->node);
++		kfree(desc_node);
++	}
++}
++
+ /**
+  * i915_cmd_parser_init_ring() - set cmd parser related fields for a ringbuffer
+  * @ring: the ringbuffer to initialize
+@@ -564,21 +628,27 @@ static bool validate_regs_sorted(struct intel_ring_buffer *ring)
+  * Optionally initializes fields related to batch buffer command parsing in the
+  * struct intel_ring_buffer based on whether the platform requires software
+  * command parsing.
++ *
++ * Return: non-zero if initialization fails
+  */
+-void i915_cmd_parser_init_ring(struct intel_ring_buffer *ring)
++int i915_cmd_parser_init_ring(struct intel_ring_buffer *ring)
+ {
++	const struct drm_i915_cmd_table *cmd_tables;
++	int cmd_table_count;
++	int ret;
++
+ 	if (!IS_GEN7(ring->dev))
+-		return;
++		return 0;
+ 
+ 	switch (ring->id) {
+ 	case RCS:
+ 		if (IS_HASWELL(ring->dev)) {
+-			ring->cmd_tables = hsw_render_ring_cmds;
+-			ring->cmd_table_count =
++			cmd_tables = hsw_render_ring_cmds;
++			cmd_table_count =
+ 				ARRAY_SIZE(hsw_render_ring_cmds);
+ 		} else {
+-			ring->cmd_tables = gen7_render_cmds;
+-			ring->cmd_table_count = ARRAY_SIZE(gen7_render_cmds);
++			cmd_tables = gen7_render_cmds;
++			cmd_table_count = ARRAY_SIZE(gen7_render_cmds);
+ 		}
+ 
+ 		ring->reg_table = gen7_render_regs;
+@@ -595,17 +665,17 @@ void i915_cmd_parser_init_ring(struct intel_ring_buffer *ring)
+ 		ring->get_cmd_length_mask = gen7_render_get_cmd_length_mask;
+ 		break;
+ 	case VCS:
+-		ring->cmd_tables = gen7_video_cmds;
+-		ring->cmd_table_count = ARRAY_SIZE(gen7_video_cmds);
++		cmd_tables = gen7_video_cmds;
++		cmd_table_count = ARRAY_SIZE(gen7_video_cmds);
+ 		ring->get_cmd_length_mask = gen7_bsd_get_cmd_length_mask;
+ 		break;
+ 	case BCS:
+ 		if (IS_HASWELL(ring->dev)) {
+-			ring->cmd_tables = hsw_blt_ring_cmds;
+-			ring->cmd_table_count = ARRAY_SIZE(hsw_blt_ring_cmds);
++			cmd_tables = hsw_blt_ring_cmds;
++			cmd_table_count = ARRAY_SIZE(hsw_blt_ring_cmds);
+ 		} else {
+-			ring->cmd_tables = gen7_blt_cmds;
+-			ring->cmd_table_count = ARRAY_SIZE(gen7_blt_cmds);
++			cmd_tables = gen7_blt_cmds;
++			cmd_table_count = ARRAY_SIZE(gen7_blt_cmds);
+ 		}
+ 
+ 		ring->reg_table = gen7_blt_regs;
+@@ -622,8 +692,8 @@ void i915_cmd_parser_init_ring(struct intel_ring_buffer *ring)
+ 		ring->get_cmd_length_mask = gen7_blt_get_cmd_length_mask;
+ 		break;
+ 	case VECS:
+-		ring->cmd_tables = hsw_vebox_cmds;
+-		ring->cmd_table_count = ARRAY_SIZE(hsw_vebox_cmds);
++		cmd_tables = hsw_vebox_cmds;
++		cmd_table_count = ARRAY_SIZE(hsw_vebox_cmds);
+ 		/* VECS can use the same length_mask function as VCS */
+ 		ring->get_cmd_length_mask = gen7_bsd_get_cmd_length_mask;
+ 		break;
+@@ -633,18 +703,45 @@ void i915_cmd_parser_init_ring(struct intel_ring_buffer *ring)
+ 		BUG();
+ 	}
+ 
+-	BUG_ON(!validate_cmds_sorted(ring));
++	BUG_ON(!validate_cmds_sorted(ring, cmd_tables, cmd_table_count));
+ 	BUG_ON(!validate_regs_sorted(ring));
++
++	ret = init_hash_table(ring, cmd_tables, cmd_table_count);
++	if (ret) {
++		DRM_ERROR("CMD: cmd_parser_init failed!\n");
++		fini_hash_table(ring);
++		return ret;
++	}
++
++	ring->needs_cmd_parser = true;
++
++	return 0;
++}
++
++/**
++ * i915_cmd_parser_fini_ring() - clean up cmd parser related fields
++ * @ring: the ringbuffer to clean up
++ *
++ * Releases any resources related to command parsing that may have been
++ * initialized for the specified ring.
++ */
++void i915_cmd_parser_fini_ring(struct intel_ring_buffer *ring)
++{
++	if (!ring->needs_cmd_parser)
++		return;
++
++	fini_hash_table(ring);
+ }
+ 
+ static const struct drm_i915_cmd_descriptor*
+-find_cmd_in_table(const struct drm_i915_cmd_table *table,
++find_cmd_in_table(struct intel_ring_buffer *ring,
+ 		  u32 cmd_header)
+ {
+-	int i;
++	struct cmd_node *desc_node;
+ 
+-	for (i = 0; i < table->count; i++) {
+-		const struct drm_i915_cmd_descriptor *desc = &table->table[i];
++	hash_for_each_possible(ring->cmd_hash, desc_node, node,
++			       cmd_header & CMD_HASH_MASK) {
++		const struct drm_i915_cmd_descriptor *desc = desc_node->desc;
+ 		u32 masked_cmd = desc->cmd.mask & cmd_header;
+ 		u32 masked_value = desc->cmd.value & desc->cmd.mask;
+ 
+@@ -668,16 +765,12 @@ find_cmd(struct intel_ring_buffer *ring,
+ 	 u32 cmd_header,
+ 	 struct drm_i915_cmd_descriptor *default_desc)
+ {
++	const struct drm_i915_cmd_descriptor *desc;
+ 	u32 mask;
+-	int i;
+-
+-	for (i = 0; i < ring->cmd_table_count; i++) {
+-		const struct drm_i915_cmd_descriptor *desc;
+ 
+-		desc = find_cmd_in_table(&ring->cmd_tables[i], cmd_header);
+-		if (desc)
+-			return desc;
+-	}
++	desc = find_cmd_in_table(ring, cmd_header);
++	if (desc)
++		return desc;
+ 
+ 	mask = ring->get_cmd_length_mask(cmd_header);
+ 	if (!mask)
+@@ -748,8 +841,7 @@ bool i915_needs_cmd_parser(struct intel_ring_buffer *ring)
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+ 
+-	/* No command tables indicates a platform without parsing */
+-	if (!ring->cmd_tables)
++	if (!ring->needs_cmd_parser)
+ 		return false;
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 4667cde..f92d8f5 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2472,7 +2472,8 @@ const char *i915_cache_level_str(int type);
+ 
+ /* i915_cmd_parser.c */
+ int i915_cmd_parser_get_version(void);
+-void i915_cmd_parser_init_ring(struct intel_ring_buffer *ring);
++int i915_cmd_parser_init_ring(struct intel_ring_buffer *ring);
++void i915_cmd_parser_fini_ring(struct intel_ring_buffer *ring);
+ bool i915_needs_cmd_parser(struct intel_ring_buffer *ring);
+ int i915_parse_cmds(struct intel_ring_buffer *ring,
+ 		    struct drm_i915_gem_object *batch_obj,
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 583810f..1b742e6 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1458,7 +1458,9 @@ static int intel_init_ring_buffer(struct drm_device *dev,
+ 	if (IS_I830(dev) || IS_845G(dev))
+ 		ring->effective_size -= 2 * CACHELINE_BYTES;
+ 
+-	i915_cmd_parser_init_ring(ring);
++	ret = i915_cmd_parser_init_ring(ring);
++	if (ret)
++		return ret;
+ 
+ 	return ring->init(ring);
+ }
+@@ -1485,6 +1487,8 @@ void intel_cleanup_ring_buffer(struct intel_ring_buffer *ring)
+ 		ring->cleanup(ring);
+ 
+ 	cleanup_status_page(ring);
++
++	i915_cmd_parser_fini_ring(ring);
+ }
+ 
+ static int intel_ring_wait_request(struct intel_ring_buffer *ring, int n)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 72c3c15..a505a71 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -1,6 +1,10 @@
+ #ifndef _INTEL_RINGBUFFER_H_
+ #define _INTEL_RINGBUFFER_H_
+ 
++#include <linux/hashtable.h>
++
++#define I915_CMD_HASH_ORDER 9
++
+ /*
+  * Gen2 BSpec "1. Programming Environment" / 1.4.4.6 "Ring Buffer Use"
+  * Gen3 BSpec "vol1c Memory Interface Functions" / 2.3.4.5 "Ring Buffer Use"
+@@ -176,12 +180,13 @@ struct  intel_ring_buffer {
+ 		volatile u32 *cpu_page;
+ 	} scratch;
+ 
++	bool needs_cmd_parser;
++
+ 	/*
+-	 * Tables of commands the command parser needs to know about
++	 * Table of commands the command parser needs to know about
+ 	 * for this ring.
+ 	 */
+-	const struct drm_i915_cmd_table *cmd_tables;
+-	int cmd_table_count;
++	DECLARE_HASHTABLE(cmd_hash, I915_CMD_HASH_ORDER);
+ 
+ 	/*
+ 	 * Table of registers allowed in commands that read/write registers.
+-- 
+1.7.5.4
+
