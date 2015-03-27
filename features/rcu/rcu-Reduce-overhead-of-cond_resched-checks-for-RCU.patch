@@ -1,0 +1,427 @@
+From 9e33f8c9abdb9579d6b1faef5d222a9e70318688 Mon Sep 17 00:00:00 2001
+From: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Date: Fri, 20 Jun 2014 16:49:01 -0700
+Subject: [PATCH] rcu: Reduce overhead of cond_resched() checks for RCU
+
+commit 4a81e8328d3791a4f99bf5b436d050f6dc5ffea3 upstream.
+
+Commit ac1bea85781e (Make cond_resched() report RCU quiescent states)
+fixed a problem where a CPU looping in the kernel with but one runnable
+task would give RCU CPU stall warnings, even if the in-kernel loop
+contained cond_resched() calls.  Unfortunately, in so doing, it introduced
+performance regressions in Anton Blanchard's will-it-scale "open1" test.
+The problem appears to be not so much the increased cond_resched() path
+length as an increase in the rate at which grace periods complete, which
+increased per-update grace-period overhead.
+
+This commit takes a different approach to fixing this bug, mainly by
+moving the RCU-visible quiescent state from cond_resched() to
+rcu_note_context_switch(), and by further reducing the check to a
+simple non-zero test of a single per-CPU variable.  However, this
+approach requires that the force-quiescent-state processing send
+resched IPIs to the offending CPUs.  These will be sent only once
+the grace period has reached an age specified by the boot/sysfs
+parameter rcutree.jiffies_till_sched_qs, or once the grace period
+reaches an age halfway to the point at which RCU CPU stall warnings
+will be emitted, whichever comes first.
+
+Reported-by: Dave Hansen <dave.hansen@intel.com>
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Christoph Lameter <cl@gentwo.org>
+Cc: Mike Galbraith <umgwanakikbuti@gmail.com>
+Cc: Eric Dumazet <eric.dumazet@gmail.com>
+Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+[ paulmck: Made rcu_momentary_dyntick_idle() as suggested by the
+  ktest build robot.  Also fixed smp_mb() comment as noted by
+  Oleg Nesterov. ]
+
+Merge with e552592e (Reduce overhead of cond_resched() checks for RCU)
+
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+[PG: use _inc suffix for __before/__after atomic variants not in 3.14.]
+Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index 1a7202f..46e791c 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -2722,6 +2722,12 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			leaf rcu_node structure.  Useful for very large
+ 			systems.
+ 
++	rcutree.jiffies_till_sched_qs= [KNL]
++			Set required age in jiffies for a
++			given grace period before RCU starts
++			soliciting quiescent-state help from
++			rcu_note_context_switch().
++
+ 	rcutree.jiffies_till_first_fqs= [KNL]
+ 			Set delay from grace-period initialization to
+ 			first attempt to force quiescent states.
+diff --git a/include/linux/rcupdate.h b/include/linux/rcupdate.h
+index 6bd7789..cac0126 100644
+--- a/include/linux/rcupdate.h
++++ b/include/linux/rcupdate.h
+@@ -44,7 +44,6 @@
+ #include <linux/debugobjects.h>
+ #include <linux/bug.h>
+ #include <linux/compiler.h>
+-#include <linux/percpu.h>
+ 
+ extern int rcu_expedited; /* for sysctl */
+ #ifdef CONFIG_RCU_TORTURE_TEST
+@@ -291,41 +290,6 @@ bool __rcu_is_watching(void);
+ #endif /* #if defined(CONFIG_DEBUG_LOCK_ALLOC) || defined(CONFIG_RCU_TRACE) || defined(CONFIG_SMP) */
+ 
+ /*
+- * Hooks for cond_resched() and friends to avoid RCU CPU stall warnings.
+- */
+-
+-#define RCU_COND_RESCHED_LIM 256	/* ms vs. 100s of ms. */
+-DECLARE_PER_CPU(int, rcu_cond_resched_count);
+-void rcu_resched(void);
+-
+-/*
+- * Is it time to report RCU quiescent states?
+- *
+- * Note unsynchronized access to rcu_cond_resched_count.  Yes, we might
+- * increment some random CPU's count, and possibly also load the result from
+- * yet another CPU's count.  We might even clobber some other CPU's attempt
+- * to zero its counter.  This is all OK because the goal is not precision,
+- * but rather reasonable amortization of rcu_note_context_switch() overhead
+- * and extremely high probability of avoiding RCU CPU stall warnings.
+- * Note that this function has to be preempted in just the wrong place,
+- * many thousands of times in a row, for anything bad to happen.
+- */
+-static inline bool rcu_should_resched(void)
+-{
+-	return raw_cpu_inc_return(rcu_cond_resched_count) >=
+-	       RCU_COND_RESCHED_LIM;
+-}
+-
+-/*
+- * Report quiscent states to RCU if it is time to do so.
+- */
+-static inline void rcu_cond_resched(void)
+-{
+-	if (unlikely(rcu_should_resched()))
+-		rcu_resched();
+-}
+-
+-/*
+  * Infrastructure to implement the synchronize_() primitives in
+  * TREE_RCU and rcu_barrier_() primitives in TINY_RCU.
+  */
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index 22575dc..8525c05 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -221,6 +221,70 @@ void rcu_bh_qs(int cpu)
+ }
+ #endif
+ 
++static DEFINE_PER_CPU(int, rcu_sched_qs_mask);
++
++static DEFINE_PER_CPU(struct rcu_dynticks, rcu_dynticks) = {
++	.dynticks_nesting = DYNTICK_TASK_EXIT_IDLE,
++	.dynticks = ATOMIC_INIT(1),
++#ifdef CONFIG_NO_HZ_FULL_SYSIDLE
++	.dynticks_idle_nesting = DYNTICK_TASK_NEST_VALUE,
++	.dynticks_idle = ATOMIC_INIT(1),
++#endif /* #ifdef CONFIG_NO_HZ_FULL_SYSIDLE */
++};
++
++/*
++ * Let the RCU core know that this CPU has gone through the scheduler,
++ * which is a quiescent state.  This is called when the need for a
++ * quiescent state is urgent, so we burn an atomic operation and full
++ * memory barriers to let the RCU core know about it, regardless of what
++ * this CPU might (or might not) do in the near future.
++ *
++ * We inform the RCU core by emulating a zero-duration dyntick-idle
++ * period, which we in turn do by incrementing the ->dynticks counter
++ * by two.
++ */
++static void rcu_momentary_dyntick_idle(void)
++{
++	unsigned long flags;
++	struct rcu_data *rdp;
++	struct rcu_dynticks *rdtp;
++	int resched_mask;
++	struct rcu_state *rsp;
++
++	local_irq_save(flags);
++
++	/*
++	 * Yes, we can lose flag-setting operations.  This is OK, because
++	 * the flag will be set again after some delay.
++	 */
++	resched_mask = raw_cpu_read(rcu_sched_qs_mask);
++	raw_cpu_write(rcu_sched_qs_mask, 0);
++
++	/* Find the flavor that needs a quiescent state. */
++	for_each_rcu_flavor(rsp) {
++		rdp = raw_cpu_ptr(rsp->rda);
++		if (!(resched_mask & rsp->flavor_mask))
++			continue;
++		smp_mb(); /* rcu_sched_qs_mask before cond_resched_completed. */
++		if (ACCESS_ONCE(rdp->mynode->completed) !=
++		    ACCESS_ONCE(rdp->cond_resched_completed))
++			continue;
++
++		/*
++		 * Pretend to be momentarily idle for the quiescent state.
++		 * This allows the grace-period kthread to record the
++		 * quiescent state, with no need for this CPU to do anything
++		 * further.
++		 */
++		rdtp = this_cpu_ptr(&rcu_dynticks);
++		smp_mb__before_atomic_inc(); /* Earlier stuff before QS. */
++		atomic_add(2, &rdtp->dynticks);  /* QS. */
++		smp_mb__after_atomic_inc(); /* Later stuff after QS. */
++		break;
++	}
++	local_irq_restore(flags);
++}
++
+ /*
+  * Note a context switch.  This is a quiescent state for RCU-sched,
+  * and requires special handling for preemptible RCU.
+@@ -231,19 +295,12 @@ void rcu_note_context_switch(int cpu)
+ 	trace_rcu_utilization(TPS("Start context switch"));
+ 	rcu_sched_qs(cpu);
+ 	rcu_preempt_note_context_switch(cpu);
++	if (unlikely(raw_cpu_read(rcu_sched_qs_mask)))
++		rcu_momentary_dyntick_idle();
+ 	trace_rcu_utilization(TPS("End context switch"));
+ }
+ EXPORT_SYMBOL_GPL(rcu_note_context_switch);
+ 
+-static DEFINE_PER_CPU(struct rcu_dynticks, rcu_dynticks) = {
+-	.dynticks_nesting = DYNTICK_TASK_EXIT_IDLE,
+-	.dynticks = ATOMIC_INIT(1),
+-#ifdef CONFIG_NO_HZ_FULL_SYSIDLE
+-	.dynticks_idle_nesting = DYNTICK_TASK_NEST_VALUE,
+-	.dynticks_idle = ATOMIC_INIT(1),
+-#endif /* #ifdef CONFIG_NO_HZ_FULL_SYSIDLE */
+-};
+-
+ static long blimit = 10;	/* Maximum callbacks per rcu_do_batch. */
+ static long qhimark = 10000;	/* If this many pending, ignore blimit. */
+ static long qlowmark = 100;	/* Once only this many pending, use blimit. */
+@@ -258,6 +315,13 @@ static ulong jiffies_till_next_fqs = ULONG_MAX;
+ module_param(jiffies_till_first_fqs, ulong, 0644);
+ module_param(jiffies_till_next_fqs, ulong, 0644);
+ 
++/*
++ * How long the grace period must be before we start recruiting
++ * quiescent-state help from rcu_note_context_switch().
++ */
++static ulong jiffies_till_sched_qs = HZ / 20;
++module_param(jiffies_till_sched_qs, ulong, 0644);
++
+ static bool rcu_start_gp_advanced(struct rcu_state *rsp, struct rcu_node *rnp,
+ 				  struct rcu_data *rdp);
+ static void force_qs_rnp(struct rcu_state *rsp,
+@@ -822,6 +886,7 @@ static int rcu_implicit_dynticks_qs(struct rcu_data *rdp,
+ 				    bool *isidle, unsigned long *maxj)
+ {
+ 	unsigned int curr;
++	int *rcrmp;
+ 	unsigned int snap;
+ 
+ 	curr = (unsigned int)atomic_add_return(0, &rdp->dynticks->dynticks);
+@@ -862,27 +927,43 @@ static int rcu_implicit_dynticks_qs(struct rcu_data *rdp,
+ 	}
+ 
+ 	/*
+-	 * There is a possibility that a CPU in adaptive-ticks state
+-	 * might run in the kernel with the scheduling-clock tick disabled
+-	 * for an extended time period.  Invoke rcu_kick_nohz_cpu() to
+-	 * force the CPU to restart the scheduling-clock tick in this
+-	 * CPU is in this state.
+-	 */
+-	rcu_kick_nohz_cpu(rdp->cpu);
+-
+-	/*
+-	 * Alternatively, the CPU might be running in the kernel
+-	 * for an extended period of time without a quiescent state.
+-	 * Attempt to force the CPU through the scheduler to gain the
+-	 * needed quiescent state, but only if the grace period has gone
+-	 * on for an uncommonly long time.  If there are many stuck CPUs,
+-	 * we will beat on the first one until it gets unstuck, then move
+-	 * to the next.  Only do this for the primary flavor of RCU.
++	 * A CPU running for an extended time within the kernel can
++	 * delay RCU grace periods.  When the CPU is in NO_HZ_FULL mode,
++	 * even context-switching back and forth between a pair of
++	 * in-kernel CPU-bound tasks cannot advance grace periods.
++	 * So if the grace period is old enough, make the CPU pay attention.
++	 * Note that the unsynchronized assignments to the per-CPU
++	 * rcu_sched_qs_mask variable are safe.  Yes, setting of
++	 * bits can be lost, but they will be set again on the next
++	 * force-quiescent-state pass.  So lost bit sets do not result
++	 * in incorrect behavior, merely in a grace period lasting
++	 * a few jiffies longer than it might otherwise.  Because
++	 * there are at most four threads involved, and because the
++	 * updates are only once every few jiffies, the probability of
++	 * lossage (and thus of slight grace-period extension) is
++	 * quite low.
++	 *
++	 * Note that if the jiffies_till_sched_qs boot/sysfs parameter
++	 * is set too high, we override with half of the RCU CPU stall
++	 * warning delay.
+ 	 */
+-	if (rdp->rsp == rcu_state_p &&
++	rcrmp = &per_cpu(rcu_sched_qs_mask, rdp->cpu);
++	if (ULONG_CMP_GE(jiffies,
++			 rdp->rsp->gp_start + jiffies_till_sched_qs) ||
+ 	    ULONG_CMP_GE(jiffies, rdp->rsp->jiffies_resched)) {
+-		rdp->rsp->jiffies_resched += 5;
+-		resched_cpu(rdp->cpu);
++		if (!(ACCESS_ONCE(*rcrmp) & rdp->rsp->flavor_mask)) {
++			ACCESS_ONCE(rdp->cond_resched_completed) =
++				ACCESS_ONCE(rdp->mynode->completed);
++			smp_mb(); /* ->cond_resched_completed before *rcrmp. */
++			ACCESS_ONCE(*rcrmp) =
++				ACCESS_ONCE(*rcrmp) + rdp->rsp->flavor_mask;
++			resched_cpu(rdp->cpu);  /* Force CPU into scheduler. */
++			rdp->rsp->jiffies_resched += 5; /* Enable beating. */
++		} else if (ULONG_CMP_GE(jiffies, rdp->rsp->jiffies_resched)) {
++			/* Time to beat on that CPU again! */
++			resched_cpu(rdp->cpu);  /* Force CPU into scheduler. */
++			rdp->rsp->jiffies_resched += 5; /* Re-enable beating. */
++		}
+ 	}
+ 
+ 	return 0;
+@@ -3495,6 +3576,7 @@ static void __init rcu_init_one(struct rcu_state *rsp,
+ 			       "rcu_node_fqs_1",
+ 			       "rcu_node_fqs_2",
+ 			       "rcu_node_fqs_3" };  /* Match MAX_RCU_LVLS */
++	static u8 fl_mask = 0x1;
+ 	int cpustride = 1;
+ 	int i;
+ 	int j;
+@@ -3513,6 +3595,8 @@ static void __init rcu_init_one(struct rcu_state *rsp,
+ 	for (i = 1; i < rcu_num_lvls; i++)
+ 		rsp->level[i] = rsp->level[i - 1] + rsp->levelcnt[i - 1];
+ 	rcu_init_levelspread(rsp);
++	rsp->flavor_mask = fl_mask;
++	fl_mask <<= 1;
+ 
+ 	/* Initialize the elements themselves, starting from the leaves. */
+ 
+diff --git a/kernel/rcu/tree.h b/kernel/rcu/tree.h
+index 0bc59b6..cc51f9b 100644
+--- a/kernel/rcu/tree.h
++++ b/kernel/rcu/tree.h
+@@ -308,6 +308,9 @@ struct rcu_data {
+ 	/* 4) reasons this CPU needed to be kicked by force_quiescent_state */
+ 	unsigned long dynticks_fqs;	/* Kicked due to dynticks idle. */
+ 	unsigned long offline_fqs;	/* Kicked due to being offline. */
++	unsigned long cond_resched_completed;
++					/* Grace period that needs help */
++					/*  from cond_resched(). */
+ 
+ 	/* 5) __rcu_pending() statistics. */
+ 	unsigned long n_rcu_pending;	/* rcu_pending() calls since boot. */
+@@ -393,6 +396,7 @@ struct rcu_state {
+ 	struct rcu_node *level[RCU_NUM_LVLS];	/* Hierarchy levels. */
+ 	u32 levelcnt[MAX_RCU_LVLS + 1];		/* # nodes in each level. */
+ 	u8 levelspread[RCU_NUM_LVLS];		/* kids/node in each level. */
++	u8 flavor_mask;				/* bit in flavor mask. */
+ 	struct rcu_data __percpu *rda;		/* pointer of percu rcu_data. */
+ 	void (*call)(struct rcu_head *head,	/* call_rcu() flavor. */
+ 		     void (*func)(struct rcu_head *head));
+@@ -557,7 +561,7 @@ static bool rcu_nocb_need_deferred_wakeup(struct rcu_data *rdp);
+ static void do_nocb_deferred_wakeup(struct rcu_data *rdp);
+ static void rcu_boot_init_nocb_percpu_data(struct rcu_data *rdp);
+ static void rcu_spawn_nocb_kthreads(struct rcu_state *rsp);
+-static void rcu_kick_nohz_cpu(int cpu);
++static void __maybe_unused rcu_kick_nohz_cpu(int cpu);
+ static bool init_nocb_callback_list(struct rcu_data *rdp);
+ static void rcu_sysidle_enter(struct rcu_dynticks *rdtp, int irq);
+ static void rcu_sysidle_exit(struct rcu_dynticks *rdtp, int irq);
+diff --git a/kernel/rcu/tree_plugin.h b/kernel/rcu/tree_plugin.h
+index 84d6bac..219509e 100644
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@ -2302,7 +2302,7 @@ static bool init_nocb_callback_list(struct rcu_data *rdp)
+  * if an adaptive-ticks CPU is failing to respond to the current grace
+  * period and has not be idle from an RCU perspective, kick it.
+  */
+-static void rcu_kick_nohz_cpu(int cpu)
++static void __maybe_unused rcu_kick_nohz_cpu(int cpu)
+ {
+ #ifdef CONFIG_NO_HZ_FULL
+ 	if (tick_nohz_full_cpu(cpu))
+diff --git a/kernel/rcu/update.c b/kernel/rcu/update.c
+index 3d02f00..320e61c 100644
+--- a/kernel/rcu/update.c
++++ b/kernel/rcu/update.c
+@@ -352,21 +352,3 @@ static int __init check_cpu_stall_init(void)
+ early_initcall(check_cpu_stall_init);
+ 
+ #endif /* #ifdef CONFIG_RCU_STALL_COMMON */
+-
+-/*
+- * Hooks for cond_resched() and friends to avoid RCU CPU stall warnings.
+- */
+-
+-DEFINE_PER_CPU(int, rcu_cond_resched_count);
+-
+-/*
+- * Report a set of RCU quiescent states, for use by cond_resched()
+- * and friends.  Out of line due to being called infrequently.
+- */
+-void rcu_resched(void)
+-{
+-	preempt_disable();
+-	__this_cpu_write(rcu_cond_resched_count, 0);
+-	rcu_note_context_switch(smp_processor_id());
+-	preempt_enable();
+-}
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 8871059..d57e783 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4357,7 +4357,6 @@ static void __cond_resched(void)
+ 
+ int __sched _cond_resched(void)
+ {
+-	rcu_cond_resched();
+ 	if (should_resched()) {
+ 		__cond_resched();
+ 		return 1;
+@@ -4376,18 +4375,15 @@ EXPORT_SYMBOL(_cond_resched);
+  */
+ int __cond_resched_lock(spinlock_t *lock)
+ {
+-	bool need_rcu_resched = rcu_should_resched();
+ 	int resched = should_resched();
+ 	int ret = 0;
+ 
+ 	lockdep_assert_held(lock);
+ 
+-	if (spin_needbreak(lock) || resched || need_rcu_resched) {
++	if (spin_needbreak(lock) || resched) {
+ 		spin_unlock(lock);
+ 		if (resched)
+ 			__cond_resched();
+-		else if (unlikely(need_rcu_resched))
+-			rcu_resched();
+ 		else
+ 			cpu_relax();
+ 		ret = 1;
+@@ -4402,7 +4398,6 @@ int __sched __cond_resched_softirq(void)
+ {
+ 	BUG_ON(!in_softirq());
+ 
+-	rcu_cond_resched();  /* BH disabled OK, just recording QSes. */
+ 	if (should_resched()) {
+ 		local_bh_enable();
+ 		__cond_resched();
+-- 
+2.1.0
+
