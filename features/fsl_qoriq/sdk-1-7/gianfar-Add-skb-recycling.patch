@@ -1,0 +1,174 @@
+From 9724eeb251fccbf5ce46c3e895348836a032408c Mon Sep 17 00:00:00 2001
+From: Claudiu Manoil <claudiu.manoil@freescale.com>
+Date: Mon, 10 Mar 2014 14:37:06 +0200
+Subject: [PATCH 094/128] gianfar: Add skb recycling
+
+Add global per-CPU skb recycle lists to improve packet
+forwarding throughput.  Having per-interface recycle
+lists doesn't allow skb recycling when you're e.g.
+unidirectionally routing from eth0 to eth1, as eth1 will
+be producing a lot of recycled skbuffs but eth0 won't
+have any skbuffs to allocate from its recycle list.
+Reclaiming resp. recycling of skbs is done on the Rx resp.
+Tx confirmation paths, in softirq context, and the access
+to the driver's per-CPU skb lists is lockless and
+preemption safe.
+
+The skb recycling support was removed from the mainline
+kernel (starting with v3.0).
+
+Signed-off-by: Claudiu Manoil <claudiu.manoil@freescale.com>
+Change-Id: I40d47d1d4da337f4e9b0b18136848aa807fc24f7
+Reviewed-on: http://git.am.freescale.net:8181/9707
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Reviewed-by: Rajan Gupta <rajan.gupta@freescale.com>
+Reviewed-by: Jose Rivera <German.Rivera@freescale.com>
+[Xulin: Original patch taken from
+QorIQ-SDK-V1.7-SOURCE-20141218-yocto_RDS_20150206.iso]
+Signed-off-by: Xulin Sun <xulin.sun@windriver.com>
+---
+ drivers/net/ethernet/freescale/gianfar.c |   84 +++++++++++++++++++++++------
+ 1 files changed, 66 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/gianfar.c b/drivers/net/ethernet/freescale/gianfar.c
+index 8b13289..d22664a 100644
+--- a/drivers/net/ethernet/freescale/gianfar.c
++++ b/drivers/net/ethernet/freescale/gianfar.c
+@@ -116,6 +116,7 @@ static int gfar_start_xmit(struct sk_buff *skb, struct net_device *dev);
+ static void gfar_reset_task(struct work_struct *work);
+ static void gfar_timeout(struct net_device *dev);
+ static int gfar_close(struct net_device *dev);
++static struct sk_buff *gfar_alloc_skb(struct net_device *dev);
+ static struct sk_buff *gfar_new_skb(struct net_device *dev,
+ 				    dma_addr_t *bufaddr);
+ static int gfar_set_mac_address(struct net_device *dev);
+@@ -153,6 +154,10 @@ MODULE_AUTHOR("Freescale Semiconductor, Inc");
+ MODULE_DESCRIPTION("Gianfar Ethernet Driver");
+ MODULE_LICENSE("GPL");
+ 
++static DEFINE_PER_CPU(struct sk_buff_head, skb_recycle_list);
++
++#define GFAR_RXB_REC_SZ (DEFAULT_RX_BUFFER_SIZE + RXBUF_ALIGNMENT)
++
+ static void gfar_init_rxbdp(struct gfar_priv_rx_q *rx_queue, struct rxbd8 *bdp,
+ 			    dma_addr_t buf)
+ {
+@@ -216,7 +221,7 @@ static int gfar_init_bds(struct net_device *ndev)
+ 			if (skb) {
+ 				bufaddr = rxbdp->bufPtr;
+ 			} else {
+-				skb = gfar_new_skb(ndev, &bufaddr);
++				skb = gfar_alloc_skb(ndev);
+ 				if (!skb) {
+ 					netdev_err(ndev, "Can't allocate RX buffers\n");
+ 					return -ENOMEM;
+@@ -2549,6 +2554,28 @@ static void gfar_align_skb(struct sk_buff *skb)
+ 		    (((unsigned long) skb->data) & (RXBUF_ALIGNMENT - 1)));
+ }
+ 
++static void gfar_recycle_skb(struct sk_buff *skb)
++{
++	struct sk_buff_head *h = &__get_cpu_var(skb_recycle_list);
++	int skb_size = SKB_DATA_ALIGN(GFAR_RXB_REC_SZ + NET_SKB_PAD);
++
++	if (skb_queue_len(h) < DEFAULT_RX_RING_SIZE &&
++	    !skb_cloned(skb) && !skb_is_nonlinear(skb) &&
++	    skb->fclone == SKB_FCLONE_UNAVAILABLE && !skb_shared(skb) &&
++	    skb_end_offset(skb) == skb_size) {
++
++		skb_recycle(skb);
++
++		gfar_align_skb(skb);
++
++		__skb_queue_head(h, skb);
++
++		return;
++	}
++
++	dev_kfree_skb_any(skb);
++}
++
+ /* Interrupt Handler for Transmit complete */
+ static void gfar_clean_tx_ring(struct gfar_priv_tx_q *tx_queue)
+ {
+@@ -2628,7 +2655,7 @@ static void gfar_clean_tx_ring(struct gfar_priv_tx_q *tx_queue)
+ 
+ 		bytes_sent += GFAR_CB(skb)->bytes_sent;
+ 
+-		dev_kfree_skb_any(skb);
++		gfar_recycle_skb(skb);
+ 
+ 		tx_queue->tx_skbuff[skb_dirtytx] = NULL;
+ 
+@@ -2668,26 +2695,22 @@ static struct sk_buff *gfar_alloc_skb(struct net_device *dev)
+ 	return skb;
+ }
+ 
+-static struct sk_buff *gfar_new_skb(struct net_device *dev, dma_addr_t *bufaddr)
++struct sk_buff *gfar_new_skb(struct net_device *dev)
+ {
+-	struct gfar_private *priv = netdev_priv(dev);
+-	struct sk_buff *skb;
+-	dma_addr_t addr;
++       struct gfar_private *priv = netdev_priv(dev);
++       struct sk_buff *skb;
+ 
+-	skb = gfar_alloc_skb(dev);
+-	if (!skb)
+-		return NULL;
++       if (likely(priv->rx_buffer_size <= DEFAULT_RX_BUFFER_SIZE)) {
++               struct sk_buff_head *h = &__get_cpu_var(skb_recycle_list);
+ 
+-	addr = dma_map_single(priv->dev, skb->data,
+-			      priv->rx_buffer_size, DMA_FROM_DEVICE);
+-	if (unlikely(dma_mapping_error(priv->dev, addr))) {
+-		dev_kfree_skb_any(skb);
+-		return NULL;
+-	}
++               skb = __skb_dequeue(h);
++               if (skb != NULL)
++                       return skb;
++       }
+ 
+-	*bufaddr = addr;
+-	return skb;
++       return gfar_alloc_skb(dev);
+ }
++EXPORT_SYMBOL(gfar_new_skb);                       
+ 
+ static inline void count_errors(unsigned short status, struct net_device *dev)
+ {
+@@ -3566,4 +3589,29 @@ static struct platform_driver gfar_driver = {
+ 	.remove = gfar_remove,
+ };
+ 
+-module_platform_driver(gfar_driver);
++static int __init gfar_init(void)
++{
++	int i;
++
++	for_each_possible_cpu(i) {
++		struct sk_buff_head *h = &per_cpu(skb_recycle_list, i);
++		skb_queue_head_init(h);
++	}
++
++	return platform_driver_register(&gfar_driver);
++}
++
++static void __exit gfar_exit(void)
++{
++	int i;
++
++	for_each_possible_cpu(i) {
++		struct sk_buff_head *h = &per_cpu(skb_recycle_list, i);
++		skb_queue_purge(h);
++	}
++
++	platform_driver_unregister(&gfar_driver);
++}
++
++module_init(gfar_init);
++module_exit(gfar_exit);
+-- 
+1.7.5.4
+
