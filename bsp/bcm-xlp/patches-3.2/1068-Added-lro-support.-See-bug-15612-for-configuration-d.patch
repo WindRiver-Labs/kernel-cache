@@ -1,0 +1,392 @@
+From 3834c46e54b37e9209b3418120f2188ac30009aa Mon Sep 17 00:00:00 2001
+From: Hareesh R <hareesh@netlogicmicro.com>
+Date: Fri, 29 Apr 2011 12:50:32 +0530
+Subject: Added lro support. See bug 15612 for configuration details
+
+[Based on SDK 3.2]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+Signed-off-by: Nam Ninh <nam.ninh@windriver.com>
+
+diff --git a/drivers/misc/netlogic/nae-perf/xlp_hw.c b/drivers/misc/netlogic/nae-perf/xlp_hw.c
+index 405ce7f..1d6c178 100755
+--- a/drivers/misc/netlogic/nae-perf/xlp_hw.c
++++ b/drivers/misc/netlogic/nae-perf/xlp_hw.c
+@@ -36,6 +36,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <linux/mii.h>
++#include <linux/inet_lro.h>
+ 
+ #include <asm/netlogic/xlr_mac.h>
+ #include <asm/netlogic/hal/nlm_hal_nae.h>
+diff --git a/drivers/misc/netlogic/nae-perf/xlp_nae.c b/drivers/misc/netlogic/nae-perf/xlp_nae.c
+index 8641988..75124d4 100755
+--- a/drivers/misc/netlogic/nae-perf/xlp_nae.c
++++ b/drivers/misc/netlogic/nae-perf/xlp_nae.c
+@@ -47,6 +47,7 @@
+ #include <linux/mm.h>
+ #include <linux/pci.h>
+ #include <linux/kthread.h>
++#include <linux/inet_lro.h>
+ 
+ #include <net/ip.h>
+ 
+@@ -118,7 +119,7 @@
+ /*Enable sanity checks while receiving or transmitting buffer */
+ #undef ENABLE_SANITY_CHECKS
+ 
+-
++#undef ENABLE_LRO_DEBUG_STATS
+ /* Module Parameters */
+ int debug = 0;
+ module_param(debug, int, 0);
+@@ -132,6 +133,8 @@ module_param(naecfg_hack, int, 0);
+ 
+ static int perf_mode= NLM_TCP_MODE;
+ module_param(perf_mode, int, 0);
++static int enable_lro =  0;
++module_param(enable_lro, int, 0);
+ 
+ /***************************************************************
+  *
+@@ -191,12 +194,18 @@ static struct pci_device_id soc_pci_table[] __devinitdata = {
+ };
+ 
+ 
+-#define MAX_TSO_SKB_PEND_REQS 	50
++#define MAX_TSO_SKB_PEND_REQS 	200
+ #define MAX_PACKET_SZ_PER_MSG	16384
+ #define P2P_EXTRA_DESCS	      	((PAGE_SIZE / MAX_PACKET_SZ_PER_MSG) + 4)
+ #define P2P_SKB_OFF	      	(MAX_SKB_FRAGS + P2P_EXTRA_DESCS - 1)
+ #define tso_dbg(fmt, args...) //printk(fmt, ##args);
+-static uint64_t p2p_dynamic_alloc_cnt;
++#define RX_UNCLASSIFIED_PKT 	(1<<5)
++#define RX_IP_CSUM_VALID 	(1<<3)
++#define RX_TCP_CSUM_VALID 	(1<<2)
++static uint64_t dbg_tcp_rx_cons[NR_CPUS * 8] __cacheline_aligned;
++static uint64_t p2p_dynamic_alloc_cnt[NR_CPUS * 8] __cacheline_aligned;
++#define CPU_INDEX(x) (x * 8)
++
+ 
+ struct p2p_desc_mem {
+ 	void *mem;
+@@ -460,7 +469,7 @@ static inline void *alloc_p2p_desc_mem(int cpu)
+ 		p2p_desc_mem[cpu].mem = (void *)*(unsigned long *)(buf);
+ 	} else {
+ 		buf = cacheline_aligned_kmalloc(p2p_desc_mem[cpu].dsize, GFP_KERNEL);
+-		p2p_dynamic_alloc_cnt++;
++		p2p_dynamic_alloc_cnt[CPU_INDEX(cpu)]++;
+ 	}
+ 	return buf;
+ }
+@@ -546,8 +555,177 @@ static __inline__ uint64_t nae_tso_desc1(
+ 
+ }
+ 
++#define FLOW_TABLE3_CFG 0x86
++#define NUM_VC_PER_THREAD 4
++#define NUM_CPU_VC	  128
++#define RX_PARSER_EN 	1
++#define RX_PPAD_EN 	0 
++#define RX_PPAD_SZ	3
++static void nlm_enable_l3_l4_parser(void)
++{
++	int l2proto = 1; //ethernet
++	int port = 0, i, ipchk = 1;
++	uint32_t val = 0;
++	uint32_t naereg;
++	int dstvc, cpu, num_cpus = 0;
++       	int max_key_size = 40; /* Ip dst, src, tcp src and dst port(12), reminining padded to zero */
++	int crcpoly = 0xffff;//0xbaad; //0xbb3d;
++
++	//enabling hardware parser
++	naereg = nlm_hal_read_nae_reg(RX_CONFIG);
++	nlm_hal_write_nae_reg(RX_CONFIG, (naereg | RX_PARSER_EN << 12 | RX_PPAD_EN << 13 | RX_PPAD_SZ << 22)); 
++	printk("Enabling parser, reg content = %x\n", nlm_hal_read_nae_reg(RX_CONFIG));
++
++	/* enabling extraction of data */
++	for(i=0; i<16;i++)
++		nlm_hal_write_nae_reg(L2_TYPE_0 + i, l2proto);
++
++	nlm_hal_write_nae_reg(L3_CTABLE_MASK_0, port | 0 << 5 | 1 << 6); // l2proto and ethtype included
++
++	val = ((0 << 26) | (9 << 20) | (ipchk << 18) | (1 << 16) | (0x800));
++	nlm_hal_write_nae_reg(L3_CTABLE_0_0, val);
++	val =   (12 << 26) | (4 << 21) | (16 << 15) | (4 << 10); /* extract sourceip and dstip */
++	nlm_hal_write_nae_reg(L3_CTABLE_0_1, val);
++
++	nlm_hal_write_nae_reg(L4_CTABLE_0_0, 1 << 17 | 0x6); /* ip_proto = tcp */
++	val = ((0 << 21) | (2 << 17) | (2 << 11) | (2 << 7)); /* extract source and dst port*/
++	nlm_hal_write_nae_reg(L4_CTABLE_0_1, val);
++
++	/* Configure flow table 1 to the num cpus as the modular */
++	for(i = 0; i < NR_CPUS; i++) {
++		if(cpu_isset(i, cpu_online_map)) 
++			num_cpus++;
++	}
++	for(i = 0; i < 20; i++) {
++		nlm_hal_write_nae_reg(0x84, i);
++		nlm_hal_write_nae_reg(0x84, (num_cpus << 20)| i);
++	}
++
++	
++	/* Using hash based distribution, Configure the flow table to send packets to the nae_rx_vc of 
++	 each online cpu */
++	dstvc = nae_rx_vc;
++	for(i = 0; i < 512;) {
++		cpu = dstvc / NUM_VC_PER_THREAD;
++		if(cpu_isset(cpu, cpu_online_map)) {
++			nlm_hal_write_nae_reg(FLOW_TABLE3_CFG, 0 << 31 | i);
++			nlm_hal_write_nae_reg(FLOW_TABLE3_CFG, dstvc << 12 | i);
++			i++;
++		}
++		dstvc += NUM_VC_PER_THREAD;
++		if(dstvc >= NUM_CPU_VC) /* max vcs in a core */
++			dstvc = nae_rx_vc;
++	}
++	val = nlm_hal_read_nae_reg(0x2f);
++	val &= (~0x3fffff) ;
++	nlm_hal_write_nae_reg(0x2f, (max_key_size << 16) | crcpoly | val);
++
++}
++
++static int lro_get_skb_hdr(struct sk_buff *skb, void **iphdr, void **tcph,
++		u64 *hdr_flags, void *priv)
++{
++	skb_reset_network_header(skb);
++	skb_set_transport_header(skb, ip_hdrlen(skb));
++
++	if(ip_hdr(skb)->protocol != 0x6) 
++		return -1;
+ 
++	*iphdr = ip_hdr(skb);
++	*tcph = tcp_hdr(skb);
++	
++	*hdr_flags = LRO_IPV4 | LRO_TCP;
+ 
++	return 0;
++}
++
++void dump_parser_config(void)
++{
++	int i; 
++	uint32_t val;
++
++	val = nlm_hal_read_nae_reg(0x2f);
++	printk("Crc config %x crc %x keysize %d Flowidx %d Dstidx %d\n", val,
++			(val & 0xffff), (val >> 16) & 0x3f, (val >> 22) & 0x01, (val >> 23) & 0x01);
++
++	printk("Flow table 1 cfg\n");
++	for(i = 0; i < 20; i++) {
++		nlm_hal_write_nae_reg(0x84, 1 << 31 | i);
++		val = nlm_hal_read_nae_reg(0x84);
++		printk("reg %x val %x index %d (%x:%x)\n",
++				0x84, val, i, (val >> 8) & 0x1ff, (val >> 20) & 0x1ff);
++	}
++
++	printk("Flow table 3 cfg\n");
++	for(i = 0; i < 50; i++) {
++		nlm_hal_write_nae_reg(0x86, 1 << 31 | i);
++		val = nlm_hal_read_nae_reg(0x86);
++		printk("reg %x val %x index %d (%x:%x)\n",
++				0x86, val, i, (val >> 12) & 0x1ff, (val >> 22) & 0x1ff);
++	}
++}
++
++
++void lro_init(struct net_device *dev)
++{
++	struct dev_data* priv;
++	static int done = 0;
++	int cpu;
++	priv = netdev_priv(dev);
++
++#ifdef CONFIG_INET_LRO
++	if(enable_lro) {
++		printk("LRO is enabled \n");
++		dev->features |= NETIF_F_LRO;
++		for (cpu=0; cpu<NR_CPUS; cpu++) {
++			memset(&priv->lro_mgr[cpu], 0, sizeof(struct net_lro_mgr));
++			priv->lro_mgr[cpu].max_aggr = 16;
++			priv->lro_mgr[cpu].max_desc = LRO_MAX_DESCS;
++			priv->lro_mgr[cpu].get_skb_header = lro_get_skb_hdr;
++			priv->lro_mgr[cpu].features = LRO_F_NAPI;
++			priv->lro_mgr[cpu].dev = dev;
++			priv->lro_mgr[cpu].ip_summed = CHECKSUM_UNNECESSARY;
++			priv->lro_mgr[cpu].ip_summed_aggr = CHECKSUM_UNNECESSARY;
++			priv->lro_mgr[cpu].lro_arr = cacheline_aligned_kmalloc(
++					sizeof(struct net_lro_desc) * LRO_MAX_DESCS, GFP_KERNEL);
++			memset(priv->lro_mgr[cpu].lro_arr, 0, sizeof(struct net_lro_desc) * LRO_MAX_DESCS);
++		}
++	}
++#endif
++	if(!done) {
++		done = 1;
++		nlm_enable_l3_l4_parser();
++		#ifdef ENABLE_LRO_DEBUG_STATS
++		dump_parser_config();
++		#endif
++	}
++}
++
++#ifdef ENABLE_LRO_DEBUG_STATS
++static void dump_skb_info(struct sk_buff *skb, uint64_t msg1)
++{
++	struct tcphdr *tcp = (void *)(skb->data + 20);
++	int cpu = hard_smp_processor_id();
++	char buf[512];
++	int blen = 0, i, len = 64;
++	unsigned char *data = skb->data;
++
++	if(tcp->syn) {
++	//	printk("cpu %04d ipsrc %04x ipdst %04x tcpsrc %08d tcpdst %08d\n",
++	//			cpu, iph->saddr, iph->daddr, tcp->source, tcp->dest);
++		dbg_tcp_rx_cons[CPU_INDEX(cpu)]++;
++	}
++	return;
++
++	for(i = 0; i < len;) {
++		if(i != 0 && (i % 16 == 0))
++			blen += sprintf(&buf[blen], "\n");
++		blen += sprintf(&buf[blen], "%02x ", data[i]);
++		i++;
++	}
++	printk("data recived on cpu %d len %d = \n%s\n", cpu, len, buf);
++}
++#endif
+ 
+ /**********************************************************************
+  * mac_refill_frin_desc -  refill rx freein buffer for a device
+@@ -671,7 +849,7 @@ static int nae_proc_read(char *page, char **start, off_t off,
+ 	uint64_t clocks = 0, instrs = 0;
+ #endif
+ 	for(i=0; i<32; i++){
+-		printk("cpu%d, fast_repl %ld, slow_repl %ld, err_repl %ld\n",i, (unsigned long)fast_replenish_count[LAST_RCVD_INDEX(i)], (unsigned long)slow_replenish_count[LAST_RCVD_INDEX(i)], (unsigned long)err_replenish_count[LAST_RCVD_INDEX(i)]);
++		printk("cpu%d, fast_repl %ld, slow_repl %ld, err_repl %ld tcprxcons %lld p2pdalloc %lld\n",i, (unsigned long)fast_replenish_count[LAST_RCVD_INDEX(i)], (unsigned long)slow_replenish_count[LAST_RCVD_INDEX(i)], (unsigned long)err_replenish_count[LAST_RCVD_INDEX(i)], dbg_tcp_rx_cons[CPU_INDEX(i)], p2p_dynamic_alloc_cnt[CPU_INDEX(i)]);
+ 		total_err += err_replenish_count[LAST_RCVD_INDEX(i)];
+ 		total_fast += fast_replenish_count[LAST_RCVD_INDEX(i)];
+ 		total_slow += slow_replenish_count[LAST_RCVD_INDEX(i)];
+@@ -682,6 +860,8 @@ static int nae_proc_read(char *page, char **start, off_t off,
+ 		skbuff_clocks[LAST_RCVD_INDEX(i)] = 0;
+ 		skbuff_event[LAST_RCVD_INDEX(i)] = 0 ;
+ #endif
++		dbg_tcp_rx_cons[CPU_INDEX(i)] = 0;
++		p2p_dynamic_alloc_cnt[CPU_INDEX(i)] = 0;
+ 	}
+ 	/*check how many hash are empty...*/
+ 	printk("TOTAL_FAST_REPL %ld, TOTAL_SLOW_REPL %ld, TOTAL_ERR_REPL %ld\n",(unsigned long)total_fast, (unsigned long)total_slow, (unsigned long)total_err);
+@@ -769,6 +949,11 @@ xlp_poll_lower(int budget, int cpu)
+ 	uint64_t stamp1, stamp2;
+ 	uint64_t count1, count2;
+ #endif
++#ifdef CONFIG_INET_LRO		  
++	int lro_flush_priv_cnt = 0, i;
++	char lro_flush_needed[20] = { 0 };
++	struct dev_data *lro_flush_priv[20];
++#endif
+ 	while (budget--) {
+ 
+ 		status = xlp_message_receive_2(nae_rx_vc, &src_id, &size, &code, &msg0, &msg1);
+@@ -796,7 +981,9 @@ xlp_poll_lower(int budget, int cpu)
+ 				mac_refill_frin_skb(addr, 1000 + (cpu/2));
+ 			}
+ 			else{
+-				int qid = 1000 + context;
++				int qid = 1000 + context * 4;
++			        if(context >= 4)
++					qid = 1016 + context - 4;
+ 				mac_refill_frin_skb(addr, qid);
+ 			}
+ 			STATS_INC(priv->stats.rx_errors);
+@@ -889,7 +1076,24 @@ xlp_poll_lower(int budget, int cpu)
+ 		  stamp1 = read_dmfur_cycles();
+ 		  count1 = read_c0_perfcntr0();
+ #endif
+-		  netif_receive_skb(skb);
++#ifdef CONFIG_INET_LRO
++		  if((skb->dev->features & NETIF_F_LRO) && 
++				  (msg1 & RX_IP_CSUM_VALID) && (msg1 & RX_TCP_CSUM_VALID)) {		
++			 #ifdef ENABLE_LRO_DEBUG_STATS
++			 dump_skb_info(skb, msg1);
++			 #endif			 
++			 skb->ip_summed = CHECKSUM_UNNECESSARY;
++			 lro_receive_skb(&priv->lro_mgr[cpu], skb, (void *)msg1);
++			 if(!lro_flush_needed[port]) {
++				 lro_flush_priv[lro_flush_priv_cnt] = priv;
++				 lro_flush_needed[port] = 1;
++				 lro_flush_priv_cnt++;
++			 }
++		  } else
++#endif
++		  {
++		  	netif_receive_skb(skb);
++		  }
+ #ifdef ENABLE_DEBUG_STATISTICS
+ 		  stamp2 = read_dmfur_cycles();
+ 		  count2 = read_c0_perfcntr0();
+@@ -925,7 +1129,7 @@ xlp_poll_lower(int budget, int cpu)
+ 		if (last_rcvd_skb[LAST_RCVD_INDEX(cpu)]) {
+ 		  //printk("[%s@%d]: Unwanted buffer allocation in driver data path!\n", __FILE__, __LINE__);
+ 			slow_replenish_count[LAST_RCVD_INDEX(cpu)]++;
+-			mac_refill_frin_one_buffer(dev_mac[port], cpu);
++			mac_refill_frin_one_buffer(pdev, cpu);
+ 			last_rcvd_skb[LAST_RCVD_INDEX(cpu)] = NULL;
+ 		}
+ #endif
+@@ -933,6 +1137,11 @@ xlp_poll_lower(int budget, int cpu)
+ #ifdef ENABLE_PER_CPU_COUNTER
+ 	total_rx_pkts[LAST_RCVD_INDEX(cpu)] += no_rx_pkt_rcvd;
+ #endif
++#ifdef CONFIG_INET_LRO
++	for(i = 0; i < lro_flush_priv_cnt; i++)
++                lro_flush_all(&lro_flush_priv[i]->lro_mgr[cpu]);
++#endif
++
+ 
+ 	return no_rx_pkt_rcvd;
+ }
+@@ -945,7 +1154,7 @@ static int xlp_nae_poll(void *buf)
+ 	//unsigned int count=0;
+ 	int rx_pkts = 0;
+ 	int cpu = hard_smp_processor_id();
+-	int budget = 300;
++	int budget = 64;
+ 
+ 	if(perf_mode == NLM_RT_MODE)
+ 		budget = 300000;
+@@ -1249,8 +1458,10 @@ static int  nlm_xlp_nae_open (struct net_device *dev)
+ 	int i;
+ 	int ret = 0;
+ 
+-	if(perf_mode == NLM_TCP_MODE)
++	if(perf_mode == NLM_TCP_MODE) {
+ 		tso_enable(dev, 1);
++		lro_init(dev);
++	}
+ 
+ 	if (priv->inited) {
+ 		spin_lock_irq(&priv->lock);
+diff --git a/drivers/misc/netlogic/nae-perf/xlp_nae.h b/drivers/misc/netlogic/nae-perf/xlp_nae.h
+index 8e19ada..f10f3cd 100644
+--- a/drivers/misc/netlogic/nae-perf/xlp_nae.h
++++ b/drivers/misc/netlogic/nae-perf/xlp_nae.h
+@@ -18,6 +18,7 @@ extern unsigned long long netlib_paddrb;
+ #define PADDR_BASE 0x100000ULL
+ #define PADDR_SIZE 0x200000
+ #define INIT_VBASE( vbase, pbase) {netlib_vaddrb = vbase ; netlib_paddrb = pbase;}
++#define LRO_MAX_DESCS 8
+ 
+ struct cpu_stat {
+         unsigned long tx_packets;
+@@ -77,6 +78,8 @@ struct dev_data
+         int nae_rx_qid;
+         int nae_tx_qid;
+ 	int hw_port_id;
++	struct net_lro_mgr lro_mgr[NR_CPUS];
++	struct net_lro_desc lro_arr[NR_CPUS][LRO_MAX_DESCS];
+ };
+ 
+ static inline void prefetch_local(const void *addr)
+-- 
+1.7.1
+

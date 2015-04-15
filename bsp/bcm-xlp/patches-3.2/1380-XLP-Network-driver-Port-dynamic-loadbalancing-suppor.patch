@@ -1,0 +1,977 @@
+From 64614e475f2c0f5372ca328d9cdccd68554b1a79 Mon Sep 17 00:00:00 2001
+From: Prabhath P Raman <prabhath@broadcom.com>
+Date: Fri, 9 Nov 2012 12:16:47 +0530
+Subject: XLP Network driver: Port dynamic loadbalancing support
+
+Added support for dynamic flow migration between cpus. With this
+feature all TCP flows are distributed uniformly to all available
+cpus without modifying the application.
+[Based on SDK 3.2]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+Signed-off-by: Nam Ninh <nam.ninh@windriver.com>
+
+diff --git a/drivers/net/ethernet/broadcom/nae/xlpge.h b/drivers/net/ethernet/broadcom/nae/xlpge.h
+index deb1198..69d0794 100644
+--- a/drivers/net/ethernet/broadcom/nae/xlpge.h
++++ b/drivers/net/ethernet/broadcom/nae/xlpge.h
+@@ -55,11 +55,19 @@
+ #define	NLM_NUM_REG_DUMP		9	/* Register 0xa0 to 0xa8 */
+ #define	NLM_ETHTOOL_REG_LEN		(NLM_NUM_REG_DUMP * 4)
+ #define	RX_PARSER_EN			1
++#ifdef CONFIG_NLM_ENABLE_LOAD_BALANCING
++#define	RX_PPAD_EN			1
++#define	RX_PPAD_SZ			0
++#else
+ #define	RX_PPAD_EN			0
+ #define	RX_PPAD_SZ			3
++#endif
+ /* TODO XXX: default enable prepad */
+ #ifdef	IEEE_1588_PTP_ENABLED
+ #define	PREPAD_LEN			64
++#elif defined(CONFIG_NLM_ENABLE_LOAD_BALANCING)
++#define	PREPAD_LEN			16
++#define	NLM_LOAD_BALANCING_MAGIC	0xdeadbeefU
+ #else
+ #define	PREPAD_LEN			0
+ #endif
+@@ -72,6 +80,7 @@
+ #define	MSG_TXQ_FULL			0x04
+ #define	NLM_TCP_MODE			1
+ #define	NLM_RT_MODE			2
++#define	NLM_TCP_LOAD_BALANCE_MODE	3
+ #define	TSO_ENABLED			1
+ #define	R_TX_CONTROL			0x0a0
+ #define	TX_PACKET_COUNTER		0x39
+@@ -95,6 +104,12 @@
+ #define	MACSEC_ETHER_TYPE		0x88e5
+ #define	PROTOCOL_TYPE_IP		0x0800
+ #define	MAC_SEC_PADDING			(12+16+16+16)
++#ifdef	CONFIG_NLM_ENABLE_LOAD_BALANCING
++#define	KB(x)				(x<<10)
++#define	NLM_UCORE_SHARED_TABLE_SIZE	((KB(16))/(sizeof(uint32_t)))
++#define	NLM_UCORE_SHMEM_OFFSET		(KB(16))
++#define	NUM_LOAD_BALANCE_CPU		32
++#endif
+ 
+ #define	NLM_RX_ETH_BUF_SIZE		(ETH_DATA_LEN + ETH_HLEN + 	\
+ 	ETH_FCS_LEN + BYTE_OFFSET + PREPAD_LEN + SKB_BACK_PTR_SIZE +	\
+@@ -210,6 +225,29 @@ struct phy_info {
+         uint32_t *serdes_addr;
+ };
+ 
++#ifdef CONFIG_NLM_ENABLE_LOAD_BALANCING
++/*Flow Meta Info*/
++struct flow_meta_info
++{
++	volatile uint64_t total_bytes_rcvd;
++	volatile uint64_t last_sample_bytes;
++	volatile uint64_t cpu_owner;
++	uint64_t pad[5];
++};
++
++/*Active flow list*/
++struct active_flow_list
++{
++	volatile int index_to_flow_meta_info[NLM_UCORE_SHARED_TABLE_SIZE];
++	volatile uint64_t cpu_data_rate;
++	spinlock_t lock;
++	volatile uint64_t nr_active_flows;
++	volatile uint64_t nr_flow_created;
++	volatile uint64_t nr_flow_processed;
++	uint64_t pad[3];
++};
++#endif
++
+ struct dev_data
+ {
+ 	struct net_device *dev;
+@@ -236,6 +274,7 @@ struct dev_data
+ 	int nae_rx_qid;
+ 	int nae_tx_qid;
+ 	int hw_port_id;
++	int mgmt_port;
+ 	struct net_lro_mgr lro_mgr[NR_CPUS];
+ 	struct net_lro_desc lro_arr[NR_CPUS][LRO_MAX_DESCS];
+ 
+@@ -428,6 +467,8 @@ int xlp_config_msec_tx_mem(struct net_device *, struct ethtool_cmd *);
+ int xlp_config_msec_rx(struct net_device *, struct ethtool_cmd *);
+ int xlp_config_msec_rx_mem(struct net_device *, struct ethtool_cmd *);
+ int tso_enable(struct net_device *, u32);
++int nlm_load_balance_proc_open(struct inode *, struct file *);
++void nlm_init_load_balance(void);
+ 
+ extern int enable_lro; 	
+ extern unsigned char eth_hw_addr[NLM_MAX_NODES][MAX_GMAC_PORT][6];
+@@ -450,6 +491,8 @@ extern int exclusive_vc;
+ extern int enable_napi;
+ extern int perf_mode;
+ extern uint64_t nlm_mode[];
++extern int nlm_prepad_len;
++extern int load_balance_timer_run;
+ 
+ #endif /* __ASSEMBLY__ */
+ #endif
+diff --git a/drivers/net/ethernet/broadcom/nae/xlpge_nae.c b/drivers/net/ethernet/broadcom/nae/xlpge_nae.c
+index bfa6d84..486b6c2 100644
+--- a/drivers/net/ethernet/broadcom/nae/xlpge_nae.c
++++ b/drivers/net/ethernet/broadcom/nae/xlpge_nae.c
+@@ -54,10 +54,15 @@ struct net_device *
+ 	per_cpu_netdev[NLM_MAX_NODES][NR_CPUS][24] __cacheline_aligned;
+ int exclusive_vc = 0;
+ module_param(exclusive_vc, int, 0);
++#ifdef CONFIG_NLM_ENABLE_LOAD_BALANCING
++int load_balance_timer_run = 1;
++module_param(load_balance_timer_run, int, S_IRUGO|S_IWUSR);
++#endif
+ int enable_napi = 1;
++int nlm_prepad_len = 0;
+ int perf_mode= NLM_TCP_MODE;
+ module_param(perf_mode, int, 0);
+-int num_descs_per_normalq = 64; 	
++int num_descs_per_normalq = 64;
+ module_param(num_descs_per_normalq, int, 0);
+ int num_descs_per_jumboq = 32;
+ module_param(num_descs_per_jumboq, int, 0);
+@@ -69,6 +74,15 @@ module_param(enable_jumbo, int, 0);
+ static struct p2p_desc_mem p2p_desc_mem[NR_CPUS] __cacheline_aligned;
+ static unsigned int phys_cpu_map[NLM_MAX_NODES];
+ 
++#ifdef CONFIG_NLM_ENABLE_LOAD_BALANCING
++struct file_operations nlm_load_balance_proc_fops = {
++	.owner = THIS_MODULE,
++	.open = nlm_load_balance_proc_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = seq_release,
++};
++#endif
+ static unsigned short nlm_select_queue(struct net_device *dev,
+ 				       struct sk_buff *skb)
+ {
+@@ -111,7 +125,7 @@ static int init_dummy_entries_for_port_fifos(int node,
+ 
+ 	for (i = 0; i < nae_cfg->frin_total_queue; i++) {
+ 		/* nothing to do, if it is owned by some domain */
+-		if((1 << i) & fifo_mask) 
++		if((1 << i) & fifo_mask)
+ 			continue;
+ 
+ 		vc_index = i + nae_cfg->frin_queue_base;
+@@ -148,7 +162,7 @@ static int nlm_initialize_vfbid(int node, nlm_nae_config_ptr nae_cfg)
+ 	int end = start + nae_cfg->vfbtbl_sw_nentries;
+ 	int frin_q_base = nlm_node_cfg.nae_cfg[0]->frin_queue_base;
+ 	int cpu, tblidx, i;
+-	
++
+ 	/*
+ 	 * For s/w replenishment, each nodes tx completes can be send to his
+ 	 * own node cpus only
+@@ -162,7 +176,7 @@ static int nlm_initialize_vfbid(int node, nlm_nae_config_ptr nae_cfg)
+ 	/*
+ 	 * For h/w replenishment, each node fills up 20 entries for all other
+ 	 * nodes starting from node0's queue-id. Software should offset the
+-	 * hw-offset + rx-node id to get the actual index 
++	 * hw-offset + rx-node id to get the actual index
+ 	 */
+ 	start = nae_cfg->vfbtbl_hw_offset;
+ 	end = start + nae_cfg->vfbtbl_hw_nentries;
+@@ -222,7 +236,7 @@ static int nlm_configure_shared_freein_fifo(int node,
+ 				&owner_replenish,
+ 				&paddr_info, &paddr_info_len,
+ 				&desc_info, &desc_info_len);
+-		if(rv != 0) 
++		if(rv != 0)
+ 			continue;
+ 
+ 		if(!owner_replenish)
+@@ -237,16 +251,16 @@ static int nlm_configure_shared_freein_fifo(int node,
+ 			paddr |= ((uint64_t)fdt32_to_cpu(t[i + 2]));
+ 			psize = ((uint64_t)fdt32_to_cpu(t[i + 3])) << 32;
+ 			psize |= ((uint64_t)fdt32_to_cpu(t[i + 4]));
+-		
++
+ 			i += 5;
+ 			len = i * 4;
+ 			if(cnode == node)
+ 				break;
+ 		} while(len < paddr_info_len);
+ 
+-		printk("domid %d node %d addr %llx size %llx\n", 
++		printk("domid %d node %d addr %llx size %llx\n",
+ 					nae_cfg->shinfo[shdom].domid, cnode,
+-					paddr, psize); 
++					paddr, psize);
+ 
+ 		epaddr = paddr + psize;
+ 		t = (uint32_t *)desc_info;
+@@ -259,7 +273,7 @@ static int nlm_configure_shared_freein_fifo(int node,
+ 			dsize = fdt32_to_cpu(t[i + 2]);
+ 			dppadsz = fdt32_to_cpu(t[i + 3]);
+ 			ndescs = fdt32_to_cpu(t[i + 4]);
+-		 
++
+ 			i += 5;
+ 			len = i * 4;
+ 
+@@ -271,7 +285,7 @@ static int nlm_configure_shared_freein_fifo(int node,
+ 
+ 			for(fifo = 0; fifo < NLM_NAE_MAX_FREEIN_FIFOS_PER_NODE;
+ 				fifo++) {
+-				if(!((1 << fifo) & fmask)) 
++				if(!((1 << fifo) & fmask))
+ 					continue;
+ 				msgrng_access_enable(mflags);
+ 				vc_index = fifo + nae_cfg->frin_queue_base;
+@@ -302,8 +316,8 @@ static int nlm_configure_shared_freein_fifo(int node,
+ 				}
+ 				msgrng_access_disable(mflags);
+ 				printk("Send %d descriptors for queue \
+-						%d(%d) of length %d\n", 
+-						ndescs, fifo, vc_index, dsize); 
++						%d(%d) of length %d\n",
++						ndescs, fifo, vc_index, dsize);
+ 
+ 			}
+ 
+@@ -323,7 +337,7 @@ static int initialize_nae_per_node(int node, uint32_t *phys_cpu_map, int mode,
+ 
+ 	nae_cfg = nlm_node_cfg.nae_cfg[node];
+ 
+-	if (nae_cfg == NULL) 
++	if (nae_cfg == NULL)
+ 		goto err;
+ 
+ 	for (i = 0; i <= NLM_NAE_MAX_SHARED_DOMS; i++) {
+@@ -331,10 +345,10 @@ static int initialize_nae_per_node(int node, uint32_t *phys_cpu_map, int mode,
+ 		lnx_shinfo[i].rxvc = nae_cfg->shinfo[i].rxvc;
+ 		lnx_shinfo[i].domid = nae_cfg->shinfo[i].domid;
+ 		memcpy(&lnx_shinfo[i].lcpu_2_pcpu_map,
+-			nae_cfg->shinfo[i].lcpu_2_pcpu_map, 
++			nae_cfg->shinfo[i].lcpu_2_pcpu_map,
+ 			sizeof(nae_cfg->shinfo[i].lcpu_2_pcpu_map));
+ 		memcpy(&lnx_shinfo[i].cpu_2_freeinfifo_map,
+-			nae_cfg->shinfo[i].cpu_2_freeinfifo_map, 
++			nae_cfg->shinfo[i].cpu_2_freeinfifo_map,
+ 			sizeof(nae_cfg->shinfo[i].cpu_2_freeinfifo_map));
+ 	}
+ 
+@@ -368,7 +382,7 @@ static int initialize_nae_per_node(int node, uint32_t *phys_cpu_map, int mode,
+ 
+ 			for (i = 0; i < NLM_NCPUS_PER_NODE; i++) {
+ 				pos = i / NLM_NAE_SH_LCPU_TO_MAP_SZ;
+-				bitoff = (i % 
++				bitoff = (i %
+ 					NLM_NAE_SH_LCPU_TO_MAP_NVALS_PER_ENTRY)
+ 					* NLM_NAE_SH_LCPU_TO_MAP_SNG_VAL_SZ;
+ 				lnx_shinfo[0].cpu_2_freeinfifo_map[pos] |=
+@@ -387,12 +401,17 @@ static int initialize_nae_per_node(int node, uint32_t *phys_cpu_map, int mode,
+ 			pos = i / NLM_NAE_SH_LCPU_TO_MAP_SZ;
+ 			bitoff = (i % NLM_NAE_SH_LCPU_TO_MAP_NVALS_PER_ENTRY) *
+ 				NLM_NAE_SH_LCPU_TO_MAP_SNG_VAL_SZ;
+-			cpu_2_normal_frfifo[node][i] = 
++			cpu_2_normal_frfifo[node][i] =
+ 				(lnx_shinfo[0].cpu_2_freeinfifo_map[pos] >>
+ 					bitoff) & 0x1f;
+ 		}
+ 	}
+ 
++#ifdef CONFIG_NLM_ENABLE_LOAD_BALANCING
++	if(mode == NLM_TCP_MODE)
++		lnx_shinfo[0].mode = NLM_TCP_LOAD_BALANCE_MODE;
++	else
++#endif
+ 	lnx_shinfo[0].mode = mode;
+ 	lnx_shinfo[0].jumbo_enabled = *jumbo_enabled;
+ 	lnx_shinfo[0].node = node;
+@@ -410,7 +429,7 @@ static int initialize_nae_per_node(int node, uint32_t *phys_cpu_map, int mode,
+ 	/* initialize my vfbid table */
+ 	if (!(nae_cfg->flags & VFBID_FROM_FDT))
+ 		nlm_initialize_vfbid(node, nae_cfg);
+-	
++
+ 	if (nae_cfg->owned == 0)
+ 		goto err;
+ 
+@@ -427,7 +446,7 @@ static int initialize_nae_per_node(int node, uint32_t *phys_cpu_map, int mode,
+ 		goto err;
+ 
+ 	init_dummy_entries_for_port_fifos(node, nae_cfg);
+-	
++
+ #if 0
+ 	if (is_nlm_xlp2xx()) {
+ 		nlm_hal_msec_tx_default_config(node,
+@@ -539,12 +558,12 @@ int replenish_freein_fifos(void)
+ 
+ 	for (node = 0; node < NLM_MAX_NODES; node++) {
+ 		nae_cfg = nlm_node_cfg.nae_cfg[node];
+-		if (nae_cfg == NULL) 
++		if (nae_cfg == NULL)
+ 			continue;
+ 
+ 		/* configure the descs */
+ 		for (i = 0; i < nae_cfg->frin_total_queue; i++) {
+-			max_descs_pqueue = 
++			max_descs_pqueue =
+ 				nae_cfg->freein_fifo_onchip_num_descs[i] +
+ 					nae_cfg->freein_fifo_spill_num_descs;
+ 
+@@ -558,9 +577,9 @@ int replenish_freein_fifos(void)
+ 					max_descs_pqueue) ?
+ 					num_descs_per_jumboq :
+ 					max_descs_pqueue;
+-			else 
++			else
+ 				continue;
+-				
++
+ 			rv = nlm_replenish_per_cpu_buffer(node, nae_cfg,
+ 				i, num_descs);
+ 		}
+@@ -796,7 +815,7 @@ static int get_hw_frfifo_queue_id(int rxnode, nlm_nae_config_ptr nae_cfg,
+ 	qid = cpu_2_normal_frfifo[rxnode][node_cpu];
+ 
+ 	if (enable_jumbo)
+-		if(truesize > NLM_RX_JUMBO_BUF_SIZE) 
++		if(truesize > NLM_RX_JUMBO_BUF_SIZE)
+ 			qid = cpu_2_jumbo_frfifo[rxnode][node_cpu];
+ 	/*
+ 	 * all the nodes vfbtable should be filled with starting node of
+@@ -823,7 +842,7 @@ int mac_refill_frin_skb(int node, int cpu, uint64_t paddr,
+ 	qid = (bufsize >= NLM_RX_JUMBO_BUF_SIZE) ?
+ 		cpu_2_jumbo_frfifo[node][node_cpu] :
+ 		cpu_2_normal_frfifo[node][node_cpu];
+-	
++
+ 	nae_cfg = nlm_node_cfg.nae_cfg[node];
+ 	if (nae_cfg == NULL) {
+ 		printk("%s Error, Invalid node id %d\n", __FUNCTION__, node);
+@@ -859,8 +878,8 @@ int mac_refill_frin_one_buffer(struct net_device *dev, int cpu,
+ 	int buf_size = NLM_RX_ETH_BUF_SIZE;
+ 
+ 	if (enable_jumbo)
+-		if(truesize > NLM_RX_JUMBO_BUF_SIZE) 
+-			buf_size = NLM_RX_JUMBO_BUF_SIZE; 
++		if(truesize > NLM_RX_JUMBO_BUF_SIZE)
++			buf_size = NLM_RX_JUMBO_BUF_SIZE;
+ 
+ 	skb = nlm_xlp_alloc_skb_atomic(buf_size, priv->node);
+ 	if (!skb) {
+@@ -1208,7 +1227,7 @@ static const struct net_device_ops nlm_xlp_nae_ops = {
+ 	.ndo_select_queue		= nlm_select_queue,
+ };
+ 
+-static int nlm_per_port_nae_init(int node, int port, 
++static int nlm_per_port_nae_init(int node, int port,
+ 			  nlm_nae_config_ptr nae_cfg, int maxnae)
+ {
+ 	struct net_device *dev;
+@@ -1243,6 +1262,7 @@ static int nlm_per_port_nae_init(int node, int port,
+ 	priv->node 	= node;
+ 	priv->block	= nae_cfg->ports[port].hw_port_id / 4;
+ 	priv->type	= nae_cfg->ports[port].iftype;
++	priv->mgmt_port	= nae_cfg->ports[port].mgmt;
+ 
+ 	switch(nae_cfg->ports[port].iftype) {
+ 	case SGMII_IF:
+@@ -1298,18 +1318,18 @@ static int nlm_per_port_nae_init(int node, int port,
+ 		 priv->cycles.read = nlm_1588_read_clock3;
+ 
+ 	priv->cycles.mask = CLOCKSOURCE_MASK(64);
+-	
++
+ 	if (is_nlm_xlp3xx() || is_nlm_xlp2xx())
+ 		priv->cycles.mult = 1000 / XLP3XX_MAX_NAE_FREQUENCY; /* Mhz */
+ 	else
+ 		priv->cycles.mult = 0x2; /*500 Mhz*/
+-	
+-	priv->cycles.shift = 0; 
++
++	priv->cycles.shift = 0;
+ 
+ 	timecounter_init(&priv->clock, &priv->cycles,
+ 		ktime_to_ns(ktime_get_real()));
+-	
+-	memset(&priv->compare, 0, sizeof(priv->compare)); 	 
++
++	memset(&priv->compare, 0, sizeof(priv->compare));
+ 	priv->compare.source = &priv->clock;
+ 	priv->compare.target = ktime_get_real;
+ 	/* no cyclecounter registered: cannot afford more samples */
+@@ -1360,7 +1380,7 @@ void nlm_xlp_nae_init(void)
+ 	if (initialize_nae(phys_cpu_map, perf_mode, &enable_jumbo))
+ 		return;
+ 
+-	maxnae = nlm_node_cfg.num_nodes;	
++	maxnae = nlm_node_cfg.num_nodes;
+ 	for (node = 0; node < maxnae; node++) {
+ 		nae_cfg = nlm_node_cfg.nae_cfg[node];
+ 		if (nae_cfg == NULL)
+@@ -1368,7 +1388,7 @@ void nlm_xlp_nae_init(void)
+ 
+ 		for(i = 0; i < nae_cfg->num_ports; i++)
+ 			nlm_per_port_nae_init(node, i, nae_cfg, maxnae);
+-		
++
+ 		nlm_hal_1588_ptp_clk_sel(node, NET_SYS_CLK);
+ 		nlm_hal_reset_1588_accum(node);
+ 		nlm_hal_1588_ld_user_val(node, 0, 0);
+@@ -1401,6 +1421,26 @@ void nlm_xlp_nae_init(void)
+ 		nlm_spawn_kthread();
+ 	}
+ 
++#ifdef CONFIG_NLM_ENABLE_LOAD_BALANCING
++	if (perf_mode == NLM_TCP_MODE)
++		nlm_prepad_len = PREPAD_LEN;
++#elif defined(IEEE_1588_PTP_ENABLED)
++	nlm_prepad_len = PREPAD_LEN;
++#endif
++
++#ifdef CONFIG_NLM_ENABLE_LOAD_BALANCING
++	if (perf_mode == NLM_TCP_MODE) {
++		entry = create_proc_entry(
++				"load_info",
++				0,		/* def mode */
++				nlm_root_proc	/* parent   */
++				);
++		if (entry)
++			entry->proc_fops = &nlm_load_balance_proc_fops;
++		nlm_init_load_balance();
++	}
++#endif
++
+ 	if (replenish_freein_fifos() != 0)
+ 		printk("Replenishmemt of freein fifos failed\n");
+ 
+diff --git a/drivers/net/ethernet/broadcom/nae/xlpge_rx.c b/drivers/net/ethernet/broadcom/nae/xlpge_rx.c
+index e4c043e..7b3cec6 100644
+--- a/drivers/net/ethernet/broadcom/nae/xlpge_rx.c
++++ b/drivers/net/ethernet/broadcom/nae/xlpge_rx.c
+@@ -42,6 +42,15 @@
+ 
+ #include "xlpge.h"
+ 
++#ifdef CONFIG_NLM_ENABLE_LOAD_BALANCING
++static struct flow_meta_info *nlm_flow_meta_info;
++static struct active_flow_list *nlm_active_flow_list;
++static struct timer_list nlm_load_balance_timer[NR_CPUS];
++static int nlm_load_balance_search_cpu[NUM_LOAD_BALANCE_CPU][NUM_LOAD_BALANCE_CPU-1];
++static uint32_t nlm_pcpu_mask = 0;
++static uint32_t *ucore_shared_data = NULL;
++#endif
++
+ uint64_t receive_count[NR_CPUS * 8] __cacheline_aligned;
+ 
+ inline void process_tx_complete(int cpu, uint32_t src_id, uint64_t msg0)
+@@ -94,6 +103,473 @@ inline void process_tx_complete(int cpu, uint32_t src_id, uint64_t msg0)
+         }
+ }
+ 
++#ifdef CONFIG_NLM_ENABLE_LOAD_BALANCING
++
++static void dump_cpu_active_flow_info(int cpu, struct seq_file *m, int weight)
++{
++	struct active_flow_list *afl = nlm_active_flow_list + cpu;
++	ulong mflags;
++
++	if (!nlm_active_flow_list || !nlm_flow_meta_info)
++		return;
++
++	spin_lock_irqsave(&afl->lock, mflags);
++	seq_printf(m, "Cpu%d ==> WeightInUcore %d ActiveFlows %llu, "
++		      "FlowCreated %llu, FlowProcessed %llu\n", cpu, weight,
++			(unsigned long long)afl->nr_active_flows,
++			(unsigned long long)afl->nr_flow_created,
++			(unsigned long long)afl->nr_flow_processed);
++	afl->nr_flow_created = 0;
++	afl->nr_flow_processed = 0;
++	spin_unlock_irqrestore(&afl->lock, mflags);
++	return;
++}
++
++static int nlm_dump_load_balance_stats(struct seq_file *m, void *v)
++{
++	uint32_t cpu_weight[32] = {0};
++	int i = 0;
++
++	if (!nlm_active_flow_list || !nlm_flow_meta_info)
++		return 0;
++
++	for (i = 0; i < NLM_UCORE_SHARED_TABLE_SIZE; i++)
++		cpu_weight[*(ucore_shared_data + i)]++;
++
++	for (i = 0; i < NUM_LOAD_BALANCE_CPU; i++) {
++		if (!cpu_isset(i, phys_cpu_present_map))
++			continue;
++		dump_cpu_active_flow_info(i, m,
++			cpu_weight[__cpu_number_map[i]]);
++	}
++	return 0;
++}
++
++int nlm_load_balance_proc_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, nlm_dump_load_balance_stats, NULL);
++}
++
++static void nlm_remove_inactive_flow(int cpu)
++{
++	struct active_flow_list *afl = nlm_active_flow_list + cpu;
++	struct flow_meta_info *fmi;
++	uint64_t bytes_received;
++	ulong mflags;
++	int index;
++	int i = 0, j = 0;
++
++	spin_lock_irqsave(&afl->lock, mflags);
++	for (i = 0; i < afl->nr_active_flows; i++) {
++		index = afl->index_to_flow_meta_info[i];
++		fmi = nlm_flow_meta_info + index;
++#ifdef LOAD_BALANCE_DEBUG_ENABLE
++		if (index > NLM_UCORE_SHARED_TABLE_SIZE)
++			printk("??? Index %d\n",index);
++#endif
++		bytes_received = fmi->total_bytes_rcvd - fmi->last_sample_bytes;
++		fmi->last_sample_bytes = fmi->total_bytes_rcvd;
++		mb();
++		if (bytes_received == 0) {
++#ifdef LOAD_BALANCE_DEBUG_ENABLE
++			if (fmi->cpu_owner != cpu) {
++				printk("Error!! fmi->cpu_owner = %lld, cpu %d, "
++					"entry %d, total_active_flows %lld\n",
++					fmi->cpu_owner, cpu, i,
++					afl->nr_active_flows);
++				continue;
++			}
++#endif
++			/*No Packet Received on this flow!!! Delete the entry */
++			if (i + 1 < afl->nr_active_flows) {
++				j = afl->nr_active_flows - 1;
++				/*Copy the last valid map to here..*/
++				afl->index_to_flow_meta_info[i] =
++					afl->index_to_flow_meta_info[j];
++				afl->index_to_flow_meta_info[j] = 0;
++			} else
++				afl->index_to_flow_meta_info[i] = 0;
++
++			i--;
++			afl->nr_active_flows--;
++			afl->nr_flow_processed++;
++			fmi->cpu_owner = -1;
++			mb();
++			continue;
++		}
++		mb();
++	}
++	spin_unlock_irqrestore(&afl->lock, mflags);
++}
++
++static void setup_search_path(void)
++{
++	uint32_t pcpu;
++	int i = 0;
++	int thrds[4] = {0, 1, 2, 3};
++	int core;
++	int previous, next;
++	int index = 0;
++	int num_phy_cpu=0;
++	int previous_core, next_core;
++#ifdef LOAD_BALANCE_DEBUG_ENABLE
++	int j;
++	uchar buf[256];
++#endif
++
++	for (i = 0; i < NUM_LOAD_BALANCE_CPU; i++) {
++		if (!cpu_isset(i, phys_cpu_present_map))
++			continue;
++		nlm_pcpu_mask |= (1UL << i);
++		num_phy_cpu++;
++	}
++#ifdef LOAD_BALANCE_DEBUG_ENABLE
++	printk("num_phy_cpu %d, nlm_pcpu_mask %#x\n",
++		num_phy_cpu, nlm_pcpu_mask);
++#endif
++	for (pcpu = 0; pcpu < NUM_LOAD_BALANCE_CPU; pcpu++) {
++		if(!((1U<<pcpu) & nlm_pcpu_mask))
++			continue;
++
++		core = pcpu / 4;
++		index = 0;
++		for (i = 0; i < 3; i++) {
++			nlm_load_balance_search_cpu[pcpu][index] =
++				thrds[(pcpu + i + 1) % 4] + core * 4;
++			if(((1U << nlm_load_balance_search_cpu[pcpu][index])
++				& nlm_pcpu_mask))
++				index++;
++		}
++		if (core >= 1)
++			previous = (core - 1) * 4;
++		else
++			previous = 28;
++		previous_core = previous / 4;
++
++		if (core < 7)
++			next = (core+1)*4;
++		else
++			next = 0;
++		next_core = next / 4;
++
++		while (index < (num_phy_cpu - 1)) {
++			if ((0xfU << previous) & nlm_pcpu_mask) {
++				for (i = 0; i < 4; i++) {
++					if ((1UL<<(i+previous) &
++						nlm_pcpu_mask)) {
++						nlm_load_balance_search_cpu[pcpu][index] =
++							i + previous;
++						index++;
++					}
++				}
++			}
++			if ((previous_core) >= 1)
++				previous = (previous_core - 1) * 4;
++			else
++				previous = 28;
++			previous_core = previous / 4;
++			if ((0xfU << next) & nlm_pcpu_mask) {
++				for (i = 0; i < 4; i++) {
++					if ((1UL << (i + next)) & nlm_pcpu_mask) {
++						nlm_load_balance_search_cpu[pcpu][index] =
++							i + next;
++						index++;
++					}
++				}
++			}
++			if (next_core < 7)
++				next = (next_core + 1) * 4;
++			else
++				next = 0;
++			next_core = next / 4;
++		}
++	}
++#ifdef LOAD_BALANCE_DEBUG_ENABLE
++	printk("\nSearchPath:\n");
++	for (i = 0; i < NUM_LOAD_BALANCE_CPU; i++) {
++		int len;
++		sprintf(buf, "Cpu%d ==> ", i);
++		len = strlen(buf);
++		for (j = 0; j < NUM_LOAD_BALANCE_CPU - 1; j++) {
++			sprintf(buf + len, "%2d ",
++				nlm_load_balance_search_cpu[i][j]);
++			len = strlen(buf);
++		}
++		sprintf(buf + len,"\n");
++		printk(buf);
++	}
++#endif
++	return;
++}
++
++static void nlm_load_balance_timer_func(unsigned long arg)
++{
++	int cpu = hard_smp_processor_id();
++	struct active_flow_list *myafl = nlm_active_flow_list + cpu;
++	struct active_flow_list *afl = NULL;
++	struct flow_meta_info *fmi;
++	ulong mflags;
++	int idx_to_fmi;
++	int lcpu;
++	int i = 0, j, k;
++
++	/*Remove inactive flows.*/
++	nlm_remove_inactive_flow(cpu);
++
++	/*Check if there is a `threshold %` of diff in load between us and any other cpus. If so
++	borrow few flows from it.
++	*/
++	for (i = 0; i < (NUM_LOAD_BALANCE_CPU - 1); i++) {
++		if (!cpu_isset(i, phys_cpu_present_map))
++			continue;
++		afl = nlm_active_flow_list +
++			nlm_load_balance_search_cpu[cpu][i];
++		Message("Checking for CPU %d\n",
++			nlm_load_balance_search_cpu[cpu][i]);
++
++		if(afl->nr_active_flows <= 1)
++			continue;
++
++		if(myafl->nr_active_flows < (afl->nr_active_flows - 1)) {
++			/*Borrow a flow from this cpu*/
++			Message("NR_ACTIVE_FLOWS %ld", afl->nr_active_flows);
++
++restart:
++			spin_lock_irqsave(&afl->lock, mflags);
++			for (j = 0; j < afl->nr_active_flows; j++) {
++				fmi = nlm_flow_meta_info +
++					afl->index_to_flow_meta_info[j];
++
++				if(myafl->nr_active_flows >=
++					(afl->nr_active_flows - 1))
++					break;
++
++				if (fmi->cpu_owner !=
++					nlm_load_balance_search_cpu[cpu][i]) {
++					spin_unlock_irqrestore(&afl->lock, mflags);
++					Message("Flow is borrowed by cpu %lld\n",
++						fmi->cpu_owner);
++					goto restart;
++				}
++				/*Borrow a flow...*/
++				fmi->cpu_owner = cpu;
++				idx_to_fmi = afl->index_to_flow_meta_info[j];
++				/* Update the active flow list of the cpu from
++				 * which we just borrowed the flow.
++				 */
++				if (j + 1 < afl->nr_active_flows) {
++					k = afl->nr_active_flows - 1;
++					/*Copy the last valid map to here..*/
++					afl->index_to_flow_meta_info[j] = 
++						afl->index_to_flow_meta_info[k];
++					afl->index_to_flow_meta_info[k] = 0;
++				} else
++					afl->index_to_flow_meta_info[j] = 0;
++				j--;
++				afl->nr_active_flows--;
++				spin_unlock_irqrestore(&afl->lock, mflags);
++
++				spin_lock_irqsave(&myafl->lock, mflags);
++				/* Create a new entry for this FMI in 
++				 * ACTIVE_FLOW_LIST. Change the u-core shared
++				 * memroy once all data structures are in place.
++				 */
++				k = myafl->nr_active_flows;
++				myafl->index_to_flow_meta_info[k] = idx_to_fmi;
++				myafl->nr_active_flows++;
++				mb();
++				spin_unlock_irqrestore(&myafl->lock, mflags);
++
++				/*Update ucore shared memory*/
++				lcpu = __cpu_number_map[cpu];
++				nlm_hal_modify_nae_ucore_sram_mem(0, 0, &lcpu,
++					NLM_UCORE_SHMEM_OFFSET +
++					(idx_to_fmi * 4), 1);
++				*(ucore_shared_data + idx_to_fmi) = 
++					__cpu_number_map[cpu];
++
++				spin_lock_irqsave(&afl->lock, mflags);
++			}
++			spin_unlock_irqrestore(&afl->lock, mflags);
++		}
++	}
++	if (!myafl->nr_active_flows)
++		mod_timer(&nlm_load_balance_timer[cpu], jiffies + 50);
++	else
++		mod_timer(&nlm_load_balance_timer[cpu],
++			jiffies + load_balance_timer_run * HZ);
++}
++
++void nlm_init_load_balance(void)
++{
++	uint32_t signature;
++	int i = 0, j = 0;
++
++	nlm_active_flow_list = vmalloc(sizeof(struct active_flow_list) *
++		NUM_LOAD_BALANCE_CPU);
++
++	if (!nlm_active_flow_list) {
++	printk("\nAllocation Failed!!! for size %lu bytes\n",
++		sizeof(struct active_flow_list) * NUM_LOAD_BALANCE_CPU);
++		return;
++	}
++	memset(nlm_active_flow_list, 0, sizeof(struct active_flow_list) *
++		NUM_LOAD_BALANCE_CPU);
++#ifdef LOAD_BALANCE_DEBUG_ENABLE
++	printk("Allocated active_flow_list @ %#lx, size %lu bytes\n",
++		(unsigned long)nlm_active_flow_list,
++		sizeof(struct active_flow_list) * NUM_LOAD_BALANCE_CPU);
++#endif 
++	nlm_flow_meta_info = vmalloc(sizeof(struct flow_meta_info) *
++		(NLM_UCORE_SHARED_TABLE_SIZE + 1));
++
++	if (!nlm_flow_meta_info) {
++		printk("\nAllocation Failed!!! for size %lu bytes\n",
++			sizeof(struct flow_meta_info) * NUM_LOAD_BALANCE_CPU);
++		return;
++	}
++	memset(nlm_flow_meta_info, 0, sizeof(struct flow_meta_info) *
++		(NLM_UCORE_SHARED_TABLE_SIZE + 1));
++#ifdef LOAD_BALANCE_DEBUG_ENABLE
++	printk("Allocated flow_meta_info @ %#lx, size %lu bytes\n",
++		(ulong)nlm_flow_meta_info, sizeof(struct flow_meta_info) *
++		(NLM_UCORE_SHARED_TABLE_SIZE + 1));
++#endif 
++
++	/*Init per cpu flow lock*/
++	for (i = 0; i < NUM_LOAD_BALANCE_CPU; i++)
++		spin_lock_init(&((nlm_active_flow_list + i)->lock));
++
++	/*Set owner field to -1*/
++	for (i = 0; i < NLM_UCORE_SHARED_TABLE_SIZE; i++)
++		(nlm_flow_meta_info+i)->cpu_owner = -1;
++
++	for (i = 0, j = 0; i < NUM_LOAD_BALANCE_CPU; i++) {
++		if (!cpu_isset(i, phys_cpu_present_map))
++			continue;
++		/* Register a timer for each cpu to calculate the flow rate */
++		setup_timer(&nlm_load_balance_timer[i],
++			nlm_load_balance_timer_func, i);
++		nlm_load_balance_timer[i].expires = jiffies + 5 * HZ;
++		add_timer_on(&nlm_load_balance_timer[i], j++);
++	}
++
++	setup_search_path();
++	/*Update ucore shared memory with the table*/
++	ucore_shared_data = vmalloc(NLM_UCORE_SHARED_TABLE_SIZE *
++		sizeof(uint32_t));
++	if (!ucore_shared_data) {
++		printk("Ucore updation failed!!\n");
++		return;
++	}
++
++	for (i = 0; i < NLM_UCORE_SHARED_TABLE_SIZE; ) {
++		for(j = 0; j < NUM_LOAD_BALANCE_CPU && 
++			i < NLM_UCORE_SHARED_TABLE_SIZE; j++) {
++			if (nlm_pcpu_mask & (1U << j)) {
++				*(ucore_shared_data + i) = __cpu_number_map[j];
++				i++;
++			}
++		}
++	}
++	nlm_hal_modify_nae_ucore_sram_mem(0, 0, ucore_shared_data,
++		NLM_UCORE_SHMEM_OFFSET, NLM_UCORE_SHARED_TABLE_SIZE);
++	mb();
++	signature = 0xdeadbeefU;
++	nlm_hal_modify_nae_ucore_sram_mem(0, 0, &signature,
++		NLM_UCORE_SHMEM_OFFSET - 4, 1);
++}
++
++#ifdef LOAD_BALANCE_DEBUG_ENABLE
++static void dump_packet(unsigned char *vaddr, int len)
++{
++	int i = 0;
++	for (i = 0; i < len; i+=8) {
++		printk("[%#x] [%#x] [%#x] [%#x] [%#x] [%#x] [%#x] [%#x]\n",
++			*(vaddr + i + 0), *(vaddr + i + 1), *(vaddr + i + 2),
++			*(vaddr + i + 3), *(vaddr + i + 4), *(vaddr + i + 5),
++			*(vaddr + i + 6), *(vaddr + i + 7));
++	}
++}
++
++static void dump_prepad(unsigned char *vaddr)
++{
++	unsigned int *tmp = (unsigned int *)vaddr;
++	int i = 0;
++
++	if (*tmp == 0xdeadbeef) {
++		for(i = 0; i < 4; i++)
++			printk("[%d] ==> [%#x]\n", i, *(tmp + i));
++	} else {
++#if 1
++	for (i = 0; i < 16; i+=8){
++		printk("[%#x] [%#x] [%#x] [%#x] [%#x] [%#x] [%#x] [%#x]\n",
++			*(vaddr + i + 0), *(vaddr + i + 1), *(vaddr + i + 2),
++			*(vaddr + i + 3), *(vaddr + i + 4), *(vaddr + i + 5),
++			*(vaddr + i + 6), *(vaddr + i + 7));
++	}
++#endif
++	}
++}
++#endif
++
++static inline void nlm_update_flow_stats(unsigned int *prepad,
++					 uint32_t len, uint32_t context)
++{
++	int cpu = hard_smp_processor_id();
++	struct active_flow_list *afl = nlm_active_flow_list + cpu;
++	struct flow_meta_info *fmi;
++	uint64_t index;
++	ulong mflags;
++	int hash_index;
++
++	if (perf_mode != NLM_TCP_MODE)
++		return;
++
++	if (*prepad != NLM_LOAD_BALANCING_MAGIC) {
++		/*No extractions have happend...*/
++#ifdef LOAD_BALANCE_DEBUG_ENABLE
++		printk("Invalid Packet!!\n");
++		dump_packet(prepad, 64 + 16);
++#endif
++		return;
++	}
++
++	hash_index = *(prepad + 1);
++	fmi = nlm_flow_meta_info + hash_index;
++
++	if (unlikely(fmi->cpu_owner == -1)) {
++		/*New flow, Create an entry in active flow list*/
++		local_irq_save(mflags);
++		if (!spin_trylock(&afl->lock)) {
++			local_irq_restore(mflags);
++			return;
++		}
++		if (fmi->cpu_owner != -1) {
++			spin_unlock(&afl->lock);
++			local_irq_restore(mflags);
++			return; 
++		}
++		fmi->cpu_owner = cpu;
++		index = afl->nr_active_flows;
++#ifdef LOAD_BALANCE_DEBUG_ENABLE
++		if (index >= NLM_UCORE_SHARED_TABLE_SIZE)
++			printk("Index %lld Crossing Table size...\n", index);
++#endif
++		afl->index_to_flow_meta_info[index] = hash_index;
++		mb();
++		afl->nr_active_flows++;
++		afl->nr_flow_created++;
++		spin_unlock(&afl->lock);
++		local_irq_restore(mflags);
++	}
++	fmi->total_bytes_rcvd += len;
++	mb();
++	return;
++}
++
++#endif
++
+ static inline void process_rx_packets(int cpu, unsigned int src_id, 
+ 		unsigned long long msg0, unsigned long long msg1)
+ {
+@@ -158,7 +634,7 @@ static inline void process_rx_packets(int cpu, unsigned int src_id,
+ 
+ 	vaddr = (uint64_t)(unsigned long)bus_to_virt(addr);
+ 	
+-	len = len  - ETH_FCS_LEN - PREPAD_LEN;
++	len = len  - ETH_FCS_LEN - nlm_prepad_len;
+ 
+ 	skb = mac_get_skb_back_ptr(vaddr);
+ 
+@@ -182,7 +658,11 @@ static inline void process_rx_packets(int cpu, unsigned int src_id,
+ 	memset(shhwtstamps, 0, sizeof(*shhwtstamps));
+ 	shhwtstamps->hwtstamp = ns_to_ktime(ns);
+ 	shhwtstamps->syststamp = timecompare_transform(&priv->compare, ns);
+-	skb_reserve(skb, PREPAD_LEN);
++	skb_reserve(skb, nlm_prepad_len);
++#elif defined(CONFIG_NLM_ENABLE_LOAD_BALANCING)
++	if (!priv->mgmt_port)
++		nlm_update_flow_stats((unsigned int *)vaddr, len, context);
++	skb_reserve(skb, nlm_prepad_len);
+ #endif
+ 
+ 	if (priv->index == XGMAC)
+diff --git a/drivers/net/ethernet/broadcom/nae/xlpge_tso.c b/drivers/net/ethernet/broadcom/nae/xlpge_tso.c
+index 580058d..93cf493 100644
+--- a/drivers/net/ethernet/broadcom/nae/xlpge_tso.c
++++ b/drivers/net/ethernet/broadcom/nae/xlpge_tso.c
+@@ -100,7 +100,7 @@ inline int tso_xmit_skb(struct sk_buff *skb, struct net_device *dev)
+ 		SOCK_TIMESTAMPING_TX_HARDWARE);
+ #endif
+ 	uint32_t msec_port, send_msec = 0, msec_bypass = 0;
+-	uint32_t pad_len, icv_len, param_index = 0;
++	uint32_t pad_len = 0, icv_len = 0, param_index = 0;
+ 
+ #ifdef MACSEC_DEBUG
+ 	printk("nae_cfg->sectag_offset = %d sectag_len = %d icv_len = %d\n",
+-- 
+1.7.1
+

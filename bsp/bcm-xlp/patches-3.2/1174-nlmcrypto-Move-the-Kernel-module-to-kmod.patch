@@ -1,0 +1,891 @@
+From ddf83f4acb5f3ff55d00e589743d512c588aea74 Mon Sep 17 00:00:00 2001
+From: Subhendu Sekhar Behera <sbehera@broadcom.com>
+Date: Wed, 21 Aug 2013 16:54:01 +0530
+Subject: nlmcrypto: Move the Kernel module to kmod.
+
+[Based on SDK 3.2]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+Signed-off-by: Nam Ninh <nam.ninh@windriver.com>
+
+diff --git a/drivers/misc/netlogic/nlmcrypto/cryptodrv.c b/drivers/misc/netlogic/nlmcrypto/cryptodrv.c
+new file mode 100644
+index 0000000..431753e
+--- /dev/null
++++ b/drivers/misc/netlogic/nlmcrypto/cryptodrv.c
+@@ -0,0 +1,624 @@
++/*-
++ * Copyright 2003-2012 Broadcom Corporation
++ *
++ * This is a derived work from software originally provided by the entity or
++ * entities identified below. The licensing terms, warranty terms and other
++ * terms specified in the header of the original work apply to this derived work
++ *
++ * #BRCM_1# */
++
++/* This software is available to you under the terms of the GNU General Public
++ * License (GPL) Version 2, available from the file 
++ * http://www.gnu.org/licenses/gpl-2.0.txt
++*/
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/spinlock.h>
++#include <linux/proc_fs.h>
++#include <linux/eventfd.h>
++#include <linux/module.h>
++#include <linux/sched.h>
++#include <asm-generic/current.h>
++#include <linux/moduleparam.h>
++#include <asm/time.h>
++#include <nlm_hal.h>
++#include <nlm_hal_macros.h>
++#include <nlm_hal_xlp_dev.h>
++#include <nlm_xlp.h>
++#include  "cryptosoc_ctx.h"
++#include "cryptodev.h"
++
++//#define Message(x, args...) printk(x, ##args)
++#define Message(x, args...) { }
++
++extern int register_xlp_msgring_handler(int major,
++			     void (*action) (uint32_t, uint32_t, uint32_t, uint32_t,
++					     uint64_t, uint64_t, uint64_t, uint64_t, void *),
++			     void *dev_id);
++extern int unregister_xlp_msgring_handler(int major, void *dev_id);
++extern int nlm_sae_init(void *fdt, struct nlm_sae_init_param *p);
++extern int nlm_rsa_init(void *fdt, struct nlm_rsa_init_param *p);
++extern int sae_rx_vc, sae_rx_sync_vc;
++extern void *fdt;
++
++//#define DBG_ALLOC 1
++#ifdef DBG_ALLOC
++static atomic_t nallocs = { 0 };
++#define DBG_NALLOCS_INC(x) atomic_inc(x);
++#define DBG_NALLOCS_DEC(x) atomic_dec(x);
++#else
++#define DBG_NALLOCS_INC(x)
++#define DBG_NALLOCS_DEC(x)
++#endif
++
++static int crypto_driver_major;
++static atomic_t nfiles_opened = { 0 };
++
++/* */
++struct file_priv_data {
++	struct hlist_head       hctxt;
++	spinlock_t		hlock;
++};
++
++/* Pages for handling the msgring responses to the userspace apps */
++static struct page *page_ptr[NLM_CRYPTO_MAX_CTXT_PAGES];
++static unsigned int page_refcnt[NLM_CRYPTO_MAX_CTXT_PAGES];
++struct hlist_head   pctxt_head[NLM_CRYPTO_MAX_CTXT_PAGES];
++static int rsp_desc_page_order = 2;
++static int num_rsp_descs_per_page = 0;
++static spinlock_t plock;
++static unsigned long page_size = 0;
++static unsigned long long page_alloc_map = 0x0ULL;
++static unsigned long long pctxt_full_map = 0x0ULL;
++static atomic_t sessionid = { 0 };
++#define PAGE_INVALID ((struct page *)0x01)
++
++/* called with lock held */
++static inline int get_page_free_index(void)
++{	
++	int i;
++	i = cryptosoc_get_lbc64(page_alloc_map);
++	return i;
++}
++
++static inline int get_pctxt_free_index(void)
++{	
++	int i;
++	i = cryptosoc_get_lbc64(pctxt_full_map);
++	return i;
++}
++
++#define GET_PAGE_INDEX(idx) (idx / num_rsp_descs_per_page)
++
++static inline struct cryptosoc_rsp *get_rsp_from_index(unsigned int index, int from_intr)
++{
++	struct page *page;
++	int page_idx;
++	struct cryptosoc_rsp *rsp = NULL;
++	unsigned long flags;
++
++	page_idx = GET_PAGE_INDEX(index);
++
++	if(page_idx >= NLM_CRYPTO_MAX_CTXT_PAGES)
++		return NULL;
++
++	Message("%s in, index %d pidx %d page %lx\n", __FUNCTION__,
++			index, page_idx, (unsigned long)page_address(page_ptr[page_idx]));
++
++	spin_lock_irqsave(&plock, flags);
++	if((page = page_ptr[page_idx])) {
++		index = index % num_rsp_descs_per_page;
++		rsp = (struct cryptosoc_rsp *)((unsigned long)page_address(page) + 
++			(index * sizeof(struct cryptosoc_rsp)));
++
++		if(from_intr) 
++			atomic_inc(&rsp->used_by_intr);
++	}
++	spin_unlock_irqrestore(&plock, flags);
++	return rsp;
++}
++
++static inline struct cryptosoc_rsp *_alloc_rsp_desc(struct file_priv_data *fpriv, struct hlist_node *node)
++{
++	struct cryptosoc_rsp *rsp;
++	rsp = ( struct cryptosoc_rsp *) ((unsigned long)node -
++			((unsigned long)(&((struct cryptosoc_rsp *)0)->priv_data)));
++	/* allocated  */
++	rsp->allocated = 1;
++	rsp->owner = current->pid;
++
++	/* Add the entry in the file list */
++	spin_lock(&fpriv->hlock);
++	INIT_HLIST_NODE(node);
++	hlist_add_head(node, &fpriv->hctxt);
++	spin_unlock(&fpriv->hlock);
++
++	Message("%s out, rsp %lx sessionid %d index %d\n", 
++		__FUNCTION__, (unsigned long)rsp, rsp->sessionid, rsp->index);
++
++	return rsp;
++}
++
++static struct cryptosoc_rsp *create_new_rsp_desc(struct file_priv_data *fpriv)
++{
++	unsigned int idx;
++	struct cryptosoc_rsp *rsp ;
++	struct hlist_node *node;
++	unsigned int page_idx, i;
++	struct page *page = NULL;
++	struct hlist_head thead = { 0 };
++	unsigned long flags;
++
++recheck:
++	spin_lock_irqsave(&plock, flags);
++	page_idx = get_page_free_index();
++	if(!page_idx) {
++		spin_unlock_irqrestore(&plock, flags);
++		return NULL;
++	}
++	spin_unlock_irqrestore(&plock, flags);
++
++	/* subtract one for the array/bitmap index */
++	page_idx--;
++	
++	page = alloc_pages(GFP_KERNEL, rsp_desc_page_order);
++	if(!page){
++		printk("Error : Couldn't allocate pages for order %d!! \n", rsp_desc_page_order);
++		page_ptr[page_idx] = NULL;
++		return NULL;
++	}
++
++	if(!page_size)
++		page_size = PAGE_SIZE * (1 << rsp_desc_page_order);
++
++	if(!num_rsp_descs_per_page)
++		num_rsp_descs_per_page = page_size / sizeof(struct cryptosoc_rsp);
++	
++	idx = page_idx * num_rsp_descs_per_page;
++	rsp = (struct cryptosoc_rsp *)page_address(page);
++	
++	Message("%s in, pidx %d nrsps %d idx %d page %lx\n", 
++		__FUNCTION__, page_idx, num_rsp_descs_per_page, idx, (unsigned long)rsp);
++	
++	for(i = 0; i < num_rsp_descs_per_page; i++, rsp++) {
++		rsp->nrcvd = 0;
++		rsp->index = idx++;
++		rsp->sessionid = atomic_inc_return(&sessionid);
++		rsp->allocated = 0;
++		atomic_set(&rsp->used_by_intr, 0);
++		rsp->fdctxt = 0;
++		node = (struct hlist_node *)rsp->priv_data;
++		INIT_HLIST_NODE(node);
++		hlist_add_head(node, &thead);
++	}
++	
++	/* if already allocated by some one */
++	spin_lock_irqsave(&plock,flags);
++	if(!page_ptr[page_idx]) {
++		page_ptr[page_idx] = page;
++		pctxt_head[page_idx].first = thead.first;
++		thead.first->pprev = &pctxt_head[page_idx].first;
++		DBG_NALLOCS_INC(&nallocs);
++		page_alloc_map |= (1ULL << page_idx);
++		page = NULL;
++	}
++	
++	if(hlist_empty(&pctxt_head[page_idx])) {
++		spin_unlock_irqrestore(&plock, flags);
++		if(page)
++			free_pages((unsigned long)page_address(page), rsp_desc_page_order); 
++		goto recheck;
++	}
++
++	node = pctxt_head[page_idx].first;
++	__hlist_del(node);
++	if(hlist_empty(&pctxt_head[page_idx])) 
++		pctxt_full_map |= (1ULL << page_idx);
++
++	page_refcnt[page_idx]++;
++	spin_unlock_irqrestore(&plock, flags);
++
++	return _alloc_rsp_desc(fpriv, node);
++}
++
++static struct cryptosoc_rsp *alloc_rsp_desc(struct file_priv_data *fpriv)
++{
++	struct hlist_node *node;
++	unsigned long flags;
++	unsigned int page_idx;
++
++	Message("%s in page_alloc_map %llx pctxt_full_map %llx\n", __FUNCTION__,
++			page_alloc_map, pctxt_full_map);
++
++	/* Remove the entry from the main page list */
++	spin_lock_irqsave(&plock, flags);
++	/* if all are full */
++	page_idx = get_pctxt_free_index();
++	if(!page_idx) {
++		spin_unlock_irqrestore(&plock, flags);
++		return NULL;
++	}
++
++	/* subtract one for the array/bitmap index */
++	page_idx--;
++
++	/* if not been allocated */
++	if(page_ptr[page_idx] == NULL) {
++		spin_unlock_irqrestore(&plock, flags);
++		return create_new_rsp_desc(fpriv);
++	}		
++
++	node = pctxt_head[page_idx].first;
++	__hlist_del(node);
++	if(hlist_empty(&pctxt_head[page_idx])) 
++		pctxt_full_map |= (1ULL << page_idx);
++
++	page_refcnt[page_idx]++;
++	spin_unlock_irqrestore(&plock, flags);
++	
++	return _alloc_rsp_desc(fpriv, node);
++}
++
++static void free_rsp_desc(struct file_priv_data *fpriv, unsigned int index, int forced)
++{
++	struct hlist_node *node;
++	int page_idx;
++	struct page *page;
++	struct cryptosoc_rsp *rsp;
++	unsigned long flags;
++
++	Message("%s in index %d\n", __FUNCTION__, index);
++	
++	if(!(rsp = get_rsp_from_index(index , 0))) {
++		printk("%s in, Error, invalid index %d\n", __FUNCTION__, index);
++		return;
++	}
++	
++	Message("%s rsp %lx allocated %d intr %d\n", __FUNCTION__, 
++		(unsigned long)rsp, rsp->allocated, atomic_read(&rsp->used_by_intr));
++
++	/* Only owner can delete the context */
++	if(!forced && (rsp->owner != current->pid))
++		return;
++	
++	if(!rsp->allocated) {
++		printk("%s in, Error, invalid rsp %lx index %d\n", __FUNCTION__, (unsigned long)rsp, index);
++		return;
++	}
++
++	/* if it is used by the intr */
++check_again:
++	spin_lock_irqsave(&plock, flags);
++	if(atomic_read(&rsp->used_by_intr)) {
++		spin_unlock_irqrestore(&plock, flags);
++		schedule_timeout(1);
++		goto check_again;
++	}
++	spin_unlock_irqrestore(&plock, flags);
++		
++	spin_lock(&fpriv->hlock);
++	node = (struct hlist_node *)rsp->priv_data;
++	__hlist_del(node);
++	spin_unlock(&fpriv->hlock);
++
++	if(rsp->fdctxt) {
++		eventfd_ctx_put((struct eventfd_ctx *)rsp->fdctxt);
++		DBG_NALLOCS_DEC(&nallocs);
++	}
++
++ 	page_idx = GET_PAGE_INDEX(rsp->index);
++	page = page_ptr[page_idx];
++
++	spin_lock_irqsave(&plock, flags);
++	page_refcnt[page_idx]--;
++	if(!page_refcnt[page_idx]) {
++		page_ptr[page_idx] = NULL;
++		page_alloc_map &= ~(1ULL << page_idx);
++	} else {
++		page = NULL;
++		INIT_HLIST_NODE(node);
++		rsp->nrcvd = 0;
++		rsp->allocated = 0;
++		rsp->sessionid = atomic_inc_return(&sessionid);
++		hlist_add_head(node, &pctxt_head[page_idx]);
++	}
++	pctxt_full_map &= (~(1ULL << page_idx));
++	spin_unlock_irqrestore(&plock, flags);
++
++	if(page) {
++		free_pages((unsigned long)page_address(page), rsp_desc_page_order); 
++		DBG_NALLOCS_DEC(&nallocs);
++	}
++
++	Message("%s, rsp %lx allocated %d sessionid %d index %d\n", 
++		__FUNCTION__, (unsigned long)rsp, rsp->allocated, rsp->sessionid, rsp->index);
++
++}
++
++static int crypto_driver_open(struct inode *inode, struct file *filp)
++{
++	filp->private_data = kmalloc(sizeof(struct file_priv_data), GFP_KERNEL);
++	if(filp->private_data == NULL) {
++		printk("Error : no mem in %s\n", __FUNCTION__);
++		return -1;
++	}
++	memset(filp->private_data, 0, sizeof(struct file_priv_data));
++	atomic_inc(&nfiles_opened);
++	DBG_NALLOCS_INC(&nallocs);
++	return 0;
++}
++
++static long crypto_driver_ioctl(struct file *filp, unsigned int cmd,
++		   unsigned long arg)
++{
++	struct file_priv_data *fpriv = filp->private_data;
++	int err = 0;
++
++	Message("%s %d, cmd %x, type %d size %d num %d\n", 
++		__FUNCTION__, __LINE__, cmd, _IOC_TYPE(cmd), _IOC_SIZE(cmd), _IOC_NR(cmd));
++	switch (cmd) {
++		case NLM_CRYPTO_CTXT_ALLOC :
++		{
++			struct cryptosoc_rsp *rsp;
++			struct page *page = NULL;
++			uint64_t *ptr = (uint64_t *) arg;
++			unsigned long long paddr, off, fd, page_idx;
++			unsigned long fdctxt;
++
++			copy_from_user(&fd, ptr, sizeof(*ptr));
++
++			rsp = alloc_rsp_desc(fpriv);
++			if(rsp == NULL) {
++				printk("Error : Couldn't allocate rsp!! \n");
++				return -1;
++			}
++
++			page_idx = GET_PAGE_INDEX(rsp->index);
++			page = page_ptr[page_idx];
++			paddr = page_to_phys(page);
++
++			fdctxt = (unsigned long )eventfd_ctx_fdget(fd);
++			if(fdctxt == 0ULL) {
++				free_rsp_desc(fpriv, rsp->index, 0);
++				return -1;
++			}
++			DBG_NALLOCS_INC(&nallocs);
++
++			rsp->fdctxt = fdctxt;
++			off = (unsigned long)rsp - (unsigned long)page_address(page);
++			copy_to_user(ptr + 0, &paddr, sizeof(*ptr));
++			copy_to_user(ptr + 1, &page_size, sizeof(*ptr));
++			copy_to_user(ptr + 2, &page_idx, sizeof(*ptr));
++			copy_to_user(ptr + 3, &off, sizeof(*ptr));
++			break;
++		}
++		case NLM_CRYPTO_CTXT_FREE :
++		{
++			uint64_t *ptr = (uint64_t *) arg;
++			uint64_t index;
++
++			copy_from_user(&index, ptr, sizeof(*ptr));
++			free_rsp_desc(fpriv, index, 0);
++			break;
++		}
++		case NLM_CRYPTO_GET_RX_VC_NUMS:
++		{
++			uint32_t *ptr = (uint32_t *) arg;
++			copy_to_user((ptr), &sae_rx_vc, sizeof(sae_rx_vc));
++			copy_to_user((ptr + 1), &sae_rx_sync_vc, sizeof(sae_rx_sync_vc));
++			break;
++		}
++#if 0
++		case NLM_CRYPTO_GET_COMMON_SHM_ADDR_SZ :
++		{
++			uint64_t *ptr = (uint64_t *) arg;
++			copy_to_user((ptr + 1), &common_shm_paddr, sizeof(common_shm_paddr));
++			copy_to_user((ptr + 2), &common_shm_size, sizeof(common_shm_size));
++			break;
++		}
++#endif
++		case NLM_CRYPTO_GET_SAE_VC_NUMS:
++		{
++			uint32_t *ptr = (uint32_t *) arg;
++			int sae_vc_base, sae_vc_lmt;
++
++			nlm_hal_get_crypto_vc_nums(&sae_vc_base, &sae_vc_lmt);
++
++			copy_to_user((ptr), &sae_vc_base, sizeof(sae_vc_base));
++			copy_to_user((ptr+1), &sae_vc_lmt, sizeof(sae_vc_lmt));
++			break;
++		}
++		case NLM_CRYPTO_GET_RSA_VC_NUMS:
++		{
++			uint32_t *ptr = (uint32_t *) arg;
++			int rsa_vc_base, rsa_vc_lmt;
++
++			nlm_hal_get_rsa_vc_nums(&rsa_vc_base, &rsa_vc_lmt);
++
++			copy_to_user((ptr), &rsa_vc_base, sizeof(rsa_vc_base));
++			copy_to_user((ptr+1), &rsa_vc_lmt, sizeof(rsa_vc_lmt));
++			break;
++
++		}
++
++		case NLM_CRYPTO_GET_CHIP_FEATURE:
++		{
++			uint32_t *ptr = (uint32_t *) arg;
++			int nlm_crypto_chip_features;
++
++			nlm_crypto_chip_features = nlm_hal_get_sae_chip_feature();
++			copy_to_user((ptr), &nlm_crypto_chip_features,sizeof(nlm_crypto_chip_features));
++
++			break;
++		}
++
++		default:
++			printk("Invalid cmd in %s\n", __FUNCTION__);
++			err = -EINVAL;
++	}
++	return err;
++}
++
++static long crypto_driver_compat_ioctl(struct file *filp, unsigned int cmd,
++	       			unsigned long arg)
++{
++	int rv;
++	rv = crypto_driver_ioctl(filp, cmd, arg);
++	return rv;
++}
++
++static int crypto_driver_release(struct inode *inode, struct file *filp)
++{
++
++	struct file_priv_data *fpriv = filp->private_data;
++	struct hlist_node *node;
++	struct cryptosoc_rsp *rsp;
++
++	Message("%s in \n", __FUNCTION__);
++	if(fpriv) {
++		while(1) {
++			spin_lock(&fpriv->hlock);
++			if(hlist_empty(&fpriv->hctxt)) {
++				spin_unlock(&fpriv->hlock);
++				break;
++			}
++			node = fpriv->hctxt.first;
++			spin_unlock(&fpriv->hlock);
++			rsp = ( struct cryptosoc_rsp *) ((unsigned long)node -
++					((unsigned long)(&((struct cryptosoc_rsp *)0)->priv_data)));
++			Message("%s Calling for rsp %lx index %d\n", __FUNCTION__, (unsigned long)rsp, rsp->index);
++			free_rsp_desc(fpriv, rsp->index, 1);
++		}
++		atomic_dec(&nfiles_opened);
++		kfree(filp->private_data);
++		filp->private_data = NULL;
++		DBG_NALLOCS_DEC(&nallocs);
++	}
++#ifdef DBG_ALLOC
++	printk("%s (nallocs %d)\n", __FUNCTION__, atomic_read(&nallocs));
++#endif
++	return 0;
++}
++
++struct file_operations crypto_driver_fops = {
++	.open = crypto_driver_open,
++	.unlocked_ioctl = crypto_driver_ioctl,
++	.compat_ioctl = crypto_driver_compat_ioctl,
++	.release = crypto_driver_release,
++};
++
++static void nlm_xlp_sae_msgring_handler(uint32_t vc, uint32_t src_id,
++					uint32_t size, uint32_t code,
++					uint64_t msg0, uint64_t msg1,
++					uint64_t msg2, uint64_t msg3, void* data)
++{
++	unsigned int instance, sessionid, rspindex, genid;
++	unsigned long long fbv, status;
++	struct cryptosoc_rsp *rsp;
++	
++       
++	Message("%s in msg received msg0 %llx msg1 %llx srcid %d\n", __FUNCTION__, 
++			(unsigned long long)msg0, (unsigned long long)msg1, src_id); 
++
++	/* for crypto scratch reg is at msg0 and for rsa scratch reg is at msg1 */
++	if((unsigned long)data == 0)  {
++		status = msg0;
++		fbv = msg1;
++	} else {
++		status = msg1;
++		fbv = msg0;
++	}
++	sessionid = CRYPTOSOC_GET_SESSION_ID(fbv);
++	rspindex = CRYPTOSOC_GET_RSP_ID(fbv);
++	instance = CRYPTOSOC_GET_ASYNC_MSG_OUT_ID(fbv);
++
++	rsp = get_rsp_from_index(rspindex, 1);
++	if(rsp == NULL || (!rsp->allocated) || (instance >= CRYPTOSOC_MAX_PENDING_REQS_PER_CTX)) {
++		printk("%s Error, Invalid response, rsp %lx rind %d instance %d \n", 
++				__FUNCTION__, (unsigned long)rsp, rspindex, instance);
++		goto err;
++	}
++	if(rsp->sessionid != sessionid) {
++		printk("%s Error, Session id does not match(%d, %d)\n",
++			       	__FUNCTION__, rsp->sessionid, sessionid);
++		goto err;
++	}
++
++	genid = CRYPTOSOC_GET_SESSION_ID(rsp->rsp_msg[instance].rsp_val);
++	rsp->rsp_msg[instance].rsp_val = CRYPTOSOC_CTX_RSP_GEN_ID_MODIFY(fbv, genid + 1);
++	rsp->rsp_msg[instance].res_val = status;
++
++	eventfd_signal((struct eventfd_ctx *)rsp->fdctxt, 1);
++err:
++	if(rsp)
++		atomic_dec(&rsp->used_by_intr);
++}
++
++static int __init crypto_driver_init(void)
++{
++	struct nlm_sae_init_param sae_param;
++	struct nlm_rsa_init_param rsa_param;
++
++	if(sae_rx_vc < 0 && sae_rx_sync_vc < 0) {
++		printk("Error, Both sae_rx_vc & sae_rx_sync_vc is not configured\n");
++		return -1;
++	}
++
++	crypto_driver_major = register_chrdev(0, NLM_CRYPTO_DEV_NAME, &crypto_driver_fops);
++	if (crypto_driver_major < 0) {
++		printk("[%s]: Register chrdev failed\n", __FUNCTION__);
++		return crypto_driver_major;
++	}
++	printk("Registered NLM crypto driver character device MAJOR(%d)\n", crypto_driver_major);
++
++	/* TODO , need to check whether this should be part of kernel or not */
++	sae_param.node = 0;
++	sae_param.freq = 500;
++	nlm_sae_init(fdt, &sae_param);
++
++	rsa_param.node = 0;
++	rsa_param.freq = 500;
++	nlm_rsa_init(fdt, &rsa_param);
++
++	if(register_xlp_msgring_handler(XLP_MSG_HANDLE_RSA_ECC, nlm_xlp_sae_msgring_handler, (void *)0))
++	{
++		printk("Error! Can't register msgring handler for sec engine\n");
++		goto out;
++	}
++
++	if(register_xlp_msgring_handler(XLP_MSG_HANDLE_CRYPTO, nlm_xlp_sae_msgring_handler, (void *)1))
++	{
++		printk("Error! Can't register msgring handler for sec engine\n");
++		goto out;
++	}
++	
++	printk("Registered NLM crypto msgring handler\n");
++	return 0;
++out:
++	//free_pages((unsigned long)common_shm_vaddr, common_shm_order);
++	return -1;
++}
++
++static void __exit crypto_driver_exit(void)
++{
++	if(atomic_read(&nfiles_opened) != 0) {
++		printk("Error : Shared resources are not freed, unload failed\n");
++		return;
++	}
++	unregister_chrdev(crypto_driver_major, NLM_CRYPTO_DEV_NAME);
++	unregister_xlp_msgring_handler(XLP_MSG_HANDLE_RSA_ECC, (void *)1);
++	//free_pages((unsigned long)common_shm_vaddr, common_shm_order);
++	return;
++}
++
++module_init(crypto_driver_init);
++module_exit(crypto_driver_exit);
++
++
++MODULE_AUTHOR("Netlogic Microsystems");
++MODULE_DESCRIPTION("Netlogic XLP SAE driver ");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("0.1");
++
++
++
+diff --git a/drivers/misc/netlogic/nlmcrypto/init.c b/drivers/misc/netlogic/nlmcrypto/init.c
+new file mode 100644
+index 0000000..635d91b
+--- /dev/null
++++ b/drivers/misc/netlogic/nlmcrypto/init.c
+@@ -0,0 +1,243 @@
++/*-
++ * Copyright 2003-2012 Broadcom Corporation
++ *
++ * This is a derived work from software originally provided by the entity or
++ * entities identified below. The licensing terms, warranty terms and other
++ * terms specified in the header of the original work apply to this derived work
++ *
++ * #BRCM_1# */
++
++/* This software is available to you under the terms of the GNU General Public
++ * License (GPL) Version 2, available from the file 
++ * http://www.gnu.org/licenses/gpl-2.0.txt
++*/
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/spinlock.h>
++#include <linux/proc_fs.h>
++#include <linux/eventfd.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <asm/time.h>
++#include <nlm_hal_macros.h>
++#include <nlm_hal_xlp_dev.h>
++#include <nlm_hal_fmn.h>
++#include <nlm_hal.h>
++#include <nlm_xlp.h>
++#include <nlm_msgring.h>
++#include "cryptosoc_ctx.h"
++#include "cryptodev.h"
++#include "rsasoc_lib.h"
++#include "rsasoc_ucode.h"
++
++#ifndef NR_VCS_PER_THREAD
++#define NR_VCS_PER_THREAD 4
++#endif
++
++
++
++static volatile int resp = 0;
++extern int register_xlp_msgring_handler(int major,
++			     void (*action) (uint32_t, uint32_t, uint32_t, uint32_t,
++					     uint64_t, uint64_t, uint64_t, uint64_t, void *),
++			     void *dev_id);
++extern int sae_rx_vc, sae_rx_sync_vc;
++
++static void nlm_xlp_sae_msgring_handler(uint32_t vc, uint32_t src_id,
++					uint32_t size, uint32_t code,
++					uint64_t msg0, uint64_t msg1,
++					uint64_t msg2, uint64_t msg3, void* data)
++{
++	int dstvc = (int)msg1;
++	struct rsasoc_rsp_result res;
++
++	if((long)data != 0) {
++		printk("Invalid message from  src_id %d\n", src_id);
++		return;
++	}
++
++	/* printk("SAE msg received from src %d engine %d error %x\n", 
++			src_id, (int)RSA_ENGINE(msg0), (int)RSA_ERROR(msg0)); */
++
++	if(src_id != dstvc) {
++		printk("Error : SAE ucore download to engine %d failed..\n", dstvc); 
++	}
++	res.result = msg0;
++	if(!rsasoc_result_valid(&res)) {
++		printk("Error : SAE ucore download to engine %d failed..\n", dstvc); 
++	}
++
++	resp = 1;
++}
++
++int rsa_init(struct nlm_rsa_init_param *p)
++{
++	uint32_t rx_vc, mycpu, fbvc;
++	unsigned char *src_org = NULL, *dst_org = NULL;
++	unsigned char *src = NULL, *dst = NULL;
++	uint64_t msg0, msg1, rmsg0, rmsg1;
++	uint32_t src_id, code, dstvc, size;
++	int rsa_vc_base = 0, rsa_vc_limit = 0;
++	struct rsasoc_rsp_result res;
++	unsigned long msgrng_flags;
++#ifdef __MIPSEL__
++	int i;
++#endif
++
++	size = sizeof(rsasoc_gen1_ucode_data);
++	src_org = kmalloc(size + XLP_CACHELINE_SIZE, GFP_KERNEL);
++	if(!src_org) {
++		printk("Error, mem allocation failed\n");
++		goto err_exit;
++	}
++
++	dst_org = kmalloc(size + XLP_CACHELINE_SIZE, GFP_KERNEL);
++	if(!dst_org) {
++		printk("Error, mem allocation failed\n");
++		goto err_exit;
++	}
++	
++	src = (unsigned char *)cryptosoc_roundup((unsigned long)src_org, 
++				(unsigned  long)XLP_CACHELINE_SIZE);
++	dst = (unsigned char *)cryptosoc_roundup((unsigned long)dst_org, 
++				(unsigned long)XLP_CACHELINE_SIZE);
++
++	
++#ifdef __MIPSEL__
++	for(i = 0; i < (size / sizeof(uint64_t)); i++) {
++		nlm_rsa_ucode_data[i] = ccpu_to_be64(nlm_rsa_ucode_data[i]);
++	}
++#endif
++	memcpy(src, (unsigned char*)rsasoc_gen1_ucode_data, size);
++	rx_vc = sae_rx_vc >= 0 ? sae_rx_vc : sae_rx_sync_vc;
++
++	printk("%s sae_rx_vc = %d sae_rx_sync_vc %d\n",__FUNCTION__, 
++			sae_rx_vc, sae_rx_sync_vc);
++
++	nlm_hal_get_rsa_vc_nums(&rsa_vc_base, &rsa_vc_limit);
++
++	if(rx_vc == sae_rx_sync_vc) {
++		/* preemption should be disabled, otherwise the rxvc can go wrong if the 
++		   task is scheduled to another cpu */
++		preempt_disable();
++		mycpu = hard_smp_processor_id();
++		msg0 = rsasoc_gen1_form_fmn_entry0(0, 0x70, 0, (uint64_t)virt_to_phys(src));
++		fbvc = rx_vc + (mycpu * NR_VCS_PER_THREAD);
++		msg1 = rsasoc_gen1_form_fmn_entry1(0, 0, fbvc, (uint64_t)virt_to_phys(dst));
++
++
++		for(dstvc = rsa_vc_base; dstvc <= rsa_vc_limit; dstvc++) {
++			if (is_nlm_xlp9xx() ) {
++				if ( dstvc != rsa_vc_base )
++					continue;
++			}
++
++			printk("!!!Ddownloading ucore data to rsa/ecc engine %d. \n", dstvc % rsa_vc_base);
++
++			msgrng_access_enable(msgrng_flags);
++			xlp_message_send_block_fast_3(0, dstvc, msg0, msg1, dstvc);
++			msgrng_access_disable(msgrng_flags);
++cont_recv:
++			msgrng_access_enable(msgrng_flags);
++			while(xlp_message_receive_2(rx_vc, &src_id, &size, &code, &rmsg0, &rmsg1) != 0);
++			msgrng_access_disable(msgrng_flags);
++
++			/*printk("SAE msg received from src %d engine %d error %x\n", 
++				src_id, (int)RSA_ENGINE(msg0), (int)RSA_ERROR(msg0));*/
++			if(src_id < rsa_vc_base || src_id > rsa_vc_limit) {
++			//	printk("Error : SAE msg received from unknown source\n");
++				goto cont_recv;
++			}
++			if(src_id !=  dstvc) {
++				preempt_enable();
++				printk("Error : SAE ucore download to engine-vc %d failed, src_id %d \n", 
++						dstvc, src_id); 
++				goto err_exit;
++			}
++			res.result = rmsg0;
++			if(!rsasoc_result_valid(&res)) {
++				printk("Error : SAE ucore download to engine-vc %d failed\n", dstvc); 
++			}
++		}
++
++		preempt_enable();
++	} else {
++
++		if(register_xlp_msgring_handler(XLP_MSG_HANDLE_RSA_ECC, nlm_xlp_sae_msgring_handler, (void *)0))
++		{
++			printk("Fatal error! Can't register msgring handler for sec engine\n");
++			goto err_exit;
++		}
++
++		if(register_xlp_msgring_handler(XLP_MSG_HANDLE_CRYPTO, nlm_xlp_sae_msgring_handler, (void *)1))
++		{
++			printk("Error! Can't register msgring handler for sec engine\n");
++			goto err_exit;
++		}
++
++
++		mycpu = hard_smp_processor_id();
++		msg0 = rsasoc_gen1_form_fmn_entry0(0, 0x70, 0, (uint64_t)virt_to_phys(src));
++		fbvc = rx_vc + (mycpu * NR_VCS_PER_THREAD);
++		msg1 = rsasoc_gen1_form_fmn_entry1(0, 0, fbvc, (uint64_t)virt_to_phys(dst));
++
++		for(dstvc = rsa_vc_base; dstvc <= rsa_vc_limit; dstvc++) {
++			if (is_nlm_xlp9xx() ) {
++				if ( dstvc != rsa_vc_base )
++					continue;
++			}
++			resp = 0;
++			printk("Downloading ucore data to rsa/ecc engine %d \n", dstvc % rsa_vc_base);
++			msgrng_access_enable(msgrng_flags);
++			xlp_message_send_block_fast_3(0, dstvc, msg0, msg1, dstvc);
++			msgrng_access_disable(msgrng_flags);
++			while(resp == 0);
++		}
++	}
++
++	printk("Downloading ucore data to rsa/ecc engine is done..\n");
++
++	/* configuring the internal scheduler by allocating all statations to all vcs */
++	//nlm_hal_set_rsa_freq(p->node, p->freq);
++	nlm_hal_set_rsa_engine_sel(p->node);
++
++err_exit:
++	if(src_org)
++		kfree(src_org);
++	if(dst_org)
++		kfree(dst_org);
++	return 0;
++}
++
++int nlm_sae_init(void *fdt, struct nlm_sae_init_param *p)
++{
++	uint32_t owner_mask;
++	int dom_id = 0; /* for linux */
++	owner_mask = get_dom_owner_mask(fdt, dom_id, "sae");
++	if (! (owner_mask & (1 << p->node)) ) {
++		printk("SAE init skipped, not owner. mask=%#x.\n", owner_mask);
++		return 0;
++	}
++
++	p->freq = nlm_hal_get_fdt_freq(fdt, NLM_SAE);
++
++	//nlm_hal_set_sae_freq(p->node, p->freq);
++	nlm_hal_set_sae_engine_sel(p->node);
++
++	return 0;
++}
++
++int nlm_rsa_init(void *fdt, struct nlm_rsa_init_param *p)
++{
++	uint32_t owner_mask;
++	int dom_id = 0; /* for linux */
++
++	owner_mask = get_dom_owner_mask(fdt, dom_id, "rsa");
++	if (! (owner_mask & (1 << p->node)) ) {
++		printk("RSA init skipped, not owner. mask=%#x.\n", owner_mask);
++		return 0;
++	}
++	p->freq = nlm_hal_get_fdt_freq(fdt, NLM_RSA);
++	return rsa_init(p);
++}
+-- 
+1.7.1
+

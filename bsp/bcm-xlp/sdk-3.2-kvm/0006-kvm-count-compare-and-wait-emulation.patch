@@ -1,0 +1,946 @@
+From 2015d32f69896b8dcc2aeeadc88c35034a28c848 Mon Sep 17 00:00:00 2001
+From: Ashok Kumar <ashoks@broadcom.com>
+Date: Wed, 8 Apr 2015 12:58:43 -0400
+Subject: kvm: count/compare and wait emulation.
+
+Use hrtimer for count/compare timer emulation
+instead of hw based guest timer to give hypervisor
+the full control of guest timer activity and for proper
+wait instruction emulation.
+
+Signed-off-by: Ashok Kumar <ashoks@broadcom.com>
+Signed-off-by: Nam Ninh <nam.ninh@windriver.com>
+
+diff --git a/arch/mips/include/asm/asmmacro-64.h b/arch/mips/include/asm/asmmacro-64.h
+index f981a40..62e210e 100644
+--- a/arch/mips/include/asm/asmmacro-64.h
++++ b/arch/mips/include/asm/asmmacro-64.h
+@@ -257,15 +257,8 @@
+ 	xor t0, t0, t1
+ 	mtc0    t0, CP0_STATUS
+ 	ehb
+-	/* save gtoffset/count first and then some cycles later, to save guest_cause.
+-	 * some lagging time to cover the cycles, we may potentially have
+-	 * during restore.
+-	 */
++
+ 	LONG_S	k0, THREAD_VM_GUESTCTL1(\thread)
+-	mfc0	k0, $12, 7
+-	LONG_S	k0, THREAD_VM_GTOFFSET(\thread)
+-	mfc0	k0, $9, 0
+-	LONG_S	k0, THREAD_VM_COUNT(\thread)
+ 	mfgc0   k0, $0, 0
+ 	LONG_S  k0, THREAD_VM_GUEST_INDEX(\thread)
+ 	mfgc0   k0, $1, 0
+@@ -302,8 +295,6 @@
+ 	LONG_S  k0, THREAD_VM_GUEST_EIMR(\thread)
+ 	dmfgc0  k0, $10, 0
+ 	LONG_S  k0, THREAD_VM_GUEST_ENTRYHI(\thread)
+-	mfgc0   k0, $11, 0
+-	LONG_S  k0, THREAD_VM_GUEST_COMPARE(\thread)
+ 	mfgc0   k0, $12, 0
+ 	LONG_S  k0, THREAD_VM_GUEST_STATUS(\thread)
+ 	mfgc0   k0, $12, 1
+@@ -347,7 +338,6 @@
+ 	dmfgc0  k0, $4, 3
+ 	LONG_S  k0, THREAD_VM_GUEST_XCONTEXTCONFIG(\thread)
+ 
+-	/* some lagging time between saving gtoffset/count and cause */
+ 	mfgc0   k0, $13, 0
+ 	LONG_S  k0, THREAD_VM_GUEST_CAUSE(\thread)
+ 
+@@ -606,29 +596,15 @@
+ 
+ 	/* avoid interrupt pass through, and restore guest cause */
+ 	LONG_L	v0, THREAD_VM_GUEST_CAUSE(\thread)
+-	ori	v0, v0, 0xfc00
+-	xori	v0, v0, 0xfc00
+-
+-	/* adjust the gtoffset */
+-	LONG_L	k0, THREAD_VM_GTOFFSET(\thread)
+-	LONG_L	k1, THREAD_VM_COUNT(\thread)
+-	daddu	k0, k1
+-	mfc0	k1, $9, 0
+-	dsubu	k0, k1
+-	mtc0	k0, $12, 7
+-
+-	/* Load the guest.compare register, and then restore guest.cause to avoid time interrupt lost */
+-	LONG_L	k0, THREAD_VM_GUEST_COMPARE(\thread)
+-	mtgc0	k0, $11, 0
+ 	mtgc0	v0, $13, 0
+ 
+ 	/* 
+ 	 * cleared EIRR[6:7] since it is not the right way to assert
+-	 * time and performance counter interrupt.
++	 * performance counter interrupt.
+ 	 */
+ 	LONG_L	k0, THREAD_VM_GUEST_EIRR(\thread)
+-	ori	k0, 0xc0
+-	xori	k0, 0xc0
++	ori	k0, 0x40
++	xori	k0, 0x40
+ 	dmtgc0	k0, $9, 6
+ 	60:
+ 	.endm
+diff --git a/arch/mips/include/asm/kvm_host_netl.h b/arch/mips/include/asm/kvm_host_netl.h
+index ae0459d..cd019ea 100644
+--- a/arch/mips/include/asm/kvm_host_netl.h
++++ b/arch/mips/include/asm/kvm_host_netl.h
+@@ -158,6 +158,24 @@ struct kvm_vcpu_arch {
+ 		uint64_t cmd;
+ 		uint64_t args[4];
+ 	}mips_hypcall;
++	struct hrtimer comparecount_timer;
++	/* Count bias from the raw time */
++	uint32_t count_bias;
++	/* Frequency of timer in Hz */
++	uint32_t count_hz;
++	/* Dynamic nanosecond bias (multiple of count_period) to avoid overflow */
++	s64 count_dyn_bias;
++	/* Period of timer tick in ns */
++	u64 count_period;
++	/* shadow copy of compare */
++	uint32_t compare;
++	/* TI state of cause */
++#define TI_SET 0x1
++#define TI_CLEAR 0x2
++	int ti_state;
++	int runnable;
++
++	int last_sched_cpu;
+ };
+ 
+ 
+diff --git a/arch/mips/include/asm/netlogic/kvm_xlp.h b/arch/mips/include/asm/netlogic/kvm_xlp.h
+index 84f54e0..da2b416 100644
+--- a/arch/mips/include/asm/netlogic/kvm_xlp.h
++++ b/arch/mips/include/asm/netlogic/kvm_xlp.h
+@@ -35,6 +35,7 @@
+ #ifndef __ASM_KVM_XLP
+ #define __ASM_KVM_XLP
+ 
++#include <linux/hrtimer.h>
+ #include <asm/branch.h>
+ 
+ /* Maximum # of guest ids supported by hardware */
+@@ -86,6 +87,17 @@ static inline struct kvm_vcpu_arch * kvm_get_vcpu_arch_ext(struct kvm *kvm, unsi
+ 	return NULL;
+ }
+ 
++static inline struct kvm_vcpu * kvm_get_vcpu_ext(struct kvm *kvm, unsigned int cpuid)
++{
++	unsigned int i;
++
++	for (i = 0; i < KVM_MAX_VCPUS; i++) {
++		if ((kvm->vcpus[i]->arch.guest.gpu.guest_ebase & 0x3ff) == cpuid)
++			return kvm->vcpus[i];
++	}
++	return NULL;
++}
++
+ static inline void kvm_get_badinstr(struct pt_regs *regs, unsigned int *badinstr,
+ 	unsigned int *epc_badinstr)
+ {
+@@ -140,4 +152,14 @@ extern void kvm_handle_pcie_io(struct pt_regs *regs, unsigned long write,
+ 	unsigned long address, unsigned long reg_num, uint32_t badinstr,
+ 	uint32_t epc_badinstr);
+ 
++extern uint32_t kvm_mips_read_count(struct kvm_vcpu *vcpu);
++extern void kvm_mips_write_count(struct kvm_vcpu *vcpu, uint32_t count);
++extern void kvm_mips_init_count(struct kvm_vcpu *vcpu);
++extern void kvm_mips_write_compare(struct kvm_vcpu *vcpu, uint32_t compare);
++extern int kvm_mips_emul_wait(struct kvm_vcpu *vcpu);
++extern enum hrtimer_restart kvm_mips_count_timeout(struct kvm_vcpu *vcpu) ;
++extern void kvm_mips_queue_timer_int(struct kvm_vcpu *vcpu);
++extern void kvm_mips_dequeue_timer_int(struct kvm_vcpu *vcpu);
++uint32_t kvm_read_c0_guest_compare(struct kvm_vcpu_arch *arch);
++
+ #endif
+diff --git a/arch/mips/include/asm/stackframe.h b/arch/mips/include/asm/stackframe.h
+index 70eb593..c4ef5f7 100644
+--- a/arch/mips/include/asm/stackframe.h
++++ b/arch/mips/include/asm/stackframe.h
+@@ -146,6 +146,55 @@
+ #endif
+ 
+ #ifdef CONFIG_KVM_NETL
++		.macro KVM_SET_INTR thread
++		/* Check whether we have other pending interrupts or not,
++ 		* assert EIRR bits if needed. EIRR[6:7] should be
++ 		* cleared since it is not the right way to assert
++ 		* performance counter interrupt.
++ 		*/
++		dmfgc0  v1, $9, 6 /* EIRR */
++		ori     v1, 0x40
++		xori    v1, 0x40
++34:
++		lld     k0, VCPU_ARCH_PIP_VECTOR(\thread)
++		or      k0, v1
++		li      k1, 0
++		scd     k1, VCPU_ARCH_PIP_VECTOR(\thread)
++		beqz    k1, 34b
++		nop
++		dmtgc0  k0, $9, 6
++30:		mfgc0	v1, $9, 0
++		ll		k0, VCPU_ARCH_TI_STATE(\thread)
++		li		v0, (1 << 15) | (1 << 30)
++		andi	k1, k0, 0x1
++		beqz	k1, 35f
++		nop
++
++		mtgc0	v1, $11, 0
++		mfgc0	v1, $13, 0
++		or		v1, v1, v0
++		mtgc0	v1, $13, 0
++		li		k1, 0
++		sc		k1, VCPU_ARCH_TI_STATE(\thread)
++		beqz	k1, 30b
++		nop
++
++35:		andi	k1, k0, 0x2
++		beqz	k1, 36f
++		nop
++		mtgc0	v1, $11, 0
++		mfgc0	v1, $13, 0
++		or		v1, v1, v0
++		xor		v1, v1, v0
++		mtgc0	v1, $13, 0
++		li		k1, 0
++		sc		k1, VCPU_ARCH_TI_STATE(\thread)
++		beqz	k1, 30b
++		nop
++36:
++		nop
++		.endm
++
+ 		.macro KVM_SAVE_GUEST
+ 
+ 		/* guestctl1 reg: save the guest id reg, clear guestctl1.rid */
+@@ -203,24 +252,8 @@
+ 		dmfc0   v1, $5, 5
+ 		LONG_S  k1, 0(v1)
+ 		82:
+-		/* Check whether we have other pending interrupts or not,
+- 		* assert EIRR bits if needed. EIRR[6:7] should be
+- 		* cleared since it is not the right way to assert
+- 		* time and performance counter interrupt.
+- 		*/
+-		LONG_L  v0, PT_OSSCRATCH7(sp)
+-		dmfgc0  v1, $9, 6 /* EIRR */
+-		ori     v1, 0xc0
+-		xori    v1, 0xc0
+-
+-		34:
+-		lld     k0, VCPU_ARCH_PIP_VECTOR(v0)
+-		or      k0, v1
+-		li      k1, 0
+-		scd     k1, VCPU_ARCH_PIP_VECTOR(v0)
+-		beqz    k1, 34b
+-
+-		dmtgc0  k0, $9, 6
++		LONG_L  a0, PT_OSSCRATCH7(sp)
++		KVM_SET_INTR a0
+ 		.endm
+ #endif
+ 
+diff --git a/arch/mips/kernel/asm-offsets.c b/arch/mips/kernel/asm-offsets.c
+index 3481322..9d87e62 100644
+--- a/arch/mips/kernel/asm-offsets.c
++++ b/arch/mips/kernel/asm-offsets.c
+@@ -629,6 +629,7 @@ void output_kvm_defines(void)
+ 	OFFSET(VCPU_ARCH_GPA_PGD, kvm_vcpu, arch.gpa_pgd);
+ 	OFFSET(VCPU_KVM, kvm_vcpu, kvm);
+ 	OFFSET(KVM_ARCH_EXIT_REQUEST, kvm, arch.exit_request);
++	OFFSET(VCPU_ARCH_TI_STATE, kvm_vcpu, arch.ti_state);
+ #else
+ 	COMMENT(" KVM/MIPS Specfic offsets. ");
+ 	DEFINE(VCPU_ARCH_SIZE, sizeof(struct kvm_vcpu_arch));
+diff --git a/arch/mips/kvm-netl/context_switch.S b/arch/mips/kvm-netl/context_switch.S
+index ceb683b..4c79e5a 100644
+--- a/arch/mips/kvm-netl/context_switch.S
++++ b/arch/mips/kvm-netl/context_switch.S
+@@ -273,6 +273,8 @@ FEXPORT(__kvm_vcpu_run_guest)
+ 	LONG_L	t0, VCPU_G_R_EPC(a1)
+ 	dmtc0	t0, $14, 0
+ 
++	KVM_SET_INTR a0
++
+ 	/* general purpose registers */
+ 	move	sp, a1
+ 	LONG_L 	$1,  VCPU_G_R1(sp)
+diff --git a/arch/mips/kvm-netl/kvm.c b/arch/mips/kvm-netl/kvm.c
+index 7f6cc67..7145c9a 100644
+--- a/arch/mips/kvm-netl/kvm.c
++++ b/arch/mips/kvm-netl/kvm.c
+@@ -68,10 +68,11 @@
+ #include <linux/bitops.h>
+ #include <linux/spinlock.h>
+ #include <linux/perf_event.h>
++#include <linux/sched.h>
+ 
+ #include <asm/pgalloc.h>
+ #include <asm/mmu_context.h>
+-
++#include <asm/processor.h>
+ #include <asm/netlogic/haldefs.h>
+ #include <asm/netlogic/common.h>
+ #include <asm/netlogic/kvm_xlp.h>
+@@ -367,7 +368,7 @@ static void kvm_set_gpa_pa_map(struct kvm *kvm, struct kvm_userspace_memory_regi
+ 
+ int kvm_arch_vcpu_runnable(struct kvm_vcpu *v)
+ {
+-	return 1;
++	return v->arch.runnable;
+ }
+ 
+ long kvm_arch_vcpu_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+@@ -628,6 +629,73 @@ int kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
++void kvm_mips_queue_timer_int(struct kvm_vcpu *vcpu)
++{
++#if 0
++	if (vcpu->arch.ti_state & TI_CLEAR) {
++		printk ("%s:%d WARN: TI_CLEAR(%#x) is set\n", 
++				__func__, __LINE__, vcpu->arch.ti_state);
++	}
++#endif
++	vcpu->arch.ti_state = TI_SET;
++	vcpu->arch.runnable = 1;
++	//atomic_or_llong(&vcpu->arch.pip_vector, 1ULL << 7);
++	kvm_vcpu_kick(vcpu);
++#if 0
++	printk ("%s:%d cpu:%d cause: %#x eirr: %#lx count: %#x compare: %#x\n",
++			__func__, __LINE__, hard_smp_processor_id(),
++			__read_32bit_guest_c0_register($13, 0),
++			__read_64bit_guest_c0_register($9, 6),
++			__read_32bit_guest_c0_register($9, 0), 
++			__read_32bit_guest_c0_register($11, 0));
++#endif
++
++}
++void kvm_mips_dequeue_timer_int(struct kvm_vcpu *vcpu)
++{
++#if 0
++	if (vcpu->arch.ti_state & TI_SET) {
++		printk ("%s:%d WARN: TI_SET(%#x) is set\n", 
++				__func__, __LINE__, vcpu->arch.ti_state);
++	}
++#endif
++	vcpu->arch.ti_state = TI_CLEAR;
++
++#if 0
++	printk ("%s:%d cause: %#x eirr: %#lx count: %#x compare: %#x\n",
++			__func__, __LINE__, 
++			__read_32bit_guest_c0_register($13, 0),
++			__read_64bit_guest_c0_register($9, 6),
++			__read_32bit_guest_c0_register($9, 0), 
++	  		__read_32bit_guest_c0_register($11, 0));
++#endif
++}
++
++static void kvm_mips_comparecount_func(unsigned long data)
++{
++	struct kvm_vcpu *vcpu = (struct kvm_vcpu *)data;
++
++	kvm_mips_queue_timer_int(vcpu);
++}
++
++static void kvm_mips_migrate_count(struct kvm_vcpu *vcpu)                                
++{                                                                                        
++	if (hrtimer_cancel(&vcpu->arch.comparecount_timer))                                  
++		hrtimer_restart(&vcpu->arch.comparecount_timer);                                 
++}                                                                                        
++
++/*
++ * low level hrtimer wake routine.
++ */
++static enum hrtimer_restart kvm_mips_comparecount_wakeup(struct hrtimer *timer)
++{
++	struct kvm_vcpu *vcpu;
++
++	vcpu = container_of(timer, struct kvm_vcpu, arch.comparecount_timer);
++	kvm_mips_comparecount_func((unsigned long) vcpu);
++	return kvm_mips_count_timeout(vcpu);
++}
++
+ int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
+ {
+ 	vcpu->arch.pip_vector = 0;
+@@ -640,21 +708,35 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
+ #if 0
+ 	printk("Guest vcpu %p initialization\n", vcpu);
+ #endif
++
++    hrtimer_init(&vcpu->arch.comparecount_timer, CLOCK_MONOTONIC,
++             HRTIMER_MODE_REL);
++    vcpu->arch.comparecount_timer.function = kvm_mips_comparecount_wakeup;
++	hrtimer_cancel(&vcpu->arch.comparecount_timer);
++
+ 	return 0;
+ }
+ 
+ void kvm_arch_vcpu_uninit(struct kvm_vcpu *vcpu)
+ {
++	hrtimer_cancel(&vcpu->arch.comparecount_timer);
+ }
+ 
+ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ {
+ 	/* Set the guest ID */
++	if (vcpu->arch.last_sched_cpu != cpu) {
++		kvm_mips_migrate_count(vcpu);
++	}
+ }
+ 
+ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
+ {
++	uint32_t cpu;
++
++	cpu = smp_processor_id();
+ 	/* Nullify the guest ID */
++	vcpu->arch.last_sched_cpu = cpu;
+ }
+ 
+ int kvm_cpu_has_pending_timer(struct kvm_vcpu *vcpu)
+@@ -727,6 +809,8 @@ struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm, unsigned int id)
+ 	if (err)
+ 		goto free_vcpu;
+ 
++	kvm_mips_init_count(vcpu);
++
+ 	return vcpu;
+ 
+ free_vcpu:
+@@ -798,7 +882,7 @@ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
+ 
+ int kvm_arch_vcpu_should_kick(struct kvm_vcpu *vcpu)
+ {
+-	return 0;
++	return 1;
+ }
+ 
+ long kvm_arch_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+diff --git a/arch/mips/netlogic/kvm-netl/Makefile b/arch/mips/netlogic/kvm-netl/Makefile
+index 28ecf29..c108b42 100644
+--- a/arch/mips/netlogic/kvm-netl/Makefile
++++ b/arch/mips/netlogic/kvm-netl/Makefile
+@@ -2,4 +2,4 @@ EXTRA_CFLAGS := -Werror
+ EXTRA_CFLAGS := $(CFLAGS)
+ 
+ obj-y = kvm_traps.o kvm_fault.o kvm_pic.o kvm_sysmgt.o kvm_fuse.o \
+-	kvm_bridge.o kvm_pcie.o kvm_clk.o
++	kvm_bridge.o kvm_pcie.o kvm_clk.o kvm_timer.o
+diff --git a/arch/mips/netlogic/kvm-netl/kvm_pic.c b/arch/mips/netlogic/kvm-netl/kvm_pic.c
+index 4cc63c8..76ff1e7 100644
+--- a/arch/mips/netlogic/kvm-netl/kvm_pic.c
++++ b/arch/mips/netlogic/kvm-netl/kvm_pic.c
+@@ -116,6 +116,7 @@ void kvm_pic_inject_guest(struct kvm_arch *arch, unsigned int irt, struct pt_reg
+ 	unsigned long long irt_entry;
+ 	unsigned int rvec;
+ 	struct kvm_vcpu_arch *vcpu_arch;
++	struct kvm_vcpu *vcpu = (struct kvm_vcpu *)regs->cp0_osscratch7;
+ 
+ 	irt_entry = arch->pic.u.v64[(0x200 >> 1) + irt];
+ 	rvec = (irt_entry >> 24) & 0x3f;
+@@ -124,6 +125,8 @@ void kvm_pic_inject_guest(struct kvm_arch *arch, unsigned int irt, struct pt_reg
+ 	printk("===== Inject IRT %u, RVEC %u to the guest (irt_entry %llx)\n", irt, rvec, irt_entry);
+ #endif
+ 	atomic_or_llong(&vcpu_arch->pip_vector, 1ULL << rvec);
++	vcpu->arch.runnable = 1;
++	kvm_vcpu_kick (vcpu);
+ }
+ 
+ void kvm_pic_inject_guest_ext(struct kvm *kvm, struct kvm_arch *arch, unsigned int irt, unsigned int cpuid)
+@@ -131,6 +134,7 @@ void kvm_pic_inject_guest_ext(struct kvm *kvm, struct kvm_arch *arch, unsigned i
+ 	unsigned long long irt_entry;
+ 	unsigned int rvec;
+ 	struct kvm_vcpu_arch *vcpu_arch;
++	struct kvm_vcpu *vcpu = kvm_get_vcpu_ext(kvm, cpuid);
+ 
+ 	/* FIXME: MSIX in 9XX doesn't use PIC and directly interrupts cpu
+ 	 * using rvec. hacked for now! */
+@@ -144,12 +148,20 @@ void kvm_pic_inject_guest_ext(struct kvm *kvm, struct kvm_arch *arch, unsigned i
+ 		 */
+ 		irt_entry = arch->pic.u.v64[(0x200 >> 1) + irt];
+ 		rvec = (irt_entry >> 24) & 0x3f;
++		if (!(irt_entry & (1 << 22))) {
++#ifdef DEBUG
++			printk (" PIC IRT is not enabled for rvec: %d\n", rvec);
++#endif
++			return;
++		}
+ 	}
+ 	vcpu_arch = kvm_get_vcpu_arch_ext(kvm, cpuid);
+ #ifdef DEBUG
+ 	printk("===== Inject IRT %u, RVEC %u to the guest (irt_entry %llx)\n", irt, rvec, irt_entry);
+ #endif
+ 	atomic_or_llong(&vcpu_arch->pip_vector, 1ULL << rvec);
++	vcpu->arch.runnable = 1;
++	kvm_vcpu_kick (vcpu);
+ }
+ 
+ static unsigned int xlp_kvm_get_ipi_cpuid(uint64_t ipi_ctrl)
+@@ -205,8 +217,12 @@ printk("Sending %s from cpuid %d to cpuid %d\n", (val & (1 << 23)) ? "NMI" : "IP
+ 			if (val & (1 << 23)) {
+ 				vcpu_arch->nmi = 1;
+ 			} else {
++				struct kvm_vcpu *vcpu = kvm_get_vcpu_ext(((struct kvm_vcpu *)
++									  regs->cp0_osscratch7)->kvm, cpuid);
+ 				rvec = (val >> 24) & 0x3f;
+ 				atomic_or_llong(&vcpu_arch->pip_vector, 1ULL << rvec);
++				vcpu_arch->runnable = 1;
++				kvm_vcpu_kick (vcpu);
+ 			}
+ 		} else
+ 			regs->regs[reg_num] = arch->pic.u.v64[rindex >> 1];
+diff --git a/arch/mips/netlogic/kvm-netl/kvm_timer.c b/arch/mips/netlogic/kvm-netl/kvm_timer.c
+new file mode 100644
+index 0000000..b0f3ffc
+--- /dev/null
++++ b/arch/mips/netlogic/kvm-netl/kvm_timer.c
+@@ -0,0 +1,345 @@
++/*
++ * Copyright (c) 2003-2013 Broadcom Corporation
++ * All Rights Reserved
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the Broadcom
++ * license below:
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY BROADCOM ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
++ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL BROADCOM OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
++ * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
++ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
++ * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
++ * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/* Heavily copied from v3.15:arch/mips/kvm/kvm_mips_emul.c */
++
++#include <linux/kernel.h>
++#include <linux/vmalloc.h>
++#include <linux/ptrace.h>
++#include <linux/kvm_host.h>
++#include <linux/delay.h>
++#include <linux/hrtimer.h>
++#include <asm/time.h>
++#include <asm/uaccess.h>
++#include <asm/kvm.h>
++#include <asm/kvm_host.h>
++#include <asm/netlogic/kvm_para.h>
++#include <asm/netlogic/kvm_xlp.h>
++#include <asm/netlogic/mips-extns.h>
++
++uint32_t kvm_read_c0_guest_compare(struct kvm_vcpu_arch *arch)
++{
++	return arch->compare;
++}
++
++static void kvm_write_c0_guest_compare(struct kvm_vcpu_arch *arch, uint32_t compare)
++{
++	arch->compare = compare;
++}
++
++/**
++ * kvm_mips_ktime_to_count() - Scale ktime_t to a 32-bit count.
++ *
++ * Caches the dynamic nanosecond bias in vcpu->arch.count_dyn_bias.
++ *
++ * Assumes guest CP0_Count timer is running.
++ */
++static uint32_t kvm_mips_ktime_to_count(struct kvm_vcpu *vcpu, ktime_t now)
++{
++	s64 now_ns, periods;
++	u64 delta;
++
++	now_ns = ktime_to_ns(now);
++	delta = now_ns + vcpu->arch.count_dyn_bias;
++
++	if (delta >= vcpu->arch.count_period) {
++		/* If delta is out of safe range the bias needs adjusting */
++		periods = div64_s64(now_ns, vcpu->arch.count_period);
++		vcpu->arch.count_dyn_bias = -periods * vcpu->arch.count_period;
++		/* Recalculate delta with new bias */
++		delta = now_ns + vcpu->arch.count_dyn_bias;
++	}
++
++	/*
++	 * We've ensured that:
++	 *   delta < count_period
++	 *
++	 * Therefore the intermediate delta*count_hz will never overflow since
++	 * at the boundary condition:
++	 *   delta = count_period
++	 *   delta = NSEC_PER_SEC * 2^32 / count_hz
++	 *   delta * count_hz = NSEC_PER_SEC * 2^32
++	 */
++	return div_u64(delta * vcpu->arch.count_hz, NSEC_PER_SEC);
++}
++
++/**
++ * kvm_mips_count_time() - Get effective current time.
++ * @vcpu:	Virtual CPU.
++ *
++ * Get effective monotonic ktime. This is usually a straightforward ktime_get(),
++ * except when the master disable bit is set in count_ctl, in which case it is
++ * count_resume, i.e. the time that the count was disabled.
++ *
++ * Returns:	Effective monotonic ktime for CP0_Count.
++ */
++static inline ktime_t kvm_mips_count_time(struct kvm_vcpu *vcpu)
++{
++	return ktime_get();
++}
++
++/**
++ * kvm_mips_count_timeout() - Push timer forward on timeout.
++ * @vcpu:	Virtual CPU.
++ *
++ * Handle an hrtimer event by push the hrtimer forward a period.
++ *
++ * Returns:	The hrtimer_restart value to return to the hrtimer subsystem.
++ */
++enum hrtimer_restart kvm_mips_count_timeout(struct kvm_vcpu *vcpu)
++{
++	/* Add the Count period to the current expiry time */
++	hrtimer_add_expires_ns(&vcpu->arch.comparecount_timer,
++			       vcpu->arch.count_period);
++	return HRTIMER_RESTART;
++}
++
++
++/**
++ * kvm_mips_read_count_running() - Read the current count value as if running.
++ * @vcpu:	Virtual CPU.
++ * @now:	Kernel time to read CP0_Count at.
++ *
++ * Returns the current guest CP0_Count register at time @now and handles if the
++ * timer interrupt is pending and hasn't been handled yet.
++ *
++ * Returns:	The current value of the guest CP0_Count register.
++ */
++static uint32_t kvm_mips_read_count_running(struct kvm_vcpu *vcpu, ktime_t now)
++{
++	ktime_t expires;
++	int running;
++
++	/* Is the hrtimer pending? */
++	expires = hrtimer_get_expires(&vcpu->arch.comparecount_timer);
++	if (ktime_compare(now, expires) >= 0) {
++		/*
++		 * Cancel it while we handle it so there's no chance of
++		 * interference with the timeout handler.
++		 */
++		running = hrtimer_cancel(&vcpu->arch.comparecount_timer);
++
++		/* Nothing should be waiting on the timeout */
++		kvm_mips_queue_timer_int(vcpu);
++
++		/*
++		 * Restart the timer if it was running based on the expiry time
++		 * we read, so that we don't push it back 2 periods.
++		 */
++		if (running) {
++			expires = ktime_add_ns(expires,
++					       vcpu->arch.count_period);
++			hrtimer_start(&vcpu->arch.comparecount_timer, expires,
++				      HRTIMER_MODE_ABS);
++		}
++	}
++
++	/* Return the biased and scaled guest CP0_Count */
++	return vcpu->arch.count_bias + kvm_mips_ktime_to_count(vcpu, now);
++}
++
++/**
++ * kvm_mips_read_count() - Read the current count value.
++ * @vcpu:	Virtual CPU.
++ *
++ * Read the current guest CP0_Count value, taking into account whether the timer
++ * is stopped.
++ *
++ * Returns:	The current guest CP0_Count value.
++ */
++uint32_t kvm_mips_read_count(struct kvm_vcpu *vcpu)
++{
++	return kvm_mips_read_count_running(vcpu, ktime_get());
++}
++
++/**
++ * kvm_mips_freeze_hrtimer() - Safely stop the hrtimer.
++ * @vcpu:	Virtual CPU.
++ * @count:	Output pointer for CP0_Count value at point of freeze.
++ *
++ * Freeze the hrtimer safely and return both the ktime and the CP0_Count value
++ * at the point it was frozen. It is guaranteed that any pending interrupts at
++ * the point it was frozen are handled, and none after that point.
++ *
++ * This is useful where the time/CP0_Count is needed in the calculation of the
++ * new parameters.
++ *
++ * Assumes guest CP0_Count timer is running.
++ *
++ * Returns:	The ktime at the point of freeze.
++ */
++static ktime_t kvm_mips_freeze_hrtimer(struct kvm_vcpu *vcpu,
++				       uint32_t *count)
++{
++	ktime_t now;
++
++	/* stop hrtimer before finding time */
++	hrtimer_cancel(&vcpu->arch.comparecount_timer);
++	now = ktime_get();
++
++	/* find count at this point and handle pending hrtimer */
++	*count = kvm_mips_read_count_running(vcpu, now);
++
++	return now;
++}
++
++
++/**
++ * kvm_mips_resume_hrtimer() - Resume hrtimer, updating expiry.
++ * @vcpu:	Virtual CPU.
++ * @now:	ktime at point of resume.
++ * @count:	CP0_Count at point of resume.
++ *
++ * Resumes the timer and updates the timer expiry based on @now and @count.
++ * This can be used in conjunction with kvm_mips_freeze_timer() when timer
++ * parameters need to be changed.
++ *
++ * It is guaranteed that a timer interrupt immediately after resume will be
++ * handled, but not if CP_Compare is exactly at @count. That case is already
++ * handled by kvm_mips_freeze_timer().
++ *
++ * Assumes guest CP0_Count timer is running.
++ */
++static void kvm_mips_resume_hrtimer(struct kvm_vcpu *vcpu,
++				    ktime_t now, uint32_t count)
++{
++	uint32_t compare;
++	u64 delta;
++	ktime_t expire;
++
++	/* Calculate timeout (wrap 0 to 2^32) */
++	compare = kvm_read_c0_guest_compare(&vcpu->arch);
++	delta = (u64)(uint32_t)(compare - count - 1) + 1;
++	delta = div_u64(delta * NSEC_PER_SEC, vcpu->arch.count_hz);
++	expire = ktime_add_ns(now, delta);
++
++	/* Update hrtimer to use new timeout */
++	hrtimer_cancel(&vcpu->arch.comparecount_timer);
++	hrtimer_start(&vcpu->arch.comparecount_timer, expire, HRTIMER_MODE_ABS);
++}
++
++/**
++ * kvm_mips_update_hrtimer() - Update next expiry time of hrtimer.
++ * @vcpu:	Virtual CPU.
++ *
++ * Recalculates and updates the expiry time of the hrtimer. This can be used
++ * after timer parameters have been altered which do not depend on the time that
++ * the change occurs (in those cases kvm_mips_freeze_hrtimer() and
++ * kvm_mips_resume_hrtimer() are used directly).
++ *
++ * It is guaranteed that no timer interrupts will be lost in the process.
++ *
++ * Assumes guest CP0_Count timer is running.
++ */
++static void kvm_mips_update_hrtimer(struct kvm_vcpu *vcpu)
++{
++	ktime_t now;
++	uint32_t count;
++
++	/*
++	 * freeze_hrtimer takes care of a timer interrupts <= count, and
++	 * resume_hrtimer the hrtimer takes care of a timer interrupts > count.
++	 */
++	now = kvm_mips_freeze_hrtimer(vcpu, &count);
++	kvm_mips_resume_hrtimer(vcpu, now, count);
++}
++
++/**
++ * kvm_mips_write_count() - Modify the count and update timer.
++ * @vcpu:	Virtual CPU.
++ * @count:	Guest CP0_Count value to set.
++ *
++ * Sets the CP0_Count value and updates the timer accordingly.
++ */
++void kvm_mips_write_count(struct kvm_vcpu *vcpu, uint32_t count)
++{
++	ktime_t now;
++
++	/* Calculate bias */
++	now = kvm_mips_count_time(vcpu);
++	vcpu->arch.count_bias = count - kvm_mips_ktime_to_count(vcpu, now);
++
++	/* Update timeout */
++	kvm_mips_resume_hrtimer(vcpu, now, count);
++}
++
++/**
++ * kvm_mips_init_count() - Initialise timer.
++ * @vcpu:	Virtual CPU.
++ *
++ * Initialise the timer to a sensible frequency, namely 100MHz, zero it, and set
++ * it going if it's enabled.
++ */
++void kvm_mips_init_count(struct kvm_vcpu *vcpu)
++{
++	vcpu->arch.count_hz = mips_hpt_frequency;
++	vcpu->arch.count_period = div_u64((u64)NSEC_PER_SEC << 32,
++					  vcpu->arch.count_hz);
++	vcpu->arch.count_dyn_bias = 0;
++
++	/* Starting at 0 */
++	kvm_mips_write_count(vcpu, 0);
++}
++
++/**
++ * kvm_mips_write_compare() - Modify compare and update timer.
++ * @vcpu:	Virtual CPU.
++ * @compare:	New CP0_Compare value.
++ *
++ * Update CP0_Compare to a new value and update the timeout.
++ */
++void kvm_mips_write_compare(struct kvm_vcpu *vcpu, uint32_t compare)
++{
++	/* if unchanged, must just be an ack */
++	if (kvm_read_c0_guest_compare(&vcpu->arch) == compare)
++		return;
++
++	/* Update compare */
++	kvm_write_c0_guest_compare(&vcpu->arch, compare);
++
++	kvm_mips_update_hrtimer(vcpu);
++}
++
++int kvm_mips_emul_wait(struct kvm_vcpu *vcpu)
++{
++
++	if (vcpu->arch.pip_vector == 0) {
++		vcpu->arch.runnable = 0;
++		kvm_vcpu_block(vcpu);
++	}
++
++	return 0;
++}
++
++
+diff --git a/arch/mips/netlogic/kvm-netl/kvm_traps.c b/arch/mips/netlogic/kvm-netl/kvm_traps.c
+index 172242c..7fe7d82 100644
+--- a/arch/mips/netlogic/kvm-netl/kvm_traps.c
++++ b/arch/mips/netlogic/kvm-netl/kvm_traps.c
+@@ -32,10 +32,13 @@
+  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include <linux/kernel.h>
+ #include <linux/vmalloc.h>
+ #include <linux/ptrace.h>
+ #include <linux/kvm_host.h>
++#include <linux/delay.h>
+ 
++#include <asm/time.h>
+ #include <asm/uaccess.h>
+ #include <asm/kvm.h>
+ #include <asm/kvm_host.h>
+@@ -122,12 +125,13 @@ static int gpa_to_hva (struct kvm_vcpu *vcpu, unsigned long gpa_address, unsigne
+ 	return 0;
+ }
+ 
+-
+ /* Guest privileged sensitive instruction */
+ static void process_psi(struct pt_regs *regs)
+ {
+ 	unsigned int badinstr, epc_badinstr;
+ 	unsigned long epc;
++	struct kvm_vcpu *vcpu = (struct kvm_vcpu *)regs->cp0_osscratch7;
++	struct kvm_vcpu_arch *vcpu_arch = kvm_get_vcpu_arch(regs);
+ 
+ 	epc = regs->cp0_epc;
+ 	kvm_get_badinstr(regs, &badinstr, &epc_badinstr);
+@@ -135,10 +139,6 @@ static void process_psi(struct pt_regs *regs)
+ 	if ((badinstr >> 26) == 0x10) {
+ 		/* cop0 */
+ 		if ((badinstr & 0xfe00003f) == 0x42000020) {
+-			struct kvm_vcpu_arch *vcpu_arch;
+-			uint32_t val, cause;
+-
+-			vcpu_arch = kvm_get_vcpu_arch(regs);
+ 			if (vcpu_arch->nmi == 1) {
+ 				regs->cp0_epc = 0xffffffffbfc00000;
+ 				__write_32bit_guest_c0_register($12, 0,
+@@ -147,22 +147,7 @@ static void process_psi(struct pt_regs *regs)
+ 				return;
+ 			}
+ 
+-			/* We do not want to simply bounce back. As for SMT,
+-			 * this will have performance implication.
+-			 */
+-#if 0
+-			__asm__ __volatile__ ("wait" : : : "memory");
+-#else
+-			/* Let us do a tpause here */
+-			/* compare - count */
+-			val = __read_32bit_guest_c0_register($11, 0) -
+-				__read_32bit_guest_c0_register($9,  0);
+-			cause = __read_32bit_guest_c0_register($13, 0);
+-			if (!((cause >> 30) & 0x1) && val > 500) {
+-				write_xlp_pausetime(val - 500);
+-				__asm__ __volatile__ ("tpause" : : : "memory");
+-			}
+-#endif
++			kvm_mips_emul_wait(vcpu);
+ 			return; 
+ 		} else if (((badinstr >> 21) & 0x1f) == 0x0) {
+ 			/* MF */
+@@ -176,6 +161,10 @@ static void process_psi(struct pt_regs *regs)
+ 			else if (rd == 12 && sel == 2) {
+ 				/* srsctl */
+ 				regs->regs[rt] = 0;
++			} else if (rd == 9 && sel == 0) {
++				regs->regs[rt] = kvm_mips_read_count(vcpu);
++			} else if (rd == 11 && sel == 0) {
++				regs->regs[rt] = kvm_read_c0_guest_compare(vcpu_arch);
+ 			} else if (rd == 25 && (sel == 0 || sel == 2 || sel == 4 || sel == 6)) {
+ 				/* perf counter control registers: enable guest use */
+ 				int32_t val = 0;
+@@ -228,8 +217,13 @@ static void process_psi(struct pt_regs *regs)
+ 
+ 			if (rd == 9 && sel == 0) {
+ 				/* count */
+-				unsigned int val = regs->regs[rt] - read_c0_count();
+-				__write_32bit_c0_register($12, 7, val);
++				/* FIXME: should this be allowed?? */
++				//kvm_mips_write_count(vcpu, regs->regs[rt]);
++				;
++			} else if (rd == 11 && sel == 0) {
++				/* compare */
++				kvm_mips_dequeue_timer_int(vcpu);
++				kvm_mips_write_compare(vcpu, regs->regs[rt]);
+ 			} else if (rd == 25 && (sel == 0 || sel == 2 || sel == 4 || sel == 6)) {
+ 				/* perf cnt registers */
+ 				if (sel == 0)
+-- 
+1.7.1
+

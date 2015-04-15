@@ -1,0 +1,400 @@
+From 85fd41a2045908d2deb3d2ee3ed8664b07bd9cd3 Mon Sep 17 00:00:00 2001
+From: Ashok Kumar <ashoks@broadcom.com>
+Date: Wed, 8 Apr 2015 13:02:43 -0400
+Subject: kvm: Add iommu support for vfio-pci.
+
+Signed-off-by: Ashok Kumar <ashoks@broadcom.com>
+Signed-off-by: Nam Ninh <nam.ninh@windriver.com>
+
+diff --git a/arch/mips/kvm-netl/Makefile b/arch/mips/kvm-netl/Makefile
+index 2505b87..b60127d 100644
+--- a/arch/mips/kvm-netl/Makefile
++++ b/arch/mips/kvm-netl/Makefile
+@@ -7,4 +7,4 @@ common-objs = $(addprefix ../../../virt/kvm/, kvm_main.o eventfd.o)
+ 
+ kvm_xlp-y += $(common-objs) kvm.o xlp.o context_switch.o kvm_vhost.o
+ 
+-obj-$(CONFIG_IOMMU_API) += kvm_iommu.o
++obj-$(CONFIG_KVM_NETL) += kvm_iommu.o
+diff --git a/arch/mips/kvm-netl/xlp.c b/arch/mips/kvm-netl/xlp.c
+index 6d8ce5a..7f0c7b3 100644
+--- a/arch/mips/kvm-netl/xlp.c
++++ b/arch/mips/kvm-netl/xlp.c
+@@ -36,6 +36,9 @@
+ #include <linux/kvm_host.h>
+ #include <linux/spinlock.h>
+ #include <linux/hugetlb.h>
++#include <linux/fdtable.h>
++#include <linux/fs.h>
++#include <linux/fs_struct.h>
+ 
+ #include <asm/pgalloc.h>
+ #include <asm/branch.h>
+@@ -414,6 +417,32 @@ void xlp_kvm_init_vm(struct kvm *kvm)
+ 	xlp_kvm_init_fuse(arch);
+ 	xlp_kvm_init_bridge(arch);
+ }
++int kvm_xlp_get_guestid(void)
++{
++	struct files_struct *current_files;
++	struct fdtable *files_table;
++	int i = 0;
++	struct path files_path;
++	char *cwd;
++	char buf[64] = {'\0'};
++	struct kvm *kvm = NULL;
++
++	current_files = current->files;
++	files_table = files_fdtable(current_files);
++
++	while (files_table->fd[i] != NULL) {
++		files_path = files_table->fd[i]->f_path;
++		cwd = d_path(&files_path, buf, sizeof(buf));
++		if (!IS_ERR(cwd) && !strncmp(cwd, "anon_inode:kvm-vm", 17))
++			break;
++		i++;
++	}
++	if (files_table->fd[i]) {
++		kvm = files_table->fd[i]->private_data;
++		return kvm->arch.guest_id;
++	}
++	return -EINVAL;
++}
+ 
+ void kvm_save_guest_context(struct pt_regs *regs, struct kvm_vcpu_guest *guest)
+ {
+diff --git a/drivers/iommu/Kconfig b/drivers/iommu/Kconfig
+index faa8b0a..49d58c0 100644
+--- a/drivers/iommu/Kconfig
++++ b/drivers/iommu/Kconfig
+@@ -263,7 +263,7 @@ config SHMOBILE_IOMMU_L1SIZE
+ 
+ config XLP_IOMMU
+ 	bool "XLP IOMMU Support"
+-	depends on CPU_XLP
++	depends on (CPU_XLP && MIPS_HUGE_TLB_SUPPORT)
+ 	select IOMMU_API
+ 	default y
+ 	help
+diff --git a/drivers/iommu/Makefile b/drivers/iommu/Makefile
+index ef0e520..67e69b1 100644
+--- a/drivers/iommu/Makefile
++++ b/drivers/iommu/Makefile
+@@ -15,3 +15,5 @@ obj-$(CONFIG_TEGRA_IOMMU_SMMU) += tegra-smmu.o
+ obj-$(CONFIG_EXYNOS_IOMMU) += exynos-iommu.o
+ obj-$(CONFIG_SHMOBILE_IOMMU) += shmobile-iommu.o
+ obj-$(CONFIG_SHMOBILE_IPMMU) += shmobile-ipmmu.o
++obj-$(CONFIG_XLP_IOMMU) += xlp-iommu.o
++
+diff --git a/drivers/iommu/xlp-iommu.c b/drivers/iommu/xlp-iommu.c
+new file mode 100644
+index 0000000..d7967f9
+--- /dev/null
++++ b/drivers/iommu/xlp-iommu.c
+@@ -0,0 +1,303 @@
++#include <linux/module.h>
++#include <linux/io.h>
++#include <linux/interrupt.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/pm_runtime.h>
++#include <linux/clk.h>
++#include <linux/err.h>
++#include <linux/mm.h>
++#include <linux/iommu.h>
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/list.h>
++#include <linux/memblock.h>
++#include <linux/export.h>
++#include <linux/pci.h>
++#include <linux/version.h>
++
++#include <asm/cacheflush.h>
++#include <asm/pgtable.h>
++#include <asm/page.h>
++#include <asm/netlogic/xlp-hal/pcibus.h>
++
++/* bitmap of the page sizes currently supported */
++
++#define XLP_IOMMU_PGSIZES      (~(PAGE_SIZE-1))
++
++#define XLP_IOMMU_MAX_ENTRIES 256
++
++#if  LINUX_VERSION_CODE <= KERNEL_VERSION(3, 10, 53)
++/**
++ * list_last_entry - get the last element from a list
++ * @ptr:    the list head to take the element from.
++ * @type:   the type of the struct this is embedded in.
++ * @member: the name of the list_struct within the struct.
++ *
++ * Note, that list is expected to be not empty.
++ */
++#define list_last_entry(ptr, type, member) \
++	list_entry((ptr)->prev, type, member)
++#endif
++
++struct xlp_iommu_map_s {
++	unsigned long long iova;
++	unsigned long long pa;
++	unsigned long size;
++	int prot;
++	struct list_head list;
++};
++
++struct xlp_iommu_priv {
++	struct list_head map_list;
++	int nr_map_entries;
++	int index;
++	int blockid;
++	int guestid;
++};
++
++struct xlp_iommu_hooks_s {
++	void (*config_iommu)(int block_id, int gid, int enable);
++	void (*config_iommu_entries)(int block_id, int gid, uint64_t gpa,
++				     uint64_t pa, uint64_t size);
++	void (*remove_iommu_entries)(int block_id, int gid, uint64_t gpa);
++} xlp_iommu_hooks = {NULL};
++EXPORT_SYMBOL(xlp_iommu_hooks);
++static int xlp_iommu_probe(struct platform_device *pdev)
++{
++	return 0;
++}
++
++static struct platform_driver xlp_iommu_driver = {
++	.probe		= xlp_iommu_probe,
++	.driver		= {
++		.owner	= THIS_MODULE,
++		.name	= "xlp-iommu",
++	}
++};
++
++static int xlp_iommu_domain_init(struct iommu_domain *domain)
++{
++	struct xlp_iommu_priv *priv;
++
++	if (!xlp_iommu_hooks.config_iommu) {
++		pr_crit("kvm_io_manager module is needed\n");
++		return -ENXIO;
++	}
++	domain->priv = kzalloc(sizeof(struct xlp_iommu_priv), GFP_KERNEL);
++	if (!domain->priv)
++		return -ENOMEM;
++	priv = (struct xlp_iommu_priv *)domain->priv;
++	INIT_LIST_HEAD(&priv->map_list);
++	return 0;
++}
++
++static void xlp_iommu_domain_destroy(struct iommu_domain *domain)
++{
++	kfree(domain->priv);
++	return;
++}
++
++static int xlp_iommu_attach_device(struct iommu_domain *domain,
++	struct device *dev)
++{
++	struct pci_dev *lnkdev;
++	struct xlp_iommu_priv *priv = domain->priv;
++	int kvm_xlp_get_guestid(void);
++
++	lnkdev = xlp_get_pcie_link(to_pci_dev(dev));
++	priv->blockid = PCI_FUNC(lnkdev->devfn);
++	priv->guestid = kvm_xlp_get_guestid();
++	if (priv->guestid < 0)
++		return -EINVAL;
++	xlp_iommu_hooks.config_iommu(priv->blockid, priv->guestid, 1);
++
++	return 0;
++}
++
++static void xlp_iommu_detach_device(struct iommu_domain *domain,
++				    struct device *dev)
++{
++	struct list_head *list, *t;
++	struct xlp_iommu_map_s *map;
++	struct xlp_iommu_priv *priv = (struct xlp_iommu_priv *)domain->priv;
++
++	xlp_iommu_hooks.config_iommu(priv->blockid, priv->guestid, 0);
++
++	list_for_each_safe(list, t, &priv->map_list) {
++		map = list_entry(list, struct xlp_iommu_map_s, list);
++		list_del(list);
++		xlp_iommu_hooks.remove_iommu_entries(priv->blockid,
++						     priv->guestid,
++						     map->iova);
++		kfree(map);
++	}
++	priv->nr_map_entries = 0;
++
++	return;
++}
++
++static int xlp_iommu_map(struct iommu_domain *domain, unsigned long iova,
++			 phys_addr_t paddr, size_t size, int prot)
++{
++	struct xlp_iommu_priv *priv = (struct xlp_iommu_priv *)domain->priv;
++	struct list_head *list = &priv->map_list;
++	struct xlp_iommu_map_s *map = list_last_entry(list,
++						      struct xlp_iommu_map_s,
++						      list);
++
++	if (!list_empty(list) && (map->size <= HPAGE_SIZE) &&
++		(map->iova+map->size == iova) &&
++		(map->pa+map->size == paddr)) {
++		map->size += size;
++		if (map->size == HPAGE_SIZE) {
++			pr_debug("iova: %#llx paddr: %#llx size: %#lx prot: %#x\n",
++					map->iova, map->pa, map->size,
++					map->prot);
++			xlp_iommu_hooks.config_iommu_entries(priv->blockid,
++							     priv->guestid,
++							     map->iova,
++							     map->pa,
++							     map->size);
++		}
++	} else {
++		map = kzalloc(sizeof(*map), GFP_KERNEL);
++		if (!map)
++			return -ENOMEM;
++		INIT_LIST_HEAD(&map->list);
++		list_add_tail(&map->list, &priv->map_list);
++		priv->nr_map_entries++;
++		if (priv->nr_map_entries >= XLP_IOMMU_MAX_ENTRIES) {
++			pr_crit("Exceeded max. entries\n");
++			return -ENOSPC;
++		}
++		map->iova = iova;
++		map->pa = paddr;
++		map->size = size;
++		map->prot = prot;
++	}
++	return 0;
++}
++
++static size_t xlp_iommu_unmap(struct iommu_domain *domain,
++	unsigned long iova, size_t size)
++{
++	struct list_head *list, *t;
++	struct xlp_iommu_map_s *map;
++	struct xlp_iommu_priv *priv = (struct xlp_iommu_priv *)domain->priv;
++
++	list_for_each_safe(list, t, &priv->map_list) {
++		map = list_entry(list, struct xlp_iommu_map_s, list);
++		if (map->iova == iova) {
++			size_t size = map->size;
++			list_del(list);
++			xlp_iommu_hooks.remove_iommu_entries(priv->blockid,
++							     priv->guestid,
++							     map->iova);
++			kfree(map);
++			priv->nr_map_entries--;
++			return size;
++		}
++	}
++
++	return 0;
++}
++
++static int xlp_iommu_domain_has_cap(struct iommu_domain *domain,
++	unsigned long cap)
++{
++	return 0;
++}
++
++static phys_addr_t xlp_iommu_iova_to_phys(struct iommu_domain *domain,
++					  dma_addr_t iova)
++{
++	struct list_head *list;
++	struct xlp_iommu_priv *priv = (struct xlp_iommu_priv *)domain->priv;
++
++	list_for_each(list, &priv->map_list) {
++		struct xlp_iommu_map_s *map = list_entry(list, struct xlp_iommu_map_s,
++							 list);
++
++		if ((iova >= map->iova) && (iova < (map->iova+map->size)))
++			return map->pa+(iova-map->iova);
++	}
++
++	return 0;
++}
++
++static int xlp_iommu_add_device(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct pci_dev *dma_pdev = NULL;
++	struct iommu_group *group;
++	int ret;
++
++	dma_pdev = pci_dev_get(pdev);
++	group = iommu_group_get(&dma_pdev->dev);
++	pci_dev_put(dma_pdev);
++	if (!group) {
++		group = iommu_group_alloc();
++		if (IS_ERR(group))
++			return PTR_ERR(group);
++	}
++
++	ret = iommu_group_add_device(group, dev);
++	iommu_group_put(group);
++	return ret;
++}
++
++static void xlp_iommu_remove_device(struct device *dev)
++{
++	iommu_group_remove_device(dev);
++}
++
++static struct iommu_ops xlp_iommu_ops = {
++	.domain_init = &xlp_iommu_domain_init,
++	.domain_destroy = &xlp_iommu_domain_destroy,
++	.attach_dev = &xlp_iommu_attach_device,
++	.detach_dev = &xlp_iommu_detach_device,
++	.map = &xlp_iommu_map,
++	.unmap = &xlp_iommu_unmap,
++	.iova_to_phys = &xlp_iommu_iova_to_phys,
++	.add_device = &xlp_iommu_add_device,
++	.remove_device = &xlp_iommu_remove_device,
++	.domain_has_cap = &xlp_iommu_domain_has_cap,
++	.pgsize_bitmap = XLP_IOMMU_PGSIZES,
++};
++
++static int device_notifier(struct notifier_block *nb, unsigned long action,
++			   void *data)
++{
++	return 0;
++}
++
++static struct notifier_block device_nb = {
++	.notifier_call = device_notifier,
++};
++
++static int __init xlp_iommu_init(void)
++{
++	int ret;
++
++	ret = platform_driver_register(&xlp_iommu_driver);
++	if (ret == 0) {
++		bus_set_iommu(&pci_bus_type, &xlp_iommu_ops);
++		bus_register_notifier(&pci_bus_type, &device_nb);
++	}
++
++	return ret;
++}
++
++static void __exit xlp_iommu_exit(void)
++{
++	platform_driver_unregister(&xlp_iommu_driver);
++}
++
++module_init(xlp_iommu_init);
++module_exit(xlp_iommu_exit);
++
++MODULE_DESCRIPTION("IOMMU API in XLP II");
++MODULE_AUTHOR("Broadcom");
++MODULE_ALIAS("platform:xlp-iommu");
++MODULE_LICENSE("GPL v2");
+-- 
+1.7.1
+
