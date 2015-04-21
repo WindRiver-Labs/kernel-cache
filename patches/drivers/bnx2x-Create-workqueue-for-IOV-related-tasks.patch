@@ -1,0 +1,513 @@
+From 4f536086d51cfc557348b13e94defb5c36698ffa Mon Sep 17 00:00:00 2001
+From: Yuval Mintz <Yuval.Mintz@qlogic.com>
+Date: Sun, 23 Mar 2014 18:12:24 +0200
+Subject: [PATCH 140/192] bnx2x: Create workqueue for IOV related tasks
+
+commit 370d4a26590fcc7510ad4a8432e4982a209f1b59 upstream
+
+The bnx2x sriov mechanisms were done in the bnx2x slowpath workitem which
+runs on the bnx2x's workqueue; This workitem is also responsible for the bottom
+half of interrupt handling in the driver, and specifically it also receives
+FW notifications of ramrod completions, allowing other flows to progress.
+
+The original design of the sriov reltaed-flows was based on the notion such
+flows must not sleep, since their context is the slowpath workitem.
+Otherwise, we might reach timeouts - those flows may wait for ramrod completion
+that will never arrive as the workitem wlll not be re-scheduled until that same
+flow will be over.
+
+In more recent time bnx2x started supporting features in which the VF interface
+can be configured by the tools accessing the PF on the hypervisor.
+This support created possible races on the VF-PF lock (which is taken either
+when the PF is handling a VF message or when the PF is doing some slowpath work
+on behalf of the VF) which may cause timeouts on the VF side and lags on the PF
+side.
+
+This patch changes the scheme - it creates a new workqueue for sriov related
+tasks and moves all handling currently done in the slowpath task into the the
+new workqueue.
+
+Signed-off-by: Yuval Mintz <Yuval.Mintz@qlogic.com>
+Signed-off-by: Ariel Elior <Ariel.Elior@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: chunguang yang <chunguang.yang@windriver.com>
+---
+ drivers/net/ethernet/broadcom/bnx2x/bnx2x.h       |   15 ++-
+ drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c  |   29 ++++---
+ drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c |   41 +++++++-
+ drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.h |   37 +++++---
+ drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c  |  102 ++++++++++++--------
+ 5 files changed, 148 insertions(+), 76 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
+index b3b88af..b36dd19 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
+@@ -1007,10 +1007,6 @@ struct bnx2x_port {
+ 			(offsetof(struct bnx2x_eth_stats, stat_name) / 4)
+ 
+ /* slow path */
+-
+-/* slow path work-queue */
+-extern struct workqueue_struct *bnx2x_wq;
+-
+ #define BNX2X_MAX_NUM_OF_VFS	64
+ #define BNX2X_VF_CID_WND	4 /* log num of queues per VF. HW config. */
+ #define BNX2X_CIDS_PER_VF	(1 << BNX2X_VF_CID_WND)
+@@ -1268,6 +1264,12 @@ enum sp_rtnl_flag {
+ 	BNX2X_SP_RTNL_GET_DRV_VERSION,
+ };
+ 
++enum bnx2x_iov_flag {
++	BNX2X_IOV_HANDLE_VF_MSG,
++	BNX2X_IOV_CONT_VFOP,
++	BNX2X_IOV_HANDLE_FLR,
++};
++
+ struct bnx2x_prev_path_list {
+ 	struct list_head list;
+ 	u8 bus;
+@@ -1465,6 +1467,8 @@ struct bnx2x {
+ 	int			mrrs;
+ 
+ 	struct delayed_work	sp_task;
++	struct delayed_work	iov_task;
++
+ 	atomic_t		interrupt_occurred;
+ 	struct delayed_work	sp_rtnl_task;
+ 
+@@ -1748,6 +1752,9 @@ struct bnx2x {
+ 	/* operation indication for the sp_rtnl task */
+ 	unsigned long				sp_rtnl_state;
+ 
++	/* Indication of the IOV tasks */
++	unsigned long				iov_task_state;
++
+ 	/* DCBX Negotiation results */
+ 	struct dcbx_features			dcbx_local_feat;
+ 	u32					dcbx_error;
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+index e99068e..4f95ad4 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+@@ -120,7 +120,8 @@ static int debug;
+ module_param(debug, int, S_IRUGO);
+ MODULE_PARM_DESC(debug, " Default debug msglevel");
+ 
+-struct workqueue_struct *bnx2x_wq;
++static struct workqueue_struct *bnx2x_wq;
++struct workqueue_struct *bnx2x_iov_wq;
+ 
+ struct bnx2x_mac_vals {
+ 	u32 xmac_addr;
+@@ -1857,7 +1858,7 @@ void bnx2x_sp_event(struct bnx2x_fastpath *fp, union eth_rx_cqe *rr_cqe)
+ 		return;
+ #endif
+ 	/* SRIOV: reschedule any 'in_progress' operations */
+-	bnx2x_iov_sp_event(bp, cid, true);
++	bnx2x_iov_sp_event(bp, cid);
+ 
+ 	smp_mb__before_atomic_inc();
+ 	atomic_inc(&bp->cq_spq_left);
+@@ -4160,7 +4161,8 @@ static void bnx2x_attn_int_deasserted3(struct bnx2x *bp, u32 attn)
+ 				bnx2x_handle_drv_info_req(bp);
+ 
+ 			if (val & DRV_STATUS_VF_DISABLED)
+-				bnx2x_vf_handle_flr_event(bp);
++				bnx2x_schedule_iov_task(bp,
++							BNX2X_IOV_HANDLE_FLR);
+ 
+ 			if ((bp->port.pmf == 0) && (val & DRV_STATUS_PMF))
+ 				bnx2x_pmf_update(bp);
+@@ -5351,8 +5353,8 @@ static void bnx2x_eq_int(struct bnx2x *bp)
+ 		/* handle eq element */
+ 		switch (opcode) {
+ 		case EVENT_RING_OPCODE_VF_PF_CHANNEL:
+-			DP(BNX2X_MSG_IOV, "vf pf channel element on eq\n");
+-			bnx2x_vf_mbx(bp, &elem->message.data.vf_pf_event);
++			bnx2x_vf_mbx_schedule(bp,
++					      &elem->message.data.vf_pf_event);
+ 			continue;
+ 
+ 		case EVENT_RING_OPCODE_STAT_QUERY:
+@@ -5567,13 +5569,6 @@ static void bnx2x_sp_task(struct work_struct *work)
+ 			     le16_to_cpu(bp->def_att_idx), IGU_INT_ENABLE, 1);
+ 	}
+ 
+-	/* must be called after the EQ processing (since eq leads to sriov
+-	 * ramrod completion flows).
+-	 * This flow may have been scheduled by the arrival of a ramrod
+-	 * completion, or by the sriov code rescheduling itself.
+-	 */
+-	bnx2x_iov_sp_task(bp);
+-
+ 	/* afex - poll to check if VIFSET_ACK should be sent to MFW */
+ 	if (test_and_clear_bit(BNX2X_AFEX_PENDING_VIFSET_MCP_ACK,
+ 			       &bp->sp_state)) {
+@@ -8990,6 +8985,7 @@ static int bnx2x_func_wait_started(struct bnx2x *bp)
+ 		synchronize_irq(bp->pdev->irq);
+ 
+ 	flush_workqueue(bnx2x_wq);
++	flush_workqueue(bnx2x_iov_wq);
+ 
+ 	while (bnx2x_func_get_state(bp, &bp->func_obj) !=
+ 				BNX2X_F_STATE_STARTED && tout--)
+@@ -11883,6 +11879,7 @@ static int bnx2x_init_bp(struct bnx2x *bp)
+ 	INIT_DELAYED_WORK(&bp->sp_task, bnx2x_sp_task);
+ 	INIT_DELAYED_WORK(&bp->sp_rtnl_task, bnx2x_sp_rtnl_task);
+ 	INIT_DELAYED_WORK(&bp->period_task, bnx2x_period_task);
++	INIT_DELAYED_WORK(&bp->iov_task, bnx2x_iov_task);
+ 	if (IS_PF(bp)) {
+ 		rc = bnx2x_get_hwinfo(bp);
+ 		if (rc)
+@@ -13505,11 +13502,18 @@ static int __init bnx2x_init(void)
+ 		pr_err("Cannot create workqueue\n");
+ 		return -ENOMEM;
+ 	}
++	bnx2x_iov_wq = create_singlethread_workqueue("bnx2x_iov");
++	if (!bnx2x_iov_wq) {
++		pr_err("Cannot create iov workqueue\n");
++		destroy_workqueue(bnx2x_wq);
++		return -ENOMEM;
++	}
+ 
+ 	ret = pci_register_driver(&bnx2x_pci_driver);
+ 	if (ret) {
+ 		pr_err("Cannot register driver\n");
+ 		destroy_workqueue(bnx2x_wq);
++		destroy_workqueue(bnx2x_iov_wq);
+ 	}
+ 	return ret;
+ }
+@@ -13521,6 +13525,7 @@ static void __exit bnx2x_cleanup(void)
+ 	pci_unregister_driver(&bnx2x_pci_driver);
+ 
+ 	destroy_workqueue(bnx2x_wq);
++	destroy_workqueue(bnx2x_iov_wq);
+ 
+ 	/* Free globally allocated resources */
+ 	list_for_each_safe(pos, q, &bnx2x_prev_list) {
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c
+index 94bfb6c..fc6e235 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.c
+@@ -2042,6 +2042,9 @@ int bnx2x_iov_init_one(struct bnx2x *bp, int int_mode_param,
+ 		goto failed;
+ 	}
+ 
++	/* Prepare the VFs event synchronization mechanism */
++	mutex_init(&bp->vfdb->event_mutex);
++
+ 	return 0;
+ failed:
+ 	DP(BNX2X_MSG_IOV, "Failed err=%d\n", err);
+@@ -2469,7 +2472,7 @@ get_vf:
+ 		return 0;
+ 	}
+ 	/* SRIOV: reschedule any 'in_progress' operations */
+-	bnx2x_iov_sp_event(bp, cid, false);
++	bnx2x_iov_sp_event(bp, cid);
+ 
+ 	return 0;
+ }
+@@ -2506,7 +2509,7 @@ void bnx2x_iov_set_queue_sp_obj(struct bnx2x *bp, int vf_cid,
+ 	}
+ }
+ 
+-void bnx2x_iov_sp_event(struct bnx2x *bp, int vf_cid, bool queue_work)
++void bnx2x_iov_sp_event(struct bnx2x *bp, int vf_cid)
+ {
+ 	struct bnx2x_virtf *vf;
+ 
+@@ -2518,8 +2521,7 @@ void bnx2x_iov_sp_event(struct bnx2x *bp, int vf_cid, bool queue_work)
+ 	if (vf) {
+ 		/* set in_progress flag */
+ 		atomic_set(&vf->op_in_progress, 1);
+-		if (queue_work)
+-			queue_delayed_work(bnx2x_wq, &bp->sp_task, 0);
++		bnx2x_schedule_iov_task(bp, BNX2X_IOV_CONT_VFOP);
+ 	}
+ }
+ 
+@@ -2604,7 +2606,7 @@ void bnx2x_iov_adjust_stats_req(struct bnx2x *bp)
+ 	bp->fw_stats_req->hdr.cmd_num = bp->fw_stats_num + stats_count;
+ }
+ 
+-void bnx2x_iov_sp_task(struct bnx2x *bp)
++void bnx2x_iov_vfop_cont(struct bnx2x *bp)
+ {
+ 	int i;
+ 
+@@ -3875,3 +3877,32 @@ void bnx2x_iov_channel_down(struct bnx2x *bp)
+ 		bnx2x_post_vf_bulletin(bp, vf_idx);
+ 	}
+ }
++
++void bnx2x_iov_task(struct work_struct *work)
++{
++	struct bnx2x *bp = container_of(work, struct bnx2x, iov_task.work);
++
++	if (!netif_running(bp->dev))
++		return;
++
++	if (test_and_clear_bit(BNX2X_IOV_HANDLE_FLR,
++			       &bp->iov_task_state))
++		bnx2x_vf_handle_flr_event(bp);
++
++	if (test_and_clear_bit(BNX2X_IOV_CONT_VFOP,
++			       &bp->iov_task_state))
++		bnx2x_iov_vfop_cont(bp);
++
++	if (test_and_clear_bit(BNX2X_IOV_HANDLE_VF_MSG,
++			       &bp->iov_task_state))
++		bnx2x_vf_mbx(bp);
++}
++
++void bnx2x_schedule_iov_task(struct bnx2x *bp, enum bnx2x_iov_flag flag)
++{
++	smp_mb__before_clear_bit();
++	set_bit(flag, &bp->iov_task_state);
++	smp_mb__after_clear_bit();
++	DP(BNX2X_MSG_IOV, "Scheduling iov task [Flag: %d]\n", flag);
++	queue_delayed_work(bnx2x_iov_wq, &bp->iov_task, 0);
++}
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.h
+index b1dc751..87f7c97 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_sriov.h
+@@ -30,6 +30,8 @@ enum sample_bulletin_result {
+ 
+ #ifdef CONFIG_BNX2X_SRIOV
+ 
++extern struct workqueue_struct *bnx2x_iov_wq;
++
+ /* The bnx2x device structure holds vfdb structure described below.
+  * The VF array is indexed by the relative vfid.
+  */
+@@ -346,11 +348,6 @@ struct bnx2x_vf_mbx {
+ 	u32 vf_addr_hi;
+ 
+ 	struct vfpf_first_tlv first_tlv;	/* saved VF request header */
+-
+-	u8 flags;
+-#define VF_MSG_INPROCESS	0x1	/* failsafe - the FW should prevent
+-					 * more then one pending msg
+-					 */
+ };
+ 
+ struct bnx2x_vf_sp {
+@@ -427,6 +424,10 @@ struct bnx2x_vfdb {
+ 	/* the number of msix vectors belonging to this PF designated for VFs */
+ 	u16 vf_sbs_pool;
+ 	u16 first_vf_igu_entry;
++
++	/* sp_rtnl synchronization */
++	struct mutex			event_mutex;
++	u64				event_occur;
+ };
+ 
+ /* queue access */
+@@ -476,13 +477,14 @@ void bnx2x_iov_init_dq(struct bnx2x *bp);
+ void bnx2x_iov_init_dmae(struct bnx2x *bp);
+ void bnx2x_iov_set_queue_sp_obj(struct bnx2x *bp, int vf_cid,
+ 				struct bnx2x_queue_sp_obj **q_obj);
+-void bnx2x_iov_sp_event(struct bnx2x *bp, int vf_cid, bool queue_work);
++void bnx2x_iov_sp_event(struct bnx2x *bp, int vf_cid);
+ int bnx2x_iov_eq_sp_event(struct bnx2x *bp, union event_ring_elem *elem);
+ void bnx2x_iov_adjust_stats_req(struct bnx2x *bp);
+ void bnx2x_iov_storm_stats_update(struct bnx2x *bp);
+-void bnx2x_iov_sp_task(struct bnx2x *bp);
+ /* global vf mailbox routines */
+-void bnx2x_vf_mbx(struct bnx2x *bp, struct vf_pf_event_data *vfpf_event);
++void bnx2x_vf_mbx(struct bnx2x *bp);
++void bnx2x_vf_mbx_schedule(struct bnx2x *bp,
++			   struct vf_pf_event_data *vfpf_event);
+ void bnx2x_vf_enable_mbx(struct bnx2x *bp, u8 abs_vfid);
+ 
+ /* CORE VF API */
+@@ -520,7 +522,8 @@ enum {
+ 		else {							\
+ 			DP(BNX2X_MSG_IOV, "no ramrod. Scheduling\n");	\
+ 			atomic_set(&vf->op_in_progress, 1);		\
+-			queue_delayed_work(bnx2x_wq, &bp->sp_task, 0);  \
++			bnx2x_schedule_iov_task(bp,			\
++						BNX2X_IOV_CONT_VFOP);	\
+ 			return;						\
+ 		}							\
+ 	} while (0)
+@@ -785,18 +788,21 @@ void bnx2x_pf_set_vfs_vlan(struct bnx2x *bp);
+ int bnx2x_sriov_configure(struct pci_dev *dev, int num_vfs);
+ void bnx2x_iov_channel_down(struct bnx2x *bp);
+ 
++void bnx2x_iov_task(struct work_struct *work);
++
++void bnx2x_schedule_iov_task(struct bnx2x *bp, enum bnx2x_iov_flag flag);
++
+ #else /* CONFIG_BNX2X_SRIOV */
+ 
+ static inline void bnx2x_iov_set_queue_sp_obj(struct bnx2x *bp, int vf_cid,
+ 				struct bnx2x_queue_sp_obj **q_obj) {}
+-static inline void bnx2x_iov_sp_event(struct bnx2x *bp, int vf_cid,
+-				      bool queue_work) {}
++static inline void bnx2x_iov_sp_event(struct bnx2x *bp, int vf_cid) {}
+ static inline void bnx2x_vf_handle_flr_event(struct bnx2x *bp) {}
+ static inline int bnx2x_iov_eq_sp_event(struct bnx2x *bp,
+ 					union event_ring_elem *elem) {return 1; }
+-static inline void bnx2x_iov_sp_task(struct bnx2x *bp) {}
+-static inline void bnx2x_vf_mbx(struct bnx2x *bp,
+-				struct vf_pf_event_data *vfpf_event) {}
++static inline void bnx2x_vf_mbx(struct bnx2x *bp) {}
++static inline void bnx2x_vf_mbx_schedule(struct bnx2x *bp,
++					 struct vf_pf_event_data *vfpf_event) {}
+ static inline int bnx2x_iov_init_ilt(struct bnx2x *bp, u16 line) {return line; }
+ static inline void bnx2x_iov_init_dq(struct bnx2x *bp) {}
+ static inline int bnx2x_iov_alloc_mem(struct bnx2x *bp) {return 0; }
+@@ -843,5 +849,8 @@ static inline void bnx2x_pf_set_vfs_vlan(struct bnx2x *bp) {}
+ static inline int bnx2x_sriov_configure(struct pci_dev *dev, int num_vfs) {return 0; }
+ static inline void bnx2x_iov_channel_down(struct bnx2x *bp) {}
+ 
++static inline void bnx2x_iov_task(struct work_struct *work) {}
++void bnx2x_schedule_iov_task(struct bnx2x *bp, enum bnx2x_iov_flag flag) {}
++
+ #endif /* CONFIG_BNX2X_SRIOV */
+ #endif /* bnx2x_sriov.h */
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c
+index 5b590df..ef44cf3 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c
+@@ -1043,9 +1043,6 @@ static void bnx2x_vf_mbx_resp(struct bnx2x *bp, struct bnx2x_virtf *vf)
+ 	storm_memset_vf_mbx_ack(bp, vf->abs_vfid);
+ 	mmiowb();
+ 
+-	/* initiate dmae to send the response */
+-	mbx->flags &= ~VF_MSG_INPROCESS;
+-
+ 	/* copy the response header including status-done field,
+ 	 * must be last dmae, must be after FW is acked
+ 	 */
+@@ -1967,13 +1964,10 @@ static void bnx2x_vf_mbx_request(struct bnx2x *bp, struct bnx2x_virtf *vf,
+ 	}
+ }
+ 
+-/* handle new vf-pf message */
+-void bnx2x_vf_mbx(struct bnx2x *bp, struct vf_pf_event_data *vfpf_event)
++void bnx2x_vf_mbx_schedule(struct bnx2x *bp,
++			   struct vf_pf_event_data *vfpf_event)
+ {
+-	struct bnx2x_virtf *vf;
+-	struct bnx2x_vf_mbx *mbx;
+ 	u8 vf_idx;
+-	int rc;
+ 
+ 	DP(BNX2X_MSG_IOV,
+ 	   "vf pf event received: vfid %d, address_hi %x, address lo %x",
+@@ -1985,47 +1979,73 @@ void bnx2x_vf_mbx(struct bnx2x *bp, struct vf_pf_event_data *vfpf_event)
+ 	    BNX2X_NR_VIRTFN(bp)) {
+ 		BNX2X_ERR("Illegal vf_id %d max allowed: %d\n",
+ 			  vfpf_event->vf_id, BNX2X_NR_VIRTFN(bp));
+-		goto mbx_done;
++		return;
++
+ 	}
++
+ 	vf_idx = bnx2x_vf_idx_by_abs_fid(bp, vfpf_event->vf_id);
+-	mbx = BP_VF_MBX(bp, vf_idx);
++	/* Update VFDB with current message and schedule its handling */
++	mutex_lock(&BP_VFDB(bp)->event_mutex);
++	BP_VF_MBX(bp, vf_idx)->vf_addr_hi = vfpf_event->msg_addr_hi;
++	BP_VF_MBX(bp, vf_idx)->vf_addr_lo = vfpf_event->msg_addr_lo;
++	BP_VFDB(bp)->event_occur |= (1ULL << vf_idx);
++	mutex_unlock(&BP_VFDB(bp)->event_mutex);
++
++	bnx2x_schedule_iov_task(bp, BNX2X_IOV_HANDLE_VF_MSG);
++}
+ 
+-	/* verify an event is not currently being processed -
+-	 * debug failsafe only
+-	 */
+-	if (mbx->flags & VF_MSG_INPROCESS) {
+-		BNX2X_ERR("Previous message is still being processed, vf_id %d\n",
+-			  vfpf_event->vf_id);
+-		goto mbx_done;
+-	}
+-	vf = BP_VF(bp, vf_idx);
++/* handle new vf-pf messages */
++void bnx2x_vf_mbx(struct bnx2x *bp)
++{
++	struct bnx2x_vfdb *vfdb = BP_VFDB(bp);
++	u64 events;
++	u8 vf_idx;
++	int rc;
++	
++	if (!vfdb)
++		return;
+ 
+-	/* save the VF message address */
+-	mbx->vf_addr_hi = vfpf_event->msg_addr_hi;
+-	mbx->vf_addr_lo = vfpf_event->msg_addr_lo;
+-	DP(BNX2X_MSG_IOV, "mailbox vf address hi 0x%x, lo 0x%x, offset 0x%x\n",
+-	   mbx->vf_addr_hi, mbx->vf_addr_lo, mbx->first_tlv.resp_msg_offset);
++	mutex_lock(&vfdb->event_mutex);
++	events = vfdb->event_occur;
++	vfdb->event_occur = 0;
++	mutex_unlock(&vfdb->event_mutex);
+ 
+-	/* dmae to get the VF request */
+-	rc = bnx2x_copy32_vf_dmae(bp, true, mbx->msg_mapping, vf->abs_vfid,
+-				  mbx->vf_addr_hi, mbx->vf_addr_lo,
+-				  sizeof(union vfpf_tlvs)/4);
+-	if (rc) {
+-		BNX2X_ERR("Failed to copy request VF %d\n", vf->abs_vfid);
+-		goto mbx_error;
+-	}
++	for_each_vf(bp, vf_idx) {
++		struct bnx2x_vf_mbx *mbx = BP_VF_MBX(bp, vf_idx);
++		struct bnx2x_virtf *vf = BP_VF(bp, vf_idx);
+ 
+-	/* process the VF message header */
+-	mbx->first_tlv = mbx->msg->req.first_tlv;
++		/* Handle VFs which have pending events */
++		if (!(events & (1ULL << vf_idx)))
++			continue;
+ 
+-	/* dispatch the request (will prepare the response) */
+-	bnx2x_vf_mbx_request(bp, vf, mbx);
+-	goto mbx_done;
++		DP(BNX2X_MSG_IOV,
++		   "Handling vf pf event vfid %d, address: [%x:%x], resp_offset 0x%x\n",
++		   vf_idx, mbx->vf_addr_hi, mbx->vf_addr_lo,
++		   mbx->first_tlv.resp_msg_offset);
++
++		/* dmae to get the VF request */
++		rc = bnx2x_copy32_vf_dmae(bp, true, mbx->msg_mapping,
++					  vf->abs_vfid, mbx->vf_addr_hi,
++					  mbx->vf_addr_lo,
++					  sizeof(union vfpf_tlvs)/4);
++		if (rc) {
++			BNX2X_ERR("Failed to copy request VF %d\n",
++				  vf->abs_vfid);
++			bnx2x_vf_release(bp, vf, false); /* non blocking */
++			return;
++		}
+ 
+-mbx_error:
+-	bnx2x_vf_release(bp, vf, false); /* non blocking */
+-mbx_done:
+-	return;
++		/* process the VF message header */
++		mbx->first_tlv = mbx->msg->req.first_tlv;
++
++		/* Clean response buffer to refrain from falsely
++		 * seeing chains.
++		 */
++		memset(&mbx->msg->resp, 0, sizeof(union pfvf_tlvs));
++
++		/* dispatch the request (will prepare the response) */
++		bnx2x_vf_mbx_request(bp, vf, mbx);
++	}
+ }
+ 
+ /* propagate local bulletin board to vf */
+-- 
+1.7.5.4
+
