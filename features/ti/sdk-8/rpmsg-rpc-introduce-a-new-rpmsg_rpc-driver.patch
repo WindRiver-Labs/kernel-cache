@@ -1,0 +1,3142 @@
+From 5345108843f9a0e287dba3dfc16f2830ef1d1b69 Mon Sep 17 00:00:00 2001
+From: Suman Anna <s-anna@ti.com>
+Date: Thu, 28 Feb 2013 14:50:10 -0600
+Subject: [PATCH 1074/1587] rpmsg: rpc: introduce a new rpmsg_rpc driver
+
+The new rpmsg client driver, rpmsg_rpc, is introduced to provide a
+framework for userspace applications to execute functions on different
+remote processors.
+
+The functions themselves are published by the remote processors by
+different libraries. Each set of functions are published and supported
+by a corresponding rpmsg server channel, and is exposed to the user-space
+as its own device. User-space applications can open this character device,
+and execute any of the published functions associated with the device.
+
+The rpmsg-rpc driver allows any function upto 10 arguments with in-built
+pointer translation. The kernel-userspace interaction allows any buffer
+pointers to be replaced in the marshalled packet, provided the buffers
+are obtained from allocators backed by dma_buf framework.
+
+Signed-off-by: Suman Anna <s-anna@ti.com>
+Signed-off-by: Erik Rainey <erik.rainey@ti.com>
+[zou: Original patch taken from
+ti-sdk-am335x-evm-08.00.00.00-Linux-x86-Install.bin]
+Signed-off-by: Cao Zou <cao.zou@windriver.com>
+---
+ drivers/rpmsg/Kconfig              |   15 +
+ drivers/rpmsg/Makefile             |    3 +
+ drivers/rpmsg/rpmsg_rpc.c          | 1389 ++++++++++++++++++++++++++++++++++++
+ drivers/rpmsg/rpmsg_rpc_dmabuf.c   |  655 +++++++++++++++++
+ drivers/rpmsg/rpmsg_rpc_internal.h |  416 +++++++++++
+ drivers/rpmsg/rpmsg_rpc_sysfs.c    |  255 +++++++
+ include/linux/rpmsg_rpc.h          |  105 +++
+ include/uapi/linux/rpmsg_rpc.h     |  208 ++++++
+ 8 files changed, 3046 insertions(+), 0 deletions(-)
+ create mode 100644 drivers/rpmsg/rpmsg_rpc.c
+ create mode 100644 drivers/rpmsg/rpmsg_rpc_dmabuf.c
+ create mode 100644 drivers/rpmsg/rpmsg_rpc_internal.h
+ create mode 100644 drivers/rpmsg/rpmsg_rpc_sysfs.c
+ create mode 100644 include/linux/rpmsg_rpc.h
+ create mode 100644 include/uapi/linux/rpmsg_rpc.h
+
+diff --git a/drivers/rpmsg/Kconfig b/drivers/rpmsg/Kconfig
+index 69a2193..1b18619 100644
+--- a/drivers/rpmsg/Kconfig
++++ b/drivers/rpmsg/Kconfig
+@@ -6,4 +6,19 @@ config RPMSG
+ 	select VIRTIO
+ 	select VIRTUALIZATION
+ 
++config RPMSG_RPC
++	tristate "rpmsg Remote Procedure Call driver"
++	default n
++	depends on RPMSG
++	depends on REMOTEPROC
++	depends on OMAP_REMOTEPROC
++	select DMA_SHARED_BUFFER
++	---help---
++	  An rpmsg driver that exposes the Remote Procedure Call API to
++	  user space, in order to allow applications to distribute
++	  remote calls to more power-efficient remote processors. This is
++	  currently available only on OMAP4+ systems.
++
++	  If unsure, say N.
++
+ endmenu
+diff --git a/drivers/rpmsg/Makefile b/drivers/rpmsg/Makefile
+index 7617fcb..74c6703 100644
+--- a/drivers/rpmsg/Makefile
++++ b/drivers/rpmsg/Makefile
+@@ -1 +1,4 @@
+ obj-$(CONFIG_RPMSG)	+= virtio_rpmsg_bus.o
++
++obj-$(CONFIG_RPMSG_RPC)	+= rpmsg-rpc.o
++rpmsg-rpc-y		:= rpmsg_rpc.o rpmsg_rpc_sysfs.o rpmsg_rpc_dmabuf.o
+diff --git a/drivers/rpmsg/rpmsg_rpc.c b/drivers/rpmsg/rpmsg_rpc.c
+new file mode 100644
+index 0000000..e5aeb4d
+--- /dev/null
++++ b/drivers/rpmsg/rpmsg_rpc.c
+@@ -0,0 +1,1389 @@
++/*
++ * Remote Processor Procedure Call Driver
++ *
++ * Copyright(c) 2012-2014 Texas Instruments. All rights reserved.
++ *
++ * Erik Rainey <erik.rainey@ti.com>
++ * Suman Anna <s-anna@ti.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#define pr_fmt(fmt) "%s: " fmt, __func__
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/idr.h>
++#include <linux/poll.h>
++#include <linux/mutex.h>
++#include <linux/sched.h>
++#include <linux/fdtable.h>
++#include <linux/remoteproc.h>
++#include <linux/rpmsg.h>
++#include <linux/rpmsg_rpc.h>
++
++#include "rpmsg_rpc_internal.h"
++
++#define RPPC_MAX_DEVICES	(8)
++#define RPPC_MAX_REG_FDS	(10)
++
++#define RPPC_SIG_NUM_PARAM(sig) ((sig).num_param - 1)
++
++/* TODO: remove these fields */
++#define RPPC_JOBID_DISCRETE	(0)
++#define RPPC_POOLID_DEFAULT	(0x8000)
++
++static struct class *rppc_class;
++static dev_t rppc_dev;
++
++/* store all remote rpc connection services (usually one per remoteproc) */
++static DEFINE_IDR(rppc_devices);
++static DEFINE_MUTEX(rppc_devices_lock);
++
++/*
++ * Retrieve the rproc instance so that it can be used for performing
++ * address translations
++ */
++static struct rproc *rpdev_to_rproc(struct rpmsg_channel *rpdev)
++{
++	struct virtio_device *vdev;
++
++	vdev = rpmsg_get_virtio_dev(rpdev);
++	if (!vdev)
++		return NULL;
++
++	return rproc_vdev_to_rproc_safe(vdev);
++}
++
++/*
++ * A wrapper function to translate local physical addresses to the remote core
++ * device addresses (virtual addresses that a code on remote processor can use
++ * directly.
++ */
++phys_addr_t rppc_local_to_remote_da(struct rppc_instance *rpc, phys_addr_t pa)
++{
++	int ret;
++	struct rproc *rproc;
++	u64 da;
++	phys_addr_t rda;
++	struct device *dev = rpc->rppcdev->dev;
++
++	if (mutex_lock_interruptible(&rpc->rppcdev->lock))
++		return -EINTR;
++
++	rproc = rpdev_to_rproc(rpc->rppcdev->rpdev);
++	if (!rproc) {
++		dev_err(dev, "error getting rproc for rpdev 0x%x\n",
++			(u32)rpc->rppcdev->rpdev);
++	} else {
++		ret = rproc_pa_to_da(rproc, pa, &da);
++		if (ret) {
++			dev_err(dev, "error from rproc_pa_to_da, rproc = %p, pa = 0x%x ret = %d\n",
++				rproc, pa, ret);
++			da = 0;
++		}
++	}
++	rda = (phys_addr_t) da;
++
++	mutex_unlock(&rpc->rppcdev->lock);
++
++	return rda;
++}
++
++static void rppc_print_msg(struct rppc_instance *rpc, char *prefix,
++							char buffer[512])
++{
++	struct rppc_msg_header *hdr = (struct rppc_msg_header *)buffer;
++	struct rppc_instance_handle *hdl = NULL;
++	struct rppc_query_function *info = NULL;
++	struct rppc_packet *packet = NULL;
++	struct rppc_param_data *param = NULL;
++	struct device *dev = rpc->rppcdev->dev;
++	u32 i = 0, paramsz = sizeof(*param);
++
++	dev_dbg(dev, "%s HDR: msg_type = %d msg_len = %d\n",
++		prefix, hdr->msg_type, hdr->msg_len);
++
++	switch (hdr->msg_type) {
++	case RPPC_MSGTYPE_CREATE_RESP:
++	case RPPC_MSGTYPE_DELETE_RESP:
++		hdl = RPPC_PAYLOAD(buffer, rppc_instance_handle);
++		dev_dbg(dev, "%s endpoint = %d status = %d\n",
++			prefix, hdl->endpoint_address, hdl->status);
++		break;
++	case RPPC_MSGTYPE_FUNCTION_INFO:
++		info = RPPC_PAYLOAD(buffer, rppc_query_function);
++		dev_dbg(dev, "%s (info not yet implemented)\n", prefix);
++		break;
++	case RPPC_MSGTYPE_FUNCTION_CALL:
++		packet = RPPC_PAYLOAD(buffer, rppc_packet);
++		dev_dbg(dev, "%s PACKET: desc = %04x msg_id = %04x flags = %08x func = 0x%08x result = %d size = %u\n",
++			prefix, packet->desc, packet->msg_id,
++			packet->flags, packet->fxn_id,
++			packet->result, packet->data_size);
++		param = (struct rppc_param_data *)packet->data;
++		for (i = 0; i < (packet->data_size / paramsz); i++) {
++			dev_dbg(dev, "%s param[%u] size = %zu data = %zu (0x%08x)",
++				prefix, i, param[i].size, param[i].data,
++				param[i].data);
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++/* free any outstanding function calls */
++static void rppc_delete_fxns(struct rppc_instance *rpc)
++{
++	struct rppc_function_list *pos, *n;
++
++	if (!list_empty(&rpc->fxn_list)) {
++		mutex_lock(&rpc->lock);
++		list_for_each_entry_safe(pos, n, &rpc->fxn_list, list) {
++			list_del(&pos->list);
++			kfree(pos->function);
++			kfree(pos);
++		}
++		mutex_unlock(&rpc->lock);
++	}
++}
++
++static
++struct rppc_function *rppc_find_fxn(struct rppc_instance *rpc, u16 msg_id)
++{
++	struct rppc_function *function = NULL;
++	struct rppc_function_list *pos, *n;
++	struct device *dev = rpc->rppcdev->dev;
++
++	mutex_lock(&rpc->lock);
++	list_for_each_entry_safe(pos, n, &rpc->fxn_list, list) {
++		dev_dbg(dev, "looking for msg %u, found msg %u\n",
++			msg_id, pos->msg_id);
++		if (pos->msg_id == msg_id) {
++			function = pos->function;
++			list_del(&pos->list);
++			kfree(pos);
++			break;
++		}
++	}
++	mutex_unlock(&rpc->lock);
++
++	return function;
++}
++
++static int rppc_add_fxn(struct rppc_instance *rpc,
++				struct rppc_function *function, u16 msg_id)
++{
++	struct rppc_function_list *fxn = NULL;
++	struct device *dev = rpc->rppcdev->dev;
++
++	fxn = kzalloc(sizeof(*fxn), GFP_KERNEL);
++	if (!fxn) {
++		dev_err(dev, "failed to add function %p to list with msg id %d\n",
++			function, msg_id);
++		return -ENOMEM;
++	}
++
++	fxn->function = function;
++	fxn->msg_id = msg_id;
++	mutex_lock(&rpc->lock);
++	list_add(&fxn->list, &rpc->fxn_list);
++	mutex_unlock(&rpc->lock);
++	dev_dbg(dev, "added msg id %u to list", msg_id);
++
++	return 0;
++}
++
++static
++void rppc_handle_create_resp(struct rppc_instance *rpc, char *data, int len)
++{
++	struct device *dev = rpc->rppcdev->dev;
++	struct rppc_msg_header *hdr = (struct rppc_msg_header *)data;
++	struct rppc_instance_handle *hdl;
++	u32 exp_len = sizeof(*hdl) + sizeof(*hdr);
++
++	if (len != exp_len) {
++		dev_err(dev, "invalid response message length %d (expected %d bytes)",
++			len, exp_len);
++		rpc->state = RPPC_STATE_STALE;
++		return;
++	}
++
++	hdl = RPPC_PAYLOAD(data, rppc_instance_handle);
++
++	mutex_lock(&rpc->lock);
++	if (rpc->state != RPPC_STATE_STALE && hdl->status == 0) {
++		rpc->dst = hdl->endpoint_address;
++		rpc->state = RPPC_STATE_CONNECTED;
++	} else {
++		rpc->state = RPPC_STATE_STALE;
++	}
++	rpc->in_transition = 0;
++	dev_dbg(dev, "creation response: status %d addr 0x%x\n",
++		hdl->status, hdl->endpoint_address);
++
++	complete(&rpc->reply_arrived);
++	mutex_unlock(&rpc->lock);
++}
++
++static
++void rppc_handle_delete_resp(struct rppc_instance *rpc, char *data, int len)
++{
++	struct device *dev = rpc->rppcdev->dev;
++	struct rppc_msg_header *hdr = (struct rppc_msg_header *)data;
++	struct rppc_instance_handle *hdl;
++	u32 exp_len = sizeof(*hdl) + sizeof(*hdr);
++
++	if (len != exp_len) {
++		dev_err(dev, "invalid response message length %d (expected %d bytes)",
++			len, exp_len);
++		rpc->state = RPPC_STATE_STALE;
++		return;
++	}
++	if (hdr->msg_len != sizeof(*hdl)) {
++		dev_err(dev, "disconnect message was incorrect size!\n");
++		rpc->state = RPPC_STATE_STALE;
++		return;
++	}
++
++	hdl = RPPC_PAYLOAD(data, rppc_instance_handle);
++	dev_dbg(dev, "deletion response: status %d addr 0x%x\n",
++		hdl->status, hdl->endpoint_address);
++	mutex_lock(&rpc->lock);
++	rpc->dst = 0;
++	rpc->state = RPPC_STATE_DISCONNECTED;
++	rpc->in_transition = 0;
++	complete(&rpc->reply_arrived);
++	mutex_unlock(&rpc->lock);
++}
++
++/*
++ * store the received message and wake up any blocking processes,
++ * waiting for new data. The allocated buffer would be freed after
++ * the user-space reads the packet.
++ */
++static void rppc_handle_fxn_resp(struct rppc_instance *rpc, char *data, int len)
++{
++	struct device *dev = rpc->rppcdev->dev;
++	struct rppc_msg_header *hdr = (struct rppc_msg_header *)data;
++	struct sk_buff *skb;
++	char *skbdata;
++
++	/* TODO: need to check the response length? */
++	skb = alloc_skb(hdr->msg_len, GFP_KERNEL);
++	if (!skb) {
++		dev_err(dev, "alloc_skb failed: %u\n", hdr->msg_len);
++		return;
++	}
++	skbdata = skb_put(skb, hdr->msg_len);
++	memcpy(skbdata, hdr->msg_data, hdr->msg_len);
++
++	mutex_lock(&rpc->lock);
++	skb_queue_tail(&rpc->queue, skb);
++	mutex_unlock(&rpc->lock);
++
++	wake_up_interruptible(&rpc->readq);
++}
++
++/*
++ * callback function for processing the different responses
++ * from the remote processor on a particular rpmsg channel
++ * instance.
++ */
++static void rppc_cb(struct rpmsg_channel *rpdev,
++		       void *data, int len, void *priv, u32 src)
++{
++	struct rppc_msg_header *hdr = data;
++	struct rppc_instance *rpc = priv;
++	struct device *dev = rpc->rppcdev->dev;
++	char *buf = (char *)data;
++
++	dev_dbg(dev, "<== incoming msg src %d len %d msg_type %d msg_len %d\n",
++		src, len, hdr->msg_type, hdr->msg_len);
++	rppc_print_msg(rpc, "RX:", buf);
++
++	if (len <= sizeof(*hdr)) {
++		dev_err(dev, "message truncated\n");
++		rpc->state = RPPC_STATE_STALE;
++		return;
++	}
++
++	switch (hdr->msg_type) {
++	case RPPC_MSGTYPE_CREATE_RESP:
++		rppc_handle_create_resp(rpc, data, len);
++		break;
++	case RPPC_MSGTYPE_DELETE_RESP:
++		rppc_handle_delete_resp(rpc, data, len);
++		break;
++	case RPPC_MSGTYPE_FUNCTION_CALL:
++	case RPPC_MSGTYPE_FUNCTION_RET:
++		rppc_handle_fxn_resp(rpc, data, len);
++		break;
++	default:
++		dev_warn(dev, "unexpected msg type: %d\n", hdr->msg_type);
++		break;
++	}
++}
++
++/*
++ * send a connection request to the remote rpc connection service. Use
++ * the new local address created during .open for this instance as the
++ * source address to complete the connection.
++ */
++static int rppc_connect(struct rppc_instance *rpc,
++			   struct rppc_create_instance *connect)
++{
++	int ret = 0;
++	u32 len = 0;
++	char kbuf[512];
++	struct rppc_device *rppcdev = rpc->rppcdev;
++	struct rppc_msg_header *hdr = (struct rppc_msg_header *)&kbuf[0];
++
++	if (rpc->state == RPPC_STATE_CONNECTED) {
++		dev_dbg(rppcdev->dev, "endpoint already connected\n");
++		return -EISCONN;
++	}
++
++	hdr->msg_type = RPPC_MSGTYPE_CREATE_REQ;
++	hdr->msg_len = sizeof(*connect);
++	memcpy(hdr->msg_data, connect, hdr->msg_len);
++	len = sizeof(struct rppc_msg_header) + hdr->msg_len;
++
++	init_completion(&rpc->reply_arrived);
++	rpc->in_transition = 1;
++	ret = rpmsg_send_offchannel(rppcdev->rpdev, rpc->ept->addr,
++				    rppcdev->rpdev->dst, (char *)kbuf, len);
++	if (ret > 0) {
++		dev_err(rppcdev->dev, "rpmsg_send failed: %d\n", ret);
++		return ret;
++	}
++
++	ret = wait_for_completion_interruptible_timeout(&rpc->reply_arrived,
++							msecs_to_jiffies(5000));
++	if (rpc->state == RPPC_STATE_CONNECTED)
++		return 0;
++
++	if (rpc->state == RPPC_STATE_STALE)
++		return -ENXIO;
++
++	if (ret > 0) {
++		dev_err(rppcdev->dev, "premature wakeup: %d\n", ret);
++		return -EIO;
++	}
++
++	return -ETIMEDOUT;
++}
++
++static void rppc_disconnect(struct rppc_instance *rpc)
++{
++	int ret;
++	size_t len;
++	char kbuf[512];
++	struct rppc_device *rppcdev = rpc->rppcdev;
++	struct rppc_msg_header *hdr = (struct rppc_msg_header *)&kbuf[0];
++	struct rppc_instance_handle *handle =
++				RPPC_PAYLOAD(kbuf, rppc_instance_handle);
++
++	if (rpc->state != RPPC_STATE_CONNECTED)
++		return;
++
++	hdr->msg_type = RPPC_MSGTYPE_DELETE_REQ;
++	hdr->msg_len = sizeof(uint32_t);
++	handle->endpoint_address = rpc->dst;
++	handle->status = 0;
++	len = sizeof(struct rppc_msg_header) + hdr->msg_len;
++
++	dev_dbg(rppcdev->dev, "disconnecting from RPC service at %d\n",
++		rpc->dst);
++	ret = rpmsg_send_offchannel(rppcdev->rpdev, rpc->ept->addr,
++					rppcdev->rpdev->dst, kbuf, len);
++	if (ret)
++		dev_err(rppcdev->dev, "rpmsg_send failed: %d\n", ret);
++
++	/*
++	 * TODO: should we wait for a message to come back?
++	 * For now, no.
++	 */
++	wait_for_completion_interruptible(&rpc->reply_arrived);
++}
++
++static int rppc_register_buffers(struct rppc_instance *rpc,
++				unsigned long arg)
++{
++	struct rppc_buf_fds data;
++	int *fds = NULL;
++	struct rppc_dma_buf **bufs = NULL;
++	struct rppc_dma_buf *tmp;
++	int i = 0, ret = 0;
++
++	if (copy_from_user(&data, (char __user *)arg, sizeof(data)))
++		return -EFAULT;
++
++	/* impose a maximum number of buffers for now */
++	if (data.num > RPPC_MAX_REG_FDS)
++		return -EINVAL;
++
++	fds = kzalloc(sizeof(*fds) * data.num, GFP_KERNEL);
++	if (!fds)
++		return -ENOMEM;
++
++	if (copy_from_user(fds, (char __user *)data.fds,
++			   sizeof(*fds) * data.num)) {
++		ret = -EFAULT;
++		goto free_fds;
++	}
++
++	for (i = 0; i < data.num; i++) {
++		if (!fcheck(fds[i])) {
++			ret = -EBADF;
++			goto free_fds;
++		}
++
++		tmp = rppc_find_dmabuf(rpc, fds[i]);
++		if (!IS_ERR_OR_NULL(tmp)) {
++			ret = -EEXIST;
++			goto free_fds;
++		}
++	}
++
++	bufs = kzalloc(sizeof(*bufs) * data.num, GFP_KERNEL);
++	if (!bufs) {
++		ret = -ENOMEM;
++		goto free_fds;
++	}
++
++	for (i = 0; i < data.num; i++) {
++		bufs[i] = rppc_alloc_dmabuf(rpc, fds[i], false);
++		if (IS_ERR(bufs[i])) {
++			ret = PTR_ERR(bufs[i]);
++			break;
++		}
++	}
++	if (i == data.num)
++		goto free_bufs;
++
++	for (i -= 1; i >= 0; i--)
++		rppc_free_dmabuf(bufs[i]->id, bufs[i], rpc);
++
++free_bufs:
++	kfree(bufs);
++free_fds:
++	kfree(fds);
++	return ret;
++}
++
++static int rppc_unregister_buffers(struct rppc_instance *rpc,
++				unsigned long arg)
++{
++	struct rppc_buf_fds data;
++	int *fds = NULL;
++	struct rppc_dma_buf **bufs = NULL;
++	int i = 0, ret = 0;
++
++	if (copy_from_user(&data, (char __user *)arg, sizeof(data)))
++		return -EFAULT;
++
++	/* impose a maximum number of buffers for now */
++	if (data.num > RPPC_MAX_REG_FDS)
++		return -EINVAL;
++
++	fds = kzalloc(sizeof(*fds) * data.num, GFP_KERNEL);
++	if (!fds)
++		return -ENOMEM;
++
++	if (copy_from_user(fds, (char __user *)data.fds,
++			   sizeof(*fds) * data.num)) {
++		ret = -EFAULT;
++		goto free_fds;
++	}
++
++	bufs = kzalloc(sizeof(*bufs) * data.num, GFP_KERNEL);
++	if (!bufs) {
++		ret = -ENOMEM;
++		goto free_fds;
++	}
++
++	for (i = 0; i < data.num; i++) {
++		if (!fcheck(fds[i])) {
++			ret = -EBADF;
++			goto free_bufs;
++		}
++
++		bufs[i] = rppc_find_dmabuf(rpc, fds[i]);
++		if (IS_ERR_OR_NULL(bufs[i])) {
++			ret = -EEXIST;
++			goto free_bufs;
++		}
++	}
++
++	for (i = 0; i < data.num; i++)
++		rppc_free_dmabuf(bufs[i]->id, bufs[i], rpc);
++
++free_bufs:
++	kfree(bufs);
++free_fds:
++	kfree(fds);
++	return ret;
++}
++
++/*
++ * create a new rpc instance that a user-space client can use to invoke
++ * remote functions. A new local address would be created and tied with
++ * this instance for uniquely identifying the messages communicated by
++ * this instance with the remote side.
++ *
++ * The function is blocking if there is no underlying connection manager
++ * channel, unless the device is opened with non-blocking flags specifically.
++ */
++static int rppc_open(struct inode *inode, struct file *filp)
++{
++	struct rppc_device *rppcdev;
++	struct rppc_instance *rpc;
++
++	rppcdev = container_of(inode->i_cdev, struct rppc_device, cdev);
++
++	if (!rppcdev->rpdev)
++		if ((filp->f_flags & O_NONBLOCK) ||
++		    wait_for_completion_interruptible(&rppcdev->comp))
++			return -EBUSY;
++
++	rpc = kzalloc(sizeof(*rpc), GFP_KERNEL);
++	if (!rpc)
++		return -ENOMEM;
++
++	mutex_init(&rpc->lock);
++	skb_queue_head_init(&rpc->queue);
++	init_waitqueue_head(&rpc->readq);
++	INIT_LIST_HEAD(&rpc->fxn_list);
++	idr_init(&rpc->dma_idr);
++	rpc->in_transition = 0;
++	rpc->msg_id = 0;
++	rpc->state = RPPC_STATE_DISCONNECTED;
++	rpc->rppcdev = rppcdev;
++
++	rpc->ept = rpmsg_create_ept(rppcdev->rpdev, rppc_cb, rpc,
++								RPMSG_ADDR_ANY);
++	if (!rpc->ept) {
++		dev_err(rppcdev->dev, "create ept failed\n");
++		kfree(rpc);
++		return -ENOMEM;
++	}
++	filp->private_data = rpc;
++
++	mutex_lock(&rppcdev->lock);
++	list_add(&rpc->list, &rppcdev->instances);
++	mutex_unlock(&rppcdev->lock);
++
++	dev_dbg(rppcdev->dev, "local addr assigned: 0x%x\n", rpc->ept->addr);
++
++	return 0;
++}
++
++/*
++ * release and free all the resources associated with a particular rpc
++ * instance. This includes the data structures maintaining the current
++ * outstanding function invocations, and all the buffers registered for
++ * use with this instance. Send a disconnect message and cleanup the
++ * local end-point only if the instance is in a normal state, with the
++ * remote connection manager functional.
++ */
++static int rppc_release(struct inode *inode, struct file *filp)
++{
++	struct rppc_instance *rpc = filp->private_data;
++	struct rppc_device *rppcdev = rpc->rppcdev;
++
++	dev_dbg(rppcdev->dev, "releasing Instance %p, in state %d\n", rpc,
++		rpc->state);
++
++	if (rpc->state != RPPC_STATE_STALE) {
++		if (rpc->ept) {
++			rppc_disconnect(rpc);
++			rpmsg_destroy_ept(rpc->ept);
++			rpc->ept = NULL;
++		}
++	}
++
++	rppc_delete_fxns(rpc);
++
++	mutex_lock(&rpc->lock);
++	idr_for_each(&rpc->dma_idr, rppc_free_dmabuf, rpc);
++	idr_destroy(&rpc->dma_idr);
++	mutex_unlock(&rpc->lock);
++
++	mutex_lock(&rppcdev->lock);
++	list_del(&rpc->list);
++	mutex_unlock(&rppcdev->lock);
++
++	dev_dbg(rppcdev->dev, "instance %p has been deleted!\n", rpc);
++	if (list_empty(&rppcdev->instances))
++		dev_dbg(rppcdev->dev, "all instances have been removed!\n");
++
++	kfree(rpc);
++	return 0;
++}
++
++static long rppc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	struct rppc_instance *rpc = filp->private_data;
++	struct rppc_device *rppcdev = rpc->rppcdev;
++	struct rppc_create_instance connect;
++	int ret = 0;
++
++	dev_dbg(rppcdev->dev, "%s: cmd %d, arg 0x%lx\n", __func__, cmd, arg);
++
++	if (_IOC_TYPE(cmd) != RPPC_IOC_MAGIC)
++		return -ENOTTY;
++
++	if (_IOC_NR(cmd) > RPPC_IOC_MAXNR)
++		return -ENOTTY;
++
++	switch (cmd) {
++	case RPPC_IOC_CREATE:
++		ret = copy_from_user(&connect, (char __user *)arg,
++							sizeof(connect));
++		if (ret) {
++			dev_err(rppcdev->dev, "%s: %d: copy_from_user fail: %d\n",
++				__func__, _IOC_NR(cmd), ret);
++			ret = -EFAULT;
++		} else {
++			connect.name[sizeof(connect.name) - 1] = '\0';
++			ret = rppc_connect(rpc, &connect);
++		}
++		break;
++	case RPPC_IOC_BUFREGISTER:
++		ret = rppc_register_buffers(rpc, arg);
++		break;
++	case RPPC_IOC_BUFUNREGISTER:
++		ret = rppc_unregister_buffers(rpc, arg);
++		break;
++	default:
++		dev_err(rppcdev->dev, "unhandled ioctl cmd: %d\n", cmd);
++		break;
++	}
++
++	return ret;
++}
++
++static ssize_t rppc_read(struct file *filp, char __user *buf, size_t len,
++				loff_t *offp)
++{
++	struct rppc_instance *rpc = filp->private_data;
++	struct rppc_packet *packet = NULL;
++	struct rppc_param_data *parameters = NULL;
++	struct rppc_function *function = NULL;
++	struct rppc_function_return returned;
++	struct sk_buff *skb = NULL;
++	int ret = 0;
++	int use = sizeof(returned);
++	DEFINE_WAIT(wait);
++
++	if (mutex_lock_interruptible(&rpc->lock))
++		return -ERESTARTSYS;
++
++	/* instance is invalid */
++	if (rpc->state == RPPC_STATE_STALE) {
++		mutex_unlock(&rpc->lock);
++		return -ENXIO;
++	}
++
++	/* not yet connected to the remote side */
++	if (rpc->state == RPPC_STATE_DISCONNECTED) {
++		mutex_unlock(&rpc->lock);
++		return -ENOTCONN;
++	}
++
++	if (len > use) {
++		mutex_unlock(&rpc->lock);
++		return -EOVERFLOW;
++	}
++	if (len < use) {
++		mutex_unlock(&rpc->lock);
++		return -EINVAL;
++	}
++
++	while (skb_queue_empty(&rpc->queue)) {
++		mutex_unlock(&rpc->lock);
++		/* non-blocking requested ? return now */
++		if (filp->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++
++		prepare_to_wait_exclusive(&rpc->readq, &wait,
++					  TASK_INTERRUPTIBLE);
++		schedule();
++		finish_wait(&rpc->readq, &wait);
++		if (signal_pending(current))
++			return -ERESTARTSYS;
++
++		ret = mutex_lock_interruptible(&rpc->lock);
++		if (ret < 0)
++			return -ERESTARTSYS;
++
++		/* make sure state is sane while we waited */
++		if (rpc->state != RPPC_STATE_CONNECTED) {
++			ret = -EIO;
++			goto out;
++		}
++	}
++
++	skb = skb_dequeue(&rpc->queue);
++	if (WARN_ON(!skb)) {
++		ret = -EIO;
++		goto out;
++	}
++	mutex_unlock(&rpc->lock);
++
++	packet = (struct rppc_packet *)skb->data;
++	parameters = (struct rppc_param_data *)packet->data;
++
++	/*
++	 * pull the function memory from the list and untranslate
++	 * the remote device address pointers in the packet back
++	 * to MPU pointers.
++	 */
++	function = rppc_find_fxn(rpc, packet->msg_id);
++	if (function && function->num_translations > 0) {
++		ret = rppc_xlate_buffers(rpc, function, RPPC_RPA_TO_UVA);
++		if (ret < 0)
++			goto failure;
++	}
++	returned.fxn_id = RPPC_FXN_MASK(packet->fxn_id);
++	returned.status = packet->result;
++
++	if (copy_to_user(buf, &returned, use)) {
++		dev_err(rpc->rppcdev->dev, "%s: copy_to_user fail\n", __func__);
++		ret = -EFAULT;
++	} else {
++		ret = use;
++	}
++
++failure:
++	kfree(function);
++	kfree_skb(skb);
++out:
++	return ret;
++}
++
++static ssize_t rppc_write(struct file *filp, const char __user *ubuf,
++				size_t len, loff_t *offp)
++{
++	struct rppc_instance *rpc = filp->private_data;
++	struct rppc_device *rppcdev = rpc->rppcdev;
++	struct device *dev = rppcdev->dev;
++	struct rppc_msg_header *hdr = NULL;
++	struct rppc_function *function = NULL;
++	struct rppc_packet *packet = NULL;
++	struct rppc_param_data *parameters = NULL;
++	char kbuf[512];
++	int use = 0, ret = 0, param = 0;
++	uint32_t sig_idx = 0;
++	uint32_t sig_prm = 0;
++	static u32 rppc_atomic_size[RPPC_PARAM_ATOMIC_MAX] = {
++		0, /* RPPC_PARAM_VOID */
++		1, /* RPPC_PARAM_S08 */
++		1, /* RPPC_PARAM_U08 */
++		2, /* RPPC_PARAM_S16 */
++		2, /* RPPC_PARAM_U16 */
++		4, /* RPPC_PARAM_S32 */
++		4, /* RPPC_PARAM_U32 */
++		8, /* RPPC_PARAM_S64 */
++		8  /* RPPC_PARAM_U64 */
++	};
++
++	if (len < sizeof(*function)) {
++		ret = -ENOTSUPP;
++		goto failure;
++	}
++
++	if (len > (sizeof(*function) + RPPC_MAX_TRANSLATIONS *
++				sizeof(struct rppc_param_translation))) {
++		ret = -ENOTSUPP;
++		goto failure;
++	}
++
++	if (rpc->state != RPPC_STATE_CONNECTED) {
++		ret = -ENOTCONN;
++		goto failure;
++	}
++
++	function = kzalloc(len, GFP_KERNEL);
++	if (function == NULL) {
++		ret = -ENOMEM;
++		goto failure;
++	}
++
++	if (copy_from_user(function, ubuf, len)) {
++		ret = -EMSGSIZE;
++		goto failure;
++	}
++
++	/* increment the message id and wrap if needed */
++	rpc->msg_id = (rpc->msg_id + 1) & 0xFFFF;
++
++	memset(kbuf, 0, sizeof(kbuf));
++	sig_idx = function->fxn_id + 1;
++	hdr = (struct rppc_msg_header *)kbuf;
++	hdr->msg_type = RPPC_MSGTYPE_FUNCTION_CALL;
++	hdr->msg_len = sizeof(*packet);
++	packet = RPPC_PAYLOAD(kbuf, rppc_packet);
++	packet->desc = RPPC_DESC_EXEC_SYNC;
++	packet->msg_id = rpc->msg_id;
++	packet->flags = (RPPC_JOBID_DISCRETE << 16) | RPPC_POOLID_DEFAULT;
++	packet->fxn_id = RPPC_SET_FXN_IDX(function->fxn_id);
++	packet->result = 0;
++	packet->data_size = sizeof(*parameters) * function->num_params;
++
++	/* check the signatures against what were published */
++	if (RPPC_SIG_NUM_PARAM(rppcdev->signatures[sig_idx]) !=
++		function->num_params) {
++		dev_err(dev, "number of parameters mismatch! params = %u expected = %u\n",
++			function->num_params,
++			RPPC_SIG_NUM_PARAM(rppcdev->signatures[sig_idx]));
++		ret = -EINVAL;
++		goto failure;
++	}
++
++	/*
++	 * compute the parameter pointer changes last since this will cause the
++	 * cache operations
++	 */
++	parameters = (struct rppc_param_data *)packet->data;
++	for (param = 0; param < function->num_params; param++) {
++		sig_prm = param + 1;
++		/*
++		 * check to make sure the parameter description matches the
++		 * signature published from the other side.
++		 */
++		if (function->params[param].type == RPPC_PARAM_TYPE_PTR &&
++		    !RPPC_IS_PTR(
++			rppcdev->signatures[sig_idx].params[sig_prm].type)) {
++			dev_err(dev, "parameter %u Pointer Type Mismatch sig type:%x func %u\n",
++				param, rppcdev->signatures[sig_idx].
++					params[sig_prm].type, sig_idx);
++			ret = -EINVAL;
++			goto failure;
++		} else if (param > 0 && function->params[param].type ==
++			RPPC_PARAM_TYPE_ATOMIC) {
++			if (!RPPC_IS_ATOMIC(
++			rppcdev->signatures[sig_idx].params[sig_prm].type)) {
++				dev_err(dev, "parameter Atomic Type Mismatch\n");
++				ret = -EINVAL;
++				goto failure;
++			} else {
++				uint32_t t = rppcdev->signatures[sig_idx].
++							params[sig_prm].type;
++				if (rppc_atomic_size[t] !=
++					function->params[param].size) {
++					dev_err(dev, "size mismatch! u:%u sig:%u\n",
++						function->params[param].size,
++						rppc_atomic_size[t]);
++					ret = -EINVAL;
++					goto failure;
++				}
++			}
++		}
++
++		parameters[param].size = function->params[param].size;
++
++		/* check the type and lookup if it's a pointer */
++		if (function->params[param].type == RPPC_PARAM_TYPE_PTR) {
++			/*
++			 * internally the buffer translations takes care of the
++			 * offsets.
++			 */
++			int fd = function->params[param].fd;
++			parameters[param].data = (size_t) rppc_buffer_lookup(
++							rpc,
++							(virt_addr_t)
++							function->
++							   params[param].data,
++							(virt_addr_t)
++							   function->
++							   params[param].base,
++							fd);
++		} else if (function->params[param].type ==
++			   RPPC_PARAM_TYPE_ATOMIC) {
++			parameters[param].data = function->params[param].data;
++		} else {
++			ret = -ENOTSUPP;
++			goto failure;
++		}
++	}
++
++	/* compute the size of the rpmsg packet */
++	use = sizeof(*hdr) + hdr->msg_len + packet->data_size;
++
++	/* failed to provide the translation data */
++	if (function->num_translations > 0 &&
++	    len < (sizeof(*function) + (function->num_translations *
++				sizeof(struct rppc_param_translation)))) {
++		ret = -ENXIO;
++		goto failure;
++	}
++
++	/*
++	 * if there are pointers to translate for the user, do so now.
++	 * alter our copy of function and the user's parameters so that
++	 * the proper pointers can be sent to remote cores
++	 */
++	if (function->num_translations > 0) {
++		ret = rppc_xlate_buffers(rpc, function, RPPC_UVA_TO_RPA);
++		if (ret < 0) {
++			dev_err(dev, "failed to translate all pointers for remote core!\n");
++			goto failure;
++		}
++	}
++
++	ret = rppc_add_fxn(rpc, function, rpc->msg_id);
++	if (ret < 0) {
++		rppc_xlate_buffers(rpc, function, RPPC_RPA_TO_UVA);
++		goto failure;
++	}
++
++	rppc_print_msg(rpc, "TX:", kbuf);
++
++	ret = rpmsg_send_offchannel(rppcdev->rpdev, rpc->ept->addr, rpc->dst,
++						kbuf, use);
++	if (ret) {
++		dev_err(dev, "rpmsg_send failed: %d\n", ret);
++		rppc_find_fxn(rpc, rpc->msg_id);
++		rppc_xlate_buffers(rpc, function, RPPC_RPA_TO_UVA);
++		goto failure;
++	}
++	dev_dbg(dev, "==> sent msg to remote endpoint %u\n", rpc->dst);
++
++failure:
++	if (ret >= 0)
++		ret = len;
++	else
++		kfree(function);
++
++	return ret;
++}
++
++static unsigned int rppc_poll(struct file *filp, struct poll_table_struct *wait)
++{
++	struct rppc_instance *rpc = filp->private_data;
++	unsigned int mask = 0;
++
++	if (mutex_lock_interruptible(&rpc->lock))
++		return -ERESTARTSYS;
++
++	poll_wait(filp, &rpc->readq, wait);
++	if (rpc->state == RPPC_STATE_STALE) {
++		mask = POLLERR;
++		goto out;
++	}
++
++	/* if the queue is not empty set the poll bit correctly */
++	if (!skb_queue_empty(&rpc->queue))
++		mask |= (POLLIN | POLLRDNORM);
++
++	/* TODO: writes are deemed to be successful always, fix this later */
++	if (true)
++		mask |= POLLOUT | POLLWRNORM;
++
++out:
++	mutex_unlock(&rpc->lock);
++	return mask;
++}
++
++static const struct file_operations rppc_fops = {
++	.owner = THIS_MODULE,
++	.open = rppc_open,
++	.release = rppc_release,
++	.unlocked_ioctl = rppc_ioctl,
++	.read = rppc_read,
++	.write = rppc_write,
++	.poll = rppc_poll,
++};
++
++/*
++ * send a function query message, the sysfs entry will be created
++ * during the processing of the response message
++ */
++static int rppc_query_function(struct rpmsg_channel *rpdev)
++{
++	int ret = 0;
++	u32 len = 0;
++	char kbuf[512];
++	struct rppc_device *rppcdev = dev_get_drvdata(&rpdev->dev);
++	struct rppc_msg_header *hdr = (struct rppc_msg_header *)&kbuf[0];
++	struct rppc_query_function *fxn_info =
++				(struct rppc_query_function *)hdr->msg_data;
++
++	if (rppcdev->cur_func >= rppcdev->num_funcs)
++		return -EINVAL;
++
++	hdr->msg_type = RPPC_MSGTYPE_FUNCTION_QUERY;
++	hdr->msg_len = sizeof(*fxn_info);
++	len = sizeof(*hdr) + hdr->msg_len;
++	fxn_info->info_type = RPPC_INFOTYPE_FUNC_SIGNATURE;
++	fxn_info->fxn_id = rppcdev->cur_func++;
++
++	dev_dbg(&rpdev->dev, "sending function query type %u for function %u\n",
++		fxn_info->info_type, fxn_info->fxn_id);
++	ret = rpmsg_send(rpdev, (char *)kbuf, len);
++	if (ret) {
++		dev_err(&rpdev->dev, "rpmsg_send failed: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void
++rppc_handle_devinfo_resp(struct rpmsg_channel *rpdev, char *data, int len)
++{
++	struct rppc_device *rppcdev = dev_get_drvdata(&rpdev->dev);
++	struct rppc_device_info *info;
++	u32 exp_len = sizeof(*info) + sizeof(struct rppc_msg_header);
++
++	if (len != exp_len) {
++		dev_err(&rpdev->dev, "invalid message length %d (expected %d bytes)",
++			len, exp_len);
++		return;
++	}
++
++	info = RPPC_PAYLOAD(data, rppc_device_info);
++	if (info->num_funcs > RPPC_MAX_NUM_FUNCS) {
++		rppcdev->num_funcs = 0;
++		dev_err(&rpdev->dev, "number of functions (%d) exceeds the limit supported(%d)\n",
++			info->num_funcs, RPPC_MAX_NUM_FUNCS);
++		return;
++	}
++
++	rppcdev->num_funcs = info->num_funcs;
++	rppcdev->signatures = kzalloc(rppcdev->num_funcs *
++				sizeof(struct rppc_func_signature), GFP_KERNEL);
++	if (!rppcdev->signatures) {
++		dev_err(&rpdev->dev, "failed to alloc signatures\n");
++		return;
++	}
++
++	dev_info(&rpdev->dev, "publised functions = %u\n", info->num_funcs);
++
++	/* send the function query for first function */
++	if (rppc_query_function(rpdev) == -EINVAL)
++		dev_err(&rpdev->dev, "failed to get a reasonable number of functions!\n");
++}
++
++static void
++rppc_handle_fxninfo_resp(struct rpmsg_channel *rpdev, char *data, int len)
++{
++	struct rppc_device *rppcdev = dev_get_drvdata(&rpdev->dev);
++	struct rppc_query_function *fxn_info;
++	struct rppc_func_signature *signature;
++	u32 exp_len = sizeof(*fxn_info) + sizeof(struct rppc_msg_header);
++	int i;
++
++	if (len != exp_len) {
++		dev_err(&rpdev->dev, "invalid message length %d (expected %d bytes)",
++			len, exp_len);
++		return;
++	}
++
++	fxn_info = RPPC_PAYLOAD(data, rppc_query_function);
++	dev_dbg(&rpdev->dev, "response for function query of type %u\n",
++		fxn_info->info_type);
++
++	switch (fxn_info->info_type) {
++	case RPPC_INFOTYPE_FUNC_SIGNATURE:
++		if (fxn_info->fxn_id >= rppcdev->num_funcs) {
++			dev_err(&rpdev->dev, "function(%d) is out of range!\n",
++				fxn_info->fxn_id);
++			break;
++		}
++
++		memcpy(&rppcdev->signatures[fxn_info->fxn_id],
++		       &fxn_info->info.signature, sizeof(*signature));
++
++		/* TODO: delete these debug prints later */
++		dev_dbg(&rpdev->dev, "received info for func(%d); name = %s #params = %u\n",
++			fxn_info->fxn_id, fxn_info->info.signature.name,
++			fxn_info->info.signature.num_param);
++		signature = &rppcdev->signatures[fxn_info->fxn_id];
++		for (i = 0; i < signature->num_param; i++) {
++			dev_dbg(&rpdev->dev, "param[%u] type = %x dir = %u\n",
++				i, signature->params[i].type,
++				signature->params[i].direction);
++		}
++
++		/* query again until we've hit our limit */
++		if (rppc_query_function(rpdev) == -EINVAL) {
++			dev_dbg(&rpdev->dev, "reached end of function list!\n");
++			rppc_create_sysfs(rppcdev);
++		}
++		break;
++	default:
++		dev_err(&rpdev->dev, "unrecognized fxn query response %u\n",
++			fxn_info->info_type);
++		break;
++	}
++}
++
++static void rppc_driver_cb(struct rpmsg_channel *rpdev, void *data, int len,
++							void *priv, u32 src)
++{
++	struct rppc_msg_header *hdr = data;
++	char *buf = (char *)data;
++
++	dev_dbg(&rpdev->dev, "<== incoming drv msg src %d len %d msg_type %d msg_len %d\n",
++		src, len, hdr->msg_type, hdr->msg_len);
++
++	if (len <= sizeof(*hdr)) {
++		dev_err(&rpdev->dev, "message truncated\n");
++		return;
++	}
++
++	switch (hdr->msg_type) {
++	case RPPC_MSGTYPE_DEVINFO_RESP:
++		rppc_handle_devinfo_resp(rpdev, buf, len);
++		break;
++	case RPPC_MSGTYPE_FUNCTION_INFO:
++		rppc_handle_fxninfo_resp(rpdev, buf, len);
++		break;
++	default:
++		dev_err(&rpdev->dev, "unrecognized message type %u\n",
++			hdr->msg_type);
++		break;
++	}
++}
++
++static int find_rpccdev_by_name(int id, void *p, void *data)
++{
++	struct rppc_device *rppcdev = p;
++
++	return strcmp(dev_name(rppcdev->dev), data) ? 0 : (int)p;
++}
++
++/*
++ * send a device info query message, the device will be created
++ * during the processing of the response message
++ */
++static int rppc_device_create(struct rpmsg_channel *rpdev)
++{
++	int ret;
++	u32 len;
++	char kbuf[512];
++	struct rppc_msg_header *hdr = (struct rppc_msg_header *)&kbuf[0];
++
++	hdr->msg_type = RPPC_MSGTYPE_DEVINFO_REQ;
++	hdr->msg_len = 0;
++	len = sizeof(*hdr);
++	ret = rpmsg_send(rpdev, (char *)kbuf, len);
++	if (ret) {
++		dev_err(&rpdev->dev, "rpmsg_send failed: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int rppc_probe(struct rpmsg_channel *rpdev)
++{
++	int ret, major, minor;
++	struct rppc_device *rppcdev = NULL;
++	dev_t dev;
++	char namedesc[RPMSG_NAME_SIZE];
++
++	dev_info(&rpdev->dev, "probing service %s with src %u dst %u\n",
++		 rpdev->desc, rpdev->src, rpdev->dst);
++
++	mutex_lock(&rppc_devices_lock);
++	snprintf(namedesc, sizeof(namedesc), "%s", rpdev->desc);
++	rppcdev = (struct rppc_device *)idr_for_each(&rppc_devices,
++						find_rpccdev_by_name, namedesc);
++	if (rppcdev) {
++		rppcdev->rpdev = rpdev;
++		dev_set_drvdata(&rpdev->dev, rppcdev);
++		goto serv_up;
++	}
++
++	rppcdev = kzalloc(sizeof(*rppcdev), GFP_KERNEL);
++	if (!rppcdev) {
++		ret = -ENOMEM;
++		goto exit;
++	}
++
++	minor = idr_alloc(&rppc_devices, rppcdev, 0, 0, GFP_KERNEL);
++	if (minor < 0) {
++		ret = minor;
++		dev_err(&rpdev->dev, "failed to get a minor number: %d\n", ret);
++		goto free_rppcdev;
++	}
++
++	INIT_LIST_HEAD(&rppcdev->instances);
++	mutex_init(&rppcdev->lock);
++	init_completion(&rppcdev->comp);
++
++	rppcdev->minor = minor;
++	rppcdev->rpdev = rpdev;
++	dev_set_drvdata(&rpdev->dev, rppcdev);
++
++	major = MAJOR(rppc_dev);
++	cdev_init(&rppcdev->cdev, &rppc_fops);
++	rppcdev->cdev.owner = THIS_MODULE;
++	dev = MKDEV(major, minor);
++	ret = cdev_add(&rppcdev->cdev, dev, 1);
++	if (ret) {
++		dev_err(&rpdev->dev, "cdev_add failed: %d\n", ret);
++		goto free_id;
++	}
++
++	rppcdev->dev = device_create(rppc_class, &rpdev->dev, dev, NULL,
++					namedesc);
++	if (IS_ERR(rppcdev->dev)) {
++		int ret = PTR_ERR(rppcdev->dev);
++		dev_err(&rpdev->dev, "device_create failed: %d\n", ret);
++		goto free_cdev;
++	}
++	dev_set_drvdata(rppcdev->dev, rppcdev);
++
++serv_up:
++	ret = rppc_device_create(rpdev);
++	if (ret) {
++		dev_err(&rpdev->dev, "failed to query channel info: %d\n", ret);
++		dev = MKDEV(MAJOR(rppc_dev), rppcdev->minor);
++		goto free_dev;
++	}
++
++	complete_all(&rppcdev->comp);
++
++	dev_dbg(&rpdev->dev, "new RPPC connection srv channel: %u -> %u!\n",
++		rpdev->src, rpdev->dst);
++
++	mutex_unlock(&rppc_devices_lock);
++	return 0;
++
++free_dev:
++	device_destroy(rppc_class, dev);
++free_cdev:
++	cdev_del(&rppcdev->cdev);
++free_id:
++	idr_remove(&rppc_devices, rppcdev->minor);
++free_rppcdev:
++	kfree(rppcdev);
++exit:
++	mutex_unlock(&rppc_devices_lock);
++	return ret;
++}
++
++static void rppc_remove(struct rpmsg_channel *rpdev)
++{
++	struct rppc_device *rppcdev = dev_get_drvdata(&rpdev->dev);
++	struct rppc_instance *rpc = NULL;
++	int major = MAJOR(rppc_dev);
++
++	dev_dbg(rppcdev->dev, "removing rpmsg-rpc device %u.%u\n",
++		major, rppcdev->minor);
++
++	mutex_lock(&rppc_devices_lock);
++
++	rppc_remove_sysfs(rppcdev);
++	rppcdev->cur_func = 0;
++	kfree(rppcdev->signatures);
++
++	/* if there are no instances in the list, just teardown */
++	if (list_empty(&rppcdev->instances)) {
++		dev_dbg(&rpdev->dev, "no instances, removing device!\n");
++		device_destroy(rppc_class, MKDEV(major, rppcdev->minor));
++		cdev_del(&rppcdev->cdev);
++		idr_remove(&rppc_devices, rppcdev->minor);
++		kfree(rppcdev);
++		mutex_unlock(&rppc_devices_lock);
++		return;
++	}
++
++	/*
++	 * if there are rpc instances that means that this is a recovery
++	 * operation. Don't clean the rppcdev, and retain it for reuse.
++	 * mark each instance as invalid, and complete any on-going transactions
++	 */
++	init_completion(&rppcdev->comp);
++	mutex_lock(&rppcdev->lock);
++	list_for_each_entry(rpc, &rppcdev->instances, list) {
++		dev_dbg(rppcdev->dev, "instance %p in state %d\n",
++			rpc, rpc->state);
++		if ((rpc->state == RPPC_STATE_CONNECTED) && rpc->in_transition)
++			complete_all(&rpc->reply_arrived);
++		rpc->state = RPPC_STATE_STALE;
++		wake_up_interruptible(&rpc->readq);
++	}
++	rppcdev->rpdev = NULL;
++	mutex_unlock(&rppcdev->lock);
++	mutex_unlock(&rppc_devices_lock);
++	dev_dbg(&rpdev->dev, "removed rpmsg rpmsgrpc driver.\n");
++}
++
++static struct rpmsg_device_id rppc_id_table[] = {
++	{.name = "rpmsg-rpc"},
++	{},
++};
++
++static struct rpmsg_driver rppc_driver = {
++	.drv.name = KBUILD_MODNAME,
++	.drv.owner = THIS_MODULE,
++	.id_table = rppc_id_table,
++	.probe = rppc_probe,
++	.remove = rppc_remove,
++	.callback = rppc_driver_cb,
++};
++
++static int __init rppc_init(void)
++{
++	int ret;
++
++	ret = alloc_chrdev_region(&rppc_dev, 0, RPPC_MAX_DEVICES,
++							KBUILD_MODNAME);
++	if (ret) {
++		pr_err("alloc_chrdev_region failed: %d\n", ret);
++		goto out;
++	}
++
++	rppc_class = class_create(THIS_MODULE, KBUILD_MODNAME);
++	if (IS_ERR(rppc_class)) {
++		ret = PTR_ERR(rppc_class);
++		pr_err("class_create failed: %d\n", ret);
++		goto unreg_region;
++	}
++
++	ret = register_rpmsg_driver(&rppc_driver);
++	if (ret) {
++		pr_err("register_rpmsg_driver failed: %d\n", ret);
++		goto destroy_class;
++	}
++	return 0;
++
++destroy_class:
++	class_destroy(rppc_class);
++unreg_region:
++	unregister_chrdev_region(rppc_dev, RPPC_MAX_DEVICES);
++out:
++	return ret;
++}
++
++static void __exit rppc_exit(void)
++{
++	unregister_rpmsg_driver(&rppc_driver);
++	class_destroy(rppc_class);
++	unregister_chrdev_region(rppc_dev, RPPC_MAX_DEVICES);
++}
++
++module_init(rppc_init);
++module_exit(rppc_exit);
++MODULE_DEVICE_TABLE(rpmsg, rppc_id_table);
++
++MODULE_AUTHOR("Suman Anna <s-anna@ti.com>");
++MODULE_AUTHOR("Erik Rainey <erik.rainey@ti.com>");
++MODULE_DESCRIPTION("Remote Processor Procedure Call Driver");
++MODULE_ALIAS("rpmsg:rpmsg-rpc");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/rpmsg/rpmsg_rpc_dmabuf.c b/drivers/rpmsg/rpmsg_rpc_dmabuf.c
+new file mode 100644
+index 0000000..2da48c4
+--- /dev/null
++++ b/drivers/rpmsg/rpmsg_rpc_dmabuf.c
+@@ -0,0 +1,655 @@
++/*
++ * Remote Processor Procedure Call Driver
++ *
++ * Copyright(c) 2012-2014 Texas Instruments. All rights reserved.
++ *
++ * Erik Rainey <erik.rainey@ti.com>
++ * Suman Anna <s-anna@ti.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/dma-buf.h>
++#include <linux/rpmsg_rpc.h>
++
++#include "rpmsg_rpc_internal.h"
++
++#if defined(CONFIG_ARCH_OMAP4) || defined(CONFIG_SOC_OMAP5) || \
++	defined(CONFIG_SOC_DRA7XX)
++/*
++ * TODO: Remove tiler_stride_from_region & rppc_recalc_off from here, and
++ *	 rely on OMAPDRM/TILER code for OMAP dependencies
++ */
++
++/**
++ * tiler_stride_from_region() - calculate stride value for OMAP TILER
++ * @localphys:	The local physical address.
++ *
++ * Returns the stride value as seen by remote processors based on the local
++ * address given to the function. This stride value is calculated based on the
++ * actual bus address, and is assumed that the TILER regions are mapped in a
++ * in a linear fashion.
++ *
++ * The physical address range decoding of local addresses is as follows:
++ *
++ * 0x60000000 - 0x67FFFFFF : 8-bit region (Stride is 16K bytes)
++ * 0x68000000 - 0x6FFFFFFF : 16-bit region (Stride is 32K bytes)
++ * 0x70000000 - 0x77FFFFFF : 32-bit region (Stride is 32K bytes)
++ * 0x78000000 - 0x7FFFFFFF : Page mode region (Stride is 0 bytes)
++ *
++ * Return: stride value
++ */
++static long tiler_stride_from_region(phys_addr_t localphys)
++{
++	switch (localphys & 0xf8000000) {
++	case 0x60000000:
++		return 0x4000;
++	case 0x68000000:
++	case 0x70000000:
++		return 0x8000;
++	default:
++		return 0;
++	}
++}
++
++/**
++ * rppc_recalc_off() - Recalculate the unsigned offset in a buffer due to
++ *		       it's location in the TILER.
++ * @lpa:	local physical address
++ * @uoff:	unsigned offset
++ *
++ * Return: adjusted offset accounting for TILER region
++ */
++static long rppc_recalc_off(phys_addr_t lpa, long uoff)
++{
++	long stride = tiler_stride_from_region(lpa);
++
++	return (stride != 0) ? (stride * (uoff / PAGE_SIZE)) +
++				(uoff & (PAGE_SIZE - 1)) : uoff;
++}
++#else
++static inline long rppc_recalc_off(phys_addr_t lpa, long uoff)
++{
++	return uoff;
++}
++#endif
++
++/**
++ * rppc_alloc_dmabuf - import a buffer and store in a rppc buffer descriptor
++ * @rpc - rppc instance handle
++ * @fd - dma_buf file descriptor
++ * @autoreg: flag indicating the mode of creation
++ *
++ * This function primarily imports a buffer into the driver and holds
++ * a reference to the buffer on behalf of the remote processor. The
++ * buffer to be imported is represented by a dma-buf file descriptor,
++ * and as such is agnostic of the buffer allocator and/or exporter.
++ * The buffer is imported using the dma-buf api, and a driver specific
++ * buffer descriptor is used to store the imported buffer properties.
++ * The imported buffers are all stored in a rppc instance specific
++ * idr, to be used for looking up and cleaning up the driver buffer
++ * descriptors.
++ *
++ * The @autoreg field is used to dictate the manner in which the buffer
++ * is imported. The user-side can pre-register the buffers with the driver
++ * (which will import the buffers) if the application is going to use
++ * these repeatedly in consecutive function invocations. The buffers
++ * are auto-imported if the user-side has not registered them previously
++ * and are un-imported once the remote function call returns.
++ *
++ * This function is to be called only after checking that buffer has
++ * not been imported already (see rppc_find_dmabuf).
++ *
++ * Return: allocated rppc_dma_buf or error
++ */
++struct rppc_dma_buf *rppc_alloc_dmabuf(struct rppc_instance *rpc, int fd,
++					bool autoreg)
++{
++	struct rppc_device *rppcdev = rpc->rppcdev;
++	struct rppc_dma_buf *dma;
++	void *ret;
++	int id;
++
++	dma = kzalloc(sizeof(*dma), GFP_KERNEL);
++	if (!dma)
++		return ERR_PTR(-ENOMEM);
++
++	dma->fd = fd;
++	dma->autoreg = !!autoreg;
++	dma->buf = dma_buf_get(dma->fd);
++	if (IS_ERR(dma->buf)) {
++		ret = dma->buf;
++		goto free_dma;
++	}
++
++	dma->attach = dma_buf_attach(dma->buf, rppcdev->dev);
++	if (IS_ERR(dma->attach)) {
++		ret = dma->attach;
++		goto put_buf;
++	}
++
++	dma->sgt = dma_buf_map_attachment(dma->attach, DMA_BIDIRECTIONAL);
++	if (IS_ERR(dma->sgt)) {
++		ret = dma->sgt;
++		goto detach_buf;
++	}
++
++	dma->pa = sg_dma_address(dma->sgt->sgl);
++	mutex_lock(&rpc->lock);
++	id = idr_alloc(&rpc->dma_idr, dma, 0, 0, GFP_KERNEL);
++	dma->id = id;
++	mutex_unlock(&rpc->lock);
++	if (id < 0) {
++		ret = ERR_PTR(id);
++		goto unmap_buf;
++	}
++
++	return dma;
++
++unmap_buf:
++	dma_buf_unmap_attachment(dma->attach, dma->sgt, DMA_BIDIRECTIONAL);
++detach_buf:
++	dma_buf_detach(dma->buf, dma->attach);
++put_buf:
++	dma_buf_put(dma->buf);
++free_dma:
++	kfree(dma);
++
++	return ret;
++}
++
++/**
++ * rppc_free_dmabuf - release the imported buffer
++ * @id: idr index of the imported buffer descriptor
++ * @p: imported buffer descriptor allocated during rppc_alloc_dmabuf
++ * @data: rpc instance handle
++ *
++ * This function is used to release a buffer that has been previously
++ * imported through a rppc_alloc_dmabuf call. The function can be used
++ * either individually for releasing a specific buffer or in a loop iterator
++ * for releasing all the buffers associated with a remote function call, or
++ * during cleanup of the rpc instance.
++ *
++ * Return: 0 on success, and -ENOENT if invalid pointers passed in
++ */
++int rppc_free_dmabuf(int id, void *p, void *data)
++{
++	struct rppc_dma_buf *dma = p;
++	struct rppc_instance *rpc = data;
++
++	if (!dma || !rpc)
++		return -ENOENT;
++
++	dma_buf_unmap_attachment(dma->attach, dma->sgt, DMA_BIDIRECTIONAL);
++	dma_buf_detach(dma->buf, dma->attach);
++	dma_buf_put(dma->buf);
++	WARN_ON(id != dma->id);
++	idr_remove(&rpc->dma_idr, id);
++	kfree(dma);
++
++	return 0;
++}
++
++/**
++ * rppc_free_auto_dmabuf - release an auto-registered imported buffer
++ * @id: idr index of the imported buffer descriptor
++ * @p: imported buffer descriptor allocated during the rppc_alloc_dmabuf
++ * @data: rpc instance handle
++ *
++ * This function is used to release a buffer that has been previously
++ * imported automatically in the remote function invocation path (for
++ * rppc_alloc_dmabuf invocations with autoreg set as true). The function
++ * is used as a loop iterator for releasing all such buffers associated
++ * with a remote function call, and is called after processing the
++ * translations while handling the return message of an executed function
++ * call.
++ *
++ * Return: 0 on success or if the buffer is not auto-imported, and -ENOENT
++ *	   if invalid pointers passed in
++ */
++static int rppc_free_auto_dmabuf(int id, void *p, void *data)
++{
++	struct rppc_dma_buf *dma = p;
++	struct rppc_instance *rpc = data;
++
++	if (WARN_ON(!dma || !rpc))
++		return -ENOENT;
++
++	if (!dma->autoreg)
++		return 0;
++
++	rppc_free_dmabuf(id, p, data);
++	return 0;
++}
++
++/**
++ * find_dma_by_fd - find the allocated buffer descriptor
++ * @id: idr loop index
++ * @p: imported buffer descriptor associated with each idr index @id
++ * @data: dma-buf file descriptor of the buffer
++ *
++ * This is a idr iterator helper function, used for checking if a buffer
++ * has been imported before and present within the rpc instance's idr.
++ *
++ * Return: rpc buffer descriptor if file descriptor matches, and 0 otherwise
++ */
++static int find_dma_by_fd(int id, void *p, void *data)
++{
++	struct rppc_dma_buf *dma = p;
++	int fd = (int)data;
++
++	if (dma->fd == fd)
++		return (int)p;
++
++	return 0;
++}
++
++/**
++ * rppc_find_dmabuf - find and return the rppc buffer descriptor of an imported
++ *		      buffer
++ * @rpc: rpc instance
++ * @fd: dma-buf file descriptor of the buffer
++ *
++ * This function is used to find and return the rppc buffer descriptor of an
++ * imported buffer. The function is used to check if ia buffer has already
++ * been imported (during manual registration to return an error), and to return
++ * the rppc buffer descriptor to be used for freeing (during manual
++ * deregistration). It is also used during auto-registration to see if the
++ * buffer needs to be imported through a rppc_alloc_dmabuf if not found.
++ *
++ * Return: rppc buffer descriptor of the buffer if it has already been imported,
++ *	   or NULL otherwise.
++ */
++struct rppc_dma_buf *rppc_find_dmabuf(struct rppc_instance *rpc, int fd)
++{
++	struct rppc_dma_buf *node = NULL;
++	void *data = (void *)fd;
++
++	dev_dbg(rpc->rppcdev->dev, "looking for fd %u\n", fd);
++
++	mutex_lock(&rpc->lock);
++	node = (struct rppc_dma_buf *)
++			idr_for_each(&rpc->dma_idr, find_dma_by_fd, data);
++	mutex_unlock(&rpc->lock);
++
++	dev_dbg(rpc->rppcdev->dev, "returning node %p for fd %u\n",
++		node, fd);
++
++	return node;
++}
++
++/**
++ * rppc_map_page - import and map a kernel page in a dma_buf
++ * @rpc - rppc instance handle
++ * @fd: file descriptor of the dma_buf to import
++ * @offset: offset of the translate location within the buffer
++ * @base_ptr: pointer for returning mapped kernel address
++ * @dmabuf: pointer for returning the imported dma_buf
++ *
++ * A helper function to import the dma_buf buffer and map into kernel
++ * the page containing the offset within the buffer. The function is
++ * called by rppc_xlate_buffers and returns the pointers to the kernel
++ * mapped address and the imported dma_buf handle in arguments. The
++ * mapping is used for performing in-place translation of the user
++ * provided pointer at location @offset within the buffer.
++ *
++ * The mapping is achieved through the appropriate dma_buf ops, and
++ * the page will be unmapped after performing the translation. See
++ * also rppc_unmap_page.
++ *
++ * Return: 0 on success, or an appropriate failure code otherwise
++ */
++static int rppc_map_page(struct rppc_instance *rpc, int fd, u32 offset,
++				uint8_t **base_ptr, struct dma_buf **dmabuf)
++{
++	int ret = 0;
++	uint8_t *ptr = NULL;
++	struct dma_buf *dbuf = NULL;
++	uint32_t pg_offset;
++	unsigned long pg_num;
++	size_t begin, end = PAGE_SIZE;
++	struct device *dev = rpc->rppcdev->dev;
++
++	if (!base_ptr || !dmabuf)
++		return -EINVAL;
++
++	pg_offset = (offset & (PAGE_SIZE - 1));
++	begin = offset & PAGE_MASK;
++	pg_num = offset >> PAGE_SHIFT;
++
++	dbuf = dma_buf_get(fd);
++	if (IS_ERR(dbuf)) {
++		ret = PTR_ERR(dbuf);
++		dev_err(dev, "invalid dma_buf file descriptor passed! fd = %d ret = %d\n",
++			fd, ret);
++		goto out;
++	}
++
++	ret = dma_buf_begin_cpu_access(dbuf, begin, end, DMA_BIDIRECTIONAL);
++	if (ret < 0) {
++		dev_err(dev, "failed to acquire cpu access to the dma buf fd = %d offset = 0x%x, ret = %d\n",
++			fd, offset, ret);
++		goto put_dmabuf;
++	}
++
++	ptr = dma_buf_kmap(dbuf, pg_num);
++	if (!ptr) {
++		ret = -ENOBUFS;
++		dev_err(dev, "failed to map the page containing the translation into kernel fd = %d offset = 0x%x\n",
++			fd, offset);
++		goto end_cpuaccess;
++	}
++
++	*base_ptr = ptr;
++	*dmabuf = dbuf;
++	dev_dbg(dev, "kmap'd base_ptr = %p buf = %p into kernel from %zu for %zu bytes, pg_offset = 0x%x\n",
++		ptr, dbuf, begin, end, pg_offset);
++	return 0;
++
++end_cpuaccess:
++	dma_buf_end_cpu_access(dbuf, begin, end, DMA_BIDIRECTIONAL);
++put_dmabuf:
++	dma_buf_put(dbuf);
++out:
++	return ret;
++}
++
++/**
++ * rppc_unmap_page - unmap and release a previously mapped page
++ * @rpc - rppc instance handle
++ * @offset: offset of the translate location within the buffer
++ * @base_ptr: kernel mapped address for the page to be unmapped
++ * @dmabuf: imported dma_buf to be released
++ *
++ * This function is called by rppc_xlate_buffers to unmap the
++ * page and release the imported buffer. It essentially undoes
++ * the functionality of rppc_map_page.
++ */
++static void rppc_unmap_page(struct rppc_instance *rpc, u32 offset,
++				uint8_t *base_ptr, struct dma_buf *dmabuf)
++{
++	uint32_t pg_offset;
++	unsigned long pg_num;
++	size_t begin, end = PAGE_SIZE;
++	struct device *dev = rpc->rppcdev->dev;
++
++	if (!base_ptr || !dmabuf)
++		return;
++
++	pg_offset = (offset & (PAGE_SIZE - 1));
++	begin = offset & PAGE_MASK;
++	pg_num = offset >> PAGE_SHIFT;
++
++	dev_dbg(dev, "Unkmaping base_ptr = %p of buf = %p from %zu to %zu bytes\n",
++		base_ptr, dmabuf, begin, end);
++	dma_buf_kunmap(dmabuf, pg_num, base_ptr);
++	dma_buf_end_cpu_access(dmabuf, begin, end, DMA_BIDIRECTIONAL);
++	dma_buf_put(dmabuf);
++}
++
++/**
++ * rppc_buffer_lookup - convert a buffer pointer to a remote processor pointer
++ * @rpc: rpc instance
++ * @uva: buffer pointer that needs to be translated
++ * @buva: base pointer of the allocated buffer
++ * @fd: dma-buf file descriptor of the allocated buffer
++ *
++ * This function is used for converting a pointer value in the function
++ * arguments to its appropriate remote processor device address value.
++ * The @uva and @buva are used for identifying the offset of the function
++ * argument pointer in an original allocation. This supports the cases where
++ * an offset pointer (eg: alignment, packed buffers etc) needs to be passed
++ * as the argument rather than the actual allocated pointer.
++ *
++ * The remote processor device address is done by retrieving the base physical
++ * address of the buffer by importing the buffer and converting it to the
++ * remote processor device address using a remoteproc api, with adjustments
++ * to the offset.
++ *
++ * The offset is specifically adjusted for OMAP TILER to account for the stride
++ * and mapping onto the remote processor.
++ *
++ * Return: remote processor device address, 0 on failure (implies invalid
++ *	   arguments)
++ */
++phys_addr_t rppc_buffer_lookup(struct rppc_instance *rpc, virt_addr_t uva,
++					virt_addr_t buva, int fd)
++{
++	phys_addr_t lpa = 0, rda = 0;
++	long uoff = uva - buva;
++	struct device *dev = rpc->rppcdev->dev;
++	struct rppc_dma_buf *buf;
++
++	dev_dbg(dev, "buva = %p uva = %p offset = %ld [0x%016lx] fd = %d\n",
++		(void *)buva, (void *)uva, uoff, (ulong) uoff, fd);
++
++	if (uoff < 0) {
++		dev_err(dev, "invalid pointer values for uva = %p from buva = %p\n",
++			(void *)uva, (void *)buva);
++		return rda;
++	}
++
++	buf = rppc_find_dmabuf(rpc, fd);
++	if (IS_ERR_OR_NULL(buf)) {
++		buf = rppc_alloc_dmabuf(rpc, fd, true);
++		if (IS_ERR(buf))
++			goto out;
++	}
++
++	lpa = buf->pa;
++	WARN_ON(lpa != sg_dma_address(buf->sgt->sgl));
++	uoff = rppc_recalc_off(lpa, uoff);
++	lpa += uoff;
++	rda = rppc_local_to_remote_da(rpc, lpa);
++
++out:
++	dev_dbg(dev, "host uva %p == host pa %p => remote da %p (fd %d)\n",
++		(void *)uva, (void *)lpa, (void *)rda, fd);
++	return rda;
++}
++
++/**
++ * rppc_xlate_buffers - translate argument pointers in the marshalled packet
++ * @rpc: rppc instance
++ * @func: rppc function packet being acted upon
++ * @direction: direction of translation
++ *
++ * This function translates all the pointers within the function call packet
++ * structure, based on the translation descriptor structures. The translation
++ * replaces the pointers to the appropriate pointers based on the direction.
++ * The function is invoked in preparing the packet to be sent to the remote
++ * processor-side and replaces the pointers to the remote processor device
++ * address pointers; and in processing the packet back after executing the
++ * function and replacing back the remote processor device addresses with
++ * the original pointers.
++ *
++ * Return: 0 on success, or an appropriate failure code otherwise
++ */
++int rppc_xlate_buffers(struct rppc_instance *rpc, struct rppc_function *func,
++				int direction)
++{
++	uint8_t *base_ptr = NULL;
++	struct dma_buf *dbuf = NULL;
++	struct device *dev = rpc->rppcdev->dev;
++	uint32_t ptr_idx, pri_offset, sec_offset, offset, pg_offset, size;
++	int i, limit, inc = 1;
++	virt_addr_t kva, uva, buva;
++	phys_addr_t rda;
++	int ret = 0;
++	int xlate_fd;
++
++	limit = func->num_translations;
++	if (WARN_ON(!limit))
++		return 0;
++
++	dev_dbg(dev, "operating on %d pointers\n", func->num_translations);
++
++	/* sanity check the translation elements */
++	for (i = 0; i < limit; i++) {
++		ptr_idx = func->translations[i].index;
++		pri_offset = func->params[ptr_idx].data -
++						func->params[ptr_idx].base;
++		sec_offset = func->translations[i].offset;
++		size = func->params[ptr_idx].size;
++
++		if (ptr_idx >= RPPC_MAX_PARAMETERS) {
++			dev_err(dev, "xlate[%d] - invalid parameter pointer index %u\n",
++				i, ptr_idx);
++			return -EINVAL;
++		}
++		if (func->params[ptr_idx].type != RPPC_PARAM_TYPE_PTR) {
++			dev_err(dev, "xlate[%d] - parameter index %u is not a pointer (type %u)\n",
++				i, ptr_idx, func->params[ptr_idx].type);
++			return -EINVAL;
++		}
++		if (func->params[ptr_idx].data == 0) {
++			dev_err(dev, "xlate[%d] - supplied user pointer is NULL!\n",
++				i);
++			return -EINVAL;
++		}
++		if (sec_offset > (size - sizeof(virt_addr_t))) {
++			dev_err(dev, "xlate[%d] offset is larger than data area! (sec_offset = %u size = %u)\n",
++				i, sec_offset, size);
++			return -ENOSPC;
++		}
++	}
++
++	/*
++	 * we may have a failure during translation, in which case use the same
++	 * loop to unwind the whole operation
++	 */
++	for (i = 0; i != limit; i += inc) {
++		dev_dbg(dev, "starting translation %d of %d by %d\n",
++			i, limit, inc);
++
++		ptr_idx = func->translations[i].index;
++		pri_offset = func->params[ptr_idx].data -
++						func->params[ptr_idx].base;
++		sec_offset = func->translations[i].offset;
++		offset = pri_offset + sec_offset;
++		pg_offset = (offset & (PAGE_SIZE - 1));
++
++		/*
++		 * map into kernel the page containing the offset, where the
++		 * pointer needs to be translated.
++		 */
++		ret = rppc_map_page(rpc, func->params[ptr_idx].fd, offset,
++					&base_ptr, &dbuf);
++		if (ret) {
++			dev_err(dev, "rppc_map_page failed, translation = %d param_index = %d fd = %d ret = %d\n",
++				i, ptr_idx, func->params[ptr_idx].fd, ret);
++			goto unwind;
++		}
++
++		/*
++		 * perform the actual translation as per the direction.
++		 */
++		if (direction == RPPC_UVA_TO_RPA) {
++			kva = (virt_addr_t) &(base_ptr[pg_offset]);
++			if (kva & 0x3) {
++				dev_err(dev, "kernel virtual address %p is not aligned for translation = %d\n",
++					(void *)kva, i);
++				ret = -EADDRNOTAVAIL;
++				goto unmap;
++			}
++
++			uva = *(virt_addr_t *)kva;
++			if (!uva) {
++				dev_err(dev, "user pointer in the translated offset location is NULL for translation = %d\n",
++					i);
++				print_hex_dump(KERN_DEBUG, "KMAP: ",
++					       DUMP_PREFIX_NONE, 16, 1,
++					       base_ptr, PAGE_SIZE, true);
++				ret = -EADDRNOTAVAIL;
++				goto unmap;
++			}
++
++			buva = (virt_addr_t) func->translations[i].base;
++			xlate_fd = func->translations[i].fd;
++
++			dev_dbg(dev, "replacing UVA %p at KVA %p prt_idx = %u pg_offset = 0x%x fd = %d\n",
++				(void *)uva, (void *)kva, ptr_idx,
++				pg_offset, xlate_fd);
++
++			/* compute the corresponding remote device address */
++			rda = rppc_buffer_lookup(rpc, uva, buva, xlate_fd);
++			if (!rda) {
++				ret = -ENODATA;
++				goto unmap;
++			}
++
++			/*
++			 * replace the pointer, save the old value for replacing
++			 * it back on the function return path
++			 */
++			func->translations[i].fd = (int32_t) uva;
++			*(phys_addr_t *)kva = rda;
++			dev_dbg(dev, "replaced UVA %p with RDA %p at KVA %p\n",
++				(void *)uva, (void *)rda, (void *)kva);
++		} else if (direction == RPPC_RPA_TO_UVA) {
++			kva = (virt_addr_t) &(base_ptr[pg_offset]);
++			if (kva & 0x3) {
++				ret = -EADDRNOTAVAIL;
++				goto unmap;
++			}
++
++			rda = *(phys_addr_t *)kva;
++			uva = (virt_addr_t) func->translations[i].fd;
++			WARN_ON(!uva);
++			*(virt_addr_t *)kva = uva;
++
++			dev_dbg(dev, "replaced RDA %p with UVA %p at KVA %p\n",
++				(void *)rda, (void *)uva, (void *)kva);
++		}
++
++unmap:
++		/*
++		 * unmap the page containing the translation from kernel, the
++		 * next translation acting on the same fd might be in a
++		 * different page altogether from the current one
++		 */
++		rppc_unmap_page(rpc, offset, base_ptr, dbuf);
++		dbuf = NULL;
++		base_ptr = NULL;
++
++		if (!ret)
++			continue;
++
++unwind:
++		/*
++		 * unwind all the previous translations if the failure occurs
++		 * while sending a message to the remote-side. There's nothing
++		 * to do but to continue if the failure occurs during the
++		 * processing of a function response.
++		 */
++		if (direction == RPPC_UVA_TO_RPA) {
++			dev_err(dev, "unwinding UVA to RDA translations! translation = %d\n",
++				i);
++			direction = RPPC_RPA_TO_UVA;
++			inc = -1;
++			limit = -1;
++		} else if (direction == RPPC_RPA_TO_UVA) {
++			dev_err(dev, "error during UVA to RDA translations!! current translation = %d\n",
++				i);
++		}
++	}
++
++	/*
++	 * all the in-place pointer replacements are done, release all the
++	 * imported buffers during the remote function return path
++	 */
++	if (direction == RPPC_RPA_TO_UVA) {
++		mutex_lock(&rpc->lock);
++		idr_for_each(&rpc->dma_idr, rppc_free_auto_dmabuf, rpc);
++		mutex_unlock(&rpc->lock);
++	}
++
++	return ret;
++}
+diff --git a/drivers/rpmsg/rpmsg_rpc_internal.h b/drivers/rpmsg/rpmsg_rpc_internal.h
+new file mode 100644
+index 0000000..ea78710
+--- /dev/null
++++ b/drivers/rpmsg/rpmsg_rpc_internal.h
+@@ -0,0 +1,416 @@
++/*
++ * Remote Processor Procedure Call Driver
++ *
++ * Copyright(c) 2012-2014 Texas Instruments. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * * Redistributions of source code must retain the above copyright
++ *   notice, this list of conditions and the following disclaimer.
++ * * Redistributions in binary form must reproduce the above copyright
++ *   notice, this list of conditions and the following disclaimer in
++ *   the documentation and/or other materials provided with the
++ *   distribution.
++ * * Neither the name Texas Instruments nor the names of its
++ *   contributors may be used to endorse or promote products derived
++ *   from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef _RPMSG_RPC_INTERNAL_H_
++#define _RPMSG_RPC_INTERNAL_H_
++
++#include <linux/cdev.h>
++#include <linux/idr.h>
++#include <linux/wait.h>
++#include <linux/fs.h>
++#include <linux/skbuff.h>
++
++#ifdef CONFIG_PHYS_ADDR_T_64BIT
++typedef u64 virt_addr_t;
++#else
++typedef u32 virt_addr_t;
++#endif
++
++/**
++ * struct rppc_device - The per-device (server) data
++ * @cdev: character device
++ * @dev: device
++ * @rpdev: rpmsg channel device associated with the remote server
++ * @instances: list of currently opened/connected instances
++ * @lock: mutex for protection of device variables
++ * @comp: completion signal used for unblocking users during a
++ *	  remote processor recovery
++ * @sig_attr: array of device attributes to use with the publishing of
++ *	      function information in sysfs for all the functions
++ *	      associated with this remote server device.
++ * @signatures: function signatures for the functions published by this
++ *		remote server device
++ * @minor: minor number for the character device
++ * @num_funcs: number of functions published by this remote server device
++ * @cur_func: counter used while querying information for each function
++ *	      associated with this remote server device
++ *
++ * A rppc_device indicates the base remote server device that supports the
++ * execution of a bunch of remote functions. Each such remote server device
++ * has an associated character device that is used by the userland apps to
++ * connect to it, and request the execution of any of these remote functions.
++ */
++struct rppc_device {
++	struct cdev cdev;
++	struct device *dev;
++	struct rpmsg_channel *rpdev;
++	struct list_head instances;
++	struct mutex lock;
++	struct completion comp;
++	struct device_attribute *sig_attr;
++	struct rppc_func_signature *signatures;
++	unsigned int minor;
++	u32 num_funcs;
++	u32 cur_func;
++};
++
++/**
++ * struct rppc_instance - The per-instance data structure (per user)
++ * @list: list node
++ * @rppcdev: the rppc device (remote server instance) handle
++ * @queue: queue of buffers waiting to be read by the user
++ * @lock: mutex for protecting instance variables
++ * @readq: wait queue of blocked user threads waiting to read data
++ * @reply_arrived: signal for unblocking the user thread
++ * @ept: rpmsg endpoint associated with the rppc device
++ * @in_transition: flag for storing a pending connection request
++ * @dst: destination end-point of the remote server instance
++ * @state: state of the opened instance, see enum rppc_state
++ * @dma_idr: idr structure storing the imported buffers
++ * @msg_id: last/current active message id tagged on a message sent
++ *	    to the remote processor
++ * @fxn_list: list of functions published by the remote server instance
++ *
++ * This structure is created whenever the user opens the driver. The
++ * various elements of the structure are used to store its state and
++ * information about the remote server it is connected to.
++ */
++struct rppc_instance {
++	struct list_head list;
++	struct rppc_device *rppcdev;
++	struct sk_buff_head queue;
++	struct mutex lock;
++	wait_queue_head_t readq;
++	struct completion reply_arrived;
++	struct rpmsg_endpoint *ept;
++	int in_transition;
++	u32 dst;
++	int state;
++	struct idr dma_idr;
++	u16 msg_id;
++	struct list_head fxn_list;
++};
++
++/**
++ * struct rppc_function_list - outstanding function descriptor
++ * @list: list node
++ * @function: current remote function descriptor
++ * @msg_id: message id for the function invocation
++ *
++ * This structure is used for storing the information about outstanding
++ * functions that the remote side is executing. This provides the host
++ * side a means to track every outstanding function, and a means to process
++ * the responses received from the remote processor.
++ */
++struct rppc_function_list {
++	struct list_head list;
++	struct rppc_function *function;
++	u16 msg_id;
++};
++
++/**
++ * struct rppc_dma_buf - a rppc dma_buf descriptor for buffers imported by rppc
++ * @fd: file descriptor of a buffer used to import the dma_buf
++ * @id: idr index value for this descriptor
++ * @buf: imported dma_buf handle for the buffer
++ * @attach: attachment structure returned by exporter upon attaching to
++ *	    the buffer by the rppc driver
++ * @sgt: the scatter-gather structure associated with @buf
++ * @pa: the physical address associated with the imported buffer
++ * @autoreg: mode of how the descriptor is created
++ *
++ * This structure is used for storing the information relevant to the imported
++ * buffer. The rpmsg rpc driver acts as a proxy on behalf of the remote core
++ * and attaches itself to the driver while the remote processor/accelerators are
++ * operating on the buffer.
++ */
++struct rppc_dma_buf {
++	int fd;
++	int id;
++	struct dma_buf *buf;
++	struct dma_buf_attachment *attach;
++	struct sg_table *sgt;
++	phys_addr_t pa;
++	int autoreg;
++};
++
++/**
++ * enum rppc_msg_type - message types exchanged between host and remote server
++ * @RPPC_MSGTYPE_DEVINFO_REQ: request remote server for channel information
++ * @RPPC_MSGTYPE_DEVINFO_RESP: response message from remote server for a
++ *			       request of type RPPC_MSGTYPE_DEVINFO_REQ
++ * @RPPC_MSGTYPE_FUNCTION_QUERY: request remote server for information about a
++ *				 specific function
++ * @RPPC_MSGTYPE_FUNCTION_INFO: response message from remote server for a prior
++ *				request of type RPPC_MSGTYPE_FUNCTION_QUERY
++ * @RPPC_MSGTYPE_CREATE_REQ: request the remote server manager to create a new
++ *			     remote server instance. No secondary data is
++ *			     needed
++ * @RPPC_MSGTYPE_CREATE_RESP: response message from remote server manager for a
++ *			      request of type RPPC_MSGTYPE_CREATE_REQ. The
++ *			      message contains the new endpoint address in the
++ *			      rppc_instance_handle
++ * @RPPC_MSGTYPE_DELETE_REQ: request the remote server manager to delete a
++ *			     remote server instance
++ * @RPPC_MSGTYPE_DELETE_RESP: response message from remote server manager to a
++ *			      request of type RPPC_MSGTYPE_DELETE_REQ. The
++ *			      message contains the old endpoint address in the
++ *			      rppc_instance_handle
++ * @RPPC_MSGTYPE_FUNCTION_CALL: request remote server to execute a specific
++ *				function
++ * @RPPC_MSGTYPE_FUNCTION_RET: response message carrying the return status of a
++ *			       specific function execution
++ * @RPPC_MSGTYPE_ERROR: an error response message sent by either the remote
++ *			server manager or remote server instance while
++ *			processing any request messages
++ * @RPPC_MSGTYPE_MAX: limit value to define the maximum message type value
++ *
++ * Every message exchanged between the host-side and the remote-side is
++ * identified through a message type defined in this enum. The message type
++ * is specified through the msg_type field of the struct rppc_msg_header,
++ * which is the common header for rppc messages.
++ */
++enum rppc_msg_type {
++	RPPC_MSGTYPE_DEVINFO_REQ	= 0,
++	RPPC_MSGTYPE_DEVINFO_RESP	= 1,
++	RPPC_MSGTYPE_FUNCTION_QUERY	= 2,
++	RPPC_MSGTYPE_FUNCTION_INFO	= 3,
++	RPPC_MSGTYPE_CREATE_REQ		= 6,
++	RPPC_MSGTYPE_CREATE_RESP	= 8,
++	RPPC_MSGTYPE_DELETE_REQ		= 4,
++	RPPC_MSGTYPE_DELETE_RESP	= 7,
++	RPPC_MSGTYPE_FUNCTION_CALL	= 5,
++	RPPC_MSGTYPE_FUNCTION_RET	= 9,
++	RPPC_MSGTYPE_ERROR = 10,
++	RPPC_MSGTYPE_MAX
++};
++
++/**
++ * enum rppc_infotype - function information query type
++ * @RPPC_INFOTYPE_FUNC_SIGNATURE: function signature
++ * @RPPC_INFOTYPE_NUM_CALLS: the number of times a function has been invoked
++ * @RPPC_INFOTYPE_MAX: limit value to define the maximum info type
++ *
++ * This enum is used for identifying the type of information queried
++ * from the remote processor. Only RPPC_INFOTYPE_FUNC_SIGNATURE is
++ * currently used.
++ */
++enum rppc_infotype {
++	RPPC_INFOTYPE_FUNC_SIGNATURE = 1,
++	RPPC_INFOTYPE_NUM_CALLS,
++	RPPC_INFOTYPE_MAX
++};
++
++/**
++ * struct rppc_instance_handle - rppc instance information
++ * @endpoint_address: end-point address of the remote server instance
++ * @status: status of the request
++ *
++ * This structure indicates the format of the message payload exchanged
++ * between the host and the remote sides for messages pertaining to
++ * creation and deletion of the remote server instances. This payload
++ * is associated with messages of type RPPC_MSGTYPE_CREATE_RESP and
++ * RPPC_MSGTYPE_DELETE_RESP.
++ */
++struct rppc_instance_handle {
++	uint32_t endpoint_address;
++	uint32_t status;
++} __packed;
++
++/**
++ * struct rppc_param_signature - parameter descriptor
++ * @direction: input or output classifier, see enum rppc_param_direction
++ * @type: parameter data type, see enum rppc_param_type
++ * @count: used to do some basic sanity checking on array bounds
++ */
++struct rppc_param_signature {
++	uint32_t direction;
++	uint32_t type;
++	uint32_t count;
++};
++
++/**
++ * struct rppc_func_signature - remote function signature descriptor
++ * @name: name of the function
++ * @num_param: number of parameters to the function
++ * @params: parameter descriptors for each of the parameters
++ *
++ * This structure contains the indicates the format of the message payload
++ * exchanged between the host and the remote sides for messages pertaining
++ * to creation and deletion of the remote server instances. This payload
++ * is associated with messages of type RPPC_MSGTYPE_CREATE_RESP and
++ * RPPC_MSGTYPE_FUNCTION_INFO.
++ */
++struct rppc_func_signature {
++	char name[RPPC_MAX_CHANNEL_NAMELEN];
++	uint32_t num_param;
++	struct rppc_param_signature params[RPPC_MAX_NUM_PARAMS + 1];
++};
++
++/**
++ * struct rppc_query_function - function info packet structure
++ * @info_type: type of the function information requested, see
++ *	       enum rppc_infotype
++ * @fxn_id: function identifier on this specific remote server instance
++ * @num_calls: number of types function is invoked, filled in during a response
++ *	       (only valid for rppc_infotype RPPC_INFOTYPE_NUM_CALLS)
++ * @signature: the signature of the function including its return type,
++ *	       parameters and thier description
++ *	       (only valid for rppc_infotype RPPC_INFOTYPE_FUNC_SIGNATURE)
++ *
++ * This structure indicates the format of the message payload exchanged
++ * between the host and the remote sides for messages pertaining to
++ * information about each function supported by the remote server instance.
++ * This payload is associated with messages of type RPPC_MSGTYPE_FUNCTION_QUERY
++ * and RPPC_MSGTYPE_FUNCTION_INFO.
++ */
++struct rppc_query_function {
++	uint32_t info_type;
++	uint32_t fxn_id;
++	union {
++		uint32_t num_calls;
++		struct rppc_func_signature signature;
++	} info;
++};
++
++/**
++ * enum rppc_translate_direction - pointer translation direction
++ * @RPPC_UVA_TO_RPA: user virtual address to remote device address translation
++ * @RPPC_RPA_TO_UVA: remote device address to user virtual address translation
++ *
++ * An enum used for identifying the rppc function message direction, whether
++ * it is going to the remote side, or is a response from the remote side. This
++ * is used in translating the pointers from the host-side to the remote-side
++ * and vice versa depending on the packet direction.
++ */
++enum rppc_translate_direction {
++	RPPC_UVA_TO_RPA,
++	RPPC_RPA_TO_UVA,
++};
++
++/**
++ * enum rppc_state - rppc instance state
++ * @RPPC_STATE_DISCONNECTED: uninitialized state
++ * @RPPC_STATE_CONNECTED: initialized state
++ * @RPPC_STATE_STALE: invalid or stale state
++ * @RPPC_STATE_MAX: limit value for the different state values
++ *
++ * This enum value is used to define the status values of a
++ * rppc_instance object.
++ */
++enum rppc_state {
++	RPPC_STATE_DISCONNECTED,
++	RPPC_STATE_CONNECTED,
++	RPPC_STATE_STALE,
++	RPPC_STATE_MAX
++};
++
++/**
++ * struct rppc_device_info - rppc remote server device info
++ * @num_funcs: number of functions supported by a remote server instance
++ *
++ * This structure indicates the format of the message payload responded by
++ * the remote side upon a request for message type RPPC_MSGTYPE_DEVINFO_REQ.
++ * This payload is associated with messages of type RPPC_MSGTYPE_DEVINFO_RESP.
++ */
++struct rppc_device_info {
++	uint32_t num_funcs;
++};
++
++/**
++ * struct rppc_error - rppc error information
++ * @endpoint_address: end-point address of the remote server instance
++ * @status: status of the request
++ *
++ * This structure indicates the format of the message payload exchanged
++ * between the host and the remote sides for error messages. This payload
++ * is associated with messages of type RPPC_MSGTYPE_ERROR
++ * XXX: check if this is needed still, not used anywhere at present
++ */
++struct rppc_error {
++	uint32_t endpoint_address;
++	uint32_t status;
++} __packed;
++
++/**
++ * struct rppc_param_data - marshalled parameter data structure
++ * @size: size of the parameter data type
++ * @data: actual parameter data
++ *
++ * Each function parameter is marshalled in this form between the host
++ * and remote sides. The @data field would contain the actual value of
++ * of the parameter if it is a scalar argument type, or the remote-side
++ * device address (virtual address) of the pointer if the argument is
++ * of pointer type.
++ */
++struct rppc_param_data {
++	size_t size;
++	size_t data;
++} __packed;
++
++/**
++ * struct rppc_msg_header - generic rpmsg rpc message header
++ * @msg_type: message type, see enum rppc_msg_type
++ * @msg_len: length of the message payload in bytes
++ * @msg_data: the actual message payload (depends on message type)
++ *
++ * All RPPC messages will start with this common header (which will begin
++ * right after the standard rpmsg header ends).
++ */
++struct rppc_msg_header {
++	uint32_t msg_type;
++	uint32_t msg_len;
++	uint8_t  msg_data[0];
++} __packed;
++
++#define RPPC_PAYLOAD(ptr, type)	\
++		((struct type *)&(ptr)[sizeof(struct rppc_msg_header)])
++
++
++/* from rpmsg_rpc.c */
++phys_addr_t rppc_local_to_remote_da(struct rppc_instance *rpc, phys_addr_t pa);
++
++/* from rpmsg_rpc_dmabuf.c */
++struct rppc_dma_buf *rppc_alloc_dmabuf(struct rppc_instance *rpc,
++					int fd, bool autoreg);
++struct rppc_dma_buf *rppc_find_dmabuf(struct rppc_instance *rpc, int fd);
++int rppc_free_dmabuf(int id, void *p, void *data);
++phys_addr_t rppc_buffer_lookup(struct rppc_instance *rpc, virt_addr_t uva,
++				virt_addr_t buva, int fd);
++int rppc_xlate_buffers(struct rppc_instance *rpc, struct rppc_function *func,
++			int direction);
++
++/* from rpmsg_rpc_sysfs.c */
++int rppc_create_sysfs(struct rppc_device *rppcdev);
++int rppc_remove_sysfs(struct rppc_device *rppcdev);
++
++#endif
+diff --git a/drivers/rpmsg/rpmsg_rpc_sysfs.c b/drivers/rpmsg/rpmsg_rpc_sysfs.c
+new file mode 100644
+index 0000000..da0e327
+--- /dev/null
++++ b/drivers/rpmsg/rpmsg_rpc_sysfs.c
+@@ -0,0 +1,255 @@
++/*
++ * Remote Processor Procedure Call Driver
++ *
++ * Copyright(c) 2012-2014 Texas Instruments. All rights reserved.
++ *
++ * Erik Rainey <erik.rainey@ti.com>
++ * Suman Anna <s-anna@ti.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/device.h>
++#include <linux/slab.h>
++#include <linux/rpmsg_rpc.h>
++
++#include "rpmsg_rpc_internal.h"
++
++static ssize_t show_numfuncs(struct device *dev, struct device_attribute *attr,
++					char *buf)
++{
++	struct rppc_device *rppcdev = dev_get_drvdata(dev);
++	return snprintf(buf, PAGE_SIZE, "%u\n", rppcdev->num_funcs - 1);
++}
++
++static ssize_t set_type_c(char *buf, uint32_t len,
++					struct rppc_param_signature *psig)
++{
++	char *isptr = (psig->type & RPPC_PARAM_PTR ? " *" : "");
++
++	switch (psig->type & RPPC_PARAM_MASK) {
++	case RPPC_PARAM_S08:
++		return snprintf(buf, len, "int8_t%s", isptr);
++	case RPPC_PARAM_U08:
++		return snprintf(buf, len, "uint8_t%s", isptr);
++	case RPPC_PARAM_S16:
++		return snprintf(buf, len, "int16_t%s", isptr);
++	case RPPC_PARAM_U16:
++		return snprintf(buf, len, "uint16_t%s", isptr);
++	case RPPC_PARAM_S32:
++		return snprintf(buf, len, "int32_t%s", isptr);
++	case RPPC_PARAM_U32:
++		return snprintf(buf, len, "uint32_t%s", isptr);
++	case RPPC_PARAM_S64:
++		return snprintf(buf, len, "int64_t%s", isptr);
++	case RPPC_PARAM_U64:
++		return snprintf(buf, len, "uint64_t%s", isptr);
++	default:
++		return snprintf(buf, len, "<unknown>%s", isptr);
++	}
++}
++
++static ssize_t set_type_doxy(char *buf, uint32_t len,
++					struct rppc_param_signature *psig)
++{
++	char *isptr = (psig->type & RPPC_PARAM_PTR ? " *" : "");
++	char dir[10];
++
++	switch (psig->direction) {
++	case RPPC_PARAMDIR_IN:
++		snprintf(dir, sizeof(dir), "[in]");
++		break;
++	case RPPC_PARAMDIR_OUT:
++		snprintf(dir, sizeof(dir), "[out]");
++		break;
++	case RPPC_PARAMDIR_BI:
++		snprintf(dir, sizeof(dir), "[in,out]");
++		break;
++	default:
++		snprintf(dir, sizeof(dir), "[unknown]");
++		break;
++	}
++
++	switch (psig->type & RPPC_PARAM_MASK) {
++	case RPPC_PARAM_S08:
++		return snprintf(buf, len, "%s int8_t%s", dir, isptr);
++	case RPPC_PARAM_U08:
++		return snprintf(buf, len, "%s uint8_t%s", dir, isptr);
++	case RPPC_PARAM_S16:
++		return snprintf(buf, len, "%s int16_t%s", dir, isptr);
++	case RPPC_PARAM_U16:
++		return snprintf(buf, len, "%s uint16_t%s", dir, isptr);
++	case RPPC_PARAM_S32:
++		return snprintf(buf, len, "%s int32_t%s", dir, isptr);
++	case RPPC_PARAM_U32:
++		return snprintf(buf, len, "%s uint32_t%s", dir, isptr);
++	case RPPC_PARAM_S64:
++		return snprintf(buf, len, "%s int64_t%s", dir, isptr);
++	case RPPC_PARAM_U64:
++		return snprintf(buf, len, "%s uint64_t%s", dir, isptr);
++	default:
++		return snprintf(buf, len, "%s <unknown>%s", dir, isptr);
++	}
++}
++
++static ssize_t show_c_function(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct rppc_device *rppcdev = dev_get_drvdata(dev);
++	char return_value[11]; /* longest string is strlen("uintXX_t *") = 10 */
++	char parameters[110]; /* longest string * 10 + 9(,) */
++	char comment[300];
++	int p;
++	ssize_t pidx = 0;
++	ssize_t cidx = 0;
++	__u32 index = 0;
++
++	if (sscanf(attr->attr.name, "c_function%u\n", &index) != 1)
++		return -EIO;
++
++	memset(return_value, 0, sizeof(return_value));
++	memset(parameters, 0, sizeof(parameters));
++
++	strcpy(return_value, "void");
++	strcpy(parameters, "void");
++	cidx += snprintf(&comment[cidx], sizeof(comment) - cidx, "/**\n");
++	cidx += snprintf(&comment[cidx], sizeof(comment) - cidx,
++		" * \\fn %s\n", rppcdev->signatures[index].name);
++	for (p = 0; p < rppcdev->signatures[index].num_param; p++) {
++		if (p == 0) {
++			set_type_c(return_value, sizeof(return_value),
++				   &rppcdev->signatures[index].params[0]);
++			cidx += snprintf(&comment[cidx], sizeof(comment) - cidx,
++					" * \\return %s\n", return_value);
++		} else {
++			pidx += set_type_c(&parameters[pidx],
++					sizeof(parameters) - pidx,
++					&rppcdev->signatures[index].params[p]);
++			if (p != rppcdev->signatures[index].num_param - 1)
++				parameters[pidx++] = ',';
++			cidx += snprintf(&comment[cidx], sizeof(comment) - cidx,
++						" * \\param ");
++			cidx += set_type_doxy(&comment[cidx],
++					sizeof(comment) - cidx,
++					&rppcdev->signatures[index].params[p]);
++			cidx += snprintf(&comment[cidx], sizeof(comment) - cidx,
++						"\n");
++		}
++	}
++	if (p <= 1)
++		pidx += strlen("void");
++	if (pidx < sizeof(parameters))
++		parameters[pidx] = '\0';
++	cidx += snprintf(&comment[cidx], sizeof(comment) - cidx, " */");
++	return snprintf(buf, PAGE_SIZE, "%s\nextern \"C\" %s %s(%s);\n",
++			comment, return_value, rppcdev->signatures[index].name,
++			parameters);
++}
++
++static struct device_attribute rppc_attrs[] = {
++	__ATTR(num_funcs, S_IRUGO, show_numfuncs, NULL),
++};
++
++/**
++ * rppc_create_sysfs - Creates the sysfs entry structures for the instance
++ * @rppcdev: the rppc device (remote server instance) handle
++ *
++ * Helper function to create all the sysfs entries associated with a rppc
++ * device. Each device is associated with a number of remote procedure
++ * functions. The number of such functions and the signatures of those
++ * functions are created in sysfs. Function is invoked after querying
++ * the remote side about the supported functions on this device.
++ *
++ * The entries are split into a set of static entries, which are common
++ * between all rppc devices, and a set of dynamic entries specific to
++ * each rppc device.
++ *
++ * Return: 0 on success, or an appropriate error code otherwise
++ */
++int rppc_create_sysfs(struct rppc_device *rppcdev)
++{
++	int i;
++	int ret;
++
++	rppcdev->sig_attr = kzalloc(sizeof(*rppcdev->sig_attr) *
++						rppcdev->num_funcs, GFP_KERNEL);
++	if (!rppcdev->sig_attr)
++		return -ENOMEM;
++
++	for (i = 0; i < ARRAY_SIZE(rppc_attrs); i++) {
++		ret = device_create_file(rppcdev->dev, &rppc_attrs[i]);
++		if (ret) {
++			dev_err(rppcdev->dev, "failed to create sysfs entry\n");
++			goto clean_static_entries;
++		}
++	}
++
++	for (i = 1; i < rppcdev->num_funcs; i++) {
++		sysfs_attr_init(&rppcdev->sig_attr[i].attr);
++		rppcdev->sig_attr[i].attr.name =
++				kzalloc(RPPC_MAX_FUNC_NAMELEN, GFP_KERNEL);
++		if (!rppcdev->sig_attr[i].attr.name) {
++			ret = -ENOMEM;
++			goto clean_dynamic_entries;
++		}
++		snprintf((char *)rppcdev->sig_attr[i].attr.name,
++			 RPPC_MAX_FUNC_NAMELEN, "c_function%u", i);
++		rppcdev->sig_attr[i].attr.mode = S_IRUGO;
++		rppcdev->sig_attr[i].show = show_c_function;
++		rppcdev->sig_attr[i].store = NULL;
++
++		ret = device_create_file(rppcdev->dev, &rppcdev->sig_attr[i]);
++		if (ret) {
++			dev_err(rppcdev->dev, "failed to create sysfs function entry (%d)\n",
++				ret);
++			goto clean_dynamic_entries;
++		}
++	}
++	return 0;
++
++clean_dynamic_entries:
++	while (i-- > 1) {
++		device_remove_file(rppcdev->dev, &rppcdev->sig_attr[i]);
++		kfree(rppcdev->sig_attr[i].attr.name);
++	}
++	i = ARRAY_SIZE(rppc_attrs);
++clean_static_entries:
++	while (i-- > 0)
++		device_remove_file(rppcdev->dev, &rppc_attrs[i]);
++	kfree(rppcdev->sig_attr);
++	return ret;
++}
++
++/**
++ * rppc_remove_sysfs: Removes the sysfs entry structures for the instance
++ * @rppcdev: the rppc device (remote server instance) handle
++ *
++ * Helper function to remove all the sysfs entries associated with the
++ * rppc device.
++ *
++ * Return: 0 on success, or an appropriate error code otherwise
++ */
++int rppc_remove_sysfs(struct rppc_device *rppcdev)
++{
++	int i;
++
++	if (rppcdev->sig_attr) {
++		for (i = 1; i < rppcdev->num_funcs; i++) {
++			device_remove_file(rppcdev->dev, &rppcdev->sig_attr[i]);
++			kfree(rppcdev->sig_attr[i].attr.name);
++		}
++	}
++	kfree(rppcdev->sig_attr);
++
++	for (i = 0; i < ARRAY_SIZE(rppc_attrs); i++)
++		device_remove_file(rppcdev->dev, &rppc_attrs[i]);
++
++	return 0;
++}
+diff --git a/include/linux/rpmsg_rpc.h b/include/linux/rpmsg_rpc.h
+new file mode 100644
+index 0000000..5141c34
+--- /dev/null
++++ b/include/linux/rpmsg_rpc.h
+@@ -0,0 +1,105 @@
++/*
++ * Remote Processor Procedure Call Driver
++ *
++ * Copyright(c) 2012-2014 Texas Instruments. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * * Redistributions of source code must retain the above copyright
++ *   notice, this list of conditions and the following disclaimer.
++ * * Redistributions in binary form must reproduce the above copyright
++ *   notice, this list of conditions and the following disclaimer in
++ *   the documentation and/or other materials provided with the
++ *   distribution.
++ * * Neither the name Texas Instruments nor the names of its
++ *   contributors may be used to endorse or promote products derived
++ *   from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef _LINUX_RPMSG_RPC_H_
++#define _LINUX_RPMSG_RPC_H_
++
++#include <uapi/linux/rpmsg_rpc.h>
++
++#define RPPC_MAX_NUM_FUNCS		(1024)
++#define RPPC_MAX_CHANNEL_NAMELEN	(64)
++#define RPPC_MAX_FUNC_NAMELEN		(64)
++#define RPPC_MAX_NUM_PARAMS		(10)
++
++/**
++ * enum rppc_param_direction - direction of the function parameter
++ * @RPPC_PARAMDIR_IN: input argument
++ * @RPPC_PARAMDIR_OUT: output argument
++ * @RPPC_PARAMDIR_BI: an in and out argument
++ * @RPPC_PARAMDIR_MAX: limit value for the direction type
++ *
++ * The parameter direction is described as relative to the function.
++ */
++enum rppc_param_direction {
++	RPPC_PARAMDIR_IN = 0,
++	RPPC_PARAMDIR_OUT,
++	RPPC_PARAMDIR_BI,
++	RPPC_PARAMDIR_MAX
++};
++
++/**
++ * enum rppc_param_datatype - parameter data type and descriptor flags
++ * @RPPC_PARAM_VOID: parameter is of type 'void'
++ * @RPPC_PARAM_S08: parameter is of type 's8'
++ * @RPPC_PARAM_U08: parameter is of type 'u8'
++ * @RPPC_PARAM_S16: parameter is of type 's16'
++ * @RPPC_PARAM_U16: parameter is of type 'u16'
++ * @RPPC_PARAM_S32: parameter is of type 's32'
++ * @RPPC_PARAM_U32: parameter is of type 'u32'
++ * @RPPC_PARAM_S64: parameter is of type 's64'
++ * @RPPC_PARAM_U64: parameter is of type 'u64'
++ * @RPPC_PARAM_ATOMIC_MAX: limit value for scalar data types
++ * @RPPC_PARAM_MASK: mask field for retrieving the scalar data type
++ * @RPPC_PARAM_PTR: flag to indicate the data type is a pointer
++ * @RPPC_PARAM_MAX: max limit value used as a marker
++ *
++ * This enum is used to describe the data type for the parameters.
++ * A pointer of a data type is reflected by using an additional bit
++ * mask field.
++ */
++enum rppc_param_datatype {
++	RPPC_PARAM_VOID = 0,
++	RPPC_PARAM_S08,
++	RPPC_PARAM_U08,
++	RPPC_PARAM_S16,
++	RPPC_PARAM_U16,
++	RPPC_PARAM_S32,
++	RPPC_PARAM_U32,
++	RPPC_PARAM_S64,
++	RPPC_PARAM_U64,
++	RPPC_PARAM_ATOMIC_MAX,
++
++	RPPC_PARAM_MASK = 0x7F,
++	RPPC_PARAM_PTR = 0x80,
++
++	RPPC_PARAM_MAX
++};
++
++/*
++ * helper macros to deal with parameter types
++ */
++#define RPPC_PTR_TYPE(type)	((type) | RPPC_PARAM_PTR)
++#define RPPC_IS_PTR(type)	((type) & RPPC_PARAM_PTR)
++#define RPPC_IS_ATOMIC(type)	(((type) > RPPC_PARAM_VOID) && \
++				 ((type) < RPPC_PARAM_ATOMIC_MAX))
++
++#endif /* _LINUX_RPMSG_RPC_H_ */
+diff --git a/include/uapi/linux/rpmsg_rpc.h b/include/uapi/linux/rpmsg_rpc.h
+new file mode 100644
+index 0000000..2c8724f
+--- /dev/null
++++ b/include/uapi/linux/rpmsg_rpc.h
+@@ -0,0 +1,208 @@
++/*
++ * Remote Processor Procedure Call Driver
++ *
++ * Copyright(c) 2012-2014 Texas Instruments. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * * Redistributions of source code must retain the above copyright
++ *   notice, this list of conditions and the following disclaimer.
++ * * Redistributions in binary form must reproduce the above copyright
++ *   notice, this list of conditions and the following disclaimer in
++ *   the documentation and/or other materials provided with the
++ *   distribution.
++ * * Neither the name Texas Instruments nor the names of its
++ *   contributors may be used to endorse or promote products derived
++ *   from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef _UAPI_LINUX_RPMSG_RPC_H_
++#define _UAPI_LINUX_RPMSG_RPC_H_
++
++#include <linux/ioctl.h>
++
++/**
++ * struct rppc_buf_fds - rppc buffer registration/deregistration
++ * @num: number of file descriptors
++ * @fds: pointer to the array holding the file descriptors
++ */
++struct rppc_buf_fds {
++	uint32_t num;
++	int32_t *fds;
++};
++
++/*
++ * ioctl definitions
++ */
++#define RPPC_IOC_MAGIC		'r'
++#define RPPC_IOC_CREATE		_IOW(RPPC_IOC_MAGIC, 1, char *)
++#define RPPC_IOC_BUFREGISTER    _IOW(RPPC_IOC_MAGIC, 2, struct rppc_buf_fds)
++#define RPPC_IOC_BUFUNREGISTER  _IOW(RPPC_IOC_MAGIC, 3, struct rppc_buf_fds)
++#define RPPC_IOC_MAXNR		(4)
++
++#define RPPC_MAX_PARAMETERS	(10)
++#define RPPC_MAX_TRANSLATIONS	(1024)
++#define RPPC_MAX_INST_NAMELEN	(48)
++
++/**
++ * enum rppc_param_type - RPC function parameter type
++ * @RPPC_PARAM_TYPE_UNKNOWN: unrecognized parameter
++ * @RPPC_PARAM_TYPE_ATOMIC: an atomic data type, 1 byte to architecture limit
++ *			    sized bytes
++ * @RPPC_PARAM_TYPE_PTR: a pointer to shared memory. The fd field in the
++ *			 structures rppc_param and rppc_param_translation must
++ *			 contain the file descriptor of the associated dma_buf
++ * @RPPC_PARAM_TYPE_STRUCT: (unsupported) a structure type. Will be architecture
++ *			    width aligned in memory
++ *
++ * These enum values are used to identify the parameter type for every
++ * parameter argument of the remote function.
++ */
++enum rppc_param_type {
++	RPPC_PARAM_TYPE_UNKNOWN = 0,
++	RPPC_PARAM_TYPE_ATOMIC,
++	RPPC_PARAM_TYPE_PTR,
++	RPPC_PARAM_TYPE_STRUCT,
++};
++
++/**
++ * struct rppc_param_translation - pointer translation helper structure
++ * @index: index of the parameter where the translation needs to be done in.
++ *	   used for computing the primary offset and mapping into kernel
++ *	   the page from the buffer referred to in the correspoding parameter
++ * @offset: offset from the primary base pointer to the pointer to translate.
++ *	    This is the secondary offset, and used either for mentioning the
++ *	    offset from an structure array element base, or within a single
++ *	    structure which itself is at an offset in an allocated buffer
++ * @base: the base user virtual address of the pointer to translate (used to
++ *	  calculate translated pointer offset)
++ * @fd: dma_buf file descriptor of the allocated buffer pointer within which
++ *	the translated pointer is present
++ */
++struct rppc_param_translation {
++	uint32_t index;
++	ptrdiff_t offset;
++	size_t base;
++	int32_t fd;
++};
++
++/**
++ * struct rppc_param - descriptor structure for each parameter
++ * @type: type of the parameter, as dictated by enum rppc_param_type
++ * @size: size of the data (for atomic types) or size of the containing
++ *	  structure in which translations are performed
++ * @data: either the parameter value itself (for atomic type) or
++ *	  the actual user space pointer address to the data (for pointer type)
++ * @base: the base user space pointer address of the original allocated buffer,
++ *	  providing a reference if data has the pointer that is at an offset
++ *	  from the original pointer
++ * @fd: file descriptor of the exported allocation (will be used to
++ *	import the associated dma_buf within the driver).
++ */
++struct rppc_param {
++	uint32_t type;
++	size_t size;
++	size_t data;
++	size_t base;
++	int32_t fd;
++};
++
++/**
++ * struct rppc_function - descriptor structure for the remote function
++ * @fxn_id: index of the function to invoke on the opened rppc device
++ * @num_params: number of parameters filled in the params field
++ * @params: array of parameter descriptor structures
++ * @num_translations: number of in-place translations to be performed within
++ *		      the arguments.
++ * @translations: an open array of the translation descriptor structures, whose
++ *		  length is given in @num_translations. Used for translating
++ *		  the pointers within the function data.
++ *
++ * This is the primary descriptor structure passed down from the userspace,
++ * describing the function, its parameter arguments and the needed translations.
++ */
++struct rppc_function {
++	uint32_t fxn_id;
++	uint32_t num_params;
++	struct rppc_param params[RPPC_MAX_PARAMETERS];
++	uint32_t num_translations;
++	struct rppc_param_translation translations[0];
++};
++
++/**
++ * struct rppc_function_return - function return status descriptor structure
++ * @fxn_id: index of the function invoked on the opened rppc device
++ * @status: return value of the executed function
++ */
++struct rppc_function_return {
++	uint32_t fxn_id;
++	uint32_t status;
++};
++
++/**
++ * struct rppc_create_instance - rppc channel connector helper
++ * @name: Name of the rppc server device to establish a connection with
++ */
++struct rppc_create_instance {
++	char name[RPPC_MAX_INST_NAMELEN];
++};
++
++/*
++ * helper macros for manipulating the function index in the marshalled packet
++ */
++#define RPPC_DESC_EXEC_SYNC	(0x0100)
++#define RPPC_DESC_TYPE_MASK	(0x0F00)
++
++/*
++ * helper macros for manipulating the function index in the marshalled packet.
++ * The remote functions are offset by one relative to the client
++ * XXX: Remove the relative offset
++ */
++#define RPPC_SET_FXN_IDX(idx)	(((idx) + 1) | 0x80000000)
++#define RPPC_FXN_MASK(idx)	(((idx) - 1) & 0x7FFFFFFF)
++
++/**
++ * struct rppc_packet - the actual marshalled packet
++ * @desc: type of function execution, currently only synchronous function
++ *	  invocations are supported
++ * @msg_id: an incremental message index identifier
++ * @flags: a combination of job id and pool id of the worker threads
++ *	   of the server
++ * @fxn_id: id of the function to execute
++ * @result: result of the remotely executed function
++ * @data_size: size of the payload packet
++ * @data: variable payload, containing the marshalled function data.
++ *
++ * This is actually a condensed structure of the Remote Command Messaging
++ * (RCM) structure. The initial fields of the structure are used by the
++ * remote-side server to schedule the execution of the function. The actual
++ * variable payload data starts from the .data field. This marshalled packet
++ * is the payload for a rpmsg message.
++ *
++ * XXX: remove or mask unneeded fields, some fields can be stripped down
++ */
++struct rppc_packet {
++	uint16_t desc;
++	uint16_t msg_id;
++	uint32_t flags;
++	uint32_t fxn_id;
++	int32_t  result;
++	uint32_t data_size;
++	uint8_t  data[0];
++} __packed;
++
++#endif /* _UAPI_LINUX_RPMSG_RPC_H_ */
+-- 
+1.7.5.4
+
