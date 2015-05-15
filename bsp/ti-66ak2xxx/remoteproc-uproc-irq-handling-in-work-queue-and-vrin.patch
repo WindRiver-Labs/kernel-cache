@@ -1,0 +1,227 @@
+From cd3c975ea5623a6acab8b61801b956a90966a87f Mon Sep 17 00:00:00 2001
+From: Murali Karicheri <m-karicheri2@ti.com>
+Date: Fri, 4 Jan 2013 13:02:40 -0500
+Subject: [PATCH 205/256] remoteproc: uproc: irq handling in work queue and
+ vring ioctl support
+
+Adding irq handling in a work queue and a new ioctl to configure
+the vring buffer region from user space.
+
+Signed-off-by: Murali Karicheri <m-karicheri2@ti.com>
+Signed-off-by: Sam Nelson <sam.nelson@ti.com>
+(cherry picked from commit 5d1571dfa4e67d6a2d4534b905b5cefcaa1c4879)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/remoteproc/remoteproc_user.c |  111 ++++++++++++++++++++++++++++++----
+ include/linux/remoteproc_user.h      |    2 +
+ 2 files changed, 102 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/remoteproc/remoteproc_user.c b/drivers/remoteproc/remoteproc_user.c
+index 6cd452f..f9c50dd 100644
+--- a/drivers/remoteproc/remoteproc_user.c
++++ b/drivers/remoteproc/remoteproc_user.c
+@@ -13,7 +13,6 @@
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  * General Public License for more details.
+  */
+-
+ #include <linux/clk.h>
+ #include <linux/slab.h>
+ #include <linux/module.h>
+@@ -23,26 +22,30 @@
+ #include <linux/uio_driver.h>
+ #include <linux/remoteproc_user.h>
+ #include <linux/platform_device.h>
++#include <linux/workqueue.h>
++#include <linux/io.h>
+ 
+ #include "remoteproc_internal.h"
+ 
+ #define DRIVER_NAME		"rproc-user"
+ #define DRIVER_VERSION		"0.1"
+-
+ #define UPROC_MAX_NOTIFIES	8
+ #define UPROC_MAX_RSC_TABLE	SZ_64K
+ 
+ struct uproc_info {
+-	struct uio_info		 uio;
++	struct uio_info		uio;
+ 	struct rproc		*rproc;
+ 	struct device		*dev;
+ 	struct clk		*clk;
+-	unsigned long		 flags;
+-	spinlock_t		 lock;
+-	int			 irq_ctl, irq_ring;
+-	int			 kick_gpio;
++	unsigned long		flags;
++	spinlock_t		lock;
++	int			irq_ctl, irq_ring;
++	int			kick_gpio;
+ 	struct resource_table	*rsc_table;
+-	int			 rsc_table_size;
++	int			rsc_table_size;
++	unsigned int		vring_addr;
++	int 			start_offset;
++	struct work_struct	workqueue;
+ };
+ 
+ static int uproc_set_rsc_table(struct uproc_info *uproc,
+@@ -147,6 +150,15 @@ static int uproc_set_state(struct uproc_info *uproc,
+ 	return error;
+ }
+ 
++static int uproc_set_vring_addr(struct uproc_info *uproc,
++			   unsigned int dma_addr)
++{
++	uproc->vring_addr = dma_addr;
++	uproc->start_offset = 0;
++	return 0;
++}
++
++
+ static long uproc_ioctl(struct uio_info *uio, unsigned cmd, unsigned long arg)
+ {
+ 	void __user *argp = (void __user *)arg;
+@@ -157,6 +169,8 @@ static long uproc_ioctl(struct uio_info *uio, unsigned cmd, unsigned long arg)
+ 		return uproc_set_rsc_table(uproc, argp);
+ 	case RPROC_USER_IOC_SET_STATE:
+ 		return uproc_set_state(uproc, arg);
++	case RPROC_USER_IOC_SET_VRING_ADDR:
++		return uproc_set_vring_addr(uproc, arg);
+ 	default:
+ 		return -ENOTSUPP;
+ 	}
+@@ -170,14 +184,80 @@ static void uproc_kick(struct rproc *rproc, int vqid)
+ 	if (uproc->kick_gpio < 0)
+ 		return;
+ 
++	/* interrupt the remote core */
+ 	gpio_set_value(uproc->kick_gpio, 1);
+-	gpio_set_value(uproc->kick_gpio, 0);
++}
++
++static void *uproc_alloc(struct device *dev, size_t size,
++		dma_addr_t *dma_handle, gfp_t flag)
++{
++	struct uproc_info *uproc = dev_get_drvdata(dev);
++	struct rproc *rproc = uproc->rproc;
++	void *va;
++
++	if((uproc->start_offset + 0x4000) > 0x8000)
++		return(NULL);
++
++	dev_dbg(uproc->dev, "\n uproc->start offset %x uproc->vring_addr %x",
++		 uproc->start_offset, uproc->vring_addr);
++
++	/* feed address set through IOCTL */
++	*dma_handle = uproc->vring_addr + uproc->start_offset;
++	uproc->start_offset += 0x4000;
++        /* Convert to virtual address */
++	va = devm_ioremap_nocache(&rproc->dev, *dma_handle, size);
++
++	return(va);
++}
++
++static void uproc_free(struct device *dev, size_t size, void *cpu_addr,
++		    dma_addr_t dma_handle)
++{
++	struct uproc_info *uproc = dev_get_drvdata(dev);
++	struct rproc *rproc = uproc->rproc;
++
++	devm_iounmap(&rproc->dev, cpu_addr);
++}
++
++/**
++ * handle_event() - inbound virtqueue message workqueue function
++ *
++ * This funciton is registered with 'workqueue' and is scheduled by the
++ * ISR handler.
++ *
++ * There is no "payload" message indicating the virtqueue index as is the
++ * case with mailbox-based implementations on OMAP4.  As such, this
++ * handler "polls" each known virtqueue index for every invocation.
++ *
++ * A payload could be added by using some of the source bits in the IPC
++ * generation registers, but we would need to change the logic in
++ * drivers/misc/keystone-ipc-int.c to avoid interpreting these as extra
++ * interrupts.
++ */
++static void handle_event(struct work_struct *work)
++{
++	struct uproc_info *uproc =
++		container_of(work, struct uproc_info, workqueue);
++
++	dev_dbg(uproc->dev, "Calling rproc_vq_interrupt...\n");
++
++	/* Process incoming buffers on our vring */
++	while (IRQ_HANDLED == rproc_vq_interrupt(uproc->rproc, 0))
++                ;
++
++	/* Must allow wakeup of potenitally blocking senders: */
++	rproc_vq_interrupt(uproc->rproc, 1);
+ }
+ 
+ static irqreturn_t uproc_interrupt(int irq, void *dev_id)
+ {
+ 	struct uproc_info *uproc = dev_id;
+-	return rproc_vq_interrupt(uproc->rproc, -1);
++
++	dev_dbg(uproc->dev, "Scheduling_work...\n");
++
++	schedule_work(&uproc->workqueue);
++
++	return IRQ_HANDLED;
+ }
+ 
+ static int uproc_start(struct rproc *rproc)
+@@ -186,6 +266,9 @@ static int uproc_start(struct rproc *rproc)
+ 	int error;
+ 
+ 	dev_dbg(uproc->dev, "start\n");
++
++	INIT_WORK(&uproc->workqueue, handle_event);
++
+ 	error = request_irq(uproc->irq_ring, uproc_interrupt, 0,
+ 			    dev_name(uproc->dev), uproc);
+ 	if (error)
+@@ -197,8 +280,13 @@ static int uproc_start(struct rproc *rproc)
+ static int uproc_stop(struct rproc *rproc)
+ {
+ 	struct uproc_info *uproc = rproc->priv;
++
+ 	dev_dbg(uproc->dev, "stop\n");
++
+ 	free_irq(uproc->irq_ring, uproc);
++	/* Flush any pending work: */
++	flush_work_sync(&uproc->workqueue);
++
+ 	return 0;
+ }
+ 
+@@ -206,9 +294,10 @@ static struct rproc_ops uproc_ops = {
+ 	.start		= uproc_start,
+ 	.stop		= uproc_stop,
+ 	.kick		= uproc_kick,
++	.alloc		= uproc_alloc,
++	.free		= uproc_free,
+ };
+ 
+-
+ static struct resource_table *
+ uproc_find_rsc_table(struct rproc *rproc, const struct firmware *fw,
+ 		     int *tablesz)
+diff --git a/include/linux/remoteproc_user.h b/include/linux/remoteproc_user.h
+index 9cfda8f..6336e54 100644
+--- a/include/linux/remoteproc_user.h
++++ b/include/linux/remoteproc_user.h
+@@ -28,5 +28,7 @@ enum rproc_user_state {
+ 				      void *)
+ #define RPROC_USER_IOC_SET_STATE _IOW(RPROC_USER_IOC_MAGIC, 1,	\
+ 				      enum rproc_user_state)
++#define RPROC_USER_IOC_SET_VRING_ADDR _IOW(RPROC_USER_IOC_MAGIC, 2,	\
++				      unsigned int)
+ 
+ #endif /* _LINUX_REMOTEPROC_USER_H */
+-- 
+1.7.5.4
+

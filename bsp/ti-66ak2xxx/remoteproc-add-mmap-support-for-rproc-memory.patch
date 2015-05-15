@@ -1,0 +1,371 @@
+From d300dead0cc7aa2aea44debead1f272be583bc46 Mon Sep 17 00:00:00 2001
+From: Sajesh Kumar Saran <sajesh@ti.com>
+Date: Wed, 17 Jul 2013 11:00:02 -0400
+Subject: [PATCH 212/256] remoteproc: add mmap support for rproc memory
+
+The remoreproc-user used to expose the device memory
+thru UIO interface. But, the UIO mmap interface does
+not provide option to configure start address of the
+mapped region. The change in rproc-user provides mmap
+interface to user for the configured rproc memory regions.
+
+One of the usecase is remotecore elf loader from user
+space. In non-iommu case the CMA buffers can't be
+used as the loader will need to load elf segments to
+start address pre-determined by the segment address of
+the image.
+
+Signed-off-by: Sajesh Kumar Saran <sajesh@ti.com>
+Acked-by: Santosh Shilimkar <santosh.shilimkar@ti.com>
+(cherry picked from commit 49dfecda588a33c020929c06decb56d15d9b1def)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/remoteproc/remoteproc_user.c |  230 +++++++++++++++++++++++++++++-----
+ 1 files changed, 201 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/remoteproc/remoteproc_user.c b/drivers/remoteproc/remoteproc_user.c
+index a4fee78..ec36ff8 100644
+--- a/drivers/remoteproc/remoteproc_user.c
++++ b/drivers/remoteproc/remoteproc_user.c
+@@ -23,6 +23,7 @@
+ #include <linux/remoteproc_user.h>
+ #include <linux/platform_device.h>
+ #include <linux/workqueue.h>
++#include <linux/miscdevice.h>
+ #include <linux/io.h>
+ 
+ #include "remoteproc_internal.h"
+@@ -32,10 +33,25 @@
+ #define UPROC_MAX_NOTIFIES	8
+ #define UPROC_MAX_RSC_TABLE	SZ_64K
+ 
++
++/**
++ * struct uproc_addr_map - remote processor address map entry
++ */
++struct uproc_addr_map {
++	phys_addr_t	addr;
++	unsigned long	length;
++	int		index;
++	struct list_head	node;
++};
++
++/**
++ * struct uproc_info - local information for remoteproc user
++ */
+ struct uproc_info {
+ 	struct uio_info		uio;
+ 	struct rproc		*rproc;
+ 	struct device		*dev;
++	struct miscdevice	misc;
+ 	struct clk		*clk;
+ 	unsigned long		flags;
+ 	spinlock_t		lock;
+@@ -44,7 +60,8 @@ struct uproc_info {
+ 	struct resource_table	*rsc_table;
+ 	int			rsc_table_size;
+ 	unsigned int		vring_addr;
+-	int 			start_offset;
++	int			start_offset;
++	struct list_head	addr_map;
+ 	struct work_struct	workqueue;
+ };
+ 
+@@ -158,6 +175,66 @@ static int uproc_set_vring_addr(struct uproc_info *uproc,
+ 	return 0;
+ }
+ 
++/**
++ * uproc_dev_fop_open() for the rproc-user driver
++ */
++static int uproc_dev_fop_open(struct inode *inode, struct file *file)
++{
++	/* Need an empty open so that file->private_data gets populated */
++	return 0;
++}
++
++/**
++ * uproc_dev_fop_mmap() - provided mmap support for
++ * rproc memory. This checks if user request is in valid range before providing
++ * mmap access. The valid range can be configured using device tree or platform
++ * data.
++ */
++static int uproc_dev_fop_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	bool is_allowed = false;
++	struct uproc_addr_map *pmap;
++	size_t size = vma->vm_end - vma->vm_start;
++	phys_addr_t addr = vma->vm_pgoff << PAGE_SHIFT;
++	struct miscdevice *misc = file->private_data;
++	struct uproc_info *uproc =
++		container_of(misc, struct uproc_info, misc);
++
++	/* Check if the requested address and length is in the
++	range configured duing probe */
++	list_for_each_entry(pmap, &uproc->addr_map, node) {
++		if (pmap->addr <= addr &&
++			pmap->addr + pmap->length >= addr + size) {
++				is_allowed = true;
++				break;
++		}
++	}
++
++	if (!is_allowed) {
++		dev_err(uproc->dev,
++			"mmap offset 0x%lx is outside the allowed range\n",
++			(long unsigned int) addr);
++		return -EINVAL;
++	}
++
++	if (vma->vm_start & ~PAGE_MASK) {
++		dev_err(uproc->dev, "must mmap at page boundary\n");
++		return -EINVAL;
++	}
++
++	vma->vm_page_prot = phys_mem_access_prot(file, vma->vm_pgoff, size,
++						 vma->vm_page_prot);
++
++	if (remap_pfn_range(vma,
++			    vma->vm_start,
++			    vma->vm_pgoff,
++			    size,
++			    vma->vm_page_prot)) {
++		return -EAGAIN;
++	}
++	return 0;
++
++}
+ 
+ static long uproc_ioctl(struct uio_info *uio, unsigned cmd, unsigned long arg)
+ {
+@@ -315,21 +392,93 @@ static int uproc_load_segments(struct rproc *rproc, const struct firmware *fw)
+ 	return 0;
+ }
+ 
++static const struct file_operations uproc_dev_fops = {
++	.owner		= THIS_MODULE,
++	.open		= uproc_dev_fop_open,
++	.mmap		= uproc_dev_fop_mmap,
++};
++
+ static struct rproc_fw_ops uproc_fw_ops = {
+ 	.find_rsc_table		= uproc_find_rsc_table,
+ 	.load			= uproc_load_segments,
+ };
+ 
++/**
++ * uproc_populate_segments() - scan the configuration for "mem" and populate
++ * polulate in uproc local structure. This information will be used to process
++ * user mmap requests.
++ */
++#ifdef CONFIG_OF
++static inline int uproc_populate_segments(struct device_node *np,
++					struct uproc_info *uproc)
++{
++	int len, i;
++	u32 *paddr_map;
++	int num_maps = 0;
++	struct uproc_addr_map *pmapentry;
++
++	if (of_get_property(np, "mem", &len)) {
++
++		paddr_map = devm_kzalloc(uproc->dev, len, GFP_KERNEL);
++		if (!paddr_map) {
++			dev_err(uproc->dev, "memory allocation failed\n");
++			return -ENOMEM;
++		}
++		/* check if length even multiple of sizeof(u32), i.e.,
++		    the dt bindings need to be of the form <addr length>
++		 */
++		len = len / sizeof(u32);
++		if ((len % 2) != 0) {
++			dev_err(uproc->dev, "invalid address map in dt binding\n");
++			return -EINVAL;
++		}
++		num_maps = len / 2;
++		if (of_property_read_u32_array(np, "mem",
++					       paddr_map, len)) {
++			dev_err(uproc->dev, "No addr-map array  in dt bindings\n");
++			return -ENODEV;
++		}
++
++		pmapentry  = devm_kzalloc(uproc->dev,
++				sizeof(struct uproc_addr_map) * num_maps,
++				GFP_KERNEL);
++		if (!pmapentry) {
++			dev_err(uproc->dev, "devm_kzalloc mapping failed\n");
++			return -ENOMEM;
++		}
++
++		/* populate the uproc structure for policing */
++		for (i = 0; i < num_maps; i++) {
++			pmapentry->index = i;
++			pmapentry->addr = *paddr_map++;
++			pmapentry->length = *paddr_map++;
++			list_add_tail(&pmapentry->node, &uproc->addr_map);
++			pmapentry++;
++		}
++
++	}
++	return 0;
++}
++#else
++static inline void uproc_populate_segments(struct device_node *np,
++					struct uproc_info *uproc)
++{
++	return 0;
++}
++#endif
++
+ static int uproc_driver_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	int *pdata = dev->platform_data;
+ 	struct device_node *np = dev->of_node;
+ 	struct uproc_info *uproc;
++	struct miscdevice *misc;
+ 	struct uio_info *uio;
+ 	struct rproc *rproc;
+ 	struct resource *r;
+-	int i, error;
++	int error = 0;
++	int i;
+ 
+ 	rproc = rproc_alloc(dev, dev_name(dev), &uproc_ops, NULL,
+ 			    sizeof(*uproc));
+@@ -346,7 +495,7 @@ static int uproc_driver_probe(struct platform_device *pdev)
+ 	uio		= &uproc->uio;
+ 	uio->name	= dev_name(dev);
+ 	uio->version	= DRIVER_VERSION;
+-	uio->priv	= uproc;
++	uio->priv		= uproc;
+ 	uio->handler	= uproc_handler;
+ 	uio->irqcontrol	= uproc_irqcontrol;
+ 	uio->open	= uproc_open;
+@@ -355,14 +504,9 @@ static int uproc_driver_probe(struct platform_device *pdev)
+ 
+ 	uproc->irq_ctl	= platform_get_irq(pdev, 0);
+ 	uproc->irq_ring	= platform_get_irq(pdev, 1);
+-	if (uproc->irq_ctl < 0 || uproc->irq_ring < 0) {
+-		dev_err(dev, "failed to get irqs\n");
+-		rproc_put(rproc);
+-		return -ENXIO;
+-	}
+-
+-	/* pass up control irq to user-space */
+-	uio->irq	= uproc->irq_ctl;
++	if (!(uproc->irq_ctl < 0))
++		/* pass up control irq to user-space */
++		uio->irq	= uproc->irq_ctl;
+ 
+ 	uproc->kick_gpio = -1;
+ 	if (pdata)
+@@ -375,13 +519,12 @@ static int uproc_driver_probe(struct platform_device *pdev)
+ 	}
+ #endif
+ 	if (uproc->kick_gpio < 0)
+-		dev_warn(dev, "failed to get kick gpio\n");
++		dev_warn(dev, "kick gpio\n");
+ 
+ 	for (i = 0; i < MAX_UIO_MAPS; ++i) {
+ 		r = platform_get_resource(pdev, IORESOURCE_MEM, i);
+ 		if (!r)
+ 			break;
+-
+ 		uio->mem[i].memtype = UIO_MEM_PHYS;
+ 		uio->mem[i].addr    = r->start;
+ 		uio->mem[i].size    = resource_size(r);
+@@ -389,33 +532,57 @@ static int uproc_driver_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	uproc->clk = clk_get(dev, NULL);
+-	if (!uproc->clk) {
+-		dev_err(dev, "failed to get clock\n");
+-		error = -ENODEV;
+-		goto fail_clk;
+-	}
+ 
+-	error = uio_register_device(dev, uio);
+-	if (error) {
+-		dev_err(dev, "failed to register uio device\n");
++	INIT_LIST_HEAD(&uproc->addr_map);
++	error = uproc_populate_segments(np, uproc);
++	if (error)
+ 		goto fail_uio;
+-	}
+ 
+-	error = rproc_add(rproc);
+-	if (error) {
+-		dev_err(dev, "error adding remoteproc device\n");
+-		goto fail_rproc;
++	if (uio->irq && uio->mem[0].memtype != UIO_MEM_NONE) {
++		error = uio_register_device(dev, uio);
++		if (error) {
++			dev_err(dev, "failed to register uio device\n");
++			goto fail_uio;
++		}
++	}
++	if (!(uproc->irq_ctl < 0 || uproc->irq_ring < 0)) {
++		error = rproc_add(rproc);
++		if (error) {
++			dev_err(dev, "error adding remoteproc device\n");
++			goto fail_rproc;
++		}
+ 	}
+ 
+ 	platform_set_drvdata(pdev, uproc);
+ 
++	if (!list_empty(&uproc->addr_map)) {
++		misc = &uproc->misc;
++
++		misc->minor	= MISC_DYNAMIC_MINOR;
++#ifdef CONFIG_OF
++		if (of_property_read_string(np, "label", &misc->name) < 0)
++			misc->name = dev_name(dev);
++		if (!misc->name)
++			misc->name = "unknown";
++#else
++		misc->name	= dev_name(dev);
++#endif
++		misc->fops	= &uproc_dev_fops;
++		misc->parent	= dev;
++
++		if (misc_register(misc)) {
++			dev_err(dev, "could not register misc device\n");
++			goto fail_rproc;
++		}
++		dev_info(dev, "registered misc device %s\n", misc->name);
++	}
++
+ 	return 0;
+ 
+ fail_rproc:
+ 	uio_unregister_device(uio);
+ fail_uio:
+ 	clk_put(uproc->clk);
+-fail_clk:
+ 	rproc_put(rproc);
+ 	devm_kfree(dev, uproc);
+ 	return error;
+@@ -424,11 +591,16 @@ fail_clk:
+ static int uproc_driver_remove(struct platform_device *pdev)
+ {
+ 	struct uproc_info *uproc = platform_get_drvdata(pdev);
++	struct uio_info *uio = &uproc->uio;
+ 
+ 	if (uproc) {
+-		uio_unregister_device(&uproc->uio);
+-		rproc_put(uproc->rproc);
++		if (uio->irq && uio->mem[0].memtype != UIO_MEM_NONE)
++			uio_unregister_device(&uproc->uio);
++		if (!(uproc->irq_ctl < 0 || uproc->irq_ring < 0))
++			rproc_put(uproc->rproc);
+ 		clk_put(uproc->clk);
++		if (!list_empty(&uproc->addr_map))
++			misc_deregister(&uproc->misc);
+ 	}
+ 	platform_set_drvdata(pdev, NULL);
+ 	return 0;
+-- 
+1.7.5.4
+

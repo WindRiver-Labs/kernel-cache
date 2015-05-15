@@ -1,0 +1,860 @@
+From 5903c110bfbd4657560d45979dfd5cc7644bdd30 Mon Sep 17 00:00:00 2001
+From: Zumeng Chen <zumeng.chen@windriver.com>
+Date: Tue, 5 May 2015 16:12:58 +0800
+Subject: [PATCH 016/256] net: keystone: add qos serdes and sgmii support
+
+This patch comes from:
+  git://git.ti.com/keystone-linux/linux.git
+
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/ti/keystone_qos.c    |  303 +++++++++++++++++++++++++++++
+ drivers/net/ethernet/ti/keystone_serdes.c |  248 +++++++++++++++++++++++
+ drivers/net/ethernet/ti/keystone_serdes.h |   67 +++++++
+ drivers/net/ethernet/ti/keystone_sgmii.c  |  195 ++++++++++++++++++
+ 4 files changed, 813 insertions(+), 0 deletions(-)
+ create mode 100644 drivers/net/ethernet/ti/keystone_qos.c
+ create mode 100644 drivers/net/ethernet/ti/keystone_serdes.c
+ create mode 100644 drivers/net/ethernet/ti/keystone_serdes.h
+ create mode 100644 drivers/net/ethernet/ti/keystone_sgmii.c
+
+diff --git a/drivers/net/ethernet/ti/keystone_qos.c b/drivers/net/ethernet/ti/keystone_qos.c
+new file mode 100644
+index 0000000..1836634
+--- /dev/null
++++ b/drivers/net/ethernet/ti/keystone_qos.c
+@@ -0,0 +1,303 @@
++/*
++ * Copyright (C) 2012 Texas Instruments Incorporated
++ * Authors: Reece Pollack <reece@theptrgroup.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed "as is" WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/io.h>
++#include <linux/clk.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/types.h>
++#include <linux/module.h>
++#include <linux/delay.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/of_address.h>
++#include <linux/firmware.h>
++#include <linux/spinlock.h>
++#include <linux/interrupt.h>
++#include <linux/dmaengine.h>
++#include <linux/dma-mapping.h>
++#include <linux/scatterlist.h>
++#include <linux/byteorder/generic.h>
++#include <linux/platform_device.h>
++#include <linux/keystone-dma.h>
++#include <linux/errqueue.h>
++
++#include "keystone_net.h"
++
++#define	QOS_TXHOOK_ORDER	20
++
++struct qos_channel {
++	const char		*tx_chan_name;
++	u32			 tx_queue_depth;
++	struct netcp_tx_pipe	 tx_pipe;
++};
++
++struct qos_device {
++	struct netcp_device		*netcp_device;
++	struct device			*dev;
++	struct device_node		*node;
++	u32				 multi_if;
++};
++
++struct qos_intf {
++	struct net_device		*ndev;
++	struct device			*dev;
++	int				 num_channels;
++	int				 max_channels;
++	struct qos_channel		 channels[1];
++};
++
++static int qos_tx_hook(int order, void *data, struct netcp_packet *p_info)
++{
++	struct qos_intf *qos_intf = data;
++	struct sk_buff *skb = p_info->skb;
++
++	dev_dbg(qos_intf->dev,
++		"priority: %u, queue_mapping: %04x\n",
++		skb->priority, skb_get_queue_mapping(skb));
++
++	if (skb->queue_mapping < qos_intf->num_channels)
++		p_info->tx_pipe =
++			&qos_intf->channels[skb->queue_mapping].tx_pipe;
++	else {
++		dev_warn(qos_intf->dev,
++			"queue mapping (%d) >= num chans (%d) QoS bypassed\n",
++			 skb_get_queue_mapping(skb), qos_intf->num_channels);
++	}
++
++	return 0;
++}
++
++
++static int qos_close(void *intf_priv, struct net_device *ndev)
++{
++	struct qos_intf *qos_intf = intf_priv;
++	struct netcp_priv *netcp_priv = netdev_priv(ndev);
++	int i;
++
++	netcp_unregister_txhook(netcp_priv, QOS_TXHOOK_ORDER, qos_tx_hook,
++				qos_intf);
++
++	for (i = 0; i < qos_intf->num_channels; ++i) {
++		struct qos_channel *qchan = &qos_intf->channels[i];
++
++		netcp_txpipe_close(&qchan->tx_pipe);
++	}
++
++	return 0;
++}
++
++static int qos_open(void *intf_priv, struct net_device *ndev)
++{
++	struct qos_intf *qos_intf = intf_priv;
++	struct netcp_priv *netcp_priv = netdev_priv(ndev);
++	int ret;
++	int i;
++
++	/* Open the QoS input queues */
++	for (i = 0; i < qos_intf->num_channels; ++i) {
++		struct qos_channel *qchan = &qos_intf->channels[i];
++
++		ret = netcp_txpipe_open(&qchan->tx_pipe);
++		if (ret)
++			goto fail;
++	}
++
++	netcp_register_txhook(netcp_priv, QOS_TXHOOK_ORDER, qos_tx_hook,
++			      intf_priv);
++
++	return 0;
++
++fail:
++	qos_close(intf_priv, ndev);
++	return ret;
++}
++
++static int init_channel(struct qos_intf *qos_intf,
++			int index,
++			struct device_node *node)
++{
++	struct qos_channel *qchan = &qos_intf->channels[index];
++	int ret;
++
++	ret = of_property_read_string(node, "tx-channel", &qchan->tx_chan_name);
++	if (ret < 0) {
++		dev_err(qos_intf->dev,
++			"missing tx-channel parameter, err %d\n", ret);
++		qchan->tx_chan_name = "qos";
++	}
++	dev_dbg(qos_intf->dev, "tx-channel \"%s\"\n", qchan->tx_chan_name);
++
++	ret = of_property_read_u32(node, "tx_queue_depth",
++				   &qchan->tx_queue_depth);
++	if (ret < 0) {
++		dev_err(qos_intf->dev,
++			"missing tx_queue_depth parameter, err %d\n", ret);
++		qchan->tx_queue_depth = 16;
++	}
++	dev_dbg(qos_intf->dev, "tx_queue_depth %u\n", qchan->tx_queue_depth);
++
++	return 0;
++}
++
++static int qos_attach(void *inst_priv, struct net_device *ndev,
++		      void **intf_priv)
++{
++	struct netcp_priv *netcp = netdev_priv(ndev);
++	struct qos_device *qos_dev = inst_priv;
++	struct qos_intf *qos_intf;
++	struct device_node *interface, *channel;
++	char node_name[24];
++	int i, ret;
++	int max_channels, size;
++
++	max_channels = netcp->ndev->num_tx_queues;
++	size = sizeof(struct qos_intf) +
++			((max_channels - 1) * sizeof(struct qos_channel));
++	qos_intf = devm_kzalloc(qos_dev->dev, size, GFP_KERNEL);
++	if (!qos_intf) {
++		dev_err(qos_dev->dev,
++			"qos interface memory allocation failed\n");
++		return -ENOMEM;
++	}
++	qos_intf->max_channels = max_channels;
++
++	qos_intf->ndev = ndev;
++	qos_intf->dev = qos_dev->dev;
++
++	snprintf(node_name, sizeof(node_name), "interface-%d",
++		 (qos_dev->multi_if) ? (netcp->cpsw_port - 1) : 0);
++
++	*intf_priv = qos_intf;
++
++	interface = of_get_child_by_name(qos_dev->node, node_name);
++	if (!interface) {
++		dev_err(qos_intf->dev,
++			"could not find interface %d node in device tree\n",
++			(netcp->cpsw_port - 1));
++		ret = -ENODEV;
++		goto exit;
++	}
++
++	qos_intf->num_channels = 0;
++	for_each_child_of_node(interface, channel) {
++		if (qos_intf->num_channels >= max_channels) {
++			dev_err(qos_intf->dev,
++				"too many QoS input channels defined\n");
++			break;
++		}
++		init_channel(qos_intf, qos_intf->num_channels, channel);
++		++qos_intf->num_channels;
++	}
++
++	of_node_put(interface);
++
++	/* Initialize the QoS input queues */
++	for (i = 0; i < qos_intf->num_channels; ++i) {
++		struct qos_channel *qchan = &qos_intf->channels[i];
++
++		netcp_txpipe_init(&qchan->tx_pipe, netdev_priv(ndev),
++				  qchan->tx_chan_name,
++				  qchan->tx_queue_depth);
++
++		qchan->tx_pipe.dma_psflags = netcp->cpsw_port;
++	}
++
++	return 0;
++exit:
++	devm_kfree(qos_dev->dev, qos_intf);
++	return ret;
++}
++
++static int qos_release(void *intf_priv)
++{
++	struct qos_intf *qos_intf = intf_priv;
++
++	kfree(qos_intf);
++
++	return 0;
++}
++
++static int qos_remove(struct netcp_device *netcp_device, void *inst_priv)
++{
++	struct qos_device *qos_dev = inst_priv;
++
++	kfree(qos_dev);
++
++	return 0;
++}
++
++static int qos_probe(struct netcp_device *netcp_device,
++		    struct device *dev,
++		    struct device_node *node,
++		    void **inst_priv)
++{
++	struct qos_device *qos_dev;
++	int ret = 0;
++	
++	qos_dev = devm_kzalloc(dev, sizeof(struct qos_device), GFP_KERNEL);
++	if (!qos_dev) {
++		dev_err(dev, "memory allocation failed\n");
++		return -ENOMEM;
++	}
++	*inst_priv = qos_dev;
++
++	if (!node) {
++		dev_err(dev, "device tree info unavailable\n");
++		ret = -ENODEV;
++		goto exit;
++	}
++
++	qos_dev->netcp_device = netcp_device;
++	qos_dev->dev = dev;
++	qos_dev->node = node;
++
++	if (of_find_property(node, "multi-interface", NULL))
++		qos_dev->multi_if = 1;
++
++	return 0;
++
++exit:
++	qos_remove(netcp_device, qos_dev);
++	*inst_priv = NULL;
++	return ret;
++}
++
++
++static struct netcp_module qos_module = {
++	.name		= "keystone-qos",
++	.owner		= THIS_MODULE,
++	.probe		= qos_probe,
++	.open		= qos_open,
++	.close		= qos_close,
++	.remove		= qos_remove,
++	.attach		= qos_attach,
++	.release	= qos_release,
++};
++
++static int __init keystone_qos_init(void)
++{
++	return netcp_register_module(&qos_module);
++}
++module_init(keystone_qos_init);
++
++static void __exit keystone_qos_exit(void)
++{
++	netcp_unregister_module(&qos_module);
++}
++module_exit(keystone_qos_exit);
++
++MODULE_LICENSE("GPL v2");
++MODULE_AUTHOR("Reece Pollack <reece@theptrgroup.com");
++MODULE_DESCRIPTION("Quality of Service driver for Keystone devices");
+diff --git a/drivers/net/ethernet/ti/keystone_serdes.c b/drivers/net/ethernet/ti/keystone_serdes.c
+new file mode 100644
+index 0000000..b7dd5c0
+--- /dev/null
++++ b/drivers/net/ethernet/ti/keystone_serdes.c
+@@ -0,0 +1,248 @@
++/*
++ * Texas Instruments Keystone SerDes driver
++ * Authors: Hao Zhang <hzhang@ti.com>
++ *
++ * Copyright (C) 2013 Texas Instruments
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed "as is" WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/io.h>
++#include <linux/err.h>
++
++#include "keystone_serdes.h"
++
++#define SERDES_CMU_REGS(x)		(0x0000 + (0x0c00 * x))
++#define SERDES_LANE_REGS(x)		(0x0200 + (0x200 * x))
++#define SERDES_COMLANE_REGS		0x0a00
++#define SERDES_WIZ_REGS			0x1fc0
++
++#define SERDES_CMU_REG_000(x)		(SERDES_CMU_REGS(x) + 0x000)
++#define SERDES_CMU_REG_010(x)		(SERDES_CMU_REGS(x) + 0x010)
++#define SERDES_COMLANE_REG_000		(SERDES_COMLANE_REGS + 0x000)
++#define SERDES_LANE_REG_000(x)		(SERDES_LANE_REGS(x) + 0x000)
++#define SERDES_LANE_REG_028(x)		(SERDES_LANE_REGS(x) + 0x028)
++#define SERDES_LANE_CTL_STATUS_REG(x)	(SERDES_WIZ_REGS + 0x0020 + (0x4 * x))
++#define SERDES_PLL_CTL_REG		(SERDES_WIZ_REGS + 0x0034)
++
++
++#define SERDES_RESET			BIT(28)
++#define SERDES_LANE_RESET		BIT(29)
++#define SERDES_LANE_LOOPBACK		BIT(30)
++
++#define SERDES_LANE_DISABLE_MASK	0x60006000
++
++#define SERDES_LANE_EN_VAL(x, y, z)	(x[y] | (z << 26) | (z << 10))
++
++#define reg_rmw(addr, value, mask) \
++	__raw_writel(((__raw_readl(addr) & (~(mask))) | \
++			(value & (mask))), (addr))
++
++struct serdes_cfg {
++	u32 ofs;
++	u32 val;
++	u32 mask;
++};
++
++/* SERDES PHY lane enable configuration value, indexed by PHY interface */
++static u32 serdes_cfg_lane_enable[] = {
++	0xf000f0c0,	/* SGMII */
++	0xf0e9f038,	/* PCSR */
++};
++
++/* SERDES PHY PLL enable configuration value, indexed by PHY interface  */
++static u32 serdes_cfg_pll_enable[] = {
++	0xe0000000,	/* SGMII */
++	0xee000000,	/* PCSR */
++};
++
++static struct serdes_cfg cfg_cmu_156p25m_5g[] = {
++	{0x0000, 0x00800000, 0xffff0000},
++	{0x0014, 0x00008282, 0x0000ffff},
++	{0x0060, 0x00142438, 0x00ffffff},
++	{0x0064, 0x00c3c700, 0x00ffff00},
++	{0x0078, 0x0000c000, 0x0000ff00}
++};
++
++static struct serdes_cfg cfg_comlane_156p25m_5g[] = {
++	{0x0a00, 0x00000800, 0x0000ff00},
++	{0x0a08, 0x38a20000, 0xffff0000},
++	{0x0a30, 0x008a8a00, 0x00ffff00},
++	{0x0a84, 0x00000600, 0x0000ff00},
++	{0x0a94, 0x10000000, 0xff000000},
++	{0x0aa0, 0x81000000, 0xff000000},
++	{0x0abc, 0xff000000, 0xff000000},
++	{0x0ac0, 0x0000008b, 0x000000ff},
++	{0x0b08, 0x583f0000, 0xffff0000},
++	{0x0b0c, 0x0000004e, 0x000000ff}
++};
++
++static struct serdes_cfg cfg_lane_156p25mhz_5g[] = {
++	{0x0004, 0x38000080, 0xff0000ff},
++	{0x0008, 0x00000000, 0x000000ff},
++	{0x000c, 0x02000000, 0xff000000},
++	{0x0010, 0x1b000000, 0xff000000},
++	{0x0014, 0x00006fb8, 0x0000ffff},
++	{0x0018, 0x758000e4, 0xffff00ff},
++	{0x00ac, 0x00004400, 0x0000ff00},
++	{0x002c, 0x00100800, 0x00ffff00},
++	{0x0080, 0x00820082, 0x00ff00ff},
++	{0x0084, 0x1d0f0385, 0xffffffff}
++
++};
++
++static void serdes_cfg_setup(void __iomem *serdes_regs,
++			     struct serdes_cfg *cfg,
++			     u32 size)
++{
++	u32 i;
++
++	for (i = 0; i < size; i++) {
++		reg_rmw(serdes_regs + cfg[i].ofs,
++			cfg[i].val,
++			cfg[i].mask);
++	}
++}
++
++static void serdes_cmu_setup(void __iomem *serdes_regs,
++			     struct serdes_cfg *cfg_cmu,
++			     u32 size)
++{
++	serdes_cfg_setup(serdes_regs, cfg_cmu, size);
++}
++
++static void serdes_comlane_setup(void __iomem *serdes_regs,
++				 struct serdes_cfg *cfg_comlane,
++				 u32 size)
++{
++	serdes_cfg_setup(serdes_regs, cfg_comlane, size);
++}
++
++static void serdes_lane_config(void __iomem *serdes_regs,
++			       struct serdes_cfg *cfg_lane,
++			       u32 size,
++			       u32 lane)
++{
++	u32 i;
++
++	for (i = 0; i < size; i++) {
++		reg_rmw(serdes_regs + cfg_lane[i].ofs + SERDES_LANE_REGS(lane),
++			cfg_lane[i].val, cfg_lane[i].mask);
++	}
++}
++
++static int serdes_init_156p25m_5g(void __iomem *serdes_regs, u32 num_lanes)
++{
++	u32 i;
++
++	serdes_cmu_setup(serdes_regs, cfg_cmu_156p25m_5g,
++			 ARRAY_SIZE(cfg_cmu_156p25m_5g));
++	serdes_comlane_setup(serdes_regs, cfg_comlane_156p25m_5g,
++			     ARRAY_SIZE(cfg_comlane_156p25m_5g));
++	for (i = 0; i < num_lanes; i++)
++		serdes_lane_config(serdes_regs, cfg_lane_156p25mhz_5g,
++				   ARRAY_SIZE(cfg_lane_156p25mhz_5g), i);
++	return 0;
++}
++
++static int serdes_init_156p25m_10p3125g(void __iomem *serdes_regs,
++					u32 num_lanes)
++{
++	/* FIXME: add support for 10G init */
++	return 0;
++}
++
++static void serdes_cmu_comlane_enable(void __iomem *serdes_regs,
++				      struct serdes *serdes)
++{
++	/* Bring SerDes out of Reset */
++	reg_rmw(serdes_regs + SERDES_CMU_REG_010(0), 0x0, SERDES_RESET);
++	if (serdes->intf == SERDES_PHY_PCSR)
++		reg_rmw(serdes_regs + SERDES_CMU_REG_010(1), 0x0,
++			SERDES_RESET);
++
++	/* Enable CMU and COMLANE */
++	reg_rmw(serdes_regs + SERDES_CMU_REG_000(0), 0x03, 0x000000ff);
++	if (serdes->intf == SERDES_PHY_PCSR)
++		reg_rmw(serdes_regs + SERDES_CMU_REG_000(1), 0x03, 0x000000ff);
++	reg_rmw(serdes_regs + SERDES_COMLANE_REG_000, 0x5f, 0x000000ff);
++}
++
++static void serdes_pll_enable(void __iomem *serdes_regs, struct serdes *serdes)
++{
++	__raw_writel(serdes_cfg_pll_enable[serdes->intf],
++			serdes_regs + SERDES_PLL_CTL_REG);
++}
++
++void serdes_lane_reset(void __iomem *serdes_regs, bool reset, u32 lane)
++{
++	if (reset)
++		reg_rmw(serdes_regs + SERDES_LANE_REG_028(lane), 0x1,
++			SERDES_LANE_RESET);
++	else
++		reg_rmw(serdes_regs + SERDES_LANE_REG_028(lane), 0x0,
++			SERDES_LANE_RESET);
++}
++
++void serdes_lane_enable(void __iomem *serdes_regs, struct serdes *serdes,
++			u32 lane)
++{
++	/* Bring lane out of reset */
++	serdes_lane_reset(serdes_regs, false, lane);
++
++	__raw_writel(SERDES_LANE_EN_VAL(serdes_cfg_lane_enable, serdes->intf,
++					serdes->rate_mode),
++		     serdes_regs + SERDES_LANE_CTL_STATUS_REG(lane));
++
++	/* Set NES bit if Loopback Enabled */
++	if (serdes->loopback)
++		reg_rmw(serdes_regs + SERDES_LANE_REG_000(lane), 0x1,
++				SERDES_LANE_LOOPBACK);
++}
++
++void serdes_lane_disable(void __iomem *serdes_regs, u32 lane)
++{
++	reg_rmw(serdes_regs + SERDES_LANE_CTL_STATUS_REG(lane), 0x0,
++				SERDES_LANE_DISABLE_MASK);
++}
++
++void serdes_reset(void __iomem *serdes_regs, u32 num_lanes)
++{
++	int i;
++
++	reg_rmw(serdes_regs + SERDES_CMU_REG_010(0), 0x1, SERDES_RESET);
++	for (i = 0; i < num_lanes; i++)
++		serdes_lane_reset(serdes_regs, true, i);
++}
++
++int serdes_init(void __iomem *serdes_regs, struct serdes *serdes, u32 num_lanes)
++{
++	int i, ret = 0;
++
++	/* The driver currently supports 5GBaud rate with ref clock 156.25MHz */
++	if (serdes->clk == SERDES_CLOCK_156P25M)
++		if (serdes->rate == SERDES_RATE_5G)
++			ret = serdes_init_156p25m_5g(serdes_regs, num_lanes);
++		else if (serdes->rate == SERDES_RATE_10p3125g)
++			ret = serdes_init_156p25m_10p3125g(serdes_regs,
++							   num_lanes);
++		else
++			return -EINVAL;
++	else
++		return -EINVAL;
++	serdes_cmu_comlane_enable(serdes_regs, serdes);
++	for (i = 0; i < num_lanes; i++)
++		serdes_lane_enable(serdes_regs, serdes, i);
++	serdes_pll_enable(serdes_regs, serdes);
++
++	return ret;
++}
+diff --git a/drivers/net/ethernet/ti/keystone_serdes.h b/drivers/net/ethernet/ti/keystone_serdes.h
+new file mode 100644
+index 0000000..f072516
+--- /dev/null
++++ b/drivers/net/ethernet/ti/keystone_serdes.h
+@@ -0,0 +1,67 @@
++/*
++ * Texas Instruments Keystone SerDes APIs
++ *
++ * Copyright (C) 2013 Texas Instruments
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed "as is" WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++#ifndef __TI_KEYSTONE_SERDES_H__
++#define __TI_KEYSTONE_SERDES_H__
++
++/* SERDES Reference clock */
++enum SERDES_CLOCK {
++	SERDES_CLOCK_100M,		/* 100 MHz */
++	SERDES_CLOCK_122P88M,		/* 122.88 MHz */
++	SERDES_CLOCK_125M,		/* 125 MHz */
++	SERDES_CLOCK_156P25M,		/* 156.25 MHz */
++	SERDES_CLOCK_312P5M,		/* 312.5 MHz */
++};
++
++/* SERDES Lane Baud Rate */
++enum SERDES_RATE {
++	SERDES_RATE_4P9152G,		/* 4.9152 GBaud */
++	SERDES_RATE_5G,			/* 5 GBaud */
++	SERDES_RATE_6P144G,		/* 6.144 GBaud */
++	SERDES_RATE_6P25G,		/* 6.25 GBaud */
++	SERDES_RATE_10p3125g,		/* 10.3215 GBaud */
++	SERDES_RATE_12p5g,		/* 12.5 GBaud */
++};
++
++/* SERDES Lane Rate Mode */
++enum SERDES_RATE_MODE {
++	SERDES_FULL_RATE,
++	SERDES_HALF_RATE,
++	SERDES_QUARTER_RATE,
++};
++
++/* SERDES PHY TYPE */
++enum SERDES_INTERFACE {
++	SERDES_PHY_SGMII,
++	SERDES_PHY_PCSR,		/* XGE SERDES */
++};
++
++struct serdes {
++	enum SERDES_CLOCK	clk;
++	enum SERDES_RATE	rate;
++	enum SERDES_RATE_MODE	rate_mode;
++	enum SERDES_INTERFACE	intf;
++	u32			loopback;
++};
++
++void serdes_reset(void __iomem *serdes_regs, u32 num_lanes);
++void serdes_lane_reset(void __iomem *serdes_regs, bool reset, u32 lane);
++void serdes_lane_enable(void __iomem *serdes_regs, struct serdes *serdes,
++			u32 lane);
++void serdes_lane_disable(void __iomem *serdes_regs, u32 lane);
++int serdes_init(void __iomem *serdes_regs, struct serdes *serdes,
++		 u32 num_lanes);
++
++#endif
++
+diff --git a/drivers/net/ethernet/ti/keystone_sgmii.c b/drivers/net/ethernet/ti/keystone_sgmii.c
+new file mode 100644
+index 0000000..351d3ee
+--- /dev/null
++++ b/drivers/net/ethernet/ti/keystone_sgmii.c
+@@ -0,0 +1,195 @@
++/*
++ * Copyright (C) 2012 - 2014 Texas Instruments Incorporated
++ * Authors: Sandeep Paulraj <s-paulraj@ti.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed "as is" WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/io.h>
++#include <linux/err.h>
++#include <linux/delay.h>
++
++#include "keystone_net.h"
++
++#define SGMII_SRESET_RESET		0x1
++#define SGMII_SRESET_RTRESET		0x2
++#define SGMII_CTL_AUTONEG		0x01
++#define SGMII_CTL_LOOPBACK		0x10
++#define SGMII_CTL_MASTER		0x20
++#define SGMII_REG_STATUS_LOCK		BIT(4)
++#define	SGMII_REG_STATUS_LINK		BIT(0)
++#define SGMII_REG_STATUS_AUTONEG	BIT(2)
++#define SGMII_REG_CONTROL_AUTONEG	BIT(0)
++
++#define SGMII23_OFFSET(x)	((x - 2) * SGMII_REGS_SIZE)
++#define SGMII_OFFSET(x)		((x <= 1) ? (x * SGMII_REGS_SIZE) : \
++					    (SGMII23_OFFSET(x)))
++/*
++ * SGMII registers
++ */
++#define SGMII_IDVER_REG(x)    (SGMII_OFFSET(x) + 0x000)
++#define SGMII_SRESET_REG(x)   (SGMII_OFFSET(x) + 0x004)
++#define SGMII_CTL_REG(x)      (SGMII_OFFSET(x) + 0x010)
++#define SGMII_STATUS_REG(x)   (SGMII_OFFSET(x) + 0x014)
++#define SGMII_MRADV_REG(x)    (SGMII_OFFSET(x) + 0x018)
++#define SGMII_LPADV_REG(x)    (SGMII_OFFSET(x) + 0x020)
++#define SGMII_TXCFG_REG(x)    (SGMII_OFFSET(x) + 0x030)
++#define SGMII_RXCFG_REG(x)    (SGMII_OFFSET(x) + 0x034)
++#define SGMII_AUXCFG_REG(x)   (SGMII_OFFSET(x) + 0x038)
++
++static inline void sgmii_write_reg(void __iomem *base, int reg, u32 val)
++{
++	__iowmb();
++	__raw_writel(val, base + reg);
++}
++
++static inline u32 sgmii_read_reg(void __iomem *base, int reg)
++{
++	u32 v;
++
++	v = __raw_readl(base + reg);
++	__iormb();
++	return v;
++}
++
++/* port is 0 based */
++int keystone_sgmii_reset(void __iomem *sgmii_ofs, int port)
++{
++	u32 reg;
++
++	/* Initiate a soft reset */
++	reg = sgmii_read_reg(sgmii_ofs, SGMII_SRESET_REG(port));
++	reg |= SGMII_SRESET_RESET;
++	sgmii_write_reg(sgmii_ofs, SGMII_SRESET_REG(port), reg);
++
++	/* Wait for the bit to auto-clear */
++	do
++		reg = sgmii_read_reg(sgmii_ofs, SGMII_SRESET_REG(port));
++	while ((reg & SGMII_SRESET_RESET) != 0x0);
++
++	return 0;
++}
++
++/* port is 0 based */
++bool keystone_sgmii_rtreset(void __iomem *sgmii_ofs, int port, bool set)
++{
++	u32 reg;
++	bool oldval;
++
++	/* Initiate a soft reset */
++	reg = sgmii_read_reg(sgmii_ofs, SGMII_SRESET_REG(port));
++	oldval = (reg & SGMII_SRESET_RTRESET) != 0x0;
++	if (set)
++		reg |= SGMII_SRESET_RTRESET;
++	else
++		reg &= ~SGMII_SRESET_RTRESET;
++	sgmii_write_reg(sgmii_ofs, SGMII_SRESET_REG(port), reg);
++	__iowmb();
++
++	return oldval;
++}
++
++/* assumes ports <= 2 */
++int keystone_sgmii_link_status(void __iomem *sgmii_ofs, int ports)
++{
++	u32 status = 0, link = 0;
++	u32 i;
++
++	for (i = 0; i < ports; i++) {
++		status = sgmii_read_reg(sgmii_ofs, SGMII_STATUS_REG(i));
++		if ((status & SGMII_REG_STATUS_LINK) != 0)
++			link |= BIT(i);
++		else
++			link &= ~BIT(i);
++	}
++
++	return link;
++}
++
++int keystone_sgmii_get_port_link(void __iomem *sgmii_ofs, int port)
++{
++	u32 status = 0, link = 0;
++
++	status = sgmii_read_reg(sgmii_ofs, SGMII_STATUS_REG(port));
++	if ((status & SGMII_REG_STATUS_LINK) != 0)
++		link |= BIT(port);
++	else
++		link &= ~BIT(port);
++
++	return link;
++}
++
++
++int keystone_sgmii_config(void __iomem *sgmii_ofs,
++			  int port, u32 interface)
++{
++	unsigned int i, status, mask;
++	u32 mr_adv_ability;
++	u32 control;
++
++	switch (interface) {
++	case SGMII_LINK_MAC_MAC_AUTONEG:
++		mr_adv_ability	= 0x9801;
++		control		= 0x21;
++		break;
++
++	case SGMII_LINK_MAC_PHY:
++	case SGMII_LINK_MAC_PHY_NO_MDIO:
++		mr_adv_ability	= 1;
++		control		= 1;
++		break;
++
++	case SGMII_LINK_MAC_MAC_FORCED:
++		mr_adv_ability	= 0x9801;
++		control		= 0x20;
++		break;
++
++	case SGMII_LINK_MAC_FIBER:
++		mr_adv_ability	= 0x20;
++		control		= 0x1;
++		break;
++
++	default:
++		WARN_ONCE(1, "Invalid sgmii interface: %d\n", interface);
++		return -EINVAL;
++	}
++
++	sgmii_write_reg(sgmii_ofs, SGMII_CTL_REG(port), 0);
++
++	/*
++	 * Wait for the SerDes pll to lock,
++	 * but don't trap if lock is never read
++	 */
++	for (i = 0; i < 1000; i++)  {
++		udelay(2000);
++		status = sgmii_read_reg(sgmii_ofs, SGMII_STATUS_REG(port));
++		if ((status & SGMII_REG_STATUS_LOCK) != 0)
++			break;
++	}
++
++	sgmii_write_reg(sgmii_ofs, SGMII_MRADV_REG(port), mr_adv_ability);
++	sgmii_write_reg(sgmii_ofs, SGMII_CTL_REG(port), control);
++
++
++	mask = SGMII_REG_STATUS_LINK;
++
++	if (control & SGMII_REG_CONTROL_AUTONEG)
++		mask |= SGMII_REG_STATUS_AUTONEG;
++
++	for (i = 0; i < 1000; i++)  {
++		status = sgmii_read_reg(sgmii_ofs, SGMII_STATUS_REG(port));
++		if ((status & mask) == mask)
++			break;
++	}
++
++	return 0;
++}
+-- 
+1.7.5.4
+
