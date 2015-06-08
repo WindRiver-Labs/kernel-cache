@@ -1,0 +1,278 @@
+From 20cb47af3aa1368f12d344b2c684a80dbef9e235 Mon Sep 17 00:00:00 2001
+From: Nam Ninh <nam.ninh@windriver.com>
+Date: Fri, 5 Jun 2015 11:40:03 -0400
+Subject: [PATCH] cpu_up: fix slow CPU init on the guest.
+
+We have observed slow CPU initialization during the boot of XLP KVM guest.
+Debug information shows kthread is scheduled twice when _cpu_up calls
+smpboot_create_threads and waits for kthread() to complete.
+
+The problem is kthread and __kthread_parkme functions call schedule()
+right after complete(). When preemption is turned on, the complete()
+function will call schedule() when the TIF_NEED_RESCHED flag is set.
+
+This patch introduces no_reschedule flag in kthread_create_info structure.
+Only _cpu_up sets the flag with this path, so the changes don't affect
+other core codes, but only CPU initialiation where the problem happens.
+
+cpu_up -> smpboot_create_threads
+         -> __smpboot_create_thread
+           -> kthread_create_on_cpu_no_reschedule
+             -> kthread_create_on_node_no_reschedule <--- flag is set
+
+kthread() calls complete_no_reschedule() and kthread_parkme_no_reschedule()
+functions if the flag is set. Otherwise, regular functions are called.
+
+Signed-off-by: Nam Ninh <nam.ninh@windriver.com>
+
+diff --git a/include/linux/completion.h b/include/linux/completion.h
+index e197dcde3eb6..c2ad9fe6b66a 100644
+--- a/include/linux/completion.h
++++ b/include/linux/completion.h
+@@ -92,6 +92,7 @@ extern bool try_wait_for_completion(struct completion *x);
+ extern bool completion_done(struct completion *x);
+ 
+ extern void complete(struct completion *);
++extern void complete_no_reschedule(struct completion *);
+ extern void complete_all(struct completion *);
+ 
+ /**
+diff --git a/include/linux/kthread.h b/include/linux/kthread.h
+index 7dcef3317689..453df165d355 100644
+--- a/include/linux/kthread.h
++++ b/include/linux/kthread.h
+@@ -19,6 +19,11 @@ struct task_struct *kthread_create_on_cpu(int (*threadfn)(void *data),
+ 					  unsigned int cpu,
+ 					  const char *namefmt);
+ 
++struct task_struct *kthread_create_on_cpu_no_reschedule(int (*threadfn)(void *data),
++					  void *data,
++					  unsigned int cpu,
++					  const char *namefmt);
++
+ /**
+  * kthread_run - create and wake a thread.
+  * @threadfn: the function to run until signal_pending(current).
+diff --git a/kernel/kthread.c b/kernel/kthread.c
+index 760e86df8c20..974510813d3d 100644
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@ -30,6 +30,7 @@ struct kthread_create_info
+ 	int (*threadfn)(void *data);
+ 	void *data;
+ 	int node;
++	bool no_reschedule;
+ 
+ 	/* Result passed back to kthread_create() from kthreadd. */
+ 	struct task_struct *result;
+@@ -167,6 +168,19 @@ static void __kthread_parkme(struct kthread *self)
+ 	__set_current_state(TASK_RUNNING);
+ }
+ 
++static void __kthread_parkme_no_reschedule(struct kthread *self)
++{
++	__set_current_state(TASK_PARKED);
++	while (test_bit(KTHREAD_SHOULD_PARK, &self->flags)) {
++		if (!test_and_set_bit(KTHREAD_IS_PARKED, &self->flags))
++			complete_no_reschedule(&self->parked);
++		schedule();
++		__set_current_state(TASK_PARKED);
++	}
++	clear_bit(KTHREAD_IS_PARKED, &self->flags);
++	__set_current_state(TASK_RUNNING);
++}
++
+ void kthread_parkme(void)
+ {
+ 	__kthread_parkme(to_kthread(current));
+@@ -190,13 +204,24 @@ static int kthread(void *_create)
+ 	/* OK, tell user we're spawned, wait for stop or wakeup */
+ 	__set_current_state(TASK_UNINTERRUPTIBLE);
+ 	create->result = current;
+-	complete(&create->done);
++	/*
++	 * no_reschedule is only for percpu hotplug thread
++	 * smpboot_thread_fn created by cpu_up during bootup. All other
++	 * threads creation will call complete().
++	 */
++	if (unlikely(create->no_reschedule))
++		complete_no_reschedule(&create->done);
++	else
++		complete(&create->done);
+ 	schedule();
+ 
+ 	ret = -EINTR;
+ 
+ 	if (!test_bit(KTHREAD_SHOULD_STOP, &self.flags)) {
+-		__kthread_parkme(&self);
++		if (unlikely(create->no_reschedule))
++			__kthread_parkme_no_reschedule(&self);
++		else
++			__kthread_parkme(&self);
+ 		ret = threadfn(data);
+ 	}
+ 	/* we can't just return, we must preserve "self" on stack */
+@@ -228,6 +253,44 @@ static void create_kthread(struct kthread_create_info *create)
+ 	}
+ }
+ 
++static struct task_struct *kthread_create_on_node_no_reschedule(int (*threadfn)(void *data),
++					   void *data, int node,
++					   const char namefmt[],
++					   ...)
++{
++	struct kthread_create_info create;
++
++	create.threadfn = threadfn;
++	create.data = data;
++	create.node = node;
++	create.no_reschedule = true;
++	init_completion(&create.done);
++
++	spin_lock(&kthread_create_lock);
++	list_add_tail(&create.list, &kthread_create_list);
++	spin_unlock(&kthread_create_lock);
++
++	wake_up_process(kthreadd_task);
++	wait_for_completion(&create.done);
++
++	if (!IS_ERR(create.result)) {
++		static const struct sched_param param = { .sched_priority = 0 };
++		va_list args;
++
++		va_start(args, namefmt);
++		vsnprintf(create.result->comm, sizeof(create.result->comm),
++			  namefmt, args);
++		va_end(args);
++		/*
++		 * root may have changed our (kthreadd's) priority or CPU mask.
++		 * The kernel thread should not inherit these properties.
++		 */
++		sched_setscheduler_nocheck(create.result, SCHED_NORMAL, &param);
++		set_cpus_allowed_ptr(create.result, cpu_all_mask);
++	}
++	return create.result;
++}
++
+ /**
+  * kthread_create_on_node - create a kthread.
+  * @threadfn: the function to run until signal_pending(current).
+@@ -343,6 +406,34 @@ struct task_struct *kthread_create_on_cpu(int (*threadfn)(void *data),
+ 	return p;
+ }
+ 
++/**
++ * kthread_create_on_cpu_no_reschedule - Create a cpu bound kthread
++ * @threadfn: the function to run until signal_pending(current).
++ * @data: data ptr for @threadfn.
++ * @cpu: The cpu on which the thread should be bound,
++ * @namefmt: printf-style name for the thread. Format is restricted
++ *	     to "name.*%u". Code fills in cpu number.
++ *
++ * Description: This helper function creates and names a kernel thread
++ * The thread will be woken and put into park mode.
++ */
++struct task_struct *kthread_create_on_cpu_no_reschedule(int (*threadfn)(void *data),
++					  void *data, unsigned int cpu,
++					  const char *namefmt)
++{
++	struct task_struct *p;
++
++	p = kthread_create_on_node_no_reschedule(threadfn, data, cpu_to_node(cpu), namefmt,
++				   cpu);
++	if (IS_ERR(p))
++		return p;
++	set_bit(KTHREAD_IS_PER_CPU, &to_kthread(p)->flags);
++	to_kthread(p)->cpu = cpu;
++	/* Park the thread to get it out of TASK_UNINTERRUPTIBLE state */
++	kthread_park(p);
++	return p;
++}
++
+ static void __kthread_unpark(struct task_struct *k, struct kthread *kthread)
+ {
+ 	clear_bit(KTHREAD_SHOULD_PARK, &kthread->flags);
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 7358b4deb3ac..bb55be034c6d 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3497,6 +3497,31 @@ void complete(struct completion *x)
+ EXPORT_SYMBOL(complete);
+ 
+ /**
++ * complete_no_reschedule: - signals a single thread waiting on this completion
++ * @x:  holds the state of this particular completion
++ *
++ * This will wake up a single thread waiting on this completion. Threads will be
++ * awakened in the same order in which they were queued.
++ *
++ * See also complete_all(), wait_for_completion() and related routines.
++ *
++ * It may be assumed that this function implies a write memory barrier before
++ * changing the task state if and only if any tasks are woken up.
++ */
++void complete_no_reschedule(struct completion *x)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&x->wait.lock, flags);
++	x->done++;
++	__swait_wake_locked(&x->wait, TASK_NORMAL, 1);
++	if (unlikely(test_thread_flag(TIF_NEED_RESCHED)))
++		clear_need_resched();
++	raw_spin_unlock_irqrestore(&x->wait.lock, flags);
++}
++EXPORT_SYMBOL(complete_no_reschedule);
++
++/**
+  * complete_all: - signals all threads waiting on this completion
+  * @x:  holds the state of this particular completion
+  *
+diff --git a/kernel/smpboot.c b/kernel/smpboot.c
+index 7020eecb398b..06047901eed2 100644
+--- a/kernel/smpboot.c
++++ b/kernel/smpboot.c
+@@ -163,7 +163,8 @@ static int smpboot_thread_fn(void *data)
+ }
+ 
+ static int
+-__smpboot_create_thread(struct smp_hotplug_thread *ht, unsigned int cpu)
++__smpboot_create_thread(struct smp_hotplug_thread *ht, unsigned int cpu,
++                        bool no_reschedule)
+ {
+ 	struct task_struct *tsk = *per_cpu_ptr(ht->store, cpu);
+ 	struct smpboot_thread_data *td;
+@@ -177,7 +178,11 @@ __smpboot_create_thread(struct smp_hotplug_thread *ht, unsigned int cpu)
+ 	td->cpu = cpu;
+ 	td->ht = ht;
+ 
+-	tsk = kthread_create_on_cpu(smpboot_thread_fn, td, cpu,
++	if (unlikely(no_reschedule))
++		tsk = kthread_create_on_cpu_no_reschedule(smpboot_thread_fn, td,
++				    cpu, ht->thread_comm);
++	else
++		tsk = kthread_create_on_cpu(smpboot_thread_fn, td, cpu,
+ 				    ht->thread_comm);
+ 	if (IS_ERR(tsk)) {
+ 		kfree(td);
+@@ -207,7 +212,7 @@ int smpboot_create_threads(unsigned int cpu)
+ 
+ 	mutex_lock(&smpboot_threads_lock);
+ 	list_for_each_entry(cur, &hotplug_threads, list) {
+-		ret = __smpboot_create_thread(cur, cpu);
++		ret = __smpboot_create_thread(cur, cpu, true);
+ 		if (ret)
+ 			break;
+ 	}
+@@ -282,7 +287,7 @@ int smpboot_register_percpu_thread(struct smp_hotplug_thread *plug_thread)
+ 	get_online_cpus();
+ 	mutex_lock(&smpboot_threads_lock);
+ 	for_each_online_cpu(cpu) {
+-		ret = __smpboot_create_thread(plug_thread, cpu);
++		ret = __smpboot_create_thread(plug_thread, cpu, false);
+ 		if (ret) {
+ 			smpboot_destroy_threads(plug_thread);
+ 			goto out;
+-- 
+2.1.0
+
