@@ -1,0 +1,208 @@
+From 7575aed64b732af4eac07f307075d5303e751256 Mon Sep 17 00:00:00 2001
+From: Kyeyoon Park <kyeyoonp@codeaurora.org>
+Date: Thu, 23 Oct 2014 14:49:17 -0700
+Subject: [PATCH 307/349] bridge: Add support for IEEE 802.11 Proxy ARP
+
+commit 958501163ddd6ea22a98f94fa0e7ce6d4734e5c4 upstream.
+
+This feature is defined in IEEE Std 802.11-2012, 10.23.13. It allows
+the AP devices to keep track of the hardware-address-to-IP-address
+mapping of the mobile devices within the WLAN network.
+
+The AP will learn this mapping via observing DHCP, ARP, and NS/NA
+frames. When a request for such information is made (i.e. ARP request,
+Neighbor Solicitation), the AP will respond on behalf of the
+associated mobile device. In the process of doing so, the AP will drop
+the multicast request frame that was intended to go out to the wireless
+medium.
+
+It was recommended at the LKS workshop to do this implementation in
+the bridge layer. vxlan.c is already doing something very similar.
+The DHCP snooping code will be added to the userspace application
+(hostapd) per the recommendation.
+
+This RFC commit is only for IPv4. A similar approach in the bridge
+layer will be taken for IPv6 as well.
+
+Signed-off-by: Kyeyoon Park <kyeyoonp@codeaurora.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ include/uapi/linux/if_link.h |    1 +
+ net/bridge/br_forward.c      |    5 +++
+ net/bridge/br_input.c        |   60 ++++++++++++++++++++++++++++++++++++++++++
+ net/bridge/br_netlink.c      |    4 ++-
+ net/bridge/br_private.h      |    1 +
+ net/bridge/br_sysfs_if.c     |    2 +
+ 6 files changed, 72 insertions(+), 1 deletions(-)
+
+diff --git a/include/uapi/linux/if_link.h b/include/uapi/linux/if_link.h
+index 9b9bd0f..56911f8 100644
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@ -223,6 +223,7 @@ enum {
+ 	IFLA_BRPORT_FAST_LEAVE,	/* multicast fast leave    */
+ 	IFLA_BRPORT_LEARNING,	/* mac learning */
+ 	IFLA_BRPORT_UNICAST_FLOOD, /* flood unicast traffic */
++	IFLA_BRPORT_PROXYARP,	/* proxy ARP */
+ 	__IFLA_BRPORT_MAX
+ };
+ #define IFLA_BRPORT_MAX (__IFLA_BRPORT_MAX - 1)
+diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
+index 4b81b14..75ae6e3 100644
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -186,6 +186,11 @@ static void br_flood(struct net_bridge *br, struct sk_buff *skb,
+ 		/* Do not flood unicast traffic to ports that turn it off */
+ 		if (unicast && !(p->flags & BR_FLOOD))
+ 			continue;
++
++		/* Do not flood to ports that enable proxy ARP */
++		if (p->flags & BR_PROXYARP)
++			continue;
++
+ 		prev = maybe_deliver(prev, p, skb, __packet_hook);
+ 		if (IS_ERR(prev))
+ 			goto out;
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index 83239a8..ac19827 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -16,6 +16,8 @@
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <linux/netfilter_bridge.h>
++#include <linux/neighbour.h>
++#include <net/arp.h>
+ #include <linux/export.h>
+ #include <linux/rculist.h>
+ #include "br_private.h"
+@@ -56,6 +58,60 @@ static int br_pass_frame_up(struct sk_buff *skb)
+ 		       netif_receive_skb);
+ }
+ 
++static void br_do_proxy_arp(struct sk_buff *skb, struct net_bridge *br,
++			    u16 vid)
++{
++	struct net_device *dev = br->dev;
++	struct neighbour *n;
++	struct arphdr *parp;
++	u8 *arpptr, *sha;
++	__be32 sip, tip;
++
++	if (dev->flags & IFF_NOARP)
++		return;
++
++	if (!pskb_may_pull(skb, arp_hdr_len(dev))) {
++		dev->stats.tx_dropped++;
++		return;
++	}
++	parp = arp_hdr(skb);
++
++	if (parp->ar_pro != htons(ETH_P_IP) ||
++	    parp->ar_op != htons(ARPOP_REQUEST) ||
++	    parp->ar_hln != dev->addr_len ||
++	    parp->ar_pln != 4)
++		return;
++
++	arpptr = (u8 *)parp + sizeof(struct arphdr);
++	sha = arpptr;
++	arpptr += dev->addr_len;	/* sha */
++	memcpy(&sip, arpptr, sizeof(sip));
++	arpptr += sizeof(sip);
++	arpptr += dev->addr_len;	/* tha */
++	memcpy(&tip, arpptr, sizeof(tip));
++
++	if (ipv4_is_loopback(tip) ||
++	    ipv4_is_multicast(tip))
++		return;
++
++	n = neigh_lookup(&arp_tbl, &tip, dev);
++	if (n) {
++		struct net_bridge_fdb_entry *f;
++
++		if (!(n->nud_state & NUD_VALID)) {
++			neigh_release(n);
++			return;
++		}
++
++		f = __br_fdb_get(br, n->ha, vid);
++		if (f)
++			arp_send(ARPOP_REPLY, ETH_P_ARP, sip, skb->dev, tip,
++				 sha, n->ha, sha);
++
++		neigh_release(n);
++	}
++}
++
+ /* note: already called with rcu_read_lock */
+ int br_handle_frame_finish(struct sk_buff *skb)
+ {
+@@ -97,6 +153,10 @@ int br_handle_frame_finish(struct sk_buff *skb)
+ 	dst = NULL;
+ 
+ 	if (is_broadcast_ether_addr(dest)) {
++		if (p->flags & BR_PROXYARP &&
++		    skb->protocol == htons(ETH_P_ARP))
++			br_do_proxy_arp(skb, br, vid);
++
+ 		skb2 = skb;
+ 		unicast = false;
+ 	} else if (is_multicast_ether_addr(dest)) {
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 0a11381..564f2c9 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -60,7 +60,8 @@ static int br_port_fill_attrs(struct sk_buff *skb,
+ 	    nla_put_u8(skb, IFLA_BRPORT_PROTECT, !!(p->flags & BR_ROOT_BLOCK)) ||
+ 	    nla_put_u8(skb, IFLA_BRPORT_FAST_LEAVE, !!(p->flags & BR_MULTICAST_FAST_LEAVE)) ||
+ 	    nla_put_u8(skb, IFLA_BRPORT_LEARNING, !!(p->flags & BR_LEARNING)) ||
+-	    nla_put_u8(skb, IFLA_BRPORT_UNICAST_FLOOD, !!(p->flags & BR_FLOOD)))
++	    nla_put_u8(skb, IFLA_BRPORT_UNICAST_FLOOD, !!(p->flags & BR_FLOOD)) ||
++	    nla_put_u8(skb, IFLA_BRPORT_PROXYARP, !!(p->flags & BR_PROXYARP)))
+ 		return -EMSGSIZE;
+ 
+ 	return 0;
+@@ -336,6 +337,7 @@ static int br_setport(struct net_bridge_port *p, struct nlattr *tb[])
+ 	br_set_port_flag(p, tb, IFLA_BRPORT_PROTECT, BR_ROOT_BLOCK);
+ 	br_set_port_flag(p, tb, IFLA_BRPORT_LEARNING, BR_LEARNING);
+ 	br_set_port_flag(p, tb, IFLA_BRPORT_UNICAST_FLOOD, BR_FLOOD);
++	br_set_port_flag(p, tb, IFLA_BRPORT_PROXYARP, BR_PROXYARP);
+ 
+ 	if (tb[IFLA_BRPORT_COST]) {
+ 		err = br_stp_set_path_cost(p, nla_get_u32(tb[IFLA_BRPORT_COST]));
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index fd217dc..fe51dc8 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -159,6 +159,7 @@ struct net_bridge_port
+ #define BR_ADMIN_COST		0x00000010
+ #define BR_LEARNING		0x00000020
+ #define BR_FLOOD		0x00000040
++#define BR_PROXYARP		0x00000100
+ 
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ 	u32				multicast_startup_queries_sent;
+diff --git a/net/bridge/br_sysfs_if.c b/net/bridge/br_sysfs_if.c
+index 2a2cdb7..1be2be8 100644
+--- a/net/bridge/br_sysfs_if.c
++++ b/net/bridge/br_sysfs_if.c
+@@ -160,6 +160,7 @@ BRPORT_ATTR_FLAG(bpdu_guard, BR_BPDU_GUARD);
+ BRPORT_ATTR_FLAG(root_block, BR_ROOT_BLOCK);
+ BRPORT_ATTR_FLAG(learning, BR_LEARNING);
+ BRPORT_ATTR_FLAG(unicast_flood, BR_FLOOD);
++BRPORT_ATTR_FLAG(proxyarp, BR_PROXYARP);
+ 
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ static ssize_t show_multicast_router(struct net_bridge_port *p, char *buf)
+@@ -203,6 +204,7 @@ static const struct brport_attribute *brport_attrs[] = {
+ 	&brport_attr_multicast_router,
+ 	&brport_attr_multicast_fast_leave,
+ #endif
++	&brport_attr_proxyarp,
+ 	NULL
+ };
+ 
+-- 
+1.7.5.4
+
