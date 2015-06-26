@@ -1,0 +1,169 @@
+From 2419c20ccfd437fb18150f3cc020115d941295be Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Thu, 5 Dec 2013 04:45:08 -0800
+Subject: [PATCH 249/348] net: introduce dev_consume_skb_any()
+
+commit e6247027e5173c00efb2084d688d06ff835bc3b0 upstream.
+
+Some network drivers use dev_kfree_skb_any() and dev_kfree_skb_irq()
+helpers to free skbs, both for dropped packets and TX completed ones.
+
+We need to separate the two causes to get better diagnostics
+given by dropwatch or "perf record -e skb:kfree_skb"
+
+This patch provides two new helpers, dev_consume_skb_any() and
+dev_consume_skb_irq() to be used for consumed skbs.
+
+__dev_kfree_skb_irq() is slightly optimized to remove one
+atomic_dec_and_test() in fast path, and use this_cpu_{r|w} accessors.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ include/linux/netdevice.h |   53 +++++++++++++++++++++++++++++++++++++-------
+ net/core/dev.c            |   45 +++++++++++++++++++++++++------------
+ 2 files changed, 74 insertions(+), 24 deletions(-)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index f321db0..4f3a03b 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2228,17 +2228,52 @@ static inline int netif_copy_real_num_queues(struct net_device *to_dev,
+ #define DEFAULT_MAX_NUM_RSS_QUEUES	(8)
+ extern int netif_get_num_default_rss_queues(void);
+ 
+-/* Use this variant when it is known for sure that it
+- * is executing from hardware interrupt context or with hardware interrupts
+- * disabled.
+- */
+-extern void dev_kfree_skb_irq(struct sk_buff *skb);
++enum skb_free_reason {
++	SKB_REASON_CONSUMED,
++	SKB_REASON_DROPPED,
++};
++
++void __dev_kfree_skb_irq(struct sk_buff *skb, enum skb_free_reason reason);
++void __dev_kfree_skb_any(struct sk_buff *skb, enum skb_free_reason reason);
+ 
+-/* Use this variant in places where it could be invoked
+- * from either hardware interrupt or other context, with hardware interrupts
+- * either disabled or enabled.
++/*
++ * It is not allowed to call kfree_skb() or consume_skb() from hardware
++ * interrupt context or with hardware interrupts being disabled.
++ * (in_irq() || irqs_disabled())
++ *
++ * We provide four helpers that can be used in following contexts :
++ *
++ * dev_kfree_skb_irq(skb) when caller drops a packet from irq context,
++ *  replacing kfree_skb(skb)
++ *
++ * dev_consume_skb_irq(skb) when caller consumes a packet from irq context.
++ *  Typically used in place of consume_skb(skb) in TX completion path
++ *
++ * dev_kfree_skb_any(skb) when caller doesn't know its current irq context,
++ *  replacing kfree_skb(skb)
++ *
++ * dev_consume_skb_any(skb) when caller doesn't know its current irq context,
++ *  and consumed a packet. Used in place of consume_skb(skb)
+  */
+-extern void dev_kfree_skb_any(struct sk_buff *skb);
++static inline void dev_kfree_skb_irq(struct sk_buff *skb)
++{
++	__dev_kfree_skb_irq(skb, SKB_REASON_DROPPED);
++}
++
++static inline void dev_consume_skb_irq(struct sk_buff *skb)
++{
++	__dev_kfree_skb_irq(skb, SKB_REASON_CONSUMED);
++}
++
++static inline void dev_kfree_skb_any(struct sk_buff *skb)
++{
++	__dev_kfree_skb_any(skb, SKB_REASON_DROPPED);
++}
++
++static inline void dev_consume_skb_any(struct sk_buff *skb)
++{
++	__dev_kfree_skb_any(skb, SKB_REASON_CONSUMED);
++}
+ 
+ extern int		netif_rx(struct sk_buff *skb);
+ extern int		netif_rx_ni(struct sk_buff *skb);
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 2af9f0b..510b300 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2117,30 +2117,42 @@ void __netif_schedule(struct Qdisc *q)
+ }
+ EXPORT_SYMBOL(__netif_schedule);
+ 
+-void dev_kfree_skb_irq(struct sk_buff *skb)
++struct dev_kfree_skb_cb {
++	enum skb_free_reason reason;
++};
++
++static struct dev_kfree_skb_cb *get_kfree_skb_cb(const struct sk_buff *skb)
++{
++	return (struct dev_kfree_skb_cb *)skb->cb;
++}
++
++void __dev_kfree_skb_irq(struct sk_buff *skb, enum skb_free_reason reason)
+ {
+-	if (atomic_dec_and_test(&skb->users)) {
+-		struct softnet_data *sd;
+-		unsigned long flags;
++	unsigned long flags;
+ 
+-		local_irq_save(flags);
+-		sd = &__get_cpu_var(softnet_data);
+-		skb->next = sd->completion_queue;
+-		sd->completion_queue = skb;
+-		raise_softirq_irqoff(NET_TX_SOFTIRQ);
+-		local_irq_restore(flags);
++	if (likely(atomic_read(&skb->users) == 1)) {
++		smp_rmb();
++		atomic_set(&skb->users, 0);
++	} else if (likely(!atomic_dec_and_test(&skb->users))) {
++		return;
+ 	}
++	get_kfree_skb_cb(skb)->reason = reason;
++	local_irq_save(flags);
++	skb->next = __this_cpu_read(softnet_data.completion_queue);
++	__this_cpu_write(softnet_data.completion_queue, skb);
++	raise_softirq_irqoff(NET_TX_SOFTIRQ);
++	local_irq_restore(flags);
+ }
+-EXPORT_SYMBOL(dev_kfree_skb_irq);
++EXPORT_SYMBOL(__dev_kfree_skb_irq);
+ 
+-void dev_kfree_skb_any(struct sk_buff *skb)
++void __dev_kfree_skb_any(struct sk_buff *skb, enum skb_free_reason reason)
+ {
+ 	if (in_irq() || irqs_disabled())
+-		dev_kfree_skb_irq(skb);
++		__dev_kfree_skb_irq(skb, reason);
+ 	else
+ 		dev_kfree_skb(skb);
+ }
+-EXPORT_SYMBOL(dev_kfree_skb_any);
++EXPORT_SYMBOL(__dev_kfree_skb_any);
+ 
+ 
+ /**
+@@ -3244,7 +3256,10 @@ static void net_tx_action(struct softirq_action *h)
+ 			clist = clist->next;
+ 
+ 			WARN_ON(atomic_read(&skb->users));
+-			trace_kfree_skb(skb, net_tx_action);
++			if (likely(get_kfree_skb_cb(skb)->reason == SKB_REASON_CONSUMED))
++				trace_consume_skb(skb);
++			else
++				trace_kfree_skb(skb, net_tx_action);
+ 			__kfree_skb(skb);
+ 		}
+ 	}
+-- 
+1.7.5.4
+
