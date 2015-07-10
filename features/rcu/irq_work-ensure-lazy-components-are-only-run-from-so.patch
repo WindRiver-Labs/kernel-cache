@@ -1,0 +1,160 @@
+From a6707a256c9e2608f35180e1f85d733dc6cdfaab Mon Sep 17 00:00:00 2001
+From: Paul Gortmaker <paul.gortmaker@windriver.com>
+Date: Thu, 9 Jul 2015 11:54:22 -0400
+Subject: [PATCH] irq_work: ensure lazy components are only run from softirq
+
+After backporting the split irq list commit, we need to ensure
+it remains -rt compatible by having the lazy components run
+only from softirq context.  Failure to do so can lead to:
+
+BUG: sleeping function called from invalid context at kernel/rtmutex.c:796
+in_atomic(): 1, irqs_disabled(): 1, pid: 41, name: rcuc/5
+Preemption disabled at:[<ffffffff81095aa8>] rcu_cpu_kthread+0x4b8/0x8b0
+
+CPU: 5 PID: 41 Comm: rcuc/5 Tainted: G           O 3.10.80-ovp-rt74-WR6.0.0.21_preempt-rt #2
+ 0000000000000001 ffff88107fca3ec0 ffffffff8195ddcb ffff88107fca3ed8
+ ffffffff8107219f ffffffff81e35460 ffff88107fca3ef0 ffffffff81964110
+ ffffffff81e35460 ffff88107fca3f20 ffffffff81075aa9 0000000000000001
+Call Trace:
+ <IRQ>  [<ffffffff8195ddcb>] dump_stack+0x19/0x1b
+ [<ffffffff8107219f>] __might_sleep+0xef/0x160
+ [<ffffffff81964110>] rt_spin_lock+0x20/0x50
+ [<ffffffff81075aa9>] __wake_up+0x29/0x60
+ [<ffffffff81042274>] wake_up_klogd_work_func+0x44/0x80
+ [<ffffffff811022bf>] irq_work_run_list+0x3f/0x60
+ [<ffffffff81102461>] __irq_work_run+0x41/0x50
+ [<ffffffff81102479>] irq_work_run+0x9/0x10
+ [<ffffffff81006f8f>] smp_irq_work_interrupt+0x2f/0x40
+ [<ffffffff819665ea>] irq_work_interrupt+0x6a/0x70
+ <EOI>  [<ffffffff819644cf>] ? _raw_spin_unlock_irqrestore+0xf/0x50
+ [<ffffffff81095abb>] rcu_cpu_kthread+0x4cb/0x8b0
+ [<ffffffff8106e3dc>] smpboot_thread_fn+0x1ec/0x360
+ [<ffffffff819628a0>] ? schedule+0x30/0x90
+
+What happens here is that we try to run wake_up_klogd_work_func in
+IRQ context, which does wake_up_interruptible(&log_wait) -- and
+in -rt the "normal" waitqueues use an rt lock; only the simple
+waitqueues (which use a raw lock) can be used in atomic/IRQ
+context.
+
+Here we align with more modern -rt versions and use irq_work_tick
+from the softirq to complete the lazy callbacks.  This is similar
+to what was added into the v3.10-rt linux-stable-rt backport of the
+split lists, commit 35716ca37146f11a10a7014811c298c932b0c150.  In
+that Steven Rostedt writes:
+
+    Merged in some changes from 4.0-rt that added the irq_work_tick()
+    code, and also has the raised_list called from hardirq context and
+    the lazy_list always from softirq context (which is threaded on RT)
+
+Since we've already got irq_work related backports, we've already
+accomplished some of what was glued onto the above backport, here
+we close the gap by adding the delta.
+
+Some of the this_cpu_ptr changes are largely cosmetic, but they
+were pulled in as well, to ease comparisons between this code base
+and the v3.10-rt branch in the public linux-stable-rt repository.
+
+Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+
+diff --git a/kernel/irq_work.c b/kernel/irq_work.c
+index 90670fe4937f..be07377ae981 100644
+--- a/kernel/irq_work.c
++++ b/kernel/irq_work.c
+@@ -87,6 +87,9 @@ EXPORT_SYMBOL_GPL(irq_work_queue_on);
+ /* Enqueue the irq work @work on the current CPU */
+ bool irq_work_queue(struct irq_work *work)
+ {
++	bool lazy_work, realtime = IS_ENABLED(CONFIG_PREEMPT_RT_FULL);
++	struct llist_head *list;
++
+ 	/* Only queue if not already pending */
+ 	if (!irq_work_claim(work))
+ 		return false;
+@@ -95,12 +98,15 @@ bool irq_work_queue(struct irq_work *work)
+ 	preempt_disable();
+ 
+ 	/* If the work is "lazy", handle it from next tick if any */
+-	if (work->flags & IRQ_WORK_LAZY) {
+-		if (llist_add(&work->llnode, &__get_cpu_var(lazy_list)) &&
+-		    tick_nohz_tick_stopped())
+-			raise_softirq(TIMER_SOFTIRQ);
+-	} else {
+-		if (llist_add(&work->llnode, &__get_cpu_var(raised_list)))
++	lazy_work = work->flags & IRQ_WORK_LAZY;
++
++	if (lazy_work || (realtime && !(work->flags & IRQ_WORK_HARD_IRQ)))
++		list = this_cpu_ptr(&lazy_list);
++	else
++		list = this_cpu_ptr(&raised_list);
++
++	if (llist_add(&work->llnode, list)) {
++		if (!lazy_work || tick_nohz_tick_stopped())
+ 			arch_irq_work_raise();
+ 	}
+ 
+@@ -164,12 +170,6 @@ static void irq_work_run_list(struct llist_head *list)
+ 	}
+ }
+ 
+-static void __irq_work_run(void)
+-{
+-	irq_work_run_list(&__get_cpu_var(raised_list));
+-	irq_work_run_list(&__get_cpu_var(lazy_list));
+-}
+-
+ /*
+  * Run the irq_work entries on this cpu. Requires to be ran from hardirq
+  * context with local IRQs disabled.
+@@ -179,17 +179,23 @@ void irq_work_run(void)
+ #ifndef CONFIG_PREEMPT_RT_FULL
+ 	BUG_ON(!in_irq());
+ #endif
+-	__irq_work_run();
++	irq_work_run_list(this_cpu_ptr(&raised_list));
++	if (IS_ENABLED(CONFIG_PREEMPT_RT_FULL)) {
++		if (!llist_empty(this_cpu_ptr(&lazy_list)))
++			raise_softirq(TIMER_SOFTIRQ);
++	} else
++		irq_work_run_list(this_cpu_ptr(&lazy_list));
++
+ }
+ EXPORT_SYMBOL_GPL(irq_work_run);
+ 
+ void irq_work_tick(void)
+ {
+-	struct llist_head *raised = &__get_cpu_var(raised_list);
++	struct llist_head *raised = this_cpu_ptr(&raised_list);
+ 
+ 	if (!llist_empty(raised) && !arch_irq_work_has_interrupt())
+ 		irq_work_run_list(raised);
+-	irq_work_run_list(&__get_cpu_var(lazy_list));
++	irq_work_run_list(this_cpu_ptr(&lazy_list));
+ }
+ 
+ /*
+@@ -216,7 +222,7 @@ static int irq_work_cpu_notify(struct notifier_block *self,
+ 		/* Called from stop_machine */
+ 		if (WARN_ON_ONCE(cpu != smp_processor_id()))
+ 			break;
+-		__irq_work_run();
++		irq_work_tick();
+ 		break;
+ 	default:
+ 		break;
+diff --git a/kernel/timer.c b/kernel/timer.c
+index bedab0613c00..606eebb39250 100644
+--- a/kernel/timer.c
++++ b/kernel/timer.c
+@@ -1468,7 +1468,7 @@ static void run_timer_softirq(struct softirq_action *h)
+ 	hrtimer_run_pending();
+ 
+ #if defined(CONFIG_IRQ_WORK) && defined(CONFIG_PREEMPT_RT_FULL)
+-	irq_work_run();
++	irq_work_tick();
+ #endif
+ 
+ 	if (time_after_eq(jiffies, base->timer_jiffies))
+-- 
+2.4.3
+
