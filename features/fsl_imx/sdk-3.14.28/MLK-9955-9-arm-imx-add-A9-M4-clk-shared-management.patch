@@ -1,0 +1,768 @@
+From d1ea37c64513597ac5d7316d166fb96c994ab1c2 Mon Sep 17 00:00:00 2001
+From: Anson Huang <b20788@freescale.com>
+Date: Thu, 4 Dec 2014 12:22:20 +0800
+Subject: [PATCH 1055/1543] MLK-9955-9 arm: imx: add A9-M4 clk shared
+ management
+
+commit 85b0386ca3daf90e3b230b76249724ed190ebc12 from
+git://git.freescale.com/imx/linux-2.6-imx.git
+
+As A9 and M4 share many resources on i.MX6SX, especially for
+clk and power related resource, so we need to handle the hardware
+conflict between these two cores, there are two cases that we
+need to consider currently:
+
+clk management: for every clk node, only when both A9 and
+M4 do NOT need it, then we can disable it from hardware;
+
+Here we use MU and hardware SEMA4 to achieve our goal, MU is
+for communiation between A9 and M4, SEMA4 is to protect the
+shared memory.
+
+For clk management, we use shared memory to maintain the clk
+status for both A9 and M4 side, and this shared memory is
+protected by hardware SEMA4, A9 and M4 will maintain their
+own clk tree info in their SW environment, and get other
+CORE's clk tree info from shared memory to decide whether
+to perform a hardware setting change when they plan to.
+
+Signed-off-by: Anson Huang <b20788@freescale.com>
+---
+ arch/arm/mach-imx/clk-gate2.c  |   59 +++++++++++++++---
+ arch/arm/mach-imx/clk-imx6sx.c |  127 ++++++++++++++++++++++++++++++++++++++--
+ arch/arm/mach-imx/clk-pfd.c    |   49 ++++++++++++++--
+ arch/arm/mach-imx/clk-pllv3.c  |   76 ++++++++++++++++++------
+ arch/arm/mach-imx/clk.h        |   21 +++++++
+ arch/arm/mach-imx/common.h     |   11 ++++
+ arch/arm/mach-imx/gpc.c        |   71 ++++++++++++++++++++++
+ arch/arm/mach-imx/src.c        |   17 +++++-
+ 8 files changed, 388 insertions(+), 43 deletions(-)
+
+diff --git a/arch/arm/mach-imx/clk-gate2.c b/arch/arm/mach-imx/clk-gate2.c
+index 5a75cdc..7e08877 100644
+--- a/arch/arm/mach-imx/clk-gate2.c
++++ b/arch/arm/mach-imx/clk-gate2.c
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright (C) 2010-2011 Canonical Ltd <jeremy.kerr@canonical.com>
+  * Copyright (C) 2011-2012 Mike Turquette, Linaro Ltd <mturquette@linaro.org>
++ * Copyright (C) 2014 Freescale Semiconductor, Inc.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License version 2 as
+@@ -10,12 +11,14 @@
+  */
+ 
+ #include <linux/clk-provider.h>
++#include <linux/imx_sema4.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/io.h>
+ #include <linux/err.h>
+ #include <linux/string.h>
+ #include "clk.h"
++#include "common.h"
+ 
+ /**
+  * DOC: basic gatable clock which can gate and ungate it's ouput
+@@ -37,11 +40,54 @@ struct clk_gate2 {
+ };
+ 
+ #define to_clk_gate2(_hw) container_of(_hw, struct clk_gate2, hw)
++#define CCM_CCGR_FULL_ENABLE	0x3
++
++static void clk_gate2_do_hardware(struct clk_gate2 *gate, bool enable)
++{
++	u32 reg;
++
++	reg = readl(gate->reg);
++	if (enable)
++		reg |= CCM_CCGR_FULL_ENABLE << gate->bit_idx;
++	else
++		reg &= ~(CCM_CCGR_FULL_ENABLE << gate->bit_idx);
++	writel(reg, gate->reg);
++}
++
++static void clk_gate2_do_shared_clks(struct clk_hw *hw, bool enable)
++{
++	struct clk_gate2 *gate = to_clk_gate2(hw);
++
++	if (imx_src_is_m4_enabled()) {
++		if (!amp_power_mutex || !shared_mem) {
++			if (enable)
++				clk_gate2_do_hardware(gate, enable);
++			return;
++		}
++
++		imx_sema4_mutex_lock(amp_power_mutex);
++		if (shared_mem->ca9_valid != SHARED_MEM_MAGIC_NUMBER ||
++			shared_mem->cm4_valid != SHARED_MEM_MAGIC_NUMBER) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++
++		if (!imx_update_shared_mem(hw, enable)) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++
++		clk_gate2_do_hardware(gate, enable);
++
++		imx_sema4_mutex_unlock(amp_power_mutex);
++	} else {
++		clk_gate2_do_hardware(gate, enable);
++	}
++}
+ 
+ static int clk_gate2_enable(struct clk_hw *hw)
+ {
+ 	struct clk_gate2 *gate = to_clk_gate2(hw);
+-	u32 reg;
+ 	unsigned long flags = 0;
+ 
+ 	spin_lock_irqsave(gate->lock, flags);
+@@ -49,10 +95,7 @@ static int clk_gate2_enable(struct clk_hw *hw)
+ 	if (gate->share_count && (*gate->share_count)++ > 0)
+ 		goto out;
+ 
+-	reg = readl(gate->reg);
+-	reg |= 3 << gate->bit_idx;
+-	writel(reg, gate->reg);
+-
++	clk_gate2_do_shared_clks(hw, true);
+ out:
+ 	spin_unlock_irqrestore(gate->lock, flags);
+ 
+@@ -62,7 +105,6 @@ out:
+ static void clk_gate2_disable(struct clk_hw *hw)
+ {
+ 	struct clk_gate2 *gate = to_clk_gate2(hw);
+-	u32 reg;
+ 	unsigned long flags = 0;
+ 
+ 	spin_lock_irqsave(gate->lock, flags);
+@@ -74,10 +116,7 @@ static void clk_gate2_disable(struct clk_hw *hw)
+ 			goto out;
+ 	}
+ 
+-	reg = readl(gate->reg);
+-	reg &= ~(3 << gate->bit_idx);
+-	writel(reg, gate->reg);
+-
++	clk_gate2_do_shared_clks(hw, false);
+ out:
+ 	spin_unlock_irqrestore(gate->lock, flags);
+ }
+diff --git a/arch/arm/mach-imx/clk-imx6sx.c b/arch/arm/mach-imx/clk-imx6sx.c
+index e19884b..cc51356 100644
+--- a/arch/arm/mach-imx/clk-imx6sx.c
++++ b/arch/arm/mach-imx/clk-imx6sx.c
+@@ -13,6 +13,7 @@
+ #include <linux/clk.h>
+ #include <linux/clkdev.h>
+ #include <linux/err.h>
++#include <linux/imx_sema4.h>
+ #include <linux/init.h>
+ #include <linux/io.h>
+ #include <linux/of.h>
+@@ -93,18 +94,19 @@ static const char *pll7_bypass_sels[] = { "pll7", "pll7_bypass_src", };
+ 
+ static struct clk *clks[IMX6SX_CLK_CLK_END];
+ static struct clk_onecell_data clk_data;
++struct imx_sema4_mutex *amp_power_mutex;
++
++static int clks_shared[MAX_SHARED_CLK_NUMBER];
++
++struct imx_shared_mem *shared_mem;
++static unsigned int shared_mem_paddr, shared_mem_size;
+ 
+ static int const clks_init_on[] __initconst = {
+ 	IMX6SX_CLK_AIPS_TZ1, IMX6SX_CLK_AIPS_TZ2, IMX6SX_CLK_AIPS_TZ3,
+ 	IMX6SX_CLK_IPMUX1, IMX6SX_CLK_IPMUX2, IMX6SX_CLK_IPMUX3,
+ 	IMX6SX_CLK_WAKEUP, IMX6SX_CLK_MMDC_P0_FAST, IMX6SX_CLK_MMDC_P0_IPG,
+ 	IMX6SX_CLK_ROM, IMX6SX_CLK_ARM, IMX6SX_CLK_IPG, IMX6SX_CLK_OCRAM,
+-	IMX6SX_CLK_PER2_MAIN, IMX6SX_CLK_PERCLK, IMX6SX_CLK_M4,
+-	IMX6SX_CLK_QSPI1, IMX6SX_CLK_QSPI2, IMX6SX_CLK_UART_IPG,
+-	IMX6SX_CLK_UART_SERIAL, IMX6SX_CLK_I2C3, IMX6SX_CLK_ECSPI5,
+-	IMX6SX_CLK_CAN1_IPG, IMX6SX_CLK_CAN1_SERIAL, IMX6SX_CLK_CAN2_IPG,
+-	IMX6SX_CLK_CAN2_SERIAL, IMX6SX_CLK_CANFD, IMX6SX_CLK_EPIT1,
+-	IMX6SX_CLK_EPIT2,
++	IMX6SX_CLK_PER2_MAIN, IMX6SX_CLK_PERCLK,
+ };
+ 
+ static struct clk_div_table clk_enet_ref_table[] = {
+@@ -135,6 +137,38 @@ static u32 share_count_audio;
+ static u32 share_count_esai;
+ static bool uart_from_osc;
+ 
++/*
++ * As IMX6SX_CLK_M4_PRE_SEL is NOT a glitchless MUX, so when
++ * M4 is trying to change its clk parent, need to ask A9 to
++ * help do it, and M4 must be hold in wfi. To avoid glitch
++ * occur, need to gate M4 clk first before switching its parent.
++ */
++void imx6sx_set_m4_highfreq(bool high_freq)
++{
++	static struct clk *m4_high_freq_sel;
++
++	imx_gpc_hold_m4_in_sleep();
++
++	clk_disable_unprepare(clks[IMX6SX_CLK_M4]);
++	imx_clk_set_parent(clks[IMX6SX_CLK_M4_SEL],
++		clks[IMX6SX_CLK_LDB_DI0]);
++
++	if (high_freq) {
++		imx_clk_set_parent(clks[IMX6SX_CLK_M4_PRE_SEL],
++			m4_high_freq_sel);
++	} else {
++		m4_high_freq_sel = clk_get_parent(clks[IMX6SX_CLK_M4_PRE_SEL]);
++		imx_clk_set_parent(clks[IMX6SX_CLK_M4_PRE_SEL],
++			clks[IMX6SX_CLK_OSC]);
++	}
++
++	imx_clk_set_parent(clks[IMX6SX_CLK_M4_SEL],
++		clks[IMX6SX_CLK_M4_PRE_SEL]);
++	clk_prepare_enable(clks[IMX6SX_CLK_M4]);
++
++	imx_gpc_release_m4_in_sleep();
++}
++
+ static int __init setup_uart_clk(char *uart_rate)
+ {
+ 	uart_from_osc = true;
+@@ -499,6 +533,22 @@ static void __init imx6sx_clocks_init(struct device_node *ccm_node)
+ 	clks[IMX6SX_CLK_CKO1]         = imx_clk_gate("cko1",           "cko1_podf",         base + 0x60, 7);
+ 	clks[IMX6SX_CLK_CKO2]         = imx_clk_gate("cko2",           "cko2_podf",         base + 0x60, 24);
+ 
++	/* get those shared clk nodes if M4 is active */
++	if (imx_src_is_m4_enabled()) {
++		u32 num;
++		of_property_read_u32(np, "fsl,shared-clks-number", &num);
++		if (num > MAX_SHARED_CLK_NUMBER)
++			pr_err("clk: shared clk nodes exceed the max number!\n");
++		of_property_read_u32_array(np, "fsl,shared-clks-index",
++			clks_shared, num);
++		if (of_property_read_u32(np, "fsl,shared-mem-addr",
++			&shared_mem_paddr))
++			pr_err("clk: fsl,shared-mem-addr NOT found!\n");
++		if (of_property_read_u32(np, "fsl,shared-mem-size",
++			&shared_mem_size))
++			pr_err("clk: fsl,shared-mem-size NOT found!\n");
++	}
++
+ 	/* mask handshake of mmdc */
+ 	writel_relaxed(BM_CCM_CCDR_MMDC_CH0_MASK, base + CCDR);
+ 
+@@ -523,6 +573,10 @@ static void __init imx6sx_clocks_init(struct device_node *ccm_node)
+ 	clk_register_clkdev(clks[IMX6SX_CLK_GPT_SERIAL], "per", "imx-gpt.0");
+ 	clk_register_clkdev(clks[IMX6SX_CLK_GPT_3M], "gpt_3m", "imx-gpt.0");
+ 
++	/* maintain M4 usecount */
++	if (imx_src_is_m4_enabled())
++		imx_clk_prepare_enable(clks[IMX6SX_CLK_M4]);
++
+ 	/* set perclk to from OSC */
+ 	imx_clk_set_parent(clks[IMX6SX_CLK_PERCLK_SEL], clks[IMX6SX_CLK_OSC]);
+ 
+@@ -606,3 +660,64 @@ static void __init imx6sx_clocks_init(struct device_node *ccm_node)
+ 	mxc_timer_init_dt(np);
+ }
+ CLK_OF_DECLARE(imx6sx, "fsl,imx6sx-ccm", imx6sx_clocks_init);
++
++int imx_update_shared_mem(struct clk_hw *hw, bool enable)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(clks_shared); i++) {
++		if (shared_mem->imx_clk[i].self == hw->clk)
++			break;
++	}
++
++	if (i >= ARRAY_SIZE(clks_shared))
++		return 1;
++
++	/* update ca9 clk status in shared memory */
++	if (enable)
++		shared_mem->imx_clk[i].ca9_enabled = 1;
++	else
++		shared_mem->imx_clk[i].ca9_enabled = 0;
++
++	if (shared_mem->imx_clk[i].cm4_enabled == 0)
++		return 1;
++
++	return 0;
++}
++
++static int __init imx_amp_power_init(void)
++{
++	int i;
++	void __iomem *shared_mem_base;
++
++	if (!imx_src_is_m4_enabled())
++		return 0;
++
++	amp_power_mutex = imx_sema4_mutex_create(0, MCC_POWER_SHMEM_NUMBER);
++
++	shared_mem_base = ioremap_nocache(shared_mem_paddr, shared_mem_size);
++
++	if (!amp_power_mutex) {
++		pr_err("Failed to create sema4 mutex!\n");
++		return 0;
++	}
++
++	shared_mem = (struct imx_shared_mem *)shared_mem_base;
++
++	for (i = 0; i < ARRAY_SIZE(clks_shared); i++) {
++		shared_mem->imx_clk[i].self = clks[clks_shared[i]];
++		shared_mem->imx_clk[i].ca9_enabled = 1;
++		pr_debug("%d: name %s, addr 0x%x\n", i,
++			__clk_get_name(shared_mem->imx_clk[i].self),
++			(u32)&(shared_mem->imx_clk[i]));
++	}
++	/* enable amp power management */
++	shared_mem->ca9_valid = SHARED_MEM_MAGIC_NUMBER;
++
++	pr_info("A9-M4 sema4 num %d, A9-M4 magic number 0x%x - 0x%x.\n",
++		amp_power_mutex->gate_num, shared_mem->ca9_valid,
++		shared_mem->cm4_valid);
++
++	return 0;
++}
++late_initcall(imx_amp_power_init);
+diff --git a/arch/arm/mach-imx/clk-pfd.c b/arch/arm/mach-imx/clk-pfd.c
+index 0b0f6f6..896fc78 100644
+--- a/arch/arm/mach-imx/clk-pfd.c
++++ b/arch/arm/mach-imx/clk-pfd.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2012 Freescale Semiconductor, Inc.
++ * Copyright 2012-2014 Freescale Semiconductor, Inc.
+  * Copyright 2012 Linaro Ltd.
+  *
+  * The code contained herein is licensed under the GNU General Public
+@@ -12,10 +12,12 @@
+ 
+ #include <linux/clk.h>
+ #include <linux/clk-provider.h>
++#include <linux/imx_sema4.h>
+ #include <linux/io.h>
+ #include <linux/slab.h>
+ #include <linux/err.h>
+ #include "clk.h"
++#include "common.h"
+ 
+ /**
+  * struct clk_pfd - IMX PFD clock
+@@ -39,20 +41,55 @@ struct clk_pfd {
+ #define CLR	0x8
+ #define OTG	0xc
+ 
+-static int clk_pfd_enable(struct clk_hw *hw)
++static void clk_pfd_do_hardware(struct clk_pfd *pfd, bool enable)
++{
++	if (enable)
++		writel_relaxed(1 << ((pfd->idx + 1) * 8 - 1), pfd->reg + CLR);
++	else
++		writel_relaxed(1 << ((pfd->idx + 1) * 8 - 1), pfd->reg + SET);
++}
++
++static void clk_pfd_do_shared_clks(struct clk_hw *hw, bool enable)
+ {
+ 	struct clk_pfd *pfd = to_clk_pfd(hw);
+ 
+-	writel_relaxed(1 << ((pfd->idx + 1) * 8 - 1), pfd->reg + CLR);
++	if (imx_src_is_m4_enabled()) {
++		if (!amp_power_mutex || !shared_mem) {
++			if (enable)
++				clk_pfd_do_hardware(pfd, enable);
++			return;
++		}
++
++		imx_sema4_mutex_lock(amp_power_mutex);
++		if (shared_mem->ca9_valid != SHARED_MEM_MAGIC_NUMBER ||
++			shared_mem->cm4_valid != SHARED_MEM_MAGIC_NUMBER) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++
++		if (!imx_update_shared_mem(hw, enable)) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++
++		clk_pfd_do_hardware(pfd, enable);
++
++		imx_sema4_mutex_unlock(amp_power_mutex);
++	} else {
++		clk_pfd_do_hardware(pfd, enable);
++	}
++}
++
++static int clk_pfd_enable(struct clk_hw *hw)
++{
++	clk_pfd_do_shared_clks(hw, true);
+ 
+ 	return 0;
+ }
+ 
+ static void clk_pfd_disable(struct clk_hw *hw)
+ {
+-	struct clk_pfd *pfd = to_clk_pfd(hw);
+-
+-	writel_relaxed(1 << ((pfd->idx + 1) * 8 - 1), pfd->reg + SET);
++	clk_pfd_do_shared_clks(hw, false);
+ }
+ 
+ static unsigned long clk_pfd_recalc_rate(struct clk_hw *hw,
+diff --git a/arch/arm/mach-imx/clk-pllv3.c b/arch/arm/mach-imx/clk-pllv3.c
+index e29fe92..2e6cb95 100644
+--- a/arch/arm/mach-imx/clk-pllv3.c
++++ b/arch/arm/mach-imx/clk-pllv3.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2012 Freescale Semiconductor, Inc.
++ * Copyright 2012-2014 Freescale Semiconductor, Inc.
+  * Copyright 2012 Linaro Ltd.
+  *
+  * The code contained herein is licensed under the GNU General Public
+@@ -13,11 +13,13 @@
+ #include <linux/clk.h>
+ #include <linux/clk-provider.h>
+ #include <linux/delay.h>
++#include <linux/imx_sema4.h>
+ #include <linux/io.h>
+ #include <linux/slab.h>
+ #include <linux/jiffies.h>
+ #include <linux/err.h>
+ #include "clk.h"
++#include "common.h"
+ 
+ #define PLL_NUM_OFFSET		0x10
+ #define PLL_DENOM_OFFSET	0x20
+@@ -59,43 +61,77 @@ static int clk_pllv3_wait_lock(struct clk_pllv3 *pll)
+ 			break;
+ 		if (time_after(jiffies, timeout))
+ 			break;
+-		usleep_range(50, 500);
+ 	} while (1);
+ 
+ 	return readl_relaxed(pll->base) & BM_PLL_LOCK ? 0 : -ETIMEDOUT;
+ }
+ 
+-static int clk_pllv3_prepare(struct clk_hw *hw)
++static int clk_pllv3_do_hardware(struct clk_hw *hw, bool enable)
+ {
+ 	struct clk_pllv3 *pll = to_clk_pllv3(hw);
+ 	u32 val;
+ 	int ret;
+ 
+ 	val = readl_relaxed(pll->base);
+-	if (pll->powerup_set)
+-		val |= BM_PLL_POWER;
+-	else
+-		val &= ~BM_PLL_POWER;
+-	writel_relaxed(val, pll->base);
++	if (enable) {
++		if (pll->powerup_set)
++			val |= BM_PLL_POWER;
++		else
++			val &= ~BM_PLL_POWER;
++		writel_relaxed(val, pll->base);
++
++		ret = clk_pllv3_wait_lock(pll);
++		if (ret)
++			return ret;
++	} else {
++		if (pll->powerup_set)
++			val &= ~BM_PLL_POWER;
++		else
++			val |= BM_PLL_POWER;
++		writel_relaxed(val, pll->base);
++	}
++
++	return 0;
++}
+ 
+-	ret = clk_pllv3_wait_lock(pll);
+-	if (ret)
+-		return ret;
++static void clk_pllv3_do_shared_clks(struct clk_hw *hw, bool enable)
++{
++	if (imx_src_is_m4_enabled()) {
++		if (!amp_power_mutex || !shared_mem) {
++			if (enable)
++				clk_pllv3_do_hardware(hw, enable);
++			return;
++		}
++
++		imx_sema4_mutex_lock(amp_power_mutex);
++		if (shared_mem->ca9_valid != SHARED_MEM_MAGIC_NUMBER ||
++			shared_mem->cm4_valid != SHARED_MEM_MAGIC_NUMBER) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++
++		if (!imx_update_shared_mem(hw, enable)) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++		clk_pllv3_do_hardware(hw, enable);
++
++		imx_sema4_mutex_unlock(amp_power_mutex);
++	} else {
++		clk_pllv3_do_hardware(hw, enable);
++	}
++}
++
++static int clk_pllv3_prepare(struct clk_hw *hw)
++{
++	clk_pllv3_do_shared_clks(hw, true);
+ 
+ 	return 0;
+ }
+ 
+ static void clk_pllv3_unprepare(struct clk_hw *hw)
+ {
+-	struct clk_pllv3 *pll = to_clk_pllv3(hw);
+-	u32 val;
+-
+-	val = readl_relaxed(pll->base);
+-	if (pll->powerup_set)
+-		val &= ~BM_PLL_POWER;
+-	else
+-		val |= BM_PLL_POWER;
+-	writel_relaxed(val, pll->base);
++	clk_pllv3_do_shared_clks(hw, false);
+ }
+ 
+ static unsigned long clk_pllv3_recalc_rate(struct clk_hw *hw,
+diff --git a/arch/arm/mach-imx/clk.h b/arch/arm/mach-imx/clk.h
+index 2e76127..043bd6a 100644
+--- a/arch/arm/mach-imx/clk.h
++++ b/arch/arm/mach-imx/clk.h
+@@ -7,6 +7,8 @@
+ extern spinlock_t imx_ccm_lock;
+ 
+ extern void imx_cscmr1_fixup(u32 *val);
++extern struct imx_sema4_mutex *amp_power_mutex;
++extern struct imx_shared_mem *shared_mem;
+ 
+ struct clk *imx_clk_pllv1(const char *name, const char *parent,
+ 		void __iomem *base);
+@@ -22,6 +24,25 @@ enum imx_pllv3_type {
+ 	IMX_PLLV3_ENET,
+ };
+ 
++#define MAX_SHARED_CLK_NUMBER		100
++#define SHARED_MEM_MAGIC_NUMBER		0x12345678
++#define MCC_POWER_SHMEM_NUMBER		(6)
++
++struct imx_shared_clk {
++	struct clk *self;
++	struct clk *parent;
++	void *m4_clk;
++	void *m4_clk_parent;
++	u8 ca9_enabled;
++	u8 cm4_enabled;
++};
++
++struct imx_shared_mem {
++	u32 ca9_valid;
++	u32 cm4_valid;
++	struct imx_shared_clk imx_clk[MAX_SHARED_CLK_NUMBER];
++};
++
+ struct clk *imx_clk_pllv3(enum imx_pllv3_type type, const char *name,
+ 		const char *parent_name, void __iomem *base, u32 div_mask);
+ 
+diff --git a/arch/arm/mach-imx/common.h b/arch/arm/mach-imx/common.h
+index 2bac742..9aa2fde 100644
+--- a/arch/arm/mach-imx/common.h
++++ b/arch/arm/mach-imx/common.h
+@@ -17,6 +17,7 @@ struct irq_data;
+ struct platform_device;
+ struct pt_regs;
+ struct clk;
++struct clk_hw;
+ struct device_node;
+ enum mxc_cpu_pwr_mode;
+ 
+@@ -83,6 +84,16 @@ unsigned int imx_get_soc_revision(void);
+ void imx_init_revision_from_anatop(void);
+ struct device *imx_soc_device_init(void);
+ unsigned int imx_gpc_is_mf_mix_off(void);
++void imx6sx_set_m4_highfreq(bool high_freq);
++void imx_mu_enable_m4_irqs_in_gic(bool enable);
++void imx_gpc_add_m4_wake_up_irq(u32 irq, bool enable);
++void imx_gpc_hold_m4_in_sleep(void);
++void imx_gpc_release_m4_in_sleep(void);
++int imx_update_shared_mem(struct clk_hw *hw, bool enable);
++bool imx_src_is_m4_enabled(void);
++void mcc_receive_from_mu_buffer(unsigned int index, unsigned int *data);
++void mcc_send_via_mu_buffer(unsigned int index, unsigned int data);
++unsigned int imx_gpc_is_m4_sleeping(void);
+ 
+ enum mxc_cpu_pwr_mode {
+ 	WAIT_CLOCKED,		/* wfi only */
+diff --git a/arch/arm/mach-imx/gpc.c b/arch/arm/mach-imx/gpc.c
+index 451dfb6..7bc2d68 100644
+--- a/arch/arm/mach-imx/gpc.c
++++ b/arch/arm/mach-imx/gpc.c
+@@ -31,6 +31,13 @@
+ #define GPC_PGC_GPU_PUPSCR	0x264
+ #define GPC_PGC_GPU_PDNSCR	0x268
+ #define GPC_PGC_CPU_PDN		0x2a0
++#define GPC_M4_LPSR		0x2c
++#define GPC_M4_LPSR_M4_SLEEPING_SHIFT	4
++#define GPC_M4_LPSR_M4_SLEEPING_MASK	0x1
++#define GPC_M4_LPSR_M4_SLEEP_HOLD_REQ_MASK	0x1
++#define GPC_M4_LPSR_M4_SLEEP_HOLD_REQ_SHIFT	0
++#define GPC_M4_LPSR_M4_SLEEP_HOLD_ACK_MASK	0x1
++#define GPC_M4_LPSR_M4_SLEEP_HOLD_ACK_SHIFT	1
+ 
+ #define IMR_NUM			4
+ 
+@@ -51,6 +58,67 @@ static u32 gpc_mf_irqs[IMR_NUM];
+ static u32 gpc_wake_irqs[IMR_NUM];
+ static u32 gpc_saved_imrs[IMR_NUM];
+ static u32 bypass;
++static DEFINE_SPINLOCK(gpc_lock);
++
++void imx_gpc_add_m4_wake_up_irq(u32 irq, bool enable)
++{
++	unsigned int idx = irq / 32 - 1;
++	unsigned long flags;
++	u32 mask;
++
++	/* Sanity check for SPI irq */
++	if (irq < 32)
++		return;
++
++	mask = 1 << irq % 32;
++	spin_lock_irqsave(&gpc_lock, flags);
++	gpc_wake_irqs[idx] = enable ? gpc_wake_irqs[idx] | mask :
++		gpc_wake_irqs[idx] & ~mask;
++	spin_unlock_irqrestore(&gpc_lock, flags);
++}
++
++void imx_gpc_hold_m4_in_sleep(void)
++{
++	int val;
++	unsigned long timeout = jiffies + msecs_to_jiffies(500);
++
++	/* wait M4 in wfi before asserting hold request */
++	while (!imx_gpc_is_m4_sleeping())
++		if (time_after(jiffies, timeout))
++			pr_err("M4 is NOT in expected sleep!\n");
++
++	val = readl_relaxed(gpc_base + GPC_M4_LPSR);
++	val &= ~(GPC_M4_LPSR_M4_SLEEP_HOLD_REQ_MASK <<
++		GPC_M4_LPSR_M4_SLEEP_HOLD_REQ_SHIFT);
++	writel_relaxed(val, gpc_base + GPC_M4_LPSR);
++
++	timeout = jiffies + msecs_to_jiffies(500);
++	while (readl_relaxed(gpc_base + GPC_M4_LPSR)
++		& (GPC_M4_LPSR_M4_SLEEP_HOLD_ACK_MASK <<
++		GPC_M4_LPSR_M4_SLEEP_HOLD_ACK_SHIFT))
++		if (time_after(jiffies, timeout))
++			pr_err("Wait M4 hold ack timeout!\n");
++}
++
++void imx_gpc_release_m4_in_sleep(void)
++{
++	int val;
++
++	val = readl_relaxed(gpc_base + GPC_M4_LPSR);
++	val |= GPC_M4_LPSR_M4_SLEEP_HOLD_REQ_MASK <<
++		GPC_M4_LPSR_M4_SLEEP_HOLD_REQ_SHIFT;
++	writel_relaxed(val, gpc_base + GPC_M4_LPSR);
++}
++
++unsigned int imx_gpc_is_m4_sleeping(void)
++{
++	if (readl_relaxed(gpc_base + GPC_M4_LPSR) &
++		(GPC_M4_LPSR_M4_SLEEPING_MASK <<
++		GPC_M4_LPSR_M4_SLEEPING_SHIFT))
++		return 1;
++
++	return 0;
++}
+ 
+ unsigned int imx_gpc_is_mf_mix_off(void)
+ {
+@@ -106,6 +174,7 @@ void imx_gpc_post_resume(void)
+ static int imx_gpc_irq_set_wake(struct irq_data *d, unsigned int on)
+ {
+ 	unsigned int idx = d->irq / 32 - 1;
++	unsigned long flags;
+ 	u32 mask;
+ 
+ 	/* Sanity check for SPI irq */
+@@ -113,8 +182,10 @@ static int imx_gpc_irq_set_wake(struct irq_data *d, unsigned int on)
+ 		return -EINVAL;
+ 
+ 	mask = 1 << d->irq % 32;
++	spin_lock_irqsave(&gpc_lock, flags);
+ 	gpc_wake_irqs[idx] = on ? gpc_wake_irqs[idx] | mask :
+ 				  gpc_wake_irqs[idx] & ~mask;
++	spin_unlock_irqrestore(&gpc_lock, flags);
+ 
+ 	return 0;
+ }
+diff --git a/arch/arm/mach-imx/src.c b/arch/arm/mach-imx/src.c
+index 45f7f4e..056cbe7 100644
+--- a/arch/arm/mach-imx/src.c
++++ b/arch/arm/mach-imx/src.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2011 Freescale Semiconductor, Inc.
++ * Copyright 2011-2014 Freescale Semiconductor, Inc.
+  * Copyright 2011 Linaro Ltd.
+  *
+  * The code contained herein is licensed under the GNU General Public
+@@ -18,6 +18,7 @@
+ #include <linux/smp.h>
+ #include <asm/smp_plat.h>
+ #include "common.h"
++#include "hardware.h"
+ 
+ #define SRC_SCR				0x000
+ #define SRC_GPR1			0x020
+@@ -32,6 +33,7 @@
+ 
+ static void __iomem *src_base;
+ static DEFINE_SPINLOCK(scr_lock);
++static bool m4_is_enabled;
+ 
+ static const int sw_reset_bits[5] = {
+ 	BP_SRC_SCR_SW_GPU_RST,
+@@ -41,6 +43,11 @@ static const int sw_reset_bits[5] = {
+ 	BP_SRC_SCR_SW_IPU2_RST
+ };
+ 
++bool imx_src_is_m4_enabled(void)
++{
++	return m4_is_enabled;
++}
++
+ static int imx_src_reset_module(struct reset_controller_dev *rcdev,
+ 		unsigned long sw_reset_idx)
+ {
+@@ -136,6 +143,14 @@ void __init imx_src_init(void)
+ 	 */
+ 	spin_lock(&scr_lock);
+ 	val = readl_relaxed(src_base + SRC_SCR);
++
++	/* bit 4 is m4c_non_sclr_rst on i.MX6SX */
++	if (cpu_is_imx6sx() && ((val &
++		(1 << BP_SRC_SCR_SW_OPEN_VG_RST)) == 0))
++		m4_is_enabled = true;
++	else
++		m4_is_enabled = false;
++
+ 	val &= ~(1 << BP_SRC_SCR_WARM_RESET_ENABLE);
+ 	writel_relaxed(val, src_base + SRC_SCR);
+ 	spin_unlock(&scr_lock);
+-- 
+1.7.5.4
+

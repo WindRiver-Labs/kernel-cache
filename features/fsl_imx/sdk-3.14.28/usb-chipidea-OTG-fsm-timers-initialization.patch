@@ -1,0 +1,318 @@
+From 5a673d2bde0f6dd68ea3c34ad5db0ad74c090685 Mon Sep 17 00:00:00 2001
+From: Li Jun <b47624@freescale.com>
+Date: Wed, 23 Apr 2014 15:56:49 +0800
+Subject: [PATCH 0819/1543] usb: chipidea: OTG fsm timers initialization
+
+commit e287b67b00c8d5306e0fe6be1d597e23d8c4783e upstream
+
+This patch adds OTG fsm timers initialization, which use controller's 1ms
+interrupt as timeout counter, also adds some local timers which are not
+in otg_fsm_timer list.
+
+Signed-off-by: Peter Chen <peter.chen@freescale.com>
+Signed-off-by: Li Jun <b47624@freescale.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/chipidea/bits.h    |    1 +
+ drivers/usb/chipidea/otg_fsm.c |  189 ++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/chipidea/otg_fsm.h |   51 +++++++++++
+ 3 files changed, 241 insertions(+), 0 deletions(-)
+
+diff --git a/drivers/usb/chipidea/bits.h b/drivers/usb/chipidea/bits.h
+index 44882c8..ca57e3d 100644
+--- a/drivers/usb/chipidea/bits.h
++++ b/drivers/usb/chipidea/bits.h
+@@ -81,6 +81,7 @@
+ /* OTGSC */
+ #define OTGSC_IDPU	      BIT(5)
+ #define OTGSC_HADP	      BIT(6)
++#define OTGSC_HABA	      BIT(7)
+ #define OTGSC_ID	      BIT(8)
+ #define OTGSC_AVV	      BIT(9)
+ #define OTGSC_ASV	      BIT(10)
+diff --git a/drivers/usb/chipidea/otg_fsm.c b/drivers/usb/chipidea/otg_fsm.c
+index 5afeb59..bb64fb4 100644
+--- a/drivers/usb/chipidea/otg_fsm.c
++++ b/drivers/usb/chipidea/otg_fsm.c
+@@ -26,6 +26,22 @@
+ #include "otg.h"
+ #include "otg_fsm.h"
+ 
++static struct ci_otg_fsm_timer *otg_timer_initializer
++(struct ci_hdrc *ci, void (*function)(void *, unsigned long),
++			unsigned long expires, unsigned long data)
++{
++	struct ci_otg_fsm_timer *timer;
++
++	timer = devm_kzalloc(ci->dev, sizeof(struct ci_otg_fsm_timer),
++								GFP_KERNEL);
++	if (!timer)
++		return NULL;
++	timer->function = function;
++	timer->expires = expires;
++	timer->data = data;
++	return timer;
++}
++
+ /*
+  * Add timer to active timer list
+  */
+@@ -77,6 +93,163 @@ static void ci_otg_del_timer(struct ci_hdrc *ci, enum ci_otg_fsm_timer_index t)
+ 		hw_write_otgsc(ci, OTGSC_1MSIE, 0);
+ }
+ 
++/* The timeout callback function to set time out bit */
++static void set_tmout(void *ptr, unsigned long indicator)
++{
++	*(int *)indicator = 1;
++}
++
++static void set_tmout_and_fsm(void *ptr, unsigned long indicator)
++{
++	struct ci_hdrc *ci = (struct ci_hdrc *)ptr;
++
++	set_tmout(ci, indicator);
++
++	disable_irq_nosync(ci->irq);
++	queue_work(ci->wq, &ci->work);
++}
++
++static void a_wait_vfall_tmout_func(void *ptr, unsigned long indicator)
++{
++	struct ci_hdrc *ci = (struct ci_hdrc *)ptr;
++
++	set_tmout(ci, indicator);
++	/* Disable port power */
++	hw_write(ci, OP_PORTSC, PORTSC_W1C_BITS | PORTSC_PP, 0);
++	/* Clear exsiting DP irq */
++	hw_write_otgsc(ci, OTGSC_DPIS, OTGSC_DPIS);
++	/* Enable data pulse irq */
++	hw_write_otgsc(ci, OTGSC_DPIE, OTGSC_DPIE);
++	disable_irq_nosync(ci->irq);
++	queue_work(ci->wq, &ci->work);
++}
++
++static void b_ase0_brst_tmout_func(void *ptr, unsigned long indicator)
++{
++	struct ci_hdrc *ci = (struct ci_hdrc *)ptr;
++
++	set_tmout(ci, indicator);
++	if (!hw_read_otgsc(ci, OTGSC_BSV))
++		ci->fsm.b_sess_vld = 0;
++
++	disable_irq_nosync(ci->irq);
++	queue_work(ci->wq, &ci->work);
++}
++
++static void b_ssend_srp_tmout_func(void *ptr, unsigned long indicator)
++{
++	struct ci_hdrc *ci = (struct ci_hdrc *)ptr;
++
++	set_tmout(ci, indicator);
++
++	/* only vbus fall below B_sess_vld in b_idle state */
++	if (ci->transceiver->state == OTG_STATE_B_IDLE) {
++		disable_irq_nosync(ci->irq);
++		queue_work(ci->wq, &ci->work);
++	}
++}
++
++static void b_sess_vld_tmout_func(void *ptr, unsigned long indicator)
++{
++	struct ci_hdrc *ci = (struct ci_hdrc *)ptr;
++
++	/* Check if A detached */
++	if (!(hw_read_otgsc(ci, OTGSC_BSV))) {
++		ci->fsm.b_sess_vld = 0;
++		ci_otg_add_timer(ci, B_SSEND_SRP);
++		disable_irq_nosync(ci->irq);
++		queue_work(ci->wq, &ci->work);
++	}
++}
++
++static void b_data_pulse_end(void *ptr, unsigned long indicator)
++{
++	struct ci_hdrc *ci = (struct ci_hdrc *)ptr;
++
++	ci->fsm.b_srp_done = 1;
++	ci->fsm.b_bus_req = 0;
++	if (ci->fsm.power_up)
++		ci->fsm.power_up = 0;
++
++	hw_write_otgsc(ci, OTGSC_HABA, 0);
++
++	disable_irq_nosync(ci->irq);
++	queue_work(ci->wq, &ci->work);
++}
++
++/* Initialize timers */
++static int ci_otg_init_timers(struct ci_hdrc *ci)
++{
++	struct otg_fsm *fsm = &ci->fsm;
++
++	/* FSM used timers */
++	ci->fsm_timer->timer_list[A_WAIT_VRISE] =
++		otg_timer_initializer(ci, &set_tmout_and_fsm, TA_WAIT_VRISE,
++			(unsigned long)&fsm->a_wait_vrise_tmout);
++	if (ci->fsm_timer->timer_list[A_WAIT_VRISE] == NULL)
++		return -ENOMEM;
++
++	ci->fsm_timer->timer_list[A_WAIT_VFALL] =
++		otg_timer_initializer(ci, &a_wait_vfall_tmout_func,
++		TA_WAIT_VFALL, (unsigned long)&fsm->a_wait_vfall_tmout);
++	if (ci->fsm_timer->timer_list[A_WAIT_VFALL] == NULL)
++		return -ENOMEM;
++
++	ci->fsm_timer->timer_list[A_WAIT_BCON] =
++		otg_timer_initializer(ci, &set_tmout_and_fsm, TA_WAIT_BCON,
++				(unsigned long)&fsm->a_wait_bcon_tmout);
++	if (ci->fsm_timer->timer_list[A_WAIT_BCON] == NULL)
++		return -ENOMEM;
++
++	ci->fsm_timer->timer_list[A_AIDL_BDIS] =
++		otg_timer_initializer(ci, &set_tmout_and_fsm, TA_AIDL_BDIS,
++				(unsigned long)&fsm->a_aidl_bdis_tmout);
++	if (ci->fsm_timer->timer_list[A_AIDL_BDIS] == NULL)
++		return -ENOMEM;
++
++	ci->fsm_timer->timer_list[A_BIDL_ADIS] =
++		otg_timer_initializer(ci, &set_tmout_and_fsm, TA_BIDL_ADIS,
++				(unsigned long)&fsm->a_bidl_adis_tmout);
++	if (ci->fsm_timer->timer_list[A_BIDL_ADIS] == NULL)
++		return -ENOMEM;
++
++	ci->fsm_timer->timer_list[B_ASE0_BRST] =
++		otg_timer_initializer(ci, &b_ase0_brst_tmout_func, TB_ASE0_BRST,
++					(unsigned long)&fsm->b_ase0_brst_tmout);
++	if (ci->fsm_timer->timer_list[B_ASE0_BRST] == NULL)
++		return -ENOMEM;
++
++	ci->fsm_timer->timer_list[B_SE0_SRP] =
++		otg_timer_initializer(ci, &set_tmout_and_fsm, TB_SE0_SRP,
++					(unsigned long)&fsm->b_se0_srp);
++	if (ci->fsm_timer->timer_list[B_SE0_SRP] == NULL)
++		return -ENOMEM;
++
++	ci->fsm_timer->timer_list[B_SSEND_SRP] =
++		otg_timer_initializer(ci, &b_ssend_srp_tmout_func, TB_SSEND_SRP,
++					(unsigned long)&fsm->b_ssend_srp);
++	if (ci->fsm_timer->timer_list[B_SSEND_SRP] == NULL)
++		return -ENOMEM;
++
++	ci->fsm_timer->timer_list[B_SRP_FAIL] =
++		otg_timer_initializer(ci, &set_tmout, TB_SRP_FAIL,
++				(unsigned long)&fsm->b_srp_done);
++	if (ci->fsm_timer->timer_list[B_SRP_FAIL] == NULL)
++		return -ENOMEM;
++
++	ci->fsm_timer->timer_list[B_DATA_PLS] =
++		otg_timer_initializer(ci, &b_data_pulse_end, TB_DATA_PLS, 0);
++	if (ci->fsm_timer->timer_list[B_DATA_PLS] == NULL)
++		return -ENOMEM;
++
++	ci->fsm_timer->timer_list[B_SESS_VLD] =	otg_timer_initializer(ci,
++					&b_sess_vld_tmout_func, TB_SESS_VLD, 0);
++	if (ci->fsm_timer->timer_list[B_SESS_VLD] == NULL)
++		return -ENOMEM;
++
++	return 0;
++}
++
+ /* -------------------------------------------------------------*/
+ /* Operations that will be called from OTG Finite State Machine */
+ /* -------------------------------------------------------------*/
+@@ -223,6 +396,7 @@ static struct otg_fsm_ops ci_otg_ops = {
+ 
+ int ci_hdrc_otg_fsm_init(struct ci_hdrc *ci)
+ {
++	int retval = 0;
+ 	struct usb_otg *otg;
+ 
+ 	otg = devm_kzalloc(ci->dev,
+@@ -244,6 +418,21 @@ int ci_hdrc_otg_fsm_init(struct ci_hdrc *ci)
+ 
+ 	mutex_init(&ci->fsm.lock);
+ 
++	ci->fsm_timer = devm_kzalloc(ci->dev,
++			sizeof(struct ci_otg_fsm_timer_list), GFP_KERNEL);
++	if (!ci->fsm_timer) {
++		dev_err(ci->dev,
++		"Failed to allocate timer structure for ci hdrc otg!\n");
++		return -ENOMEM;
++	}
++
++	INIT_LIST_HEAD(&ci->fsm_timer->active_timers);
++	retval = ci_otg_init_timers(ci);
++	if (retval) {
++		dev_err(ci->dev, "Couldn't init OTG timers\n");
++		return retval;
++	}
++
+ 	/* Enable A vbus valid irq */
+ 	hw_write_otgsc(ci, OTGSC_AVVIE, OTGSC_AVVIE);
+ 
+diff --git a/drivers/usb/chipidea/otg_fsm.h b/drivers/usb/chipidea/otg_fsm.h
+index 4d0dfe6..420f081 100644
+--- a/drivers/usb/chipidea/otg_fsm.h
++++ b/drivers/usb/chipidea/otg_fsm.h
+@@ -13,6 +13,57 @@
+ 
+ #include <linux/usb/otg-fsm.h>
+ 
++/*
++ *  A-DEVICE timing  constants
++ */
++
++/* Wait for VBUS Rise  */
++#define TA_WAIT_VRISE        (100)	/* a_wait_vrise: section 7.1.2
++					 * a_wait_vrise_tmr: section 7.4.5.1
++					 * TA_VBUS_RISE <= 100ms, section 4.4
++					 * Table 4-1: Electrical Characteristics
++					 * ->DC Electrical Timing
++					 */
++/* Wait for VBUS Fall  */
++#define TA_WAIT_VFALL        (1000)	/* a_wait_vfall: section 7.1.7
++					 * a_wait_vfall_tmr: section: 7.4.5.2
++					 */
++/* Wait for B-Connect */
++#define TA_WAIT_BCON         (10000)	/* a_wait_bcon: section 7.1.3
++					 * TA_WAIT_BCON: should be between 1100
++					 * and 30000 ms, section 5.5, Table 5-1
++					 */
++/* A-Idle to B-Disconnect */
++#define TA_AIDL_BDIS         (5000)	/* a_suspend min 200 ms, section 5.2.1
++					 * TA_AIDL_BDIS: section 5.5, Table 5-1
++					 */
++/* B-Idle to A-Disconnect */
++#define TA_BIDL_ADIS         (500)	/* TA_BIDL_ADIS: section 5.2.1
++					 * 500ms is used for B switch to host
++					 * for safe
++					 */
++
++/*
++ * B-device timing constants
++ */
++
++/* Data-Line Pulse Time*/
++#define TB_DATA_PLS          (10)	/* b_srp_init,continue 5~10ms
++					 * section:5.1.3
++					 */
++/* SRP Fail Time  */
++#define TB_SRP_FAIL          (6000)	/* b_srp_init,fail time 5~6s
++					 * section:5.1.6
++					 */
++/* A-SE0 to B-Reset  */
++#define TB_ASE0_BRST         (155)	/* minimum 155 ms, section:5.3.1 */
++/* SE0 Time Before SRP */
++#define TB_SE0_SRP           (1000)	/* b_idle,minimum 1s, section:5.1.2 */
++/* SSEND time before SRP */
++#define TB_SSEND_SRP         (1500)	/* minimum 1.5 sec, section:5.1.2 */
++
++#define TB_SESS_VLD          (1000)
++
+ enum ci_otg_fsm_timer_index {
+ 	/*
+ 	 * CI specific timers, start from the end
+-- 
+1.7.5.4
+
