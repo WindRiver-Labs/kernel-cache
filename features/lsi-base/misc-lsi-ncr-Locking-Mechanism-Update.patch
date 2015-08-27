@@ -1,0 +1,573 @@
+From 448e3543a5166277109ecb37414e7e5865f62887 Mon Sep 17 00:00:00 2001
+From: Li Wang <li.wang@windriver.com>
+Date: Wed, 26 Aug 2015 09:46:52 +0800
+Subject: [PATCH 45/68] misc: lsi-ncr: Locking Mechanism Update
+
+the patch comes from:
+git://git.yoctoproject.org/linux-yocto-3.10
+commit 75793b3933519714fd158c088d6d4e0da2be6f08 upstream
+
+Allow for other drivers to share the locking mechanisms for
+lsi-ncr h/w - provide unlocked methods for read/write - provide
+consistent way of detecting/reporting lsi-ncr errors
+
+Signed-off-by: Gary McGee <gary.mcgee@lsi.com>
+Signed-off-by: Bruce Ashfield <bruce.ashfield@windriver.com>
+Signed-off-by: Li Wang <li.wang@windriver.com>
+---
+ drivers/misc/lsi-ncr.c |  308 +++++++++++++++++++++++++++++-------------------
+ drivers/misc/lsi-ncr.h |    2 +
+ 2 files changed, 189 insertions(+), 121 deletions(-)
+
+diff --git a/drivers/misc/lsi-ncr.c b/drivers/misc/lsi-ncr.c
+index 20101ef..16b1907 100644
+--- a/drivers/misc/lsi-ncr.c
++++ b/drivers/misc/lsi-ncr.c
+@@ -42,7 +42,10 @@ static void __iomem *apb2ser0_address;
+ #define WFC_TIMEOUT (400000)
+ 
+ static DEFINE_RAW_SPINLOCK(ncr_spin_lock);
+-static unsigned long flags;
++static DEFINE_RAW_SPINLOCK(nca_access_lock);
++EXPORT_SYMBOL(nca_access_lock);
++static unsigned long ncr_spin_flags, axi_access_flags;
++
+ 
+ #define LOCK_DOMAIN 0
+ 
+@@ -93,6 +96,10 @@ typedef union {
+ 	} __packed bits;
+ } __packed command_data_register_2_t;
+ 
++int
++ncr_read_nolock(unsigned long region, unsigned long address, int number,
++void *buffer);
++
+ #ifdef CONFIG_ARM
+ 
+ /*
+@@ -165,6 +172,42 @@ ncr_register_write(const unsigned value, unsigned *address)
+ #endif
+ 
+ /*
++  ----------------------------------------------------------------------
++  nca_register_read
++*/
++
++inline unsigned long
++nca_register_read(unsigned *address)
++{
++	unsigned long value;
++
++	raw_spin_lock_irqsave(&nca_access_lock,
++		axi_access_flags);
++	value = ncr_register_read(address);
++	raw_spin_unlock_irqrestore(&nca_access_lock,
++		axi_access_flags);
++
++	return value;
++}
++
++/*
++  ----------------------------------------------------------------------
++  nca_register_write
++*/
++
++void
++inline nca_register_write(const unsigned value, unsigned *address)
++{
++	raw_spin_lock_irqsave(&nca_access_lock,
++		axi_access_flags);
++	ncr_register_write(value, address);
++	raw_spin_unlock_irqrestore(&nca_access_lock,
++		axi_access_flags);
++
++	return;
++}
++
++/*
+   ------------------------------------------------------------------------------
+   ncr_lock
+ */
+@@ -175,42 +218,21 @@ ncr_lock(int domain)
+ 	unsigned long offset;
+ 	unsigned long value;
+ 	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
+-	command_data_register_0_t cdr0;
+ 
+-	raw_spin_lock_irqsave(&ncr_spin_lock, flags);
++	raw_spin_lock_irqsave(&ncr_spin_lock, ncr_spin_flags);
+ 	offset = (0xff80 + (domain * 4));
+ 
+ 	do {
+-		value = ncr_register_read((unsigned *)(nca_address + offset));
++		value = nca_register_read((unsigned *)(nca_address + offset));
+ 	} while ((0 != value) && (time_before(jiffies, timeout)));
+ 
+ 	if (!(time_before(jiffies, timeout))) {
+-		raw_spin_unlock_irqrestore(&ncr_spin_lock, flags);
++		raw_spin_unlock_irqrestore(&ncr_spin_lock, ncr_spin_flags);
+ 		pr_err("ncr_lock() Timeout!\n");
+ 		BUG();
+ 
+ 		return -1;
+ 	}
+-	/*
+-	  Make sure any previous commands completed, and check for errors.
+-	*/
+-	timeout = jiffies + msecs_to_jiffies(1000);
+-
+-	do {
+-		cdr0.raw =
+-			ncr_register_read((unsigned *)(nca_address + 0xf0));
+-	} while ((0x1 == cdr0.bits.status) &&
+-		(time_before(jiffies, timeout)));
+-
+-	if (!(time_before(jiffies, timeout))) {
+-		raw_spin_unlock_irqrestore(&ncr_spin_lock, flags);
+-		pr_err("ncr_lock() Previous command didn't complete!\n");
+-		BUG();
+-
+-		return -1;
+-	}
+-	if (0x2 == cdr0.bits.status)
+-		pr_err("Previous ncr access failed!\n");
+ 
+ 	return 0;
+ }
+@@ -227,13 +249,75 @@ ncr_unlock(int domain)
+ 	unsigned long offset;
+ 
+ 	offset = (0xff80 + (domain * 4));
+-	ncr_register_write(0, (unsigned *)(nca_address + offset));
+-	raw_spin_unlock_irqrestore(&ncr_spin_lock, flags);
++	nca_register_write(0, (unsigned *)(nca_address + offset));
++	raw_spin_unlock_irqrestore(&ncr_spin_lock, ncr_spin_flags);
+ 
+ 	return;
+ }
+ EXPORT_SYMBOL(ncr_unlock);
+ 
++
++/*
++  ------------------------------------------------------------------------------
++  ncr_pio_error_dump
++*/
++
++static void
++ncr_pio_error_dump(char *str)
++{
++	unsigned long cdr0, cdr1, cdr2;
++	unsigned long stat0, stat1;
++
++	cdr0 = nca_register_read((unsigned *)(nca_address + 0xf0));
++	cdr1 = nca_register_read((unsigned *)(nca_address + 0xf4));
++	cdr2 = nca_register_read((unsigned *)(nca_address + 0xf8));
++
++	stat0 = nca_register_read((unsigned *)(nca_address + 0xe4));
++	stat1 = nca_register_read((unsigned *)(nca_address + 0xe8));
++
++	pr_err("lsi-ncr: %8s failed, error status : 0x%08lx 0x%08lx\n",
++			str, stat0, stat1);
++	pr_err("lsi-ncr:  CDR0-2: 0x%08lx 0x%08lx 0x%08lx\n",
++			cdr0, cdr1, cdr2);
++
++}
++/*
++  ------------------------------------------------------------------------------
++  ncr_check_pio_status
++*/
++
++static int
++ncr_check_pio_status(char *str)
++{
++	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
++	command_data_register_0_t cdr0;
++
++	/*
++	  Make sure any previous commands completed, and check for errors.
++	*/
++
++	do {
++		cdr0.raw =
++			nca_register_read((unsigned *)(nca_address + 0xf0));
++	} while ((0x1 == cdr0.bits.status) &&
++		(time_before(jiffies, timeout)));
++
++	if (!(time_before(jiffies, timeout))) {
++		raw_spin_unlock_irqrestore(&ncr_spin_lock, ncr_spin_flags);
++		pr_err("ncr_check_pio_status() PIO operation timeout!\n");
++		BUG();
++
++		return -1;
++	}
++	if (0x3 != cdr0.bits.status) {
++		ncr_pio_error_dump(str);
++	/* clear CDR0 to allow subsequent commands to complete */
++		nca_register_write(0, (unsigned *) (nca_address + 0xf0));
++	}
++
++	return 0;
++}
++
+ /*
+   ======================================================================
+   ======================================================================
+@@ -248,7 +332,7 @@ EXPORT_SYMBOL(ncr_unlock);
+ */
+ 
+ int
+-ncr_read(unsigned long region, unsigned long address, int number,
++ncr_read_nolock(unsigned long region, unsigned long address, int number,
+ 	void *buffer)
+ {
+ 	command_data_register_0_t cdr0;
+@@ -256,18 +340,11 @@ ncr_read(unsigned long region, unsigned long address, int number,
+ 	command_data_register_2_t cdr2;
+ 	int wfc_timeout = WFC_TIMEOUT;
+ 
+-	if (NULL == nca_address)
+-		return -1;
+-
+-#ifdef APB2SER_PHY_PHYS_ADDRESS
+-	if (NULL == apb2ser0_address)
+-		return -1;
+-#endif /* APB2SER_PHY_PHYS_ADDRESS */
+-
+-	if (0 != ncr_lock(LOCK_DOMAIN))
+-		return -1;
+-
+ 	if ((NCP_NODE_ID(region) != 0x0153) && (NCP_NODE_ID(region) != 0x115)) {
++		/* make sure any previous command has completed */
++		if (0 != ncr_check_pio_status("previous"))
++			return -1;
++
+ 		/*
+ 		Set up the read command.
+ 		*/
+@@ -275,11 +352,11 @@ ncr_read(unsigned long region, unsigned long address, int number,
+ 		cdr2.raw = 0;
+ 		cdr2.bits.target_node_id = NCP_NODE_ID(region);
+ 		cdr2.bits.target_id_address_upper = NCP_TARGET_ID(region);
+-		ncr_register_write(cdr2.raw, (unsigned *) (nca_address + 0xf8));
++		nca_register_write(cdr2.raw, (unsigned *) (nca_address + 0xf8));
+ 
+ 		cdr1.raw = 0;
+ 		cdr1.bits.target_address = (address >> 2);
+-		ncr_register_write(cdr1.raw, (unsigned *) (nca_address + 0xf4));
++		nca_register_write(cdr1.raw, (unsigned *) (nca_address + 0xf4));
+ 
+ 		cdr0.raw = 0;
+ 		cdr0.bits.start_done = 1;
+@@ -290,35 +367,14 @@ ncr_read(unsigned long region, unsigned long address, int number,
+ 		cdr0.bits.cmd_type = 4;
+ 		/* TODO: Verify number... */
+ 		cdr0.bits.dbs = (number - 1);
+-		ncr_register_write(cdr0.raw, (unsigned *) (nca_address + 0xf0));
++		nca_register_write(cdr0.raw, (unsigned *) (nca_address + 0xf0));
+ 		mb();
+ 
+ 		/*
+ 		Wait for completion.
+ 		*/
+-
+-		do {
+-			--wfc_timeout;
+-			cdr0.raw =
+-				ncr_register_read((unsigned *)
+-						  (nca_address + 0xf0));
+-		} while (1 == cdr0.bits.start_done && 0 < wfc_timeout);
+-
+-		if (0 == wfc_timeout) {
+-			ncr_unlock(LOCK_DOMAIN);
+-			pr_err("ncr_read() Timeout!\n");
+-			BUG();
+-
+-			return -1;
+-		}
+-
+-		if (0x3 != cdr0.bits.status) {
+-			ncr_unlock(LOCK_DOMAIN);
+-			pr_err("ncr_write() failed: 0x%x\n",
+-			       cdr0.bits.status);
+-
++		if (0 != ncr_check_pio_status("read"))
+ 			return -1;
+-		}
+ 
+ 		/*
+ 		Copy data words to the buffer.
+@@ -327,7 +383,7 @@ ncr_read(unsigned long region, unsigned long address, int number,
+ 		address = (unsigned long)(nca_address + 0x1000);
+ 		while (4 <= number) {
+ 			*((unsigned long *) buffer) =
+-				ncr_register_read((unsigned *) address);
++				nca_register_read((unsigned *) address);
+ 			address += 4;
+ 			buffer += 4;
+ 			number -= 4;
+@@ -335,7 +391,7 @@ ncr_read(unsigned long region, unsigned long address, int number,
+ 
+ 		if (0 < number) {
+ 			unsigned long temp =
+-				ncr_register_read((unsigned *) address);
++				nca_register_read((unsigned *) address);
+ 			memcpy((void *) buffer, &temp, number);
+ 		}
+ 	} else {
+@@ -356,7 +412,6 @@ ncr_read(unsigned long region, unsigned long address, int number,
+ 		} else {
+ 			void __iomem *base;
+ 			if (0xffff < address) {
+-				ncr_unlock(LOCK_DOMAIN);
+ 				return -1;
+ 			}
+ 
+@@ -380,7 +435,6 @@ ncr_read(unsigned long region, unsigned long address, int number,
+ 				base = (apb2ser0_address + 0x230);
+ 				break;
+ 			default:
+-				ncr_unlock(LOCK_DOMAIN);
+ 				return -1;
+ 			}
+ 			if ((NCP_TARGET_ID(region) == 0x1) ||
+@@ -397,7 +451,6 @@ ncr_read(unsigned long region, unsigned long address, int number,
+ 					&& 0 < wfc_timeout);
+ 
+ 			if (0 == wfc_timeout) {
+-				ncr_unlock(LOCK_DOMAIN);
+ 				return -1;
+ 			}
+ 
+@@ -412,15 +465,41 @@ ncr_read(unsigned long region, unsigned long address, int number,
+ 
+ 		}
+ #else
+-		ncr_unlock(LOCK_DOMAIN);
+ 		return -1;
+ #endif /* APB2SER_PHY_PHYS_ADDRESS */
+ 	}
+ 
+-	ncr_unlock(LOCK_DOMAIN);
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL(ncr_read_nolock);
++
++
++int
++ncr_read(unsigned long region, unsigned long address, int number,
++	void *buffer)
++{
++
++	int	rc;
++
++	if (NULL == nca_address)
++		return -1;
++
++#ifdef APB2SER_PHY_PHYS_ADDRESS
++	if (NULL == apb2ser0_address)
++		return -1;
++#endif /* APB2SER_PHY_PHYS_ADDRESS */
++
++	if (0 != ncr_lock(LOCK_DOMAIN))
++		return -1;
++
++
++	rc = ncr_read_nolock(region, address, number, buffer);
++
++	ncr_unlock(LOCK_DOMAIN);
++
++	return rc;
++}
+ EXPORT_SYMBOL(ncr_read);
+ 
+ /*
+@@ -429,7 +508,7 @@ EXPORT_SYMBOL(ncr_read);
+ */
+ 
+ int
+-ncr_write(unsigned long region, unsigned long address, int number,
++ncr_write_nolock(unsigned long region, unsigned long address, int number,
+ 	  void *buffer)
+ {
+ 	command_data_register_0_t cdr0;
+@@ -439,18 +518,11 @@ ncr_write(unsigned long region, unsigned long address, int number,
+ 	int dbs = (number - 1);
+ 	int wfc_timeout = WFC_TIMEOUT;
+ 
+-	if (NULL == nca_address)
+-		return -1;
+-
+-#ifdef APB2SER_PHY_PHYS_ADDRESS
+-	if (NULL == apb2ser0_address)
+-		return -1;
+-#endif /* APB2SER_PHY_PHYS_ADDRESS */
+-
+-	if (0 != ncr_lock(LOCK_DOMAIN))
+-		return -1;
+-
+ 	if ((NCP_NODE_ID(region) != 0x0153) && (NCP_NODE_ID(region) != 0x115)) {
++		/* make sure any previous command has completed */
++		if (0 != ncr_check_pio_status("previous"))
++			return -1;
++
+ 		/*
+ 		  Set up the write.
+ 		*/
+@@ -458,11 +530,11 @@ ncr_write(unsigned long region, unsigned long address, int number,
+ 		cdr2.raw = 0;
+ 		cdr2.bits.target_node_id = NCP_NODE_ID(region);
+ 		cdr2.bits.target_id_address_upper = NCP_TARGET_ID(region);
+-		ncr_register_write(cdr2.raw, (unsigned *) (nca_address + 0xf8));
++		nca_register_write(cdr2.raw, (unsigned *) (nca_address + 0xf8));
+ 
+ 		cdr1.raw = 0;
+ 		cdr1.bits.target_address = (address >> 2);
+-		ncr_register_write(cdr1.raw, (unsigned *) (nca_address + 0xf4));
++		nca_register_write(cdr1.raw, (unsigned *) (nca_address + 0xf4));
+ 
+ 		/*
+ 		  Copy from buffer to the data words.
+@@ -471,7 +543,7 @@ ncr_write(unsigned long region, unsigned long address, int number,
+ 		data_word_base = (unsigned long)(nca_address + 0x1000);
+ 
+ 		while (4 <= number) {
+-			ncr_register_write(*((unsigned long *) buffer),
++			nca_register_write(*((unsigned long *) buffer),
+ 					(unsigned *) data_word_base);
+ 			data_word_base += 4;
+ 			buffer += 4;
+@@ -482,7 +554,7 @@ ncr_write(unsigned long region, unsigned long address, int number,
+ 			unsigned long temp = 0;
+ 
+ 			memcpy((void *) &temp, (void *) buffer, number);
+-			ncr_register_write(temp, (unsigned *) data_word_base);
++			nca_register_write(temp, (unsigned *) data_word_base);
+ 			data_word_base += number;
+ 			buffer += number;
+ 			number = 0;
+@@ -497,43 +569,16 @@ ncr_write(unsigned long region, unsigned long address, int number,
+ 		cdr0.bits.cmd_type = 5;
+ 		/* TODO: Verify number... */
+ 		cdr0.bits.dbs = dbs;
+-		ncr_register_write(cdr0.raw, (unsigned *) (nca_address + 0xf0));
++		nca_register_write(cdr0.raw, (unsigned *) (nca_address + 0xf0));
+ 		mb();
+ 
+ 		/*
+ 		Wait for completion.
+ 		*/
+ 
+-		do {
+-			--wfc_timeout;
+-			cdr0.raw =
+-				ncr_register_read((unsigned *)
+-						  (nca_address + 0xf0));
+-		} while (1 == cdr0.bits.start_done && 0 < wfc_timeout);
+-
+-		if (0 == wfc_timeout) {
+-			ncr_unlock(LOCK_DOMAIN);
+-			pr_err("ncr_write() Timeout!\n");
+-			BUG();
+-
++		if (0 != ncr_check_pio_status("write"))
+ 			return -1;
+-		}
+-
+-		/*
+-		Check status.
+-		*/
+ 
+-		if ((0x3 != cdr0.bits.status) && (0x00c00000) >> 22) {
+-			unsigned long status;
+-
+-			status = ncr_register_read((unsigned *)(nca_address +
+-								0xe4));
+-			ncr_unlock(LOCK_DOMAIN);
+-			pr_err("ncr_write() Error: 0x%x 0x%lx\n",
+-			       cdr0.bits.status, status);
+-
+-			return status;
+-		}
+ 	} else {
+ #ifdef APB2SER_PHY_PHYS_ADDRESS
+ 	if (NCP_NODE_ID(region) != 0x115) {
+@@ -552,7 +597,6 @@ ncr_write(unsigned long region, unsigned long address, int number,
+ 	} else {
+ 		void __iomem *base;
+ 		if (0xffff < address) {
+-			ncr_unlock(LOCK_DOMAIN);
+ 			return -1;
+ 		}
+ 
+@@ -576,7 +620,6 @@ ncr_write(unsigned long region, unsigned long address, int number,
+ 			base = (apb2ser0_address + 0x230);
+ 			break;
+ 		default:
+-			ncr_unlock(LOCK_DOMAIN);
+ 			return -1;
+ 		}
+ 		if ((NCP_TARGET_ID(region) == 0x1) ||
+@@ -595,20 +638,43 @@ ncr_write(unsigned long region, unsigned long address, int number,
+ 				&& 0 < wfc_timeout);
+ 
+ 			if (0 == wfc_timeout) {
+-				ncr_unlock(LOCK_DOMAIN);
+ 				return -1;
+ 			}
+ 		}
+ #else
+-		ncr_unlock(LOCK_DOMAIN);
+ 		return -1;
+ #endif /* APB2SER_PHY_PHYS_ADDRESS */
+ 	}
+ 
++	return 0;
++}
++EXPORT_SYMBOL(ncr_write_nolock);
++
++
++int
++ncr_write(unsigned long region, unsigned long address, int number,
++	  void *buffer)
++{
++	int rc = 0;
++
++	if (NULL == nca_address)
++		return -1;
++
++#ifdef APB2SER_PHY_PHYS_ADDRESS
++	if (NULL == apb2ser0_address)
++		return -1;
++#endif /* APB2SER_PHY_PHYS_ADDRESS */
++
++	if (0 != ncr_lock(LOCK_DOMAIN))
++		return -1;
++
++	rc = ncr_write_nolock(region, address, number, buffer);
++
+ 	ncr_unlock(LOCK_DOMAIN);
+ 
+-	return 0;
++	return rc;
+ }
++
+ EXPORT_SYMBOL(ncr_write);
+ 
+ /*
+diff --git a/drivers/misc/lsi-ncr.h b/drivers/misc/lsi-ncr.h
+index cb6bebb..db54f6b 100644
+--- a/drivers/misc/lsi-ncr.h
++++ b/drivers/misc/lsi-ncr.h
+@@ -38,5 +38,7 @@ unsigned long ncr_register_read(unsigned *);
+ void ncr_register_write(const unsigned, unsigned *);
+ int ncr_read(unsigned long, unsigned long, int, void *);
+ int ncr_write(unsigned long, unsigned long, int, void *);
++int ncr_read_nolock(unsigned long, unsigned long, int, void *);
++int ncr_write_nolock(unsigned long, unsigned long, int, void *);
+ 
+ #endif /*  __DRIVERS_LSI_ACP_NCR_H */
+-- 
+1.7.5.4
+
