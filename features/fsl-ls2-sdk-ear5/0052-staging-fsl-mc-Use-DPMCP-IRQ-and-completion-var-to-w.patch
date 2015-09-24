@@ -1,0 +1,1156 @@
+From a9b309d2f94a7830a5ef6fa75f6bb3d009933dd1 Mon Sep 17 00:00:00 2001
+From: "J. German Rivera" <German.Rivera@freescale.com>
+Date: Thu, 2 Apr 2015 16:21:27 -0500
+Subject: [PATCH 052/214] staging: fsl-mc: Use DPMCP IRQ and completion var to
+ wait for MC
+
+- Refactored fsl_mc_io object to have a DPMCP object attached to it
+- Created DPMCP object for DPRC's built-in portal, so that waiting
+  on MC command completions for MC commands sent on the DPRC's built-in
+  portal can be done using a DPMCP interrupt and a Linux completion
+  variable.  For most cases, mc_send_command() will wait on this
+  completion variable, instead of doing polling. This completion
+  variable will be signaled from the DPMCP IRQ handler.
+
+Signed-off-by: J. German Rivera <German.Rivera@freescale.com>
+Change-Id: Iab294be9c00fb029702cc8625eaf29ba058fa960
+Reviewed-on: http://git.am.freescale.net:8181/34276
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Reviewed-by: Stuart Yoder <stuart.yoder@freescale.com>
+[Original patch extracted from FSL LS2085 SDK EAR5.0,
+Layerscape2-SDK-SOURCE-20150828-yocto.iso]
+Signed-off-by: Jiang Lu <lu.jiang@windriver.com>
+---
+ drivers/staging/fsl-mc/bus/dprc-driver.c    | 214 ++++++++++-----
+ drivers/staging/fsl-mc/bus/mc-allocator.c   | 101 +++----
+ drivers/staging/fsl-mc/bus/mc-bus.c         |  13 +-
+ drivers/staging/fsl-mc/bus/mc-sys.c         | 403 +++++++++++++++++++++++++---
+ drivers/staging/fsl-mc/include/mc-private.h |   6 +-
+ drivers/staging/fsl-mc/include/mc-sys.h     |  22 +-
+ 6 files changed, 607 insertions(+), 152 deletions(-)
+
+diff --git a/drivers/staging/fsl-mc/bus/dprc-driver.c b/drivers/staging/fsl-mc/bus/dprc-driver.c
+index ff321c9..114869b 100644
+--- a/drivers/staging/fsl-mc/bus/dprc-driver.c
++++ b/drivers/staging/fsl-mc/bus/dprc-driver.c
+@@ -15,6 +15,7 @@
+ #include <linux/slab.h>
+ #include <linux/interrupt.h>
+ #include "dprc-cmd.h"
++#include "dpmcp.h"
+ 
+ struct dprc_child_objs {
+ 	int child_count;
+@@ -348,57 +349,6 @@ int dprc_scan_objects(struct fsl_mc_device *mc_bus_dev,
+ EXPORT_SYMBOL_GPL(dprc_scan_objects);
+ 
+ /**
+- * dprc_lookup_object - Finds a given MC object in a DPRC and returns
+- * the index of the object in the DPRC
+- *
+- * @mc_bus_dev: pointer to the fsl-mc device that represents a DPRC object
+- * @child_dev: pointer to the fsl-mc device to be looked up
+- * @child_obj_index: output parameter to hold the index of the object
+- */
+-int dprc_lookup_object(struct fsl_mc_device *mc_bus_dev,
+-		       struct fsl_mc_device *child_dev,
+-		       uint32_t *child_obj_index)
+-{
+-	int i;
+-	int num_child_objects;
+-	int error;
+-
+-	error = dprc_get_obj_count(mc_bus_dev->mc_io,
+-				   mc_bus_dev->mc_handle,
+-				   &num_child_objects);
+-	if (error < 0) {
+-		dev_err(&mc_bus_dev->dev, "dprc_get_obj_count() failed: %d\n",
+-			error);
+-		return error;
+-	}
+-
+-	for (i = 0; i < num_child_objects; i++) {
+-		struct dprc_obj_desc obj_desc;
+-
+-		error = dprc_get_obj(mc_bus_dev->mc_io,
+-				     mc_bus_dev->mc_handle,
+-				     i, &obj_desc);
+-		if (error < 0) {
+-			dev_err(&mc_bus_dev->dev,
+-				"dprc_get_obj(i=%d) failed: %d\n",
+-				i, error);
+-			return error;
+-		}
+-
+-		if (strcmp(obj_desc.type, child_dev->obj_desc.type) == 0 &&
+-		    obj_desc.id == child_dev->obj_desc.id) {
+-			*child_obj_index = i;
+-			return 0;
+-		}
+-	}
+-
+-	dev_err(&mc_bus_dev->dev, "%s.%u not found\n",
+-		child_dev->obj_desc.type, child_dev->obj_desc.id);
+-
+-	return -ENODEV;
+-}
+-
+-/**
+  * dprc_scan_container - Scans a physical DPRC and synchronizes Linux bus state
+  *
+  * @mc_bus_dev: pointer to the fsl-mc device that represents a DPRC object
+@@ -466,7 +416,8 @@ static irqreturn_t dprc_irq0_handler_thread(int irq_num, void *arg)
+ 	struct fsl_mc_io *mc_io = mc_dev->mc_io;
+ 	int irq_index = 0;
+ 
+-	dev_dbg(dev, "DPRC IRQ %d\n", irq_num);
++	dev_dbg(dev, "DPRC IRQ %d triggered on CPU %u\n",
++		irq_num, smp_processor_id());
+ 	if (WARN_ON(!(mc_dev->flags & FSL_MC_IS_DPRC)))
+ 		return IRQ_HANDLED;
+ 
+@@ -540,7 +491,8 @@ static int disable_dprc_irqs(struct fsl_mc_device *mc_dev)
+ 		error = dprc_set_irq_enable(mc_io, mc_dev->mc_handle, i, 0);
+ 		if (error < 0) {
+ 			dev_err(&mc_dev->dev,
+-				"dprc_set_irq_enable() failed: %d\n", error);
++				"Disabling DPRC IRQ %d failed: dprc_set_irq_enable() failed: %d\n",
++				i, error);
+ 
+ 			return error;
+ 		}
+@@ -551,7 +503,8 @@ static int disable_dprc_irqs(struct fsl_mc_device *mc_dev)
+ 		error = dprc_set_irq_mask(mc_io, mc_dev->mc_handle, i, 0x0);
+ 		if (error < 0) {
+ 			dev_err(&mc_dev->dev,
+-				"dprc_set_irq_mask() failed: %d\n", error);
++				"Disabling DPRC IRQ %d failed: dprc_set_irq_mask() failed: %d\n",
++				i, error);
+ 
+ 			return error;
+ 		}
+@@ -563,8 +516,9 @@ static int disable_dprc_irqs(struct fsl_mc_device *mc_dev)
+ 					      ~0x0U);
+ 		if (error < 0) {
+ 			dev_err(&mc_dev->dev,
+-				"dprc_clear_irq_status() failed: %d\n",
+-				error);
++				"Disabling DPRC IRQ %d failed: dprc_clear_irq_status() failed: %d\n",
++				i, error);
++
+ 			return error;
+ 		}
+ 	}
+@@ -685,7 +639,8 @@ static int enable_dprc_irqs(struct fsl_mc_device *mc_dev)
+ 					  ~0x0u);
+ 		if (error < 0) {
+ 			dev_err(&mc_dev->dev,
+-				"dprc_set_irq_mask() failed: %d\n", error);
++				"Enabling DPRC IRQ %d failed: dprc_set_irq_mask() failed: %d\n",
++				i, error);
+ 
+ 			return error;
+ 		}
+@@ -698,7 +653,8 @@ static int enable_dprc_irqs(struct fsl_mc_device *mc_dev)
+ 					    i, 1);
+ 		if (error < 0) {
+ 			dev_err(&mc_dev->dev,
+-				"dprc_set_irq_enable() failed: %d\n", error);
++				"Enabling DPRC IRQ %d failed: dprc_set_irq_enable() failed: %d\n",
++				i, error);
+ 
+ 			return error;
+ 		}
+@@ -740,6 +696,95 @@ error_free_irqs:
+ 	return error;
+ }
+ 
++/*
++ * Creates a DPMCP for a DPRC's built-in MC portal
++ */
++static int dprc_create_dpmcp(struct fsl_mc_device *dprc_dev)
++{
++	int error;
++	struct dpmcp_cfg dpmcp_cfg;
++	uint16_t dpmcp_handle;
++	struct dprc_res_req res_req;
++	struct dpmcp_attr dpmcp_attr;
++	struct fsl_mc_bus *mc_bus = to_fsl_mc_bus(dprc_dev);
++
++	dpmcp_cfg.portal_id = mc_bus->dprc_attr.portal_id;
++	error = dpmcp_create(dprc_dev->mc_io, &dpmcp_cfg, &dpmcp_handle);
++	if (error < 0) {
++		dev_err(&dprc_dev->dev, "dpmcp_create() failed: %d\n",
++			error);
++		return error;
++	}
++
++	/*
++	 * Set the state of the newly created DPMCP object to be "plugged":
++	 */
++
++	error = dpmcp_get_attributes(dprc_dev->mc_io, dpmcp_handle,
++				     &dpmcp_attr);
++	if (error < 0) {
++		dev_err(&dprc_dev->dev, "dpmcp_get_attributes() failed: %d\n",
++			error);
++		goto error_destroy_dpmcp;
++	}
++
++	if (WARN_ON(dpmcp_attr.id != mc_bus->dprc_attr.portal_id)) {
++		error = -EINVAL;
++		goto error_destroy_dpmcp;
++	}
++
++	strcpy(res_req.type, "dpmcp");
++	res_req.num = 1;
++	res_req.options =
++			(DPRC_RES_REQ_OPT_EXPLICIT | DPRC_RES_REQ_OPT_PLUGGED);
++	res_req.id_base_align = dpmcp_attr.id;
++
++	error = dprc_assign(dprc_dev->mc_io,
++			    dprc_dev->mc_handle,
++			    dprc_dev->obj_desc.id,
++			    &res_req);
++
++	if (error < 0) {
++		dev_err(&dprc_dev->dev, "dprc_assign() failed: %d\n", error);
++		goto error_destroy_dpmcp;
++	}
++
++	(void)dpmcp_close(dprc_dev->mc_io, dpmcp_handle);
++	return 0;
++
++error_destroy_dpmcp:
++	(void)dpmcp_destroy(dprc_dev->mc_io, dpmcp_handle);
++	return error;
++}
++
++/*
++ * Destroys the DPMCP for a DPRC's built-in MC portal
++ */
++static void dprc_destroy_dpmcp(struct fsl_mc_device *dprc_dev)
++{
++	int error;
++	uint16_t dpmcp_handle;
++	struct fsl_mc_bus *mc_bus = to_fsl_mc_bus(dprc_dev);
++
++	if (WARN_ON(!dprc_dev->mc_io || dprc_dev->mc_io->dpmcp_dev))
++		return;
++
++	error = dpmcp_open(dprc_dev->mc_io, mc_bus->dprc_attr.portal_id,
++			   &dpmcp_handle);
++	if (error < 0) {
++		dev_err(&dprc_dev->dev, "dpmcp_open() failed: %d\n",
++			error);
++		return;
++	}
++
++	error = dpmcp_destroy(dprc_dev->mc_io, dpmcp_handle);
++	if (error < 0) {
++		dev_err(&dprc_dev->dev, "dpmcp_destroy() failed: %d\n",
++			error);
++		return;
++	}
++}
++
+ /**
+  * dprc_probe - callback invoked when a DPRC is being bound to this driver
+  *
+@@ -756,6 +801,7 @@ static int dprc_probe(struct fsl_mc_device *mc_dev)
+ 	size_t region_size;
+ 	struct fsl_mc_bus *mc_bus = to_fsl_mc_bus(mc_dev);
+ 	struct fsl_mc *mc = dev_get_drvdata(fsl_mc_bus_type.dev_root->parent);
++	bool mc_io_created = false;
+ 
+ 	if (WARN_ON(strcmp(mc_dev->obj_desc.type, "dprc") != 0))
+ 		return -EINVAL;
+@@ -776,6 +822,8 @@ static int dprc_probe(struct fsl_mc_device *mc_dev)
+ 					 NULL, 0, &mc_dev->mc_io);
+ 		if (error < 0)
+ 			return error;
++
++		mc_io_created = true;
+ 	}
+ 
+ 	error = dprc_open(mc_dev->mc_io, mc_dev->obj_desc.id,
+@@ -785,14 +833,49 @@ static int dprc_probe(struct fsl_mc_device *mc_dev)
+ 		goto error_cleanup_mc_io;
+ 	}
+ 
++	error = dprc_get_attributes(mc_dev->mc_io, mc_dev->mc_handle,
++				    &mc_bus->dprc_attr);
++	if (error < 0) {
++		dev_err(&mc_dev->dev, "dprc_get_attributes() failed: %d\n",
++			error);
++		goto error_cleanup_open;
++	}
++
++	/*
++	 * Create DPMCP for the DPRC's built-in portal:
++	 */
++	error = dprc_create_dpmcp(mc_dev);
++	if (error < 0)
++		goto error_cleanup_open;
++
+ 	mutex_init(&mc_bus->scan_mutex);
+ 
+ 	/*
+-	 * Discover MC objects in DPRC object:
++	 * Discover MC objects in the DPRC object:
+ 	 */
+ 	error = dprc_scan_container(mc_dev);
+ 	if (error < 0)
+-		goto error_cleanup_open;
++		goto error_destroy_dpmcp;
++
++	/*
++	 * The fsl_mc_device object associated with the DPMCP object created
++	 * above was created as part of the dprc_scan_container() call above:
++	 */
++	if (WARN_ON(!mc_dev->mc_io->dpmcp_dev)) {
++		error = -EINVAL;
++		goto error_cleanup_dprc_scan;
++	}
++
++	/*
++	 * Configure interrupt for the DPMCP object associated with the
++	 * DPRC object's built-in portal:
++	 *
++	 * NOTE: We have to do this after calling dprc_scan_container(), since
++	 * dprc_scan_container() will populate the IRQ pool for this DPRC.
++	 */
++	error = fsl_mc_io_setup_dpmcp_irq(mc_dev->mc_io);
++	if (error < 0)
++		goto error_cleanup_dprc_scan;
+ 
+ 	if (mc->gic_supported) {
+ 		/*
+@@ -808,16 +891,23 @@ static int dprc_probe(struct fsl_mc_device *mc_dev)
+ 	return 0;
+ 
+ error_cleanup_dprc_scan:
++	fsl_mc_io_unset_dpmcp(mc_dev->mc_io);
+ 	device_for_each_child(&mc_dev->dev, NULL, __fsl_mc_device_remove);
+ 	dprc_cleanup_all_resource_pools(mc_dev);
+ 	if (mc->gic_supported)
+ 		fsl_mc_cleanup_irq_pool(mc_bus);
+ 
++error_destroy_dpmcp:
++	dprc_destroy_dpmcp(mc_dev);
++
+ error_cleanup_open:
+ 	(void)dprc_close(mc_dev->mc_io, mc_dev->mc_handle);
+ 
+ error_cleanup_mc_io:
+-	fsl_destroy_mc_io(mc_dev->mc_io);
++	if (mc_io_created) {
++		fsl_destroy_mc_io(mc_dev->mc_io);
++		mc_dev->mc_io = NULL;
++	}
+ 	return error;
+ }
+ 
+@@ -858,8 +948,10 @@ static int dprc_remove(struct fsl_mc_device *mc_dev)
+ 	if (mc->gic_supported)
+ 		dprc_teardown_irqs(mc_dev);
+ 
++	fsl_mc_io_unset_dpmcp(mc_dev->mc_io);
+ 	device_for_each_child(&mc_dev->dev, NULL, __fsl_mc_device_remove);
+ 	dprc_cleanup_all_resource_pools(mc_dev);
++	dprc_destroy_dpmcp(mc_dev);
+ 	error = dprc_close(mc_dev->mc_io, mc_dev->mc_handle);
+ 	if (error < 0)
+ 		dev_err(&mc_dev->dev, "dprc_close() failed: %d\n", error);
+diff --git a/drivers/staging/fsl-mc/bus/mc-allocator.c b/drivers/staging/fsl-mc/bus/mc-allocator.c
+index 313a533..a29bb5f 100644
+--- a/drivers/staging/fsl-mc/bus/mc-allocator.c
++++ b/drivers/staging/fsl-mc/bus/mc-allocator.c
+@@ -111,7 +111,7 @@ static int __must_check fsl_mc_resource_pool_remove_device(struct fsl_mc_device
+ 		goto out;
+ 
+ 	resource = mc_dev->resource;
+-	if (WARN_ON(resource->data != mc_dev))
++	if (WARN_ON(!resource || resource->data != mc_dev))
+ 		goto out;
+ 
+ 	mc_bus_dev = to_fsl_mc_device(mc_dev->dev.parent);
+@@ -285,7 +285,7 @@ int __must_check fsl_mc_portal_allocate(struct fsl_mc_device *mc_dev,
+ 	struct fsl_mc_bus *mc_bus;
+ 	phys_addr_t mc_portal_phys_addr;
+ 	size_t mc_portal_size;
+-	struct fsl_mc_device *mc_adev;
++	struct fsl_mc_device *dpmcp_dev;
+ 	int error = -EINVAL;
+ 	struct fsl_mc_resource *resource = NULL;
+ 	struct fsl_mc_io *mc_io = NULL;
+@@ -305,23 +305,24 @@ int __must_check fsl_mc_portal_allocate(struct fsl_mc_device *mc_dev,
+ 	if (error < 0)
+ 		return error;
+ 
+-	mc_adev = resource->data;
+-	if (WARN_ON(!mc_adev))
++	dpmcp_dev = resource->data;
++	if (WARN_ON(!dpmcp_dev ||
++		    strcmp(dpmcp_dev->obj_desc.type, "dpmcp") != 0))
+ 		goto error_cleanup_resource;
+ 
+-	if (WARN_ON(mc_adev->obj_desc.region_count == 0))
++	if (WARN_ON(dpmcp_dev->obj_desc.region_count == 0))
+ 		goto error_cleanup_resource;
+ 
+-	mc_portal_phys_addr = mc_adev->regions[0].start;
+-	mc_portal_size = mc_adev->regions[0].end -
+-			 mc_adev->regions[0].start + 1;
++	mc_portal_phys_addr = dpmcp_dev->regions[0].start;
++	mc_portal_size = dpmcp_dev->regions[0].end -
++			 dpmcp_dev->regions[0].start + 1;
+ 
+ 	if (WARN_ON(mc_portal_size != mc_bus_dev->mc_io->portal_size))
+ 		goto error_cleanup_resource;
+ 
+ 	error = fsl_create_mc_io(&mc_bus_dev->dev,
+ 				 mc_portal_phys_addr,
+-				 mc_portal_size, resource,
++				 mc_portal_size, dpmcp_dev,
+ 				 mc_io_flags, &mc_io);
+ 	if (error < 0)
+ 		goto error_cleanup_resource;
+@@ -343,12 +344,20 @@ EXPORT_SYMBOL_GPL(fsl_mc_portal_allocate);
+  */
+ void fsl_mc_portal_free(struct fsl_mc_io *mc_io)
+ {
++	struct fsl_mc_device *dpmcp_dev;
+ 	struct fsl_mc_resource *resource;
+ 
+-	resource = mc_io->resource;
+-	if (WARN_ON(resource->type != FSL_MC_POOL_DPMCP))
++	dpmcp_dev = mc_io->dpmcp_dev;
++	if (WARN_ON(strcmp(dpmcp_dev->obj_desc.type, "dpmcp") != 0))
++		return;
++	if (WARN_ON(dpmcp_dev->mc_io != mc_io))
++		return;
++
++	resource = dpmcp_dev->resource;
++	if (WARN_ON(!resource || resource->type != FSL_MC_POOL_DPMCP))
+ 		return;
+-	if (WARN_ON(!resource->data))
++
++	if (WARN_ON(resource->data != dpmcp_dev))
+ 		return;
+ 
+ 	fsl_destroy_mc_io(mc_io);
+@@ -364,31 +373,14 @@ EXPORT_SYMBOL_GPL(fsl_mc_portal_free);
+ int fsl_mc_portal_reset(struct fsl_mc_io *mc_io)
+ {
+ 	int error;
+-	uint16_t token;
+-	struct fsl_mc_resource *resource = mc_io->resource;
+-	struct fsl_mc_device *mc_dev = resource->data;
+-
+-	if (WARN_ON(resource->type != FSL_MC_POOL_DPMCP))
+-		return -EINVAL;
++	struct fsl_mc_device *dpmcp_dev = mc_io->dpmcp_dev;
+ 
+-	if (WARN_ON(!mc_dev))
++	if (WARN_ON(!dpmcp_dev))
+ 		return -EINVAL;
+ 
+-	error = dpmcp_open(mc_io, mc_dev->obj_desc.id, &token);
++	error = dpmcp_reset(mc_io, dpmcp_dev->mc_handle);
+ 	if (error < 0) {
+-		dev_err(&mc_dev->dev, "dpmcp_open() failed: %d\n", error);
+-		return error;
+-	}
+-
+-	error = dpmcp_reset(mc_io, token);
+-	if (error < 0) {
+-		dev_err(&mc_dev->dev, "dpmcp_reset() failed: %d\n", error);
+-		return error;
+-	}
+-
+-	error = dpmcp_close(mc_io, token);
+-	if (error < 0) {
+-		dev_err(&mc_dev->dev, "dpmcp_close() failed: %d\n", error);
++		dev_err(&dpmcp_dev->dev, "dpmcp_reset() failed: %d\n", error);
+ 		return error;
+ 	}
+ 
+@@ -610,13 +602,28 @@ static int fsl_mc_allocator_probe(struct fsl_mc_device *mc_dev)
+ 		goto error;
+ 
+ 	mc_bus = to_fsl_mc_bus(mc_bus_dev);
+-	error = object_type_to_pool_type(mc_dev->obj_desc.type, &pool_type);
+-	if (error < 0)
+-		goto error;
+ 
+-	error = fsl_mc_resource_pool_add_device(mc_bus, pool_type, mc_dev);
+-	if (error < 0)
+-		goto error;
++	/*
++	 * If mc_dev is the DPMCP object for the parent DPRC's built-in
++	 * portal, we don't add this DPMCP to the DPMCP object pool,
++	 * but instead allocate it directly to the parent DPRC (mc_bus_dev):
++	 */
++	if (strcmp(mc_dev->obj_desc.type, "dpmcp") == 0 &&
++	    mc_dev->obj_desc.id == mc_bus->dprc_attr.portal_id) {
++		error = fsl_mc_io_set_dpmcp(mc_bus_dev->mc_io, mc_dev);
++		if (error < 0)
++			goto error;
++	} else {
++		error = object_type_to_pool_type(mc_dev->obj_desc.type,
++						 &pool_type);
++		if (error < 0)
++			goto error;
++
++		error = fsl_mc_resource_pool_add_device(mc_bus, pool_type,
++							mc_dev);
++		if (error < 0)
++			goto error;
++	}
+ 
+ 	dev_dbg(&mc_dev->dev,
+ 		"Allocatable MC object device bound to fsl_mc_allocator driver");
+@@ -632,20 +639,20 @@ error:
+  */
+ static int fsl_mc_allocator_remove(struct fsl_mc_device *mc_dev)
+ {
+-	int error = -EINVAL;
++	int error;
+ 
+ 	if (WARN_ON(!FSL_MC_IS_ALLOCATABLE(mc_dev->obj_desc.type)))
+-		goto out;
++		return -EINVAL;
+ 
+-	error = fsl_mc_resource_pool_remove_device(mc_dev);
+-	if (error < 0)
+-		goto out;
++	if (mc_dev->resource) {
++		error = fsl_mc_resource_pool_remove_device(mc_dev);
++		if (error < 0)
++			return error;
++	}
+ 
+ 	dev_dbg(&mc_dev->dev,
+ 		"Allocatable MC object device unbound from fsl_mc_allocator driver");
+-	error = 0;
+-out:
+-	return error;
++	return 0;
+ }
+ 
+ static const struct fsl_mc_device_match_id match_id_table[] = {
+diff --git a/drivers/staging/fsl-mc/bus/mc-bus.c b/drivers/staging/fsl-mc/bus/mc-bus.c
+index 98fddc7..eb76caa9 100644
+--- a/drivers/staging/fsl-mc/bus/mc-bus.c
++++ b/drivers/staging/fsl-mc/bus/mc-bus.c
+@@ -595,6 +595,11 @@ void fsl_mc_device_remove(struct fsl_mc_device *mc_dev)
+ 
+ 		if (&mc_dev->dev == fsl_mc_bus_type.dev_root)
+ 			fsl_mc_bus_type.dev_root = NULL;
++	} else if (strcmp(mc_dev->obj_desc.type, "dpmcp") == 0) {
++		if (mc_dev->mc_io) {
++			fsl_destroy_mc_io(mc_dev->mc_io);
++			mc_dev->mc_io = NULL;
++		}
+ 	}
+ 
+ 	kfree(mc_dev->driver_override);
+@@ -670,12 +675,14 @@ static void mc_bus_msi_domain_write_msg(struct irq_data *irq_data,
+ 	struct fsl_mc_device_irq *irq_res =
+ 		&mc_bus->irq_resources[msi_entry->msi_attrib.entry_nr];
+ 
++	/*
++	 * NOTE: This function is invoked with interrupts disabled
++	 */
++
+ 	if (irq_res->irq_number == irq_data->irq) {
+-		/*
+-		 * write msg->address_hi/lo to irq_resource
+-		 */
+ 		irq_res->msi_paddr =
+ 			((u64)msg->address_hi << 32) | msg->address_lo;
++
+ 		irq_res->msi_value = msg->data;
+ 
+ 		/*
+diff --git a/drivers/staging/fsl-mc/bus/mc-sys.c b/drivers/staging/fsl-mc/bus/mc-sys.c
+index 1679054..92b3a7f 100644
+--- a/drivers/staging/fsl-mc/bus/mc-sys.c
++++ b/drivers/staging/fsl-mc/bus/mc-sys.c
+@@ -34,10 +34,13 @@
+ 
+ #include "../include/mc-sys.h"
+ #include "../include/mc-cmd.h"
++#include "../include/mc.h"
+ #include <linux/delay.h>
+ #include <linux/slab.h>
+ #include <linux/ioport.h>
+ #include <linux/device.h>
++#include <linux/interrupt.h>
++#include "dpmcp.h"
+ 
+ /**
+  * Timeout in jiffies to wait for the completion of an MC command
+@@ -55,6 +58,225 @@
+ 	((uint16_t)mc_dec((_hdr), MC_CMD_HDR_CMDID_O, MC_CMD_HDR_CMDID_S))
+ 
+ /**
++ * dpmcp_irq0_handler - Regular ISR for DPMCP interrupt 0
++ *
++ * @irq: IRQ number of the interrupt being handled
++ * @arg: Pointer to device structure
++ */
++static irqreturn_t dpmcp_irq0_handler(int irq_num, void *arg)
++{
++	struct device *dev = (struct device *)arg;
++	struct fsl_mc_device *dpmcp_dev = to_fsl_mc_device(dev);
++
++	dev_dbg(dev, "DPMCP IRQ %d triggered on CPU %u\n", irq_num,
++		smp_processor_id());
++
++	if (WARN_ON(dpmcp_dev->irqs[0]->irq_number != (uint32_t)irq_num))
++		goto out;
++
++	if (WARN_ON(!dpmcp_dev->mc_io))
++		goto out;
++
++	/*
++	 * NOTE: We cannot invoke MC flib function here
++	 */
++
++	complete(&dpmcp_dev->mc_io->mc_command_done_completion);
++out:
++	return IRQ_HANDLED;
++}
++
++/*
++ * Disable and clear interrupts for a given DPMCP object
++ */
++static int disable_dpmcp_irq(struct fsl_mc_device *dpmcp_dev)
++{
++	int error;
++
++	/*
++	 * Disable generation of the DPMCP interrupt:
++	 */
++	error = dpmcp_set_irq_enable(dpmcp_dev->mc_io,
++				     dpmcp_dev->mc_handle,
++				     DPMCP_IRQ_INDEX, 0);
++	if (error < 0) {
++		dev_err(&dpmcp_dev->dev,
++			"dpmcp_set_irq_enable() failed: %d\n", error);
++
++		return error;
++	}
++
++	/*
++	 * Disable all DPMCP interrupt causes:
++	 */
++	error = dpmcp_set_irq_mask(dpmcp_dev->mc_io, dpmcp_dev->mc_handle,
++				   DPMCP_IRQ_INDEX, 0x0);
++	if (error < 0) {
++		dev_err(&dpmcp_dev->dev,
++			"dpmcp_set_irq_mask() failed: %d\n", error);
++
++		return error;
++	}
++
++	/*
++	 * Clear any leftover interrupts:
++	 */
++	error = dpmcp_clear_irq_status(dpmcp_dev->mc_io, dpmcp_dev->mc_handle,
++				       DPMCP_IRQ_INDEX, ~0x0U);
++	if (error < 0) {
++		dev_err(&dpmcp_dev->dev,
++			"dpmcp_clear_irq_status() failed: %d\n",
++			error);
++		return error;
++	}
++
++	return 0;
++}
++
++static void unregister_dpmcp_irq_handler(struct fsl_mc_device *dpmcp_dev)
++{
++	struct fsl_mc_device_irq *irq = dpmcp_dev->irqs[DPMCP_IRQ_INDEX];
++
++	devm_free_irq(&dpmcp_dev->dev, irq->irq_number, &dpmcp_dev->dev);
++}
++
++static int register_dpmcp_irq_handler(struct fsl_mc_device *dpmcp_dev)
++{
++	int error;
++	struct fsl_mc_device_irq *irq = dpmcp_dev->irqs[DPMCP_IRQ_INDEX];
++
++	error = devm_request_irq(&dpmcp_dev->dev,
++				 irq->irq_number,
++				 dpmcp_irq0_handler,
++				 IRQF_NO_SUSPEND | IRQF_ONESHOT,
++				 "FSL MC DPMCP irq0",
++				 &dpmcp_dev->dev);
++	if (error < 0) {
++		dev_err(&dpmcp_dev->dev,
++			"devm_request_irq() failed: %d\n",
++			error);
++		return error;
++	}
++
++	error = dpmcp_set_irq(dpmcp_dev->mc_io,
++			      dpmcp_dev->mc_handle,
++			      DPMCP_IRQ_INDEX,
++			      irq->msi_paddr,
++			      irq->msi_value,
++			      irq->irq_number);
++	if (error < 0) {
++		dev_err(&dpmcp_dev->dev,
++			"dpmcp_set_irq() failed: %d\n", error);
++		goto error_unregister_irq_handler;
++	}
++
++	return 0;
++
++error_unregister_irq_handler:
++	devm_free_irq(&dpmcp_dev->dev, irq->irq_number, &dpmcp_dev->dev);
++	return error;
++}
++
++static int enable_dpmcp_irq(struct fsl_mc_device *dpmcp_dev)
++{
++	int error;
++
++	/*
++	 * Enable MC command completion event to trigger DPMCP interrupt:
++	 */
++	error = dpmcp_set_irq_mask(dpmcp_dev->mc_io,
++				   dpmcp_dev->mc_handle,
++				   DPMCP_IRQ_INDEX,
++				   DPMCP_IRQ_EVENT_CMD_DONE);
++	if (error < 0) {
++		dev_err(&dpmcp_dev->dev,
++			"dpmcp_set_irq_mask() failed: %d\n", error);
++
++		return error;
++	}
++
++	/*
++	 * Enable generation of the interrupt:
++	 */
++	error = dpmcp_set_irq_enable(dpmcp_dev->mc_io,
++				     dpmcp_dev->mc_handle,
++				     DPMCP_IRQ_INDEX, 1);
++	if (error < 0) {
++		dev_err(&dpmcp_dev->dev,
++			"dpmcp_set_irq_enable() failed: %d\n", error);
++
++		return error;
++	}
++
++	return 0;
++}
++
++/*
++ * Setup MC command completion interrupt for the DPMCP device associated with a
++ * given fsl_mc_io object
++ */
++int fsl_mc_io_setup_dpmcp_irq(struct fsl_mc_io *mc_io)
++{
++	int error;
++	struct fsl_mc_device *dpmcp_dev = mc_io->dpmcp_dev;
++
++	if (WARN_ON(!dpmcp_dev))
++		return -EINVAL;
++
++	if (WARN_ON(dpmcp_dev->obj_desc.irq_count != 1))
++		return -EINVAL;
++
++	if (WARN_ON(!dpmcp_dev->mc_io))
++		return -EINVAL;
++
++	error = fsl_mc_allocate_irqs(dpmcp_dev);
++	if (error < 0)
++		return error;
++
++	error = disable_dpmcp_irq(dpmcp_dev);
++	if (error < 0)
++		goto error_free_irqs;
++
++	error = register_dpmcp_irq_handler(dpmcp_dev);
++	if (error < 0)
++		goto error_free_irqs;
++
++	error = enable_dpmcp_irq(dpmcp_dev);
++	if (error < 0)
++		goto error_unregister_irq_handler;
++
++	mc_io->mc_command_done_irq_armed = true;
++	return 0;
++
++error_unregister_irq_handler:
++	unregister_dpmcp_irq_handler(dpmcp_dev);
++
++error_free_irqs:
++	fsl_mc_free_irqs(dpmcp_dev);
++	return error;
++}
++EXPORT_SYMBOL_GPL(fsl_mc_io_setup_dpmcp_irq);
++
++/*
++ * Tear down interrupts for the DPMCP device associated with a given fsl_mc_io
++ * object
++ */
++static void teardown_dpmcp_irq(struct fsl_mc_io *mc_io)
++{
++	struct fsl_mc_device *dpmcp_dev = mc_io->dpmcp_dev;
++
++	if (WARN_ON(!dpmcp_dev))
++		return;
++	if (WARN_ON(!dpmcp_dev->irqs))
++		return;
++
++	mc_io->mc_command_done_irq_armed = false;
++	(void)disable_dpmcp_irq(dpmcp_dev);
++	unregister_dpmcp_irq_handler(dpmcp_dev);
++	fsl_mc_free_irqs(dpmcp_dev);
++}
++
++/**
+  * Creates an MC I/O object
+  *
+  * @dev: device to be associated with the MC I/O object
+@@ -70,9 +292,10 @@
+ int __must_check fsl_create_mc_io(struct device *dev,
+ 				  phys_addr_t mc_portal_phys_addr,
+ 				  uint32_t mc_portal_size,
+-				  struct fsl_mc_resource *resource,
++				  struct fsl_mc_device *dpmcp_dev,
+ 				  uint32_t flags, struct fsl_mc_io **new_mc_io)
+ {
++	int error;
+ 	struct fsl_mc_io *mc_io;
+ 	void __iomem *mc_portal_virt_addr;
+ 	struct resource *res;
+@@ -85,11 +308,13 @@ int __must_check fsl_create_mc_io(struct device *dev,
+ 	mc_io->flags = flags;
+ 	mc_io->portal_phys_addr = mc_portal_phys_addr;
+ 	mc_io->portal_size = mc_portal_size;
+-	mc_io->resource = resource;
+-	if (flags & FSL_MC_IO_ATOMIC_CONTEXT_PORTAL)
++	mc_io->mc_command_done_irq_armed = false;
++	if (flags & FSL_MC_IO_ATOMIC_CONTEXT_PORTAL) {
+ 		spin_lock_init(&mc_io->spinlock);
+-	else
++	} else {
+ 		mutex_init(&mc_io->mutex);
++		init_completion(&mc_io->mc_command_done_completion);
++	}
+ 
+ 	res = devm_request_mem_region(dev,
+ 				      mc_portal_phys_addr,
+@@ -113,8 +338,25 @@ int __must_check fsl_create_mc_io(struct device *dev,
+ 	}
+ 
+ 	mc_io->portal_virt_addr = mc_portal_virt_addr;
++	if (dpmcp_dev) {
++		error = fsl_mc_io_set_dpmcp(mc_io, dpmcp_dev);
++		if (error < 0)
++			goto error_destroy_mc_io;
++
++		if (!(flags & FSL_MC_IO_ATOMIC_CONTEXT_PORTAL)) {
++			error = fsl_mc_io_setup_dpmcp_irq(mc_io);
++			if (error < 0)
++				goto error_destroy_mc_io;
++		}
++	}
++
+ 	*new_mc_io = mc_io;
+ 	return 0;
++
++error_destroy_mc_io:
++	fsl_destroy_mc_io(mc_io);
++	return error;
++
+ }
+ EXPORT_SYMBOL_GPL(fsl_create_mc_io);
+ 
+@@ -125,6 +367,11 @@ EXPORT_SYMBOL_GPL(fsl_create_mc_io);
+  */
+ void fsl_destroy_mc_io(struct fsl_mc_io *mc_io)
+ {
++	struct fsl_mc_device *dpmcp_dev = mc_io->dpmcp_dev;
++
++	if (dpmcp_dev)
++		fsl_mc_io_unset_dpmcp(mc_io);
++
+ 	devm_iounmap(mc_io->dev, mc_io->portal_virt_addr);
+ 	devm_release_mem_region(mc_io->dev,
+ 				mc_io->portal_phys_addr,
+@@ -135,6 +382,57 @@ void fsl_destroy_mc_io(struct fsl_mc_io *mc_io)
+ }
+ EXPORT_SYMBOL_GPL(fsl_destroy_mc_io);
+ 
++int fsl_mc_io_set_dpmcp(struct fsl_mc_io *mc_io,
++			struct fsl_mc_device *dpmcp_dev)
++{
++	int error;
++
++	if (WARN_ON(mc_io->dpmcp_dev))
++		return -EINVAL;
++
++	if (WARN_ON(dpmcp_dev->mc_io))
++		return -EINVAL;
++
++	if (!(mc_io->flags & FSL_MC_IO_ATOMIC_CONTEXT_PORTAL)) {
++		error = dpmcp_open(mc_io, dpmcp_dev->obj_desc.id,
++				   &dpmcp_dev->mc_handle);
++		if (error < 0)
++			return error;
++	}
++
++	mc_io->dpmcp_dev = dpmcp_dev;
++	dpmcp_dev->mc_io = mc_io;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(fsl_mc_io_set_dpmcp);
++
++void fsl_mc_io_unset_dpmcp(struct fsl_mc_io *mc_io)
++{
++	int error;
++	struct fsl_mc_device *dpmcp_dev = mc_io->dpmcp_dev;
++
++	if (WARN_ON(!dpmcp_dev))
++		return;
++
++	if (WARN_ON(dpmcp_dev->mc_io != mc_io))
++		return;
++
++	if (!(mc_io->flags & FSL_MC_IO_ATOMIC_CONTEXT_PORTAL)) {
++		if (dpmcp_dev->irqs)
++			teardown_dpmcp_irq(mc_io);
++
++		error = dpmcp_close(mc_io, dpmcp_dev->mc_handle);
++		if (error < 0) {
++			dev_err(&dpmcp_dev->dev, "dpmcp_close() failed: %d\n",
++				error);
++		}
++	}
++
++	mc_io->dpmcp_dev = NULL;
++	dpmcp_dev->mc_io = NULL;
++}
++EXPORT_SYMBOL_GPL(fsl_mc_io_unset_dpmcp);
++
+ static int mc_status_to_error(enum mc_cmd_status status)
+ {
+ 	static const int mc_status_to_error_map[] = {
+@@ -228,8 +526,66 @@ static inline enum mc_cmd_status mc_read_response(struct mc_command __iomem *
+ 	return status;
+ }
+ 
++static int mc_completion_wait(struct fsl_mc_io *mc_io, struct mc_command *cmd,
++			      enum mc_cmd_status *mc_status)
++{
++	enum mc_cmd_status status;
++	unsigned long jiffies_left;
++
++	if (WARN_ON(!mc_io->dpmcp_dev))
++		return -EINVAL;
++
++	for (;;) {
++		status = mc_read_response(mc_io->portal_virt_addr, cmd);
++		if (status != MC_CMD_STATUS_READY)
++			break;
++
++		jiffies_left = wait_for_completion_timeout(
++					&mc_io->mc_command_done_completion,
++					MC_CMD_COMPLETION_TIMEOUT_JIFFIES);
++		if (jiffies_left == 0)
++			return -ETIMEDOUT;
++	}
++
++	*mc_status = status;
++	return 0;
++}
++
++static int mc_polling_wait(struct fsl_mc_io *mc_io, struct mc_command *cmd,
++			   enum mc_cmd_status *mc_status)
++{
++	enum mc_cmd_status status;
++	unsigned long jiffies_until_timeout =
++	    jiffies + MC_CMD_COMPLETION_TIMEOUT_JIFFIES;
++
++	for (;;) {
++		status = mc_read_response(mc_io->portal_virt_addr, cmd);
++		if (status != MC_CMD_STATUS_READY)
++			break;
++
++		if (preemptible()) {
++			usleep_range(MC_CMD_COMPLETION_POLLING_MIN_SLEEP_USECS,
++				     MC_CMD_COMPLETION_POLLING_MAX_SLEEP_USECS);
++		}
++
++		if (time_after_eq(jiffies, jiffies_until_timeout)) {
++			pr_debug("MC command timed out (portal: %#llx, obj handle: %#x, command: %#x)\n",
++				 mc_io->portal_phys_addr,
++				 (unsigned int)
++					MC_CMD_HDR_READ_TOKEN(cmd->header),
++				 (unsigned int)
++					MC_CMD_HDR_READ_CMDID(cmd->header));
++
++			return -ETIMEDOUT;
++		}
++	}
++
++	*mc_status = status;
++	return 0;
++}
++
+ /**
+- * Sends an command to the MC device using the given MC I/O object
++ * Sends a command to the MC device using the given MC I/O object
+  *
+  * @mc_io: MC I/O object to be used
+  * @cmd: command to be sent
+@@ -240,8 +596,10 @@ int mc_send_command(struct fsl_mc_io *mc_io, struct mc_command *cmd)
+ {
+ 	int error;
+ 	enum mc_cmd_status status;
+-	unsigned long jiffies_until_timeout =
+-	    jiffies + MC_CMD_COMPLETION_TIMEOUT_JIFFIES;
++
++	/*
++	 * NOTE: This function may be invoked from atomic context
++	 */
+ 
+ 	if (preemptible()) {
+ 		if (WARN_ON(mc_io->flags & FSL_MC_IO_ATOMIC_CONTEXT_PORTAL))
+@@ -263,32 +621,13 @@ int mc_send_command(struct fsl_mc_io *mc_io, struct mc_command *cmd)
+ 	/*
+ 	 * Wait for response from the MC hardware:
+ 	 */
+-	for (;;) {
+-		status = mc_read_response(mc_io->portal_virt_addr, cmd);
+-		if (status != MC_CMD_STATUS_READY)
+-			break;
+-
+-		/*
+-		 * TODO: When MC command completion interrupts are supported
+-		 * call wait function here instead of usleep_range()
+-		 */
+-		if (preemptible()) {
+-			usleep_range(MC_CMD_COMPLETION_POLLING_MIN_SLEEP_USECS,
+-				     MC_CMD_COMPLETION_POLLING_MAX_SLEEP_USECS);
+-		}
+-
+-		if (time_after_eq(jiffies, jiffies_until_timeout)) {
+-			pr_debug("MC command timed out (portal: %#llx, obj handle: %#x, command: %#x)\n",
+-				 mc_io->portal_phys_addr,
+-				 (unsigned int)
+-					MC_CMD_HDR_READ_TOKEN(cmd->header),
+-				 (unsigned int)
+-					MC_CMD_HDR_READ_CMDID(cmd->header));
++	if (mc_io->mc_command_done_irq_armed && preemptible())
++		error = mc_completion_wait(mc_io, cmd, &status);
++	else
++		error = mc_polling_wait(mc_io, cmd, &status);
+ 
+-			error = -ETIMEDOUT;
+-			goto common_exit;
+-		}
+-	}
++	if (error < 0)
++		goto common_exit;
+ 
+ 	if (status != MC_CMD_STATUS_OK) {
+ 		pr_debug("MC command failed: portal: %#llx, obj handle: %#x, command: %#x, status: %s (%#x)\n",
+diff --git a/drivers/staging/fsl-mc/include/mc-private.h b/drivers/staging/fsl-mc/include/mc-private.h
+index 0757258..90b059a 100644
+--- a/drivers/staging/fsl-mc/include/mc-private.h
++++ b/drivers/staging/fsl-mc/include/mc-private.h
+@@ -111,12 +111,14 @@ struct fsl_mc_resource_pool {
+  * from the physical DPRC.
+  * @irq_resources: Pointer to array of IRQ objects for the IRQ pool.
+  * @scan_mutex: Serializes bus scanning
++ * @dprc_attr: DPRC attributes
+  */
+ struct fsl_mc_bus {
+ 	struct fsl_mc_device mc_dev;
+ 	struct fsl_mc_resource_pool resource_pools[FSL_MC_NUM_POOL_TYPES];
+ 	struct fsl_mc_device_irq *irq_resources;
+ 	struct mutex scan_mutex;    /* serializes bus scanning */
++	struct dprc_attributes dprc_attr;
+ };
+ 
+ #define to_fsl_mc_bus(_mc_dev) \
+@@ -134,10 +136,6 @@ int dprc_scan_objects(struct fsl_mc_device *mc_bus_dev,
+ 		      const char *driver_override,
+ 		      unsigned int *total_irq_count);
+ 
+-int dprc_lookup_object(struct fsl_mc_device *mc_bus_dev,
+-		       struct fsl_mc_device *child_dev,
+-		       uint32_t *child_obj_index);
+-
+ int __init dprc_driver_init(void);
+ 
+ void __exit dprc_driver_exit(void);
+diff --git a/drivers/staging/fsl-mc/include/mc-sys.h b/drivers/staging/fsl-mc/include/mc-sys.h
+index 24e51f7..1ffd6df 100644
+--- a/drivers/staging/fsl-mc/include/mc-sys.h
++++ b/drivers/staging/fsl-mc/include/mc-sys.h
+@@ -39,6 +39,7 @@
+ #include <linux/errno.h>
+ #include <linux/io.h>
+ #include <linux/dma-mapping.h>
++#include <linux/completion.h>
+ #include <linux/mutex.h>
+ #include <linux/spinlock.h>
+ 
+@@ -57,9 +58,11 @@ struct mc_command;
+  * @portal_size: MC command portal size in bytes
+  * @portal_phys_addr: MC command portal physical address
+  * @portal_virt_addr: MC command portal virtual address
+- * @resource: generic resource associated with the MC portal if
+- * the MC portal came from a resource pool, or NULL if the MC portal
+- * is permanently bound to a device (e.g., a DPRC)
++ * @dpmcp_dev: pointer to the DPMCP device associated with the MC portal.
++ * @mc_command_done_irq_armed: Flag indicating that the MC command done IRQ
++ * is currently armed.
++ * @mc_command_done_completion: Completion variable to be signaled when an MC
++ * command sent to the MC fw is completed.
+  * @mutex: Mutex to serialize mc_send_command() calls that use the same MC
+  * portal, if the fsl_mc_io object was created with the
+  * FSL_MC_IO_ATOMIC_CONTEXT_PORTAL flag off. mc_send_command() calls for this
+@@ -75,7 +78,9 @@ struct fsl_mc_io {
+ 	uint16_t portal_size;
+ 	phys_addr_t portal_phys_addr;
+ 	void __iomem *portal_virt_addr;
+-	struct fsl_mc_resource *resource;
++	struct fsl_mc_device *dpmcp_dev;
++	bool mc_command_done_irq_armed;
++	struct completion mc_command_done_completion;
+ 	union {
+ 		struct mutex mutex;	/* serializes mc_send_command() calls */
+ 		spinlock_t spinlock;	/* serializes mc_send_command() calls */
+@@ -85,11 +90,18 @@ struct fsl_mc_io {
+ int __must_check fsl_create_mc_io(struct device *dev,
+ 				  phys_addr_t mc_portal_phys_addr,
+ 				  uint32_t mc_portal_size,
+-				  struct fsl_mc_resource *resource,
++				  struct fsl_mc_device *dpmcp_dev,
+ 				  uint32_t flags, struct fsl_mc_io **new_mc_io);
+ 
+ void fsl_destroy_mc_io(struct fsl_mc_io *mc_io);
+ 
++int fsl_mc_io_set_dpmcp(struct fsl_mc_io *mc_io,
++			struct fsl_mc_device *dpmcp_dev);
++
++void fsl_mc_io_unset_dpmcp(struct fsl_mc_io *mc_io);
++
++int fsl_mc_io_setup_dpmcp_irq(struct fsl_mc_io *mc_io);
++
+ int mc_send_command(struct fsl_mc_io *mc_io, struct mc_command *cmd);
+ 
+ #endif /* _FSL_MC_SYS_H */
+-- 
+2.5.3
+
