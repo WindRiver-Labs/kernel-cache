@@ -1,0 +1,164 @@
+From 066f838720e0dded2b65c8272c7a787e1d116f5c Mon Sep 17 00:00:00 2001
+From: Alex Porosanu <alexandru.porosanu@freescale.com>
+Date: Tue, 21 Jul 2015 01:05:38 +0300
+Subject: [PATCH 428/451] crypto/caam: poll on the portal that generated the
+ interrupt
+
+This patch changes the way the CAAM QI driver behaves when a
+frame is dequeued: instead of polling on all portals, it will
+poll only on the portal corresponding to the core that got the
+interrupt. This aligns the QI driver with the dpa_eth driver,
+both of them sharing the QMan portal.
+This also fixes the
+
+softirq: huh, entered softirq 3 NET_RX ffffffc00060239c with preempt_count 00000101, exited with 00000102?
+
+message that was received for every frame the QI driver dequeued
+from the portal.
+
+Change-Id: Ife2d961604c6789a575710cbec74d026fb18f6c3
+Signed-off-by: Alex Porosanu <alexandru.porosanu@freescale.com>
+[Xulin: Original patch taken from
+Linux-LS1043A-SDK-V0.4-SOURCE-20150826-yocto.iso]
+Signed-off-by: Xulin Sun <xulin.sun@windriver.com>
+---
+ drivers/crypto/caam/qi.c |   58 ++++++++++++++++++++++++++++-----------------
+ 1 files changed, 36 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/crypto/caam/qi.c b/drivers/crypto/caam/qi.c
+index 4a9064b..439a298 100644
+--- a/drivers/crypto/caam/qi.c
++++ b/drivers/crypto/caam/qi.c
+@@ -42,12 +42,17 @@ struct caam_drv_ctx {
+ 	struct device *qidev;		/* device pointer for QI backend */
+ } ____cacheline_aligned;
+ 
++struct caam_napi {
++	struct napi_struct irqtask;	/* IRQ task for QI backend */
++	struct qman_portal *p;
++};
++
+ /*
+  * percpu private data structure to main list of pending responses expected
+  * on each cpu.
+  */
+ struct caam_qi_pcpu_priv {
+-	struct napi_struct irqtask;	/* IRQ task for QI backend */
++	struct caam_napi caam_napi;
+ 	struct net_device net_dev;	/* netdev used by NAPI */
+ 	struct qman_fq rsp_fq;		/* Response FQ from CAAM */
+ } ____cacheline_aligned;
+@@ -134,8 +139,7 @@ static void caam_fq_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
+ 	const struct qm_fd *fd;
+ 	struct caam_drv_req *drv_req;
+ 	const size_t size = 2 * sizeof(struct qm_sg_entry);
+-	struct device *qidev = &per_cpu(pcpu_qipriv.net_dev,
+-					smp_processor_id()).dev;
++	struct device *qidev = &(raw_cpu_ptr(&pcpu_qipriv)->net_dev.dev);
+ 
+ 	fd = &msg->ern.fd;
+ 
+@@ -492,11 +496,13 @@ EXPORT_SYMBOL(qi_cache_free);
+ 
+ static int caam_qi_poll(struct napi_struct *napi, int budget)
+ {
+-	int cleaned = qman_poll_dqrr(budget);
++	struct caam_napi *np = container_of(napi, struct caam_napi, irqtask);
++
++	int cleaned = qman_p_poll_dqrr(np->p, budget);
+ 
+ 	if (cleaned < budget) {
+ 		napi_complete(napi);
+-		qman_irqsource_add(QM_PIRQ_DQRI);
++		qman_p_irqsource_add(np->p, QM_PIRQ_DQRI);
+ 	}
+ 
+ 	return cleaned;
+@@ -532,8 +538,13 @@ int caam_qi_shutdown(struct device *qidev)
+ 	struct cpumask old_cpumask = *tsk_cpus_allowed(current);
+ 
+ 	for_each_cpu(i, cpus) {
+-		napi_disable(&per_cpu(pcpu_qipriv.irqtask, i));
+-		netif_napi_del(&per_cpu(pcpu_qipriv.irqtask, i));
++		struct napi_struct *irqtask;
++
++		irqtask = &per_cpu_ptr(&pcpu_qipriv.caam_napi, i)->irqtask;
++
++		napi_disable(irqtask);
++		netif_napi_del(irqtask);
++
+ 		if (kill_fq(qidev, &per_cpu(pcpu_qipriv.rsp_fq, i)))
+ 			dev_err(qidev, "Rsp FQ kill failed, cpu: %d\n", i);
+ 	}
+@@ -572,7 +583,7 @@ static void rsp_cgr_cb(struct qman_portal *qm, struct qman_cgr *cgr,
+ 		pr_info_ratelimited("CAAM rsp path congestion state exit\n");
+ }
+ 
+-static int caam_qi_napi_schedule(struct napi_struct *napi)
++static int caam_qi_napi_schedule(struct qman_portal *p, struct caam_napi *np)
+ {
+ 	/*
+ 	 * In case of threaded ISR for RT enable kernel,
+@@ -580,10 +591,12 @@ static int caam_qi_napi_schedule(struct napi_struct *napi)
+ 	 * in_serving_softirq to distinguish softirq or irq context.
+ 	 */
+ 	if (unlikely(in_irq() || !in_serving_softirq())) {
+-		/* Disable QMan IRQ and invoke NAPI */
+-		int ret = qman_irqsource_remove(QM_PIRQ_DQRI);
++		/* Disable QMan IRQ source and invoke NAPI */
++		int ret = qman_p_irqsource_remove(p, QM_PIRQ_DQRI);
++
+ 		if (likely(!ret)) {
+-			napi_schedule(napi);
++			np->p = p;
++			napi_schedule(&np->irqtask);
+ 			return 1;
+ 		}
+ 	}
+@@ -594,15 +607,13 @@ static enum qman_cb_dqrr_result caam_rsp_fq_dqrr_cb(struct qman_portal *p,
+ 					struct qman_fq *rsp_fq,
+ 					const struct qm_dqrr_entry *dqrr)
+ {
+-	struct napi_struct *napi;
++	struct caam_napi *caam_napi = raw_cpu_ptr(&pcpu_qipriv.caam_napi);
+ 	struct caam_drv_req *drv_req;
+ 	const struct qm_fd *fd;
+ 	const size_t size = 2 * sizeof(struct qm_sg_entry);
+-	struct device *qidev = &per_cpu(pcpu_qipriv.net_dev,
+-					smp_processor_id()).dev;
++	struct device *qidev = &(raw_cpu_ptr(&pcpu_qipriv)->net_dev.dev);
+ 
+-	napi = &per_cpu(pcpu_qipriv.irqtask, smp_processor_id());
+-	if (caam_qi_napi_schedule(napi))
++	if (caam_qi_napi_schedule(p, caam_napi))
+ 		return qman_cb_dqrr_stop;
+ 
+ 	fd = &dqrr->fd;
+@@ -812,15 +823,18 @@ int caam_qi_init(struct platform_device *caam_pdev, struct device_node *np)
+ 	 * portal.
+ 	 */
+ 	for_each_cpu(i, cpus) {
+-		per_cpu(pcpu_qipriv.net_dev, i).dev = *qidev;
++		struct caam_qi_pcpu_priv *priv = per_cpu_ptr(&pcpu_qipriv, i);
++		struct caam_napi *caam_napi = &priv->caam_napi;
++		struct napi_struct *irqtask = &caam_napi->irqtask;
++		struct net_device *net_dev = &priv->net_dev;
+ 
+-		INIT_LIST_HEAD(&per_cpu(pcpu_qipriv.net_dev, i).napi_list);
++		net_dev->dev = *qidev;
++		INIT_LIST_HEAD(&net_dev->napi_list);
+ 
+-		netif_napi_add(&per_cpu(pcpu_qipriv.net_dev, i),
+-			       &per_cpu(pcpu_qipriv.irqtask, i),
+-			       caam_qi_poll, CAAM_NAPI_WEIGHT);
++		netif_napi_add(net_dev, irqtask, caam_qi_poll,
++			       CAAM_NAPI_WEIGHT);
+ 
+-		napi_enable(&per_cpu(pcpu_qipriv.irqtask, i));
++		napi_enable(irqtask);
+ 	}
+ 
+ 	/* Hook up QI device to parent controlling caam device */
+-- 
+1.7.5.4
+
