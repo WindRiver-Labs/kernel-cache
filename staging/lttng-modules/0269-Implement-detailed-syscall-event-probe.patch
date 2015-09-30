@@ -1,0 +1,507 @@
+From 40e403817b1a453eeadd78346c5b0ba4d7b1cea6 Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Fri, 16 Sep 2011 16:41:56 -0400
+Subject: [PATCH 269/757] Implement detailed syscall event probe
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+---
+ drivers/staging/lttng/ltt-debugfs-abi.c            |  58 +++--
+ drivers/staging/lttng/ltt-debugfs-abi.h            |   2 +
+ drivers/staging/lttng/ltt-events.c                 |   6 +
+ drivers/staging/lttng/ltt-events.h                 |  17 ++
+ drivers/staging/lttng/probes/lttng-events.h        |  19 +-
+ .../staging/lttng/probes/lttng-probe-syscalls.c    | 247 ++++++++++++++++++++-
+ 6 files changed, 318 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/staging/lttng/ltt-debugfs-abi.c b/drivers/staging/lttng/ltt-debugfs-abi.c
+index 0b8a60a..81afdbd 100644
+--- a/drivers/staging/lttng/ltt-debugfs-abi.c
++++ b/drivers/staging/lttng/ltt-debugfs-abi.c
+@@ -514,31 +514,41 @@ int lttng_abi_create_event(struct file *channel_file,
+ 	default:
+ 		break;
+ 	}
+-	event_fd = get_unused_fd();
+-	if (event_fd < 0) {
+-		ret = event_fd;
+-		goto fd_error;
+-	}
+-	event_file = anon_inode_getfile("[lttng_event]",
+-					&lttng_event_fops,
+-					NULL, O_RDWR);
+-	if (IS_ERR(event_file)) {
+-		ret = PTR_ERR(event_file);
+-		goto file_error;
+-	}
+-	/*
+-	 * We tolerate no failure path after event creation. It will stay
+-	 * invariant for the rest of the session.
+-	 */
+-	event = ltt_event_create(channel, &event_param, NULL);
+-	if (!event) {
+-		ret = -EINVAL;
+-		goto event_error;
++	switch (event_param.instrumentation) {
++	default:
++		event_fd = get_unused_fd();
++		if (event_fd < 0) {
++			ret = event_fd;
++			goto fd_error;
++		}
++		event_file = anon_inode_getfile("[lttng_event]",
++						&lttng_event_fops,
++						NULL, O_RDWR);
++		if (IS_ERR(event_file)) {
++			ret = PTR_ERR(event_file);
++			goto file_error;
++		}
++		/*
++		 * We tolerate no failure path after event creation. It
++		 * will stay invariant for the rest of the session.
++		 */
++		event = ltt_event_create(channel, &event_param, NULL);
++		if (!event) {
++			ret = -EINVAL;
++			goto event_error;
++		}
++		event_file->private_data = event;
++		fd_install(event_fd, event_file);
++		/* The event holds a reference on the channel */
++		atomic_long_inc(&channel_file->f_count);
++		break;
++	case LTTNG_KERNEL_SYSCALLS:
++		ret = lttng_syscalls_register(channel, NULL);
++		if (ret)
++			goto fd_error;
++		event_fd = 0;
++		break;
+ 	}
+-	event_file->private_data = event;
+-	fd_install(event_fd, event_file);
+-	/* The event holds a reference on the channel */
+-	atomic_long_inc(&channel_file->f_count);
+ 	return event_fd;
+ 
+ event_error:
+diff --git a/drivers/staging/lttng/ltt-debugfs-abi.h b/drivers/staging/lttng/ltt-debugfs-abi.h
+index f7e6431..ce56944 100644
+--- a/drivers/staging/lttng/ltt-debugfs-abi.h
++++ b/drivers/staging/lttng/ltt-debugfs-abi.h
+@@ -20,6 +20,8 @@ enum lttng_kernel_instrumentation {
+ 	LTTNG_KERNEL_KPROBE	= 1,
+ 	LTTNG_KERNEL_FUNCTION	= 2,
+ 	LTTNG_KERNEL_KRETPROBE	= 3,
++	LTTNG_KERNEL_NOOP	= 4,	/* not hooked */
++	LTTNG_KERNEL_SYSCALLS	= 5,
+ };
+ 
+ /*
+diff --git a/drivers/staging/lttng/ltt-events.c b/drivers/staging/lttng/ltt-events.c
+index 28f7bdb..f9688f5 100644
+--- a/drivers/staging/lttng/ltt-events.c
++++ b/drivers/staging/lttng/ltt-events.c
+@@ -66,6 +66,10 @@ void ltt_session_destroy(struct ltt_session *session)
+ 
+ 	mutex_lock(&sessions_mutex);
+ 	ACCESS_ONCE(session->active) = 0;
++	list_for_each_entry(chan, &session->chan, list) {
++		ret = lttng_syscalls_unregister(chan);
++		WARN_ON(ret);
++	}
+ 	list_for_each_entry(event, &session->events, list) {
+ 		ret = _ltt_event_unregister(event);
+ 		WARN_ON(ret);
+@@ -361,6 +365,8 @@ struct ltt_event *ltt_event_create(struct ltt_channel *chan,
+ 		ret = try_module_get(event->desc->owner);
+ 		WARN_ON_ONCE(!ret);
+ 		break;
++	case LTTNG_KERNEL_NOOP:
++		break;
+ 	default:
+ 		WARN_ON_ONCE(1);
+ 	}
+diff --git a/drivers/staging/lttng/ltt-events.h b/drivers/staging/lttng/ltt-events.h
+index 5dcfd94..395e410 100644
+--- a/drivers/staging/lttng/ltt-events.h
++++ b/drivers/staging/lttng/ltt-events.h
+@@ -241,6 +241,7 @@ struct ltt_channel {
+ 	struct list_head list;		/* Channel list */
+ 	struct ltt_channel_ops *ops;
+ 	struct ltt_transport *transport;
++	struct ltt_event **sc_table;	/* for syscall tracing */
+ 	int header_type;		/* 0: unset, 1: compact, 2: large */
+ 	int metadata_dumped:1;
+ };
+@@ -297,6 +298,22 @@ const struct lttng_event_desc *ltt_event_get(const char *name);
+ void ltt_event_put(const struct lttng_event_desc *desc);
+ int ltt_probes_init(void);
+ void ltt_probes_exit(void);
++
++#ifdef SYSCALL_DETAIL
++int lttng_syscalls_register(struct ltt_channel *chan, void *filter);
++int lttng_syscalls_unregister(struct ltt_channel *chan);
++#else
++static inline int lttng_syscalls_register(struct ltt_channel *chan, void *filter)
++{
++	return -ENOSYS;
++}
++
++static inline int lttng_syscalls_unregister(struct ltt_channel *chan)
++{
++	return 0;
++}
++#endif
++
+ struct lttng_ctx_field *lttng_append_context(struct lttng_ctx **ctx);
+ int lttng_find_context(struct lttng_ctx *ctx, const char *name);
+ void lttng_remove_context_field(struct lttng_ctx **ctx,
+diff --git a/drivers/staging/lttng/probes/lttng-events.h b/drivers/staging/lttng/probes/lttng-events.h
+index d517da7..39b2888 100644
+--- a/drivers/staging/lttng/probes/lttng-events.h
++++ b/drivers/staging/lttng/probes/lttng-events.h
+@@ -211,12 +211,16 @@ static void __event_probe__##_name(void *__data, _proto);
+ 
+ #include "lttng-events-reset.h"	/* Reset all macros within TRACE_EVENT */
+ 
++#ifndef TP_PROBE_CB
++#define TP_PROBE_CB(_template)	&__event_probe__##_template
++#endif
++
+ #undef DEFINE_EVENT
+ #define DEFINE_EVENT(_template, _name, _proto, _args)			       \
+ 		{							       \
+ 			.fields = __event_fields___##_template,		       \
+ 			.name = #_name,					       \
+-			.probe_callback = (void *) &__event_probe__##_template,\
++			.probe_callback = (void *) TP_PROBE_CB(_template),     \
+ 			.nr_fields = ARRAY_SIZE(__event_fields___##_template), \
+ 			.owner = THIS_MODULE,				       \
+ 		},
+@@ -532,6 +536,15 @@ static void __event_probe__##_name(void *__data, _proto)		      \
+ 
+ #include "lttng-events-reset.h"	/* Reset all macros within TRACE_EVENT */
+ 
++/* Override for syscall tracing */
++#ifndef TP_REGISTER_OVERRIDE
++#define TP_REGISTER_OVERRIDE	ltt_probe_register
++#endif
++
++#ifndef TP_UNREGISTER_OVERRIDE
++#define TP_UNREGISTER_OVERRIDE	ltt_probe_unregister
++#endif
++
+ #define TP_ID1(_token, _system)	_token##_system
+ #define TP_ID(_token, _system)	TP_ID1(_token, _system)
+ #define module_init_eval1(_token, _system)	module_init(_token##_system)
+@@ -542,14 +555,14 @@ static void __event_probe__##_name(void *__data, _proto)		      \
+ static int TP_ID(__lttng_events_init__, TRACE_SYSTEM)(void)
+ {
+ 	wrapper_vmalloc_sync_all();
+-	return ltt_probe_register(&TP_ID(__probe_desc___, TRACE_SYSTEM));
++	return TP_REGISTER_OVERRIDE(&TP_ID(__probe_desc___, TRACE_SYSTEM));
+ }
+ 
+ module_init_eval(__lttng_events_init__, TRACE_SYSTEM);
+ 
+ static void TP_ID(__lttng_events_exit__, TRACE_SYSTEM)(void)
+ {
+-	ltt_probe_unregister(&TP_ID(__probe_desc___, TRACE_SYSTEM));
++	TP_UNREGISTER_OVERRIDE(&TP_ID(__probe_desc___, TRACE_SYSTEM));
+ }
+ 
+ module_exit_eval(__lttng_events_exit__, TRACE_SYSTEM);
+diff --git a/drivers/staging/lttng/probes/lttng-probe-syscalls.c b/drivers/staging/lttng/probes/lttng-probe-syscalls.c
+index 6bc65fc..bb7217b 100644
+--- a/drivers/staging/lttng/probes/lttng-probe-syscalls.c
++++ b/drivers/staging/lttng/probes/lttng-probe-syscalls.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include <linux/module.h>
++#include "../ltt-events.h"
+ 
+ #ifndef SYSCALL_DETAIL
+ 
+@@ -29,37 +30,275 @@
+ 
+ #else	/* SYSCALL_DETAIL */
+ 
++#include <linux/slab.h>
++#include <asm/ptrace.h>
++#include <asm/syscall.h>
++
++static void syscall_entry_probe(void *__data, struct pt_regs *regs, long id);
++static int lttng_syscalls_register_probe(struct lttng_probe_desc *desc);
++static void lttng_syscalls_unregister_probe(struct lttng_probe_desc *desc);
++
++static struct lttng_probe_desc *syscall_probe_desc;
++
+ /*
+  * Create LTTng tracepoint probes.
+  */
+ #define LTTNG_PACKAGE_BUILD
+ #define CREATE_TRACE_POINTS
+ 
+-#define TRACE_INCLUDE_PATH ../instrumentation/syscalls/headers
++/* Hijack probe callback for system calls */
++#define TP_PROBE_CB(_template)		&syscall_entry_probe
++#define TP_REGISTER_OVERRIDE		lttng_syscalls_register_probe
++#define TP_UNREGISTER_OVERRIDE		lttng_syscalls_unregister_probe
+ 
+-#define TRACE_SYSCALL_TABLE(_name, _nr, _nrargs)
++#define TRACE_INCLUDE_PATH ../instrumentation/syscalls/headers
+ 
+ #include "../instrumentation/syscalls/headers/syscalls.h"
+ 
++#undef TP_UNREGISTER_OVERRIDE
++#undef TP_REGISTER_OVERRIDE
++#undef TP_PROBE_CB
+ #undef LTTNG_PACKAGE_BUILD
+ #undef CREATE_TRACE_POINTS
+ 
+ struct trace_syscall_entry {
+ 	void *func;
++	const struct lttng_event_desc *desc;	/* Set dynamically */
++	const struct lttng_event_field *fields;
+ 	unsigned int nrargs;
+ };
+ 
++static int sc_table_desc_filled;
++
+ #define CREATE_SYSCALL_TABLE
+ 
+ #undef TRACE_SYSCALL_TABLE
+-#define TRACE_SYSCALL_TABLE(_name, _nr, _nrargs)	\
+-	[ _nr ] = { .func = __event_probe__##_name, .nrargs = (_nrargs) },
++#define TRACE_SYSCALL_TABLE(_name, _nr, _nrargs)		\
++	[ _nr ] = {						\
++		.func = __event_probe__##_name,			\
++		.nrargs = (_nrargs),				\
++		.fields = __event_fields___##_name,		\
++	},
+ 
+ static struct trace_syscall_entry sc_table[] = {
+ #include "../instrumentation/syscalls/headers/syscalls.h"
+ };
++
+ #undef CREATE_SYSCALL_TABLE
+ 
++static void syscall_entry_probe(void *__data, struct pt_regs *regs, long id)
++{
++	struct trace_syscall_entry *entry;
++	struct ltt_channel *chan = __data;
++	struct ltt_event *event;
++
++	if (unlikely(id >= ARRAY_SIZE(sc_table)))
++		return;
++	entry = &sc_table[id];
++	if (unlikely(!entry->func))
++		return;
++	event = chan->sc_table[id];
++	WARN_ON_ONCE(!event);
++
++	switch (entry->nrargs) {
++	case 0:
++	{
++		void (*fptr)(void *__data) = entry->func;
++
++		fptr(event);
++		break;
++	}
++	case 1:
++	{
++		void (*fptr)(void *__data, unsigned long arg0) = entry->func;
++		unsigned long args[1];
++
++		syscall_get_arguments(current, regs, 0, entry->nrargs, args);
++		fptr(event, args[0]);
++		break;
++	}
++	case 2:
++	{
++		void (*fptr)(void *__data,
++			unsigned long arg0,
++			unsigned long arg1) = entry->func;
++		unsigned long args[2];
++
++		syscall_get_arguments(current, regs, 0, entry->nrargs, args);
++		fptr(event, args[0], args[1]);
++		break;
++	}
++	case 3:
++	{
++		void (*fptr)(void *__data,
++			unsigned long arg0,
++			unsigned long arg1,
++			unsigned long arg2) = entry->func;
++		unsigned long args[3];
++
++		syscall_get_arguments(current, regs, 0, entry->nrargs, args);
++		fptr(event, args[0], args[1], args[2]);
++		break;
++	}
++	case 4:
++	{
++		void (*fptr)(void *__data,
++			unsigned long arg0,
++			unsigned long arg1,
++			unsigned long arg2,
++			unsigned long arg3) = entry->func;
++		unsigned long args[4];
++
++		syscall_get_arguments(current, regs, 0, entry->nrargs, args);
++		fptr(event, args[0], args[1], args[2], args[3]);
++		break;
++	}
++	case 5:
++	{
++		void (*fptr)(void *__data,
++			unsigned long arg0,
++			unsigned long arg1,
++			unsigned long arg2,
++			unsigned long arg3,
++			unsigned long arg4) = entry->func;
++		unsigned long args[5];
++
++		syscall_get_arguments(current, regs, 0, entry->nrargs, args);
++		fptr(event, args[0], args[1], args[2], args[3], args[4]);
++		break;
++	}
++	case 6:
++	{
++		void (*fptr)(void *__data,
++			unsigned long arg0,
++			unsigned long arg1,
++			unsigned long arg2,
++			unsigned long arg3,
++			unsigned long arg4,
++			unsigned long arg5) = entry->func;
++		unsigned long args[6];
++
++		syscall_get_arguments(current, regs, 0, entry->nrargs, args);
++		fptr(event, args[0], args[1], args[2],
++			args[3], args[4], args[5]);
++		break;
++	}
++	default:
++		break;
++	}
++}
++
++static const struct lttng_event_desc *find_syscall_desc(unsigned int id)
++{
++	unsigned int i;
++
++	for (i = 0; i < syscall_probe_desc->nr_events; i++) {
++		if (syscall_probe_desc->event_desc[i].fields
++				== sc_table[id].fields)
++			return &syscall_probe_desc->event_desc[i];
++	}
++	WARN_ON_ONCE(1);
++	return NULL;
++}
++
++static void fill_sc_table_desc(void)
++{
++	unsigned int i;
++
++	if (sc_table_desc_filled)
++		return;
++	/*
++	 * This is O(n^2), but rare. Eventually get the TRACE_EVENT code
++	 * to emit per-event symbols to skip this.
++	 */
++	for (i = 0; i < ARRAY_SIZE(sc_table); i++) {
++		const struct lttng_event_desc **desc = &sc_table[i].desc;
++
++		if (!sc_table[i].func)
++			continue;
++		(*desc) = find_syscall_desc(i);
++	}
++	sc_table_desc_filled = 1;
++}
++
++
++int lttng_syscalls_register(struct ltt_channel *chan, void *filter)
++{
++	unsigned int i;
++	int ret;
++
++	fill_sc_table_desc();
++
++	if (!chan->sc_table) {
++		/* create syscall table mapping syscall to events */
++		chan->sc_table = kzalloc(sizeof(struct ltt_event *)
++					* ARRAY_SIZE(sc_table), GFP_KERNEL);
++		if (!chan->sc_table)
++			return -ENOMEM;
++	}
++
++	/* Allocate events for each syscall, insert into table */
++	for (i = 0; i < ARRAY_SIZE(sc_table); i++) {
++		struct lttng_kernel_event ev;
++		const struct lttng_event_desc *desc = sc_table[i].desc;
++
++		/*
++		 * Skip those already populated by previous failed
++		 * register for this channel.
++		 */
++		if (chan->sc_table[i])
++			continue;
++		memset(&ev, 0, sizeof(ev));
++		strncpy(ev.name, desc->name, LTTNG_SYM_NAME_LEN);
++		ev.name[LTTNG_SYM_NAME_LEN - 1] = '\0';
++		ev.instrumentation = LTTNG_KERNEL_NOOP;
++		chan->sc_table[i] = ltt_event_create(chan, &ev, filter);
++		if (!chan->sc_table[i]) {
++			/*
++			 * If something goes wrong in event registration
++			 * after the first one, we have no choice but to
++			 * leave the previous events in there, until
++			 * deleted by session teardown.
++			 */
++			return -EINVAL;
++		}
++	}
++	ret = tracepoint_probe_register("syscall_entry",
++			(void *) syscall_entry_probe, chan);
++	return ret;
++}
++
++/*
++ * Only called at session destruction.
++ */
++int lttng_syscalls_unregister(struct ltt_channel *chan)
++{
++	int ret;
++
++	if (!chan->sc_table)
++		return 0;
++	ret = tracepoint_probe_unregister("syscall_entry",
++			(void *) syscall_entry_probe, chan);
++	if (ret)
++		return ret;
++	/* ltt_event destroy will be performed by ltt_session_destroy() */
++	kfree(chan->sc_table);
++	return 0;
++}
++
++static int lttng_syscalls_register_probe(struct lttng_probe_desc *desc)
++{
++	WARN_ON_ONCE(syscall_probe_desc);
++	syscall_probe_desc = desc;
++	return 0;
++}
++
++static void lttng_syscalls_unregister_probe(struct lttng_probe_desc *desc)
++{
++	WARN_ON_ONCE(!syscall_probe_desc);
++	syscall_probe_desc = NULL;
++}
++
+ #endif	/* SYSCALL_DETAIL */
+ 
+ MODULE_LICENSE("GPL and additional rights");
+-- 
+2.0.2
+

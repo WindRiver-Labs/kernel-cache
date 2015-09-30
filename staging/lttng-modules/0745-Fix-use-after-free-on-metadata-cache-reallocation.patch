@@ -1,0 +1,166 @@
+From 45f1216ab54d6167831953caa77c288dc5ec7331 Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Thu, 25 Jun 2015 09:10:52 -0400
+Subject: [PATCH 745/757] Fix: use after free on metadata cache reallocation
+
+When the metadata cache is expanded (reallocated) by
+lttng_metadata_printf(), the metadata cache reader
+(lttng_metadata_output_channel()) may use freed memory, because the
+metadata cache is not protected from concurrent read accesses. The
+metadata cache updates are protected from each other by the sessions
+mutex, but metadata cache reads do not hold the sessions mutex.
+Actually, the comment on top of lttng_metadata_output_channel() stating
+"We have exclusive access to our metadata buffer (protected by the
+sessions_mutex)" is simply wrong, because this mutex is never held when
+calling lttng_metadata_output_channel().
+
+Promote the per-stream lock to the metadata cache used by each of those
+metadata streams, thus ensuring mutual exclusion between metadata cache
+reallocation and readers.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+---
+ drivers/staging/lttng/lttng-abi.c    |  3 ++-
+ drivers/staging/lttng/lttng-events.c | 32 +++++++++++++++++++++-----------
+ drivers/staging/lttng/lttng-events.h |  2 +-
+ 3 files changed, 24 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/staging/lttng/lttng-abi.c b/drivers/staging/lttng/lttng-abi.c
+index 5823a1d..6993a46 100644
+--- a/drivers/staging/lttng/lttng-abi.c
++++ b/drivers/staging/lttng/lttng-abi.c
+@@ -565,9 +565,11 @@ unsigned int lttng_metadata_ring_buffer_poll(struct file *filp,
+ 		if (finalized)
+ 			mask |= POLLHUP;
+ 
++		mutex_lock(&stream->metadata_cache->lock);
+ 		if (stream->metadata_cache->metadata_written >
+ 				stream->metadata_out)
+ 			mask |= POLLIN;
++		mutex_unlock(&stream->metadata_cache->lock);
+ 	}
+ 
+ 	return mask;
+@@ -865,7 +867,6 @@ int lttng_abi_open_metadata_stream(struct file *channel_file)
+ 	metadata_stream->priv = buf;
+ 	stream_priv = metadata_stream;
+ 	metadata_stream->transport = channel->transport;
+-	mutex_init(&metadata_stream->lock);
+ 
+ 	/*
+ 	 * Since life-time of metadata cache differs from that of
+diff --git a/drivers/staging/lttng/lttng-events.c b/drivers/staging/lttng/lttng-events.c
+index 2820a0e..9b3d766 100644
+--- a/drivers/staging/lttng/lttng-events.c
++++ b/drivers/staging/lttng/lttng-events.c
+@@ -102,6 +102,7 @@ struct lttng_session *lttng_session_create(void)
+ 		goto err_free_cache;
+ 	metadata_cache->cache_alloc = METADATA_CACHE_DEFAULT_SIZE;
+ 	kref_init(&metadata_cache->refcount);
++	mutex_init(&metadata_cache->lock);
+ 	session->metadata_cache = metadata_cache;
+ 	INIT_LIST_HEAD(&metadata_cache->metadata_stream);
+ 	memcpy(&metadata_cache->uuid, &session->uuid,
+@@ -595,10 +596,12 @@ void _lttng_event_destroy(struct lttng_event *event)
+ /*
+  * Serialize at most one packet worth of metadata into a metadata
+  * channel.
+- * We have exclusive access to our metadata buffer (protected by the
+- * sessions_mutex), so we can do racy operations such as looking for
+- * remaining space left in packet and write, since mutual exclusion
+- * protects us from concurrent writes.
++ * We grab the metadata cache mutex to get exclusive access to our metadata
++ * buffer and to the metadata cache. Exclusive access to the metadata buffer
++ * allows us to do racy operations such as looking for remaining space left in
++ * packet and write, since mutual exclusion protects us from concurrent writes.
++ * Mutual exclusion on the metadata cache allow us to read the cache content
++ * without racing against reallocation of the cache by updates.
+  * Returns the number of bytes written in the channel, 0 if no data
+  * was written and a negative value on error.
+  */
+@@ -610,13 +613,15 @@ int lttng_metadata_output_channel(struct lttng_metadata_stream *stream,
+ 	size_t len, reserve_len;
+ 
+ 	/*
+-	 * Ensure we support mutiple get_next / put sequences followed
+-	 * by put_next. The metadata stream lock internally protects
+-	 * reading the metadata cache. It can indeed be read
+-	 * concurrently by "get_next_subbuf" and "flush" operations on
+-	 * the buffer invoked by different processes.
++	 * Ensure we support mutiple get_next / put sequences followed by
++	 * put_next. The metadata cache lock protects reading the metadata
++	 * cache. It can indeed be read concurrently by "get_next_subbuf" and
++	 * "flush" operations on the buffer invoked by different processes.
++	 * Moreover, since the metadata cache memory can be reallocated, we
++	 * need to have exclusive access against updates even though we only
++	 * read it.
+ 	 */
+-	mutex_lock(&stream->lock);
++	mutex_lock(&stream->metadata_cache->lock);
+ 	WARN_ON(stream->metadata_in < stream->metadata_out);
+ 	if (stream->metadata_in != stream->metadata_out)
+ 		goto end;
+@@ -646,13 +651,15 @@ int lttng_metadata_output_channel(struct lttng_metadata_stream *stream,
+ 	ret = reserve_len;
+ 
+ end:
+-	mutex_unlock(&stream->lock);
++	mutex_unlock(&stream->metadata_cache->lock);
+ 	return ret;
+ }
+ 
+ /*
+  * Write the metadata to the metadata cache.
+  * Must be called with sessions_mutex held.
++ * The metadata cache lock protects us from concurrent read access from
++ * thread outputting metadata content to ring buffer.
+  */
+ int lttng_metadata_printf(struct lttng_session *session,
+ 			  const char *fmt, ...)
+@@ -671,6 +678,7 @@ int lttng_metadata_printf(struct lttng_session *session,
+ 		return -ENOMEM;
+ 
+ 	len = strlen(str);
++	mutex_lock(&session->metadata_cache->lock);
+ 	if (session->metadata_cache->metadata_written + len >
+ 			session->metadata_cache->cache_alloc) {
+ 		char *tmp_cache_realloc;
+@@ -690,6 +698,7 @@ int lttng_metadata_printf(struct lttng_session *session,
+ 			session->metadata_cache->metadata_written,
+ 			str, len);
+ 	session->metadata_cache->metadata_written += len;
++	mutex_unlock(&session->metadata_cache->lock);
+ 	kfree(str);
+ 
+ 	list_for_each_entry(stream, &session->metadata_cache->metadata_stream, list)
+@@ -698,6 +707,7 @@ int lttng_metadata_printf(struct lttng_session *session,
+ 	return 0;
+ 
+ err:
++	mutex_unlock(&session->metadata_cache->lock);
+ 	kfree(str);
+ 	return -ENOMEM;
+ }
+diff --git a/drivers/staging/lttng/lttng-events.h b/drivers/staging/lttng/lttng-events.h
+index 118ea3b..c2eba8f 100644
+--- a/drivers/staging/lttng/lttng-events.h
++++ b/drivers/staging/lttng/lttng-events.h
+@@ -321,7 +321,6 @@ struct lttng_metadata_stream {
+ 	wait_queue_head_t read_wait;	/* Reader buffer-level wait queue */
+ 	struct list_head list;		/* Stream list */
+ 	struct lttng_transport *transport;
+-	struct mutex lock;
+ };
+ 
+ struct lttng_session {
+@@ -344,6 +343,7 @@ struct lttng_metadata_cache {
+ 	struct kref refcount;		/* Metadata cache usage */
+ 	struct list_head metadata_stream;	/* Metadata stream list */
+ 	uuid_le uuid;			/* Trace session unique ID (copy) */
++	struct mutex lock;
+ };
+ 
+ struct lttng_session *lttng_session_create(void);
+-- 
+2.0.2
+
