@@ -1,0 +1,438 @@
+From d4a49424a492fff178aa556f375427a3581785d3 Mon Sep 17 00:00:00 2001
+From: Marian Rotariu <marian.rotariu@freescale.com>
+Date: Mon, 17 Mar 2014 16:45:57 +0200
+Subject: [PATCH 619/987] offline_port: add functionality for OH port driver
+
+[Original patch taken from QorIQ-SDK-V1.6-SOURCE-20140619-yocto.iso]
+
+Historically the offline port driver did not initialize the frame queues that
+entered and exited the OH port and relied on software components (Ethernet
+driver, USDPAA, other kernel modules) to initialize those queues.
+
+The last major modification in the offline port driver added capabilities to
+initialize ingress queues (queues that enter the Offline Port) simplifying
+the work for the Ethernet driver, but maintaining the same complexity in USDPAA
+and/or other kernel modules.
+
+This patch adds full capability for initializing both ingress and egress
+queues, eliminating the dependency on USDPAA and/or other kernel modules. With
+it, complex offload architectures that have OH ports can be largely initialized
+by the offline port driver.
+
+The additional device tree attributes that this patch adds are optional and do
+not interfere with the current code. Therefore, backward compatibility is
+maintained.
+
+This patch also simplifies the initialization of the hardware used by the
+macless or the newer Ethernet driver, oNIC. Test scenarios (mainly unit tests)
+can be created without using USDPAA or Offload Driver.
+
+The device tree format for the new attributes is:
+fsl,qman-frame-queues-ingress = <base_id1 count1 ... base_idn countn>;
+fsl,qman-frame-queues-egress = <base_id1 count1 ... base_idn countn>;
+fsl,qman-channel-ids-egress = <channel_id1 ... channel_idn>;
+
+The above queues are connected only to DC portals. Frame queues connected to SW
+portals should be created from another software entity. Also, if a frame queue
+uses different initialization parameters it should be created by another
+software entity.
+
+Change-Id: I0fffc6116bbf543542c30eb6225b2a76945d3813
+Signed-off-by: Marian Rotariu <marian.rotariu@freescale.com>
+Reviewed-on: http://git.am.freescale.net:8181/9648
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Reviewed-by: Madalin-Cristian Bucur <madalin.bucur@freescale.com>
+Reviewed-by: Bogdan Purcareata <bogdan.purcareata@freescale.com>
+Reviewed-by: Jose Rivera <German.Rivera@freescale.com>
+(cherry picked from commit 43c88bc759c12472262788d8f39dd3d79c6f5e44)
+Reviewed-on: http://git.am.freescale.net:8181/10296
+---
+ drivers/net/ethernet/freescale/dpa/offline_port.c | 284 ++++++++++++++++++++--
+ drivers/net/ethernet/freescale/dpa/offline_port.h |  12 +
+ 2 files changed, 275 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/dpa/offline_port.c b/drivers/net/ethernet/freescale/dpa/offline_port.c
+index 7b0d8f7..17ed9af 100644
+--- a/drivers/net/ethernet/freescale/dpa/offline_port.c
++++ b/drivers/net/ethernet/freescale/dpa/offline_port.c
+@@ -143,6 +143,50 @@ static uint32_t oh_fq_create(struct qman_fq *fq,
+ 	return 0;
+ }
+ 
++void dump_fq(struct device *dev, int fqid, int channel)
++{
++	if (channel) {
++		/* display fqs with a valid (!= 0) destination channel */
++		dev_info(dev, "FQ ID:%d Channel ID:%d\n", fqid, channel);
++	}
++}
++
++void dump_fq_duple(struct device *dev, struct qman_fq *fqs, int fqs_count,
++		int channel_id)
++{
++	int i;
++	for (i = 0; i < fqs_count; i++)
++		dump_fq(dev, (fqs + i)->fqid, channel_id);
++}
++
++void dump_oh_config(struct device *dev, struct dpa_oh_config_s *conf)
++{
++	struct list_head *fq_list;
++	struct fq_duple *fqd;
++	int i;
++
++	dev_info(dev, "Default egress frame queue: %d\n", conf->default_fqid);
++	dev_info(dev, "Default error frame queue: %d\n", conf->error_fqid);
++
++	/* TX queues (old initialization) */
++	dev_info(dev, "Initialized queues:");
++	for (i = 0; i < conf->egress_cnt; i++)
++		dump_fq_duple(dev, conf->egress_fqs, conf->egress_cnt,
++				conf->channel);
++
++	/* initialized ingress queues */
++	list_for_each(fq_list, &conf->fqs_ingress_list) {
++		fqd = list_entry(fq_list, struct fq_duple, fq_list);
++		dump_fq_duple(dev, fqd->fqs, fqd->fqs_count, fqd->channel_id);
++	}
++
++	/* initialized egress queues */
++	list_for_each(fq_list, &conf->fqs_egress_list) {
++		fqd = list_entry(fq_list, struct fq_duple, fq_list);
++		dump_fq_duple(dev, fqd->fqs, fqd->fqs_count, fqd->channel_id);
++	}
++}
++
+ /* Destroys Frame Queues */
+ static void oh_fq_destroy(struct qman_fq *fq)
+ {
+@@ -202,31 +246,41 @@ static void oh_set_buffer_layout(struct fm_port *port,
+ static int
+ oh_port_probe(struct platform_device *_of_dev)
+ {
+-	struct device		*dpa_oh_dev;
+-	struct device_node	*dpa_oh_node;
+-	int			 lenp, _errno = 0, fq_idx, n_size, i, ret;
+-	const phandle		*oh_port_handle, *bpool_handle;
+-	struct platform_device	*oh_of_dev;
+-	struct device_node	*oh_node, *bpool_node = NULL, *root_node;
+-	struct device		*oh_dev;
+-	struct dpa_oh_config_s	*oh_config = NULL;
+-	uint32_t		*oh_all_queues;
+-	uint32_t		*oh_tx_queues;
+-	uint32_t		 queues_count;
+-	uint32_t		 crt_fqid_base;
+-	uint32_t		 crt_fq_count;
+-	bool			frag_enabled = false;
+-	struct fm_port_params	oh_port_tx_params;
+-	struct fm_port_pcd_param	oh_port_pcd_params;
++	struct device *dpa_oh_dev;
++	struct device_node *dpa_oh_node;
++	int lenp, _errno = 0, fq_idx, duple_idx;
++	int n_size, i, j, ret, duples_count;
++	const phandle *oh_port_handle, *bpool_handle;
++	struct platform_device *oh_of_dev;
++	struct device_node *oh_node, *bpool_node = NULL, *root_node;
++	struct device *oh_dev;
++	struct dpa_oh_config_s *oh_config = NULL;
++	uint32_t *oh_all_queues;
++	uint32_t *channel_ids;
++	uint32_t *oh_tx_queues;
++	uint32_t queues_count;
++	uint32_t crt_fqid_base;
++	uint32_t crt_fq_count;
++	bool frag_enabled = false;
++	struct fm_port_params oh_port_tx_params;
++	struct fm_port_pcd_param oh_port_pcd_params;
+ 	struct dpa_buffer_layout_s buf_layout;
++
+ 	/* True if the current partition owns the OH port. */
+ 	bool init_oh_port;
++
+ 	const struct of_device_id *match;
+ 	uint32_t crt_ext_pools_count, ext_pool_size;
+ 	const unsigned int *port_id;
+ 	const unsigned int *channel_id;
+-	const uint32_t		*bpool_cfg;
+-	const uint32_t		*bpid;
++
++	int channel_ids_count;
++	int channel_idx;
++	struct fq_duple *fqd;
++	struct list_head *fq_list, *fq_list_tmp;
++
++	const uint32_t *bpool_cfg;
++	const uint32_t *bpid;
+ 
+ 	memset(&oh_port_tx_params, 0, sizeof(oh_port_tx_params));
+ 	dpa_oh_dev = &_of_dev->dev;
+@@ -270,16 +324,22 @@ oh_port_probe(struct platform_device *_of_dev)
+ 		match->compatible);
+ 
+ 	port_id = of_get_property(oh_node, "cell-index", &lenp);
+-
+ 	if (port_id == NULL) {
+ 		dev_err(dpa_oh_dev, "No port id found in node %s\n",
+ 			dpa_oh_node->full_name);
+ 		_errno = -EINVAL;
+ 		goto return_kfree;
+ 	}
+-
+ 	BUG_ON(lenp % sizeof(*port_id));
+ 
++	channel_id = of_get_property(oh_node, "fsl,qman-channel-id", &lenp);
++	if (channel_id == NULL) {
++		dev_err(dpa_oh_dev, "No channel id found in node %s\n",
++			dpa_oh_node->full_name);
++		_errno = -EINVAL;
++		goto return_kfree;
++	}
++
+ 	oh_of_dev = of_find_device_by_node(oh_node);
+ 	BUG_ON(oh_of_dev == NULL);
+ 	oh_dev = &oh_of_dev->dev;
+@@ -318,6 +378,170 @@ oh_port_probe(struct platform_device *_of_dev)
+ 		goto return_kfree;
+ 	}
+ 
++	INIT_LIST_HEAD(&oh_config->fqs_ingress_list);
++	INIT_LIST_HEAD(&oh_config->fqs_egress_list);
++
++	/* FQs that enter OH port */
++	lenp = 0;
++	oh_all_queues = (uint32_t *)of_get_property(dpa_oh_node,
++		"fsl,qman-frame-queues-ingress", &lenp);
++	if (lenp % (2 * sizeof(*oh_all_queues))) {
++		dev_warn(dpa_oh_dev,
++			"Wrong ingress queues format for OH node %s referenced from node %s!\n",
++			oh_node->full_name, dpa_oh_node->full_name);
++		/* just ignore the last unpaired value */
++	}
++
++	duples_count = lenp / (2 * sizeof(*oh_all_queues));
++	dev_err(dpa_oh_dev, "Allocating %d ingress frame queues duples\n",
++			duples_count);
++	for (duple_idx = 0; duple_idx < duples_count; duple_idx++) {
++		crt_fqid_base = oh_all_queues[2 * duple_idx];
++		crt_fq_count = oh_all_queues[2 * duple_idx + 1];
++
++		fqd = devm_kzalloc(dpa_oh_dev,
++				sizeof(struct fq_duple), GFP_KERNEL);
++		if (!fqd) {
++			dev_err(dpa_oh_dev, "Can't allocate structures for ingress frame queues for OH node %s referenced from node %s!\n",
++					oh_node->full_name,
++					dpa_oh_node->full_name);
++			_errno = -ENOMEM;
++			goto return_kfree;
++		}
++
++		fqd->fqs = devm_kzalloc(dpa_oh_dev,
++				crt_fq_count * sizeof(struct qman_fq),
++				GFP_KERNEL);
++		if (!fqd->fqs) {
++			dev_err(dpa_oh_dev, "Can't allocate structures for ingress frame queues for OH node %s referenced from node %s!\n",
++					oh_node->full_name,
++					dpa_oh_node->full_name);
++			_errno = -ENOMEM;
++			goto return_kfree;
++		}
++
++		for (j = 0; j < crt_fq_count; j++)
++			(fqd->fqs + j)->fqid = crt_fqid_base + j;
++		fqd->fqs_count = crt_fq_count;
++		fqd->channel_id = *channel_id;
++		list_add(&fqd->fq_list, &oh_config->fqs_ingress_list);
++	}
++
++	/* create the ingress queues */
++	list_for_each(fq_list, &oh_config->fqs_ingress_list) {
++		fqd = list_entry(fq_list, struct fq_duple, fq_list);
++
++		for (j = 0; j < fqd->fqs_count; j++) {
++			ret = oh_fq_create(fqd->fqs + j,
++					(fqd->fqs + j)->fqid,
++					fqd->channel_id, 3);
++			if (ret != 0) {
++				dev_err(dpa_oh_dev, "Unable to create ingress frame queue %d for OH node %s referenced from node %s!\n",
++						(fqd->fqs + j)->fqid,
++						oh_node->full_name,
++						dpa_oh_node->full_name);
++				_errno = -EINVAL;
++				goto return_kfree;
++			}
++		}
++	}
++
++	/* FQs that exit OH port */
++	lenp = 0;
++	oh_all_queues = (uint32_t *)of_get_property(dpa_oh_node,
++		"fsl,qman-frame-queues-egress", &lenp);
++	if (lenp % (2 * sizeof(*oh_all_queues))) {
++		dev_warn(dpa_oh_dev,
++			"Wrong egress queues format for OH node %s referenced from node %s!\n",
++			oh_node->full_name, dpa_oh_node->full_name);
++		/* just ignore the last unpaired value */
++	}
++
++	duples_count = lenp / (2 * sizeof(*oh_all_queues));
++	dev_dbg(dpa_oh_dev, "Allocating %d egress frame queues duples\n",
++			duples_count);
++	for (duple_idx = 0; duple_idx < duples_count; duple_idx++) {
++		crt_fqid_base = oh_all_queues[2 * duple_idx];
++		crt_fq_count = oh_all_queues[2 * duple_idx + 1];
++
++		fqd = devm_kzalloc(dpa_oh_dev,
++				sizeof(struct fq_duple), GFP_KERNEL);
++		if (!fqd) {
++			dev_err(dpa_oh_dev, "Can't allocate structures for egress frame queues for OH node %s referenced from node %s!\n",
++					oh_node->full_name,
++					dpa_oh_node->full_name);
++			_errno = -ENOMEM;
++			goto return_kfree;
++		}
++
++		fqd->fqs = devm_kzalloc(dpa_oh_dev,
++				crt_fq_count * sizeof(struct qman_fq),
++				GFP_KERNEL);
++		if (!fqd->fqs) {
++			dev_err(dpa_oh_dev,
++					"Can't allocate structures for egress frame queues for OH node %s referenced from node %s!\n",
++					oh_node->full_name,
++					dpa_oh_node->full_name);
++			_errno = -ENOMEM;
++			goto return_kfree;
++		}
++
++		for (j = 0; j < crt_fq_count; j++)
++			(fqd->fqs + j)->fqid = crt_fqid_base + j;
++		fqd->fqs_count = crt_fq_count;
++		/* channel ID is specified in another attribute */
++		fqd->channel_id = 0;
++		list_add(&fqd->fq_list, &oh_config->fqs_egress_list);
++
++		/* allocate the queue */
++
++	}
++
++	/* channel_ids for FQs that exit OH port */
++	lenp = 0;
++	channel_ids = (uint32_t *)of_get_property(dpa_oh_node,
++		"fsl,qman-channel-ids-egress", &lenp);
++
++	channel_ids_count = lenp / (sizeof(*channel_ids));
++	if (channel_ids_count != duples_count) {
++		dev_warn(dpa_oh_dev,
++			"Not all egress queues have a channel id for OH node %s referenced from node %s!\n",
++			oh_node->full_name, dpa_oh_node->full_name);
++		/* just ignore the queues that do not have a Channel ID */
++	}
++
++	channel_idx = 0;
++	list_for_each(fq_list, &oh_config->fqs_egress_list) {
++		if (channel_idx + 1 > channel_ids_count)
++			break;
++		fqd = list_entry(fq_list, struct fq_duple, fq_list);
++		fqd->channel_id = channel_ids[channel_idx++];
++	}
++
++	/* create egress queues */
++	list_for_each(fq_list, &oh_config->fqs_egress_list) {
++		fqd = list_entry(fq_list, struct fq_duple, fq_list);
++
++		if (fqd->channel_id == 0) {
++			/* missing channel id in dts */
++			continue;
++		}
++
++		for (j = 0; j < fqd->fqs_count; j++) {
++			ret = oh_fq_create(fqd->fqs + j,
++					(fqd->fqs + j)->fqid,
++					fqd->channel_id, 3);
++			if (ret != 0) {
++				dev_err(dpa_oh_dev, "Unable to create egress frame queue %d for OH node %s referenced from node %s!\n",
++						(fqd->fqs + j)->fqid,
++						oh_node->full_name,
++						dpa_oh_node->full_name);
++				_errno = -EINVAL;
++				goto return_kfree;
++			}
++		}
++	}
++
+ 	/* Read FQ ids/nums for the DPA OH node */
+ 	oh_all_queues = (uint32_t *)of_get_property(dpa_oh_node,
+ 		"fsl,qman-frame-queues-oh", &lenp);
+@@ -472,7 +696,7 @@ config_port:
+ 
+ 	crt_ext_pools_count = lenp / sizeof(phandle);
+ 	dev_dbg(dpa_oh_dev, "OH port number of pools = %u\n",
+-					crt_ext_pools_count);
++			crt_ext_pools_count);
+ 
+ 	oh_port_tx_params.num_pools = crt_ext_pools_count;
+ 
+@@ -540,6 +764,9 @@ init_port:
+ 
+ 	dev_info(dpa_oh_dev, "OH port %s enabled.\n", oh_node->full_name);
+ 
++	/* print of all referenced & created queues */
++	dump_oh_config(dpa_oh_dev, oh_config);
++
+ 	return 0;
+ 
+ return_kfree:
+@@ -549,6 +776,21 @@ return_kfree:
+ 		of_node_put(oh_node);
+ 	if (oh_config && oh_config->egress_fqs)
+ 		devm_kfree(dpa_oh_dev, oh_config->egress_fqs);
++
++	list_for_each_safe(fq_list, fq_list_tmp, &oh_config->fqs_ingress_list) {
++		fqd = list_entry(fq_list, struct fq_duple, fq_list);
++		list_del(fq_list);
++		devm_kfree(dpa_oh_dev, fqd->fqs);
++		devm_kfree(dpa_oh_dev, fqd);
++	}
++
++	list_for_each_safe(fq_list, fq_list_tmp, &oh_config->fqs_egress_list) {
++		fqd = list_entry(fq_list, struct fq_duple, fq_list);
++		list_del(fq_list);
++		devm_kfree(dpa_oh_dev, fqd->fqs);
++		devm_kfree(dpa_oh_dev, fqd);
++	}
++
+ 	devm_kfree(dpa_oh_dev, oh_config);
+ 	return _errno;
+ }
+diff --git a/drivers/net/ethernet/freescale/dpa/offline_port.h b/drivers/net/ethernet/freescale/dpa/offline_port.h
+index 0b867e8..54b0fe4 100644
+--- a/drivers/net/ethernet/freescale/dpa/offline_port.h
++++ b/drivers/net/ethernet/freescale/dpa/offline_port.h
+@@ -35,6 +35,14 @@
+ struct fm_port;
+ struct qman_fq;
+ 
++/* fqs are defined in duples (base_fq, fq_count) */
++struct fq_duple {
++	struct qman_fq *fqs;
++	int fqs_count;
++	int channel_id;
++	struct list_head fq_list;
++};
++
+ /* OH port configuration */
+ struct dpa_oh_config_s {
+ 	uint32_t		error_fqid;
+@@ -42,6 +50,10 @@ struct dpa_oh_config_s {
+ 	struct fm_port		*oh_port;
+ 	uint32_t		egress_cnt;
+ 	struct qman_fq		*egress_fqs;
++	uint16_t		channel;
++
++	struct list_head fqs_ingress_list;
++	struct list_head fqs_egress_list;
+ };
+ 
+ #endif /* __OFFLINE_PORT_H */
+-- 
+1.9.1
+
