@@ -1,0 +1,312 @@
+From 833f86de057f7918d239785f2b3c42aa2dd9ced1 Mon Sep 17 00:00:00 2001
+From: "Chen, Gong" <gong.chen@linux.intel.com>
+Date: Wed, 12 Aug 2015 18:29:36 +0200
+Subject: [PATCH 16/25] x86/mce: Remove the MCE ring for Action Optional errors
+
+commit fd4cf79fcc4b5130ced8fd8c40378d3cec2e5fa8 upstream.
+
+Use unified genpool to save Action Optional error events and put
+Action Optional error handling in the same notification chain as
+MCE error decoding.
+
+Signed-off-by: Chen, Gong <gong.chen@linux.intel.com>
+[ Fold in subsequent patch from Boris for early boot logging. ]
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+[ Correct a lot. ]
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1439396985-12812-5-git-send-email-bp@alien8.de
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ arch/x86/include/asm/mce.h       |   2 +-
+ arch/x86/kernel/cpu/mcheck/mce.c | 135 +++++++++++++++++----------------------
+ drivers/acpi/acpi_extlog.c       |   2 +-
+ drivers/edac/i7core_edac.c       |   2 +-
+ drivers/edac/mce_amd.c           |   2 +-
+ drivers/edac/sb_edac.c           |   2 +-
+ 6 files changed, 65 insertions(+), 80 deletions(-)
+
+diff --git a/arch/x86/include/asm/mce.h b/arch/x86/include/asm/mce.h
+index 1f5a86d..d16f983 100644
+--- a/arch/x86/include/asm/mce.h
++++ b/arch/x86/include/asm/mce.h
+@@ -123,7 +123,7 @@ struct mce_vendor_flags {
+ extern struct mce_vendor_flags mce_flags;
+ 
+ extern struct mca_config mca_cfg;
+-extern void mce_register_decode_chain(struct notifier_block *nb);
++extern void mce_register_decode_chain(struct notifier_block *nb, bool drain);
+ extern void mce_unregister_decode_chain(struct notifier_block *nb);
+ 
+ #include <linux/percpu.h>
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index 8de4899..22acf60 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -111,6 +111,7 @@ static struct work_struct mce_work;
+ static struct irq_work mce_irq_work;
+ 
+ static void (*quirk_no_way_out)(int bank, struct mce *m, struct pt_regs *regs);
++static int mce_usable_address(struct mce *m);
+ 
+ /*
+  * CPU/chipset specific EDAC code can register a notifier call here to print
+@@ -231,11 +232,18 @@ static void drain_mcelog_buffer(void)
+ 	} while (next != prev);
+ }
+ 
++static struct notifier_block mce_srao_nb;
+ 
+-void mce_register_decode_chain(struct notifier_block *nb)
++void mce_register_decode_chain(struct notifier_block *nb, bool drain)
+ {
++	/* Ensure SRAO notifier has the highest priority in the decode chain. */
++	if (nb != &mce_srao_nb && nb->priority == INT_MAX)
++		nb->priority -= 1;
++
+ 	atomic_notifier_chain_register(&x86_mce_decoder_chain, nb);
+-	drain_mcelog_buffer();
++
++	if (drain)
++		drain_mcelog_buffer();
+ }
+ EXPORT_SYMBOL_GPL(mce_register_decode_chain);
+ 
+@@ -459,61 +467,6 @@ static inline void mce_gather_info(struct mce *m, struct pt_regs *regs)
+ 	}
+ }
+ 
+-/*
+- * Simple lockless ring to communicate PFNs from the exception handler with the
+- * process context work function. This is vastly simplified because there's
+- * only a single reader and a single writer.
+- */
+-#define MCE_RING_SIZE 16	/* we use one entry less */
+-
+-struct mce_ring {
+-	unsigned short start;
+-	unsigned short end;
+-	unsigned long ring[MCE_RING_SIZE];
+-};
+-static DEFINE_PER_CPU(struct mce_ring, mce_ring);
+-
+-/* Runs with CPU affinity in workqueue */
+-static int mce_ring_empty(void)
+-{
+-	struct mce_ring *r = this_cpu_ptr(&mce_ring);
+-
+-	return r->start == r->end;
+-}
+-
+-static int mce_ring_get(unsigned long *pfn)
+-{
+-	struct mce_ring *r;
+-	int ret = 0;
+-
+-	*pfn = 0;
+-	get_cpu();
+-	r = this_cpu_ptr(&mce_ring);
+-	if (r->start == r->end)
+-		goto out;
+-	*pfn = r->ring[r->start];
+-	r->start = (r->start + 1) % MCE_RING_SIZE;
+-	ret = 1;
+-out:
+-	put_cpu();
+-	return ret;
+-}
+-
+-/* Always runs in MCE context with preempt off */
+-static int mce_ring_add(unsigned long pfn)
+-{
+-	struct mce_ring *r = this_cpu_ptr(&mce_ring);
+-	unsigned next;
+-
+-	next = (r->end + 1) % MCE_RING_SIZE;
+-	if (next == r->start)
+-		return -1;
+-	r->ring[r->end] = pfn;
+-	wmb();
+-	r->end = next;
+-	return 0;
+-}
+-
+ int mce_available(struct cpuinfo_x86 *c)
+ {
+ 	if (mca_cfg.disabled)
+@@ -523,7 +476,7 @@ int mce_available(struct cpuinfo_x86 *c)
+ 
+ static void mce_schedule_work(void)
+ {
+-	if (!mce_ring_empty())
++	if (!mce_gen_pool_empty() && keventd_up())
+ 		schedule_work(&mce_work);
+ }
+ 
+@@ -550,6 +503,27 @@ static void mce_report_event(struct pt_regs *regs)
+ 	irq_work_queue(&mce_irq_work);
+ }
+ 
++static int srao_decode_notifier(struct notifier_block *nb, unsigned long val,
++				void *data)
++{
++	struct mce *mce = (struct mce *)data;
++	unsigned long pfn;
++
++	if (!mce)
++		return NOTIFY_DONE;
++
++	if (mce->usable_addr && (mce->severity == MCE_AO_SEVERITY)) {
++		pfn = mce->addr >> PAGE_SHIFT;
++		memory_failure(pfn, MCE_VECTOR, 0);
++	}
++
++	return NOTIFY_OK;
++}
++static struct notifier_block mce_srao_nb = {
++	.notifier_call	= srao_decode_notifier,
++	.priority = INT_MAX,
++};
++
+ /*
+  * Read ADDR and MISC registers.
+  */
+@@ -668,8 +642,11 @@ bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
+ 		 */
+ 		if (severity == MCE_DEFERRED_SEVERITY && memory_error(&m)) {
+ 			if (m.status & MCI_STATUS_ADDRV) {
+-				mce_ring_add(m.addr >> PAGE_SHIFT);
+-				mce_schedule_work();
++				m.severity = severity;
++				m.usable_addr = mce_usable_address(&m);
++
++				if (!mce_gen_pool_add(&m))
++					mce_schedule_work();
+ 			}
+ 		}
+ 
+@@ -1129,15 +1106,10 @@ void do_machine_check(struct pt_regs *regs, long error_code)
+ 
+ 		mce_read_aux(&m, i);
+ 
+-		/*
+-		 * Action optional error. Queue address for later processing.
+-		 * When the ring overflows we just ignore the AO error.
+-		 * RED-PEN add some logging mechanism when
+-		 * usable_address or mce_add_ring fails.
+-		 * RED-PEN don't ignore overflow for mca_cfg.tolerant == 0
+-		 */
+-		if (severity == MCE_AO_SEVERITY && mce_usable_address(&m))
+-			mce_ring_add(m.addr >> PAGE_SHIFT);
++		/* assuming valid severity level != 0 */
++		m.severity = severity;
++		m.usable_addr = mce_usable_address(&m);
++		mce_gen_pool_add(&m);
+ 
+ 		mce_log(&m);
+ 
+@@ -1223,14 +1195,11 @@ int memory_failure(unsigned long pfn, int vector, int flags)
+ /*
+  * Action optional processing happens here (picking up
+  * from the list of faulting pages that do_machine_check()
+- * placed into the "ring").
++ * placed into the genpool).
+  */
+ static void mce_process_work(struct work_struct *dummy)
+ {
+-	unsigned long pfn;
+-
+-	while (mce_ring_get(&pfn))
+-		memory_failure(pfn, MCE_VECTOR, 0);
++	mce_gen_pool_process();
+ }
+ 
+ #ifdef CONFIG_X86_MCE_INTEL
+@@ -2024,6 +1993,7 @@ __setup("mce", mcheck_enable);
+ int __init mcheck_init(void)
+ {
+ 	mcheck_intel_therm_init();
++	mce_register_decode_chain(&mce_srao_nb, false);
+ 	mcheck_vendor_init_severity();
+ 
+ 	INIT_WORK(&mce_work, mce_process_work);
+@@ -2562,5 +2532,20 @@ static int __init mcheck_debugfs_init(void)
+ 
+ 	return 0;
+ }
+-late_initcall(mcheck_debugfs_init);
++#else
++static int __init mcheck_debugfs_init(void) { return -EINVAL; }
+ #endif
++
++static int __init mcheck_late_init(void)
++{
++	mcheck_debugfs_init();
++
++	/*
++	 * Flush out everything that has been logged during early boot, now that
++	 * everything has been initialized (workqueues, decoders, ...).
++	 */
++	mce_schedule_work();
++
++	return 0;
++}
++late_initcall(mcheck_late_init);
+diff --git a/drivers/acpi/acpi_extlog.c b/drivers/acpi/acpi_extlog.c
+index b3842ff..07e012e 100644
+--- a/drivers/acpi/acpi_extlog.c
++++ b/drivers/acpi/acpi_extlog.c
+@@ -286,7 +286,7 @@ static int __init extlog_init(void)
+ 	 */
+ 	old_edac_report_status = get_edac_report_status();
+ 	set_edac_report_status(EDAC_REPORTING_DISABLED);
+-	mce_register_decode_chain(&extlog_mce_dec);
++	mce_register_decode_chain(&extlog_mce_dec, true);
+ 	/* enable OS to be involved to take over management from BIOS */
+ 	((struct extlog_l1_head *)extlog_l1_addr)->flags |= FLAG_OS_OPTIN;
+ 
+diff --git a/drivers/edac/i7core_edac.c b/drivers/edac/i7core_edac.c
+index 01087a3..13d77f4 100644
+--- a/drivers/edac/i7core_edac.c
++++ b/drivers/edac/i7core_edac.c
+@@ -2424,7 +2424,7 @@ static int __init i7core_init(void)
+ 	pci_rc = pci_register_driver(&i7core_driver);
+ 
+ 	if (pci_rc >= 0) {
+-		mce_register_decode_chain(&i7_mce_dec);
++		mce_register_decode_chain(&i7_mce_dec, true);
+ 		return 0;
+ 	}
+ 
+diff --git a/drivers/edac/mce_amd.c b/drivers/edac/mce_amd.c
+index 58586d5..aca31a2 100644
+--- a/drivers/edac/mce_amd.c
++++ b/drivers/edac/mce_amd.c
+@@ -895,7 +895,7 @@ static int __init mce_amd_init(void)
+ 
+ 	pr_info("MCE: In-kernel MCE decoding enabled.\n");
+ 
+-	mce_register_decode_chain(&amd_mce_dec_nb);
++	mce_register_decode_chain(&amd_mce_dec_nb, true);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/edac/sb_edac.c b/drivers/edac/sb_edac.c
+index 1acf57b..494a23e 100644
+--- a/drivers/edac/sb_edac.c
++++ b/drivers/edac/sb_edac.c
+@@ -2556,7 +2556,7 @@ static int __init sbridge_init(void)
+ 
+ 	pci_rc = pci_register_driver(&sbridge_driver);
+ 	if (pci_rc >= 0) {
+-		mce_register_decode_chain(&sbridge_mce_dec);
++		mce_register_decode_chain(&sbridge_mce_dec, true);
+ 		if (get_edac_report_status() == EDAC_REPORTING_DISABLED)
+ 			sbridge_printk(KERN_WARNING, "Loading driver, error reporting disabled.\n");
+ 		return 0;
+-- 
+2.0.2
+
