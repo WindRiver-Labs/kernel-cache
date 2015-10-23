@@ -1,0 +1,205 @@
+From 8d1c2574a4695b1db9ada4b8d994d705d756e825 Mon Sep 17 00:00:00 2001
+From: "Yan, Zheng" <zheng.z.yan@intel.com>
+Date: Wed, 6 May 2015 15:33:50 -0400
+Subject: [PATCH 29/75] perf/x86/intel: Implement batched PEBS interrupt
+ handling (large PEBS interrupt threshold)
+
+commit 3569c0d7c5440d6fd06b10e1ef9614588a049bc7 upstream.
+
+PEBS always had the capability to log samples to its buffers without
+an interrupt. Traditionally perf has not used this but always set the
+PEBS threshold to one.
+
+For frequently occurring events (like cycles or branches or load/store)
+this in term requires using a relatively high sampling period to avoid
+overloading the system, by only processing PMIs. This in term increases
+sampling error.
+
+For the common cases we still need to use the PMI because the PEBS
+hardware has various limitations. The biggest one is that it can not
+supply a callgraph. It also requires setting a fixed period, as the
+hardware does not support adaptive period. Another issue is that it
+cannot supply a time stamp and some other options. To supply a TID it
+requires flushing on context switch. It can however supply the IP, the
+load/store address, TSX information, registers, and some other things.
+
+So we can make PEBS work for some specific cases, basically as long as
+you can do without a callgraph and can set the period you can use this
+new PEBS mode.
+
+The main benefit is the ability to support much lower sampling period
+(down to -c 1000) without extensive overhead.
+
+One use cases is for example to increase the resolution of the c2c tool.
+Another is double checking when you suspect the standard sampling has
+too much sampling error.
+
+Some numbers on the overhead, using cycle soak, comparing the elapsed
+time from "kernbench -M -H" between plain (threshold set to one) and
+multi (large threshold).
+
+The test command for plain:
+  "perf record --time -e cycles:p -c $period -- kernbench -M -H"
+
+The test command for multi:
+  "perf record --no-time -e cycles:p -c $period -- kernbench -M -H"
+
+( The only difference of test command between multi and plain is time
+  stamp options. Since time stamp is not supported by large PEBS
+  threshold, it can be used as a flag to indicate if large threshold is
+  enabled during the test. )
+
+	period    plain(Sec)  multi(Sec)  Delta
+	10003     32.7        16.5        16.2
+	20003     30.2        16.2        14.0
+	40003     18.6        14.1        4.5
+	80003     16.8        14.6        2.2
+	100003    16.9        14.1        2.8
+	800003    15.4        15.7        -0.3
+	1000003   15.3        15.2        0.2
+	2000003   15.3        15.1        0.1
+
+With periods below 100003, plain (threshold one) cause much more
+overhead. With 10003 sampling period, the Elapsed Time for multi is
+even 2X faster than plain.
+
+Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+Signed-off-by: Kan Liang <kan.liang@intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: acme@infradead.org
+Cc: eranian@google.com
+Link: http://lkml.kernel.org/r/1430940834-8964-5-git-send-email-kan.liang@intel.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ arch/x86/kernel/cpu/perf_event.h          | 11 +++++++++++
+ arch/x86/kernel/cpu/perf_event_intel.c    |  5 ++++-
+ arch/x86/kernel/cpu/perf_event_intel_ds.c | 27 +++++++++++++++++++++++----
+ 3 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/perf_event.h b/arch/x86/kernel/cpu/perf_event.h
+index 73d671c..768b377 100644
+--- a/arch/x86/kernel/cpu/perf_event.h
++++ b/arch/x86/kernel/cpu/perf_event.h
+@@ -76,6 +76,7 @@ struct event_constraint {
+ #define PERF_X86_EVENT_RDPMC_ALLOWED	0x0100 /* grant rdpmc permission */
+ #define PERF_X86_EVENT_EXCL_ACCT	0x0200 /* accounted EXCL event */
+ #define PERF_X86_EVENT_AUTO_RELOAD	0x0400 /* use PEBS auto-reload */
++#define PERF_X86_EVENT_FREERUNNING	0x0800 /* use freerunning PEBS */
+ 
+ 
+ struct amd_nb {
+@@ -89,6 +90,16 @@ struct amd_nb {
+ #define MAX_PEBS_EVENTS		8
+ 
+ /*
++ * Flags PEBS can handle without an PMI.
++ *
++ */
++#define PEBS_FREERUNNING_FLAGS \
++	(PERF_SAMPLE_IP | PERF_SAMPLE_ADDR | \
++	PERF_SAMPLE_ID | PERF_SAMPLE_CPU | PERF_SAMPLE_STREAM_ID | \
++	PERF_SAMPLE_DATA_SRC | PERF_SAMPLE_IDENTIFIER | \
++	PERF_SAMPLE_TRANSACTION)
++
++/*
+  * A debug store configuration.
+  *
+  * We only support architectures that use 64bit fields.
+diff --git a/arch/x86/kernel/cpu/perf_event_intel.c b/arch/x86/kernel/cpu/perf_event_intel.c
+index f003df3..f4490f1 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel.c
++++ b/arch/x86/kernel/cpu/perf_event_intel.c
+@@ -2261,8 +2261,11 @@ static int intel_pmu_hw_config(struct perf_event *event)
+ 		return ret;
+ 
+ 	if (event->attr.precise_ip) {
+-		if (!event->attr.freq)
++		if (!event->attr.freq) {
+ 			event->hw.flags |= PERF_X86_EVENT_AUTO_RELOAD;
++			if (!(event->attr.sample_type & ~PEBS_FREERUNNING_FLAGS))
++				event->hw.flags |= PERF_X86_EVENT_FREERUNNING;
++		}
+ 		if (x86_pmu.pebs_aliases)
+ 			x86_pmu.pebs_aliases(event);
+ 	}
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_ds.c b/arch/x86/kernel/cpu/perf_event_intel_ds.c
+index 72529c2..0ce455d 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_ds.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_ds.c
+@@ -250,7 +250,7 @@ static int alloc_pebs_buffer(int cpu)
+ {
+ 	struct debug_store *ds = per_cpu(cpu_hw_events, cpu).ds;
+ 	int node = cpu_to_node(cpu);
+-	int max, thresh = 1; /* always use a single PEBS record */
++	int max;
+ 	void *buffer, *ibuffer;
+ 
+ 	if (!x86_pmu.pebs)
+@@ -280,9 +280,6 @@ static int alloc_pebs_buffer(int cpu)
+ 	ds->pebs_absolute_maximum = ds->pebs_buffer_base +
+ 		max * x86_pmu.pebs_record_size;
+ 
+-	ds->pebs_interrupt_threshold = ds->pebs_buffer_base +
+-		thresh * x86_pmu.pebs_record_size;
+-
+ 	return 0;
+ }
+ 
+@@ -684,14 +681,22 @@ struct event_constraint *intel_pebs_constraints(struct perf_event *event)
+ 	return &emptyconstraint;
+ }
+ 
++static inline bool pebs_is_enabled(struct cpu_hw_events *cpuc)
++{
++	return (cpuc->pebs_enabled & ((1ULL << MAX_PEBS_EVENTS) - 1));
++}
++
+ void intel_pmu_pebs_enable(struct perf_event *event)
+ {
+ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+ 	struct hw_perf_event *hwc = &event->hw;
+ 	struct debug_store *ds = cpuc->ds;
++	bool first_pebs;
++	u64 threshold;
+ 
+ 	hwc->config &= ~ARCH_PERFMON_EVENTSEL_INT;
+ 
++	first_pebs = !pebs_is_enabled(cpuc);
+ 	cpuc->pebs_enabled |= 1ULL << hwc->idx;
+ 
+ 	if (event->hw.flags & PERF_X86_EVENT_PEBS_LDLAT)
+@@ -699,11 +704,25 @@ void intel_pmu_pebs_enable(struct perf_event *event)
+ 	else if (event->hw.flags & PERF_X86_EVENT_PEBS_ST)
+ 		cpuc->pebs_enabled |= 1ULL << 63;
+ 
++	/*
++	 * When the event is constrained enough we can use a larger
++	 * threshold and run the event with less frequent PMI.
++	 */
++	if (hwc->flags & PERF_X86_EVENT_FREERUNNING) {
++		threshold = ds->pebs_absolute_maximum -
++			x86_pmu.max_pebs_events * x86_pmu.pebs_record_size;
++	} else {
++		threshold = ds->pebs_buffer_base + x86_pmu.pebs_record_size;
++	}
++
+ 	/* Use auto-reload if possible to save a MSR write in the PMI */
+ 	if (hwc->flags & PERF_X86_EVENT_AUTO_RELOAD) {
+ 		ds->pebs_event_reset[hwc->idx] =
+ 			(u64)(-hwc->sample_period) & x86_pmu.cntval_mask;
+ 	}
++
++	if (first_pebs || ds->pebs_interrupt_threshold > threshold)
++		ds->pebs_interrupt_threshold = threshold;
+ }
+ 
+ void intel_pmu_pebs_disable(struct perf_event *event)
+-- 
+2.0.2
+

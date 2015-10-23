@@ -1,0 +1,369 @@
+From 72dd212e723d2ca699fd7bd413a850f1632fb856 Mon Sep 17 00:00:00 2001
+From: "Yan, Zheng" <zheng.z.yan@intel.com>
+Date: Wed, 6 May 2015 15:33:49 -0400
+Subject: [PATCH 28/75] perf/x86/intel: Handle multiple records in the PEBS
+ buffer
+
+commit 21509084f999d7accd32e45961ef76853112e978 upstream.
+
+When the PEBS interrupt threshold is larger than one record and the
+machine supports multiple PEBS events, the records of these events are
+mixed up and we need to demultiplex them.
+
+Demuxing the records is hard because the hardware is deficient. The
+hardware has two issues that, when combined, create impossible
+scenarios to demux.
+
+The first issue is that the 'status' field of the PEBS record is a copy
+of the GLOBAL_STATUS MSR at PEBS assist time. To see why this is a
+problem let us first describe the regular PEBS cycle:
+
+A) the CTRn value reaches 0:
+  - the corresponding bit in GLOBAL_STATUS gets set
+  - we start arming the hardware assist
+  < some unspecified amount of time later -- this could cover multiple
+    events of interest >
+
+B) the hardware assist is armed, any next event will trigger it
+
+C) a matching event happens:
+  - the hardware assist triggers and generates a PEBS record
+    this includes a copy of GLOBAL_STATUS at this moment
+  - if we auto-reload we (re)set CTRn
+  - we clear the relevant bit in GLOBAL_STATUS
+
+Now consider the following chain of events:
+
+  A0, B0, A1, C0
+
+The event generated for counter 0 will include a status with counter 1
+set, even though its not at all related to the record. A similar thing
+can happen with a !PEBS event if it just happens to overflow at the
+right moment.
+
+The second issue is that the hardware will only emit one record for two
+or more counters if the event that triggers the assist is 'close'. The
+'close' can be several cycles. In some cases even the complete assist,
+if the event is something that doesn't need retirement.
+
+For instance, consider this chain of events:
+
+  A0, B0, A1, B1, C01
+
+Where C01 is an event that triggers both hardware assists, we will
+generate but a single record, but again with both counters listed in the
+status field.
+
+This time the record pertains to both events.
+
+Note that these two cases are different but undistinguishable with the
+data as generated. Therefore demuxing records with multiple PEBS bits
+(we can safely ignore status bits for !PEBS counters) is impossible.
+
+Furthermore we cannot emit the record to both events because that might
+cause a data leak -- the events might not have the same privileges -- so
+what this patch does is discard such events.
+
+The assumption/hope is that such discards will be rare.
+
+Here lists some possible ways you may get high discard rate.
+
+  - when you count the same thing multiple times. But it is not a useful
+    configuration.
+  - you can be unfortunate if you measure with a userspace only PEBS
+    event along with either a kernel or unrestricted PEBS event. Imagine
+    the event triggering and setting the overflow flag right before
+    entering the kernel. Then all kernel side events will end up with
+    multiple bits set.
+
+Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+Signed-off-by: Kan Liang <kan.liang@intel.com>
+[ Changelog improvements. ]
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: acme@infradead.org
+Cc: eranian@google.com
+Link: http://lkml.kernel.org/r/1430940834-8964-4-git-send-email-kan.liang@intel.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ arch/x86/kernel/cpu/perf_event_intel_ds.c | 142 +++++++++++++++++++++---------
+ include/linux/perf_event.h                |  13 +++
+ kernel/events/core.c                      |   6 +-
+ kernel/events/internal.h                  |   9 --
+ 4 files changed, 116 insertions(+), 54 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_ds.c b/arch/x86/kernel/cpu/perf_event_intel_ds.c
+index a5fe561..72529c2 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_ds.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_ds.c
+@@ -872,6 +872,9 @@ static void setup_pebs_sample_data(struct perf_event *event,
+ 	int fll, fst, dsrc;
+ 	int fl = event->hw.flags;
+ 
++	if (pebs == NULL)
++		return;
++
+ 	sample_type = event->attr.sample_type;
+ 	dsrc = sample_type & PERF_SAMPLE_DATA_SRC;
+ 
+@@ -966,19 +969,68 @@ static void setup_pebs_sample_data(struct perf_event *event,
+ 		data->br_stack = &cpuc->lbr_stack;
+ }
+ 
++static inline void *
++get_next_pebs_record_by_bit(void *base, void *top, int bit)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++	void *at;
++	u64 pebs_status;
++
++	if (base == NULL)
++		return NULL;
++
++	for (at = base; at < top; at += x86_pmu.pebs_record_size) {
++		struct pebs_record_nhm *p = at;
++
++		if (test_bit(bit, (unsigned long *)&p->status)) {
++
++			if (p->status == (1 << bit))
++				return at;
++
++			/* clear non-PEBS bit and re-check */
++			pebs_status = p->status & cpuc->pebs_enabled;
++			pebs_status &= (1ULL << MAX_PEBS_EVENTS) - 1;
++			if (pebs_status == (1 << bit))
++				return at;
++		}
++	}
++	return NULL;
++}
++
+ static void __intel_pmu_pebs_event(struct perf_event *event,
+-				   struct pt_regs *iregs, void *__pebs)
++				   struct pt_regs *iregs,
++				   void *base, void *top,
++				   int bit, int count)
+ {
+ 	struct perf_sample_data data;
+ 	struct pt_regs regs;
++	int i;
++	void *at = get_next_pebs_record_by_bit(base, top, bit);
+ 
+-	if (!intel_pmu_save_and_restart(event))
++	if (!intel_pmu_save_and_restart(event) &&
++	    !(event->hw.flags & PERF_X86_EVENT_AUTO_RELOAD))
+ 		return;
+ 
+-	setup_pebs_sample_data(event, iregs, __pebs, &data, &regs);
++	if (count > 1) {
++		for (i = 0; i < count - 1; i++) {
++			setup_pebs_sample_data(event, iregs, at, &data, &regs);
++			perf_event_output(event, &data, &regs);
++			at += x86_pmu.pebs_record_size;
++			at = get_next_pebs_record_by_bit(at, top, bit);
++		}
++	}
++
++	setup_pebs_sample_data(event, iregs, at, &data, &regs);
+ 
+-	if (perf_event_overflow(event, &data, &regs))
++	/*
++	 * All but the last records are processed.
++	 * The last one is left to be able to call the overflow handler.
++	 */
++	if (perf_event_overflow(event, &data, &regs)) {
+ 		x86_pmu_stop(event, 0);
++		return;
++	}
++
+ }
+ 
+ static void intel_pmu_drain_pebs_core(struct pt_regs *iregs)
+@@ -1008,72 +1060,78 @@ static void intel_pmu_drain_pebs_core(struct pt_regs *iregs)
+ 	if (!event->attr.precise_ip)
+ 		return;
+ 
+-	n = top - at;
++	n = (top - at) / x86_pmu.pebs_record_size;
+ 	if (n <= 0)
+ 		return;
+ 
+-	/*
+-	 * Should not happen, we program the threshold at 1 and do not
+-	 * set a reset value.
+-	 */
+-	WARN_ONCE(n > 1, "bad leftover pebs %d\n", n);
+-	at += n - 1;
+-
+-	__intel_pmu_pebs_event(event, iregs, at);
++	__intel_pmu_pebs_event(event, iregs, at, top, 0, n);
+ }
+ 
+ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs)
+ {
+ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+ 	struct debug_store *ds = cpuc->ds;
+-	struct perf_event *event = NULL;
+-	void *at, *top;
+-	u64 status = 0;
++	struct perf_event *event;
++	void *base, *at, *top;
+ 	int bit;
++	short counts[MAX_PEBS_EVENTS] = {};
+ 
+ 	if (!x86_pmu.pebs_active)
+ 		return;
+ 
+-	at  = (struct pebs_record_nhm *)(unsigned long)ds->pebs_buffer_base;
++	base = (struct pebs_record_nhm *)(unsigned long)ds->pebs_buffer_base;
+ 	top = (struct pebs_record_nhm *)(unsigned long)ds->pebs_index;
+ 
+ 	ds->pebs_index = ds->pebs_buffer_base;
+ 
+-	if (unlikely(at > top))
++	if (unlikely(base >= top))
+ 		return;
+ 
+-	/*
+-	 * Should not happen, we program the threshold at 1 and do not
+-	 * set a reset value.
+-	 */
+-	WARN_ONCE(top - at > x86_pmu.max_pebs_events * x86_pmu.pebs_record_size,
+-		  "Unexpected number of pebs records %ld\n",
+-		  (long)(top - at) / x86_pmu.pebs_record_size);
+-
+-	for (; at < top; at += x86_pmu.pebs_record_size) {
++	for (at = base; at < top; at += x86_pmu.pebs_record_size) {
+ 		struct pebs_record_nhm *p = at;
+ 
+-		for_each_set_bit(bit, (unsigned long *)&p->status,
+-				 x86_pmu.max_pebs_events) {
+-			event = cpuc->events[bit];
+-			if (!test_bit(bit, cpuc->active_mask))
+-				continue;
+-
+-			WARN_ON_ONCE(!event);
+-
+-			if (!event->attr.precise_ip)
+-				continue;
++		bit = find_first_bit((unsigned long *)&p->status,
++					x86_pmu.max_pebs_events);
++		if (bit >= x86_pmu.max_pebs_events)
++			continue;
++		if (!test_bit(bit, cpuc->active_mask))
++			continue;
++		/*
++		 * The PEBS hardware does not deal well with the situation
++		 * when events happen near to each other and multiple bits
++		 * are set. But it should happen rarely.
++		 *
++		 * If these events include one PEBS and multiple non-PEBS
++		 * events, it doesn't impact PEBS record. The record will
++		 * be handled normally. (slow path)
++		 *
++		 * If these events include two or more PEBS events, the
++		 * records for the events can be collapsed into a single
++		 * one, and it's not possible to reconstruct all events
++		 * that caused the PEBS record. It's called collision.
++		 * If collision happened, the record will be dropped.
++		 *
++		 */
++		if (p->status != (1 << bit)) {
++			u64 pebs_status;
+ 
+-			if (__test_and_set_bit(bit, (unsigned long *)&status))
++			/* slow path */
++			pebs_status = p->status & cpuc->pebs_enabled;
++			pebs_status &= (1ULL << MAX_PEBS_EVENTS) - 1;
++			if (pebs_status != (1 << bit))
+ 				continue;
+-
+-			break;
+ 		}
++		counts[bit]++;
++	}
+ 
+-		if (!event || bit >= x86_pmu.max_pebs_events)
++	for (bit = 0; bit < x86_pmu.max_pebs_events; bit++) {
++		if (counts[bit] == 0)
+ 			continue;
++		event = cpuc->events[bit];
++		WARN_ON_ONCE(!event);
++		WARN_ON_ONCE(!event->attr.precise_ip);
+ 
+-		__intel_pmu_pebs_event(event, iregs, at);
++		__intel_pmu_pebs_event(event, iregs, base, top, bit, counts[bit]);
+ 	}
+ }
+ 
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index b4e9bcf..89d3f4e 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -730,6 +730,19 @@ extern int perf_event_overflow(struct perf_event *event,
+ 				 struct perf_sample_data *data,
+ 				 struct pt_regs *regs);
+ 
++extern void perf_event_output(struct perf_event *event,
++				struct perf_sample_data *data,
++				struct pt_regs *regs);
++
++extern void
++perf_event_header__init_id(struct perf_event_header *header,
++			   struct perf_sample_data *data,
++			   struct perf_event *event);
++extern void
++perf_event__output_id_sample(struct perf_event *event,
++			     struct perf_output_handle *handle,
++			     struct perf_sample_data *sample);
++
+ static inline bool is_sampling_event(struct perf_event *event)
+ {
+ 	return event->attr.sample_period != 0;
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 9481749..9395178 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -5424,9 +5424,9 @@ void perf_prepare_sample(struct perf_event_header *header,
+ 	}
+ }
+ 
+-static void perf_event_output(struct perf_event *event,
+-				struct perf_sample_data *data,
+-				struct pt_regs *regs)
++void perf_event_output(struct perf_event *event,
++			struct perf_sample_data *data,
++			struct pt_regs *regs)
+ {
+ 	struct perf_output_handle handle;
+ 	struct perf_event_header header;
+diff --git a/kernel/events/internal.h b/kernel/events/internal.h
+index 9f6ce9b..2deb24c 100644
+--- a/kernel/events/internal.h
++++ b/kernel/events/internal.h
+@@ -72,15 +72,6 @@ static inline bool rb_has_aux(struct ring_buffer *rb)
+ void perf_event_aux_event(struct perf_event *event, unsigned long head,
+ 			  unsigned long size, u64 flags);
+ 
+-extern void
+-perf_event_header__init_id(struct perf_event_header *header,
+-			   struct perf_sample_data *data,
+-			   struct perf_event *event);
+-extern void
+-perf_event__output_id_sample(struct perf_event *event,
+-			     struct perf_output_handle *handle,
+-			     struct perf_sample_data *sample);
+-
+ extern struct page *
+ perf_mmap_to_page(struct ring_buffer *rb, unsigned long pgoff);
+ 
+-- 
+2.0.2
+
