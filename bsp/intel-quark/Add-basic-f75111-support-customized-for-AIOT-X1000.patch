@@ -1,0 +1,825 @@
+From 2466e212019c9f93f66c9fbf7d44820f8fbb3093 Mon Sep 17 00:00:00 2001
+From: Mihaita Ivascu <mihaita.ivascu@windriver.com>
+Date: Wed, 9 Sep 2015 16:26:40 +0300
+Subject: [PATCH 3/6] Add basic f75111 support customized for AIOT X1000.
+
+Signed-off-by: Mihaita Ivascu <mihaita.ivascu@windriver.com>
+---
+ drivers/gpio/Kconfig   |   11 +
+ drivers/gpio/Makefile  |    1 +
+ drivers/gpio/f75111.c  |  637 ++++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/f75111.h |  127 ++++++++++
+ 4 files changed, 776 insertions(+), 0 deletions(-)
+ create mode 100644 drivers/gpio/f75111.c
+ create mode 100644 include/linux/f75111.h
+
+diff --git a/drivers/gpio/Kconfig b/drivers/gpio/Kconfig
+index f2cb69f..0724bf6 100644
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -833,6 +833,17 @@ config GPIO_TPS65910
+ 	  Select this option to enable GPIO driver for the TPS65910
+ 	  chip family.
+ 
++config F75111
++        tristate "Fintec F75111 chip"
++        depends on I2C
++        depends on GPIOLIB
++        depends on LEDS_CLASS
++        help
++          Say yes here if you need support for the Fintec F75111 GPIO/LED
++          chip.
++          This driver can also be built as a module.  If so, the module
++          will be called f75111.
++
+ config GPIO_MSIC
+ 	bool "Intel MSIC mixed signal gpio support"
+ 	depends on MFD_INTEL_MSIC
+diff --git a/drivers/gpio/Makefile b/drivers/gpio/Makefile
+index f1d4b83..b1aceb3 100644
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -103,3 +103,4 @@ obj-$(CONFIG_GPIO_WM8350)	+= gpio-wm8350.o
+ obj-$(CONFIG_GPIO_WM8994)	+= gpio-wm8994.o
+ obj-$(CONFIG_GPIO_XILINX)	+= gpio-xilinx.o
+ obj-$(CONFIG_GPIO_XTENSA)	+= gpio-xtensa.o
++obj-$(CONFIG_F75111)		+= f75111.o
+diff --git a/drivers/gpio/f75111.c b/drivers/gpio/f75111.c
+new file mode 100644
+index 0000000..611a93b
+--- /dev/null
++++ b/drivers/gpio/f75111.c
+@@ -0,0 +1,637 @@
++/*
+++ * drivers/gpio/f75111.c
+++ *
+++ * Driver for the Fintec F75111 chip
+++ *
+++ * Copyright (C) Arnaud Patard <arnaud.patard@rtp-net.org>
+++ *
+++ * Note 1 : This driver is implementing only basic stuff : gpio mode or led mode
+++ * Note 2 : The gpios are configured as leds or gpio thanks to pdata->gpios. One
+++ *         can set pdata->leds_data to configure leds on gpios (if the gpios are
+++ *         in LED mode, you can set the pwm with the timer trigger stuff)
+++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/debugfs.h>
++#include <linux/i2c.h>
++#include <linux/f75111.h>
++#include <linux/leds.h>
++#include <linux/workqueue.h>
++#include <linux/gpio.h>
++
++
++#define MAX_TRIES 2
++
++struct f75111_led {
++	struct led_classdev	cdev;
++	struct i2c_client	*client;
++	u8			gpio;
++	u8			active_low;
++	/* i2c doesn't go that well with interrupts
++	 * so we need that to avoid scheduling while atomic
++	 */
++	struct work_struct	work;
++	struct workqueue_struct	*workqueue;
++	int			value;
++};
++
++struct f75111 {
++	struct gpio_chip	chip;
++	struct i2c_client	*client;
++	struct f75111_led	*leds;
++};
++
++static struct i2c_driver f75111_driver;
++
++/*
++ * Gahhhh... the gpio chip transfers don't always succeed at the first try
++ */
++static inline s32 read_byte(struct i2c_client *client, u8 command)
++{
++	int i;
++	s32 value = -1;
++
++	for (i = 0 ; (i < MAX_TRIES) && (value < 0); i++)
++		value = i2c_smbus_read_byte_data(client, command);
++
++	if (value < 0)
++		dev_err(&client->dev,
++			"Reading reg 0x%02x failed after %d tries\n",
++			command, i);
++	return value;
++}
++
++static inline s32 write_byte(struct i2c_client *client, u8 command, u8 value)
++{
++	int i;
++	s32 ret = -1;
++
++	for (i = 0 ; (i < MAX_TRIES) && (ret < 0); i++)
++		ret = i2c_smbus_write_byte_data(client, command, value);
++
++	if (ret < 0)
++		dev_err(&client->dev,
++			"Reading reg 0x%02x failed after %d tries\n",
++			command, i);
++
++	return ret;
++}
++
++/*
++ * configure pin as gpio/led/watchdog
++ */
++static int f75111_mode(struct i2c_client *client, u8 pin, u8 mode, bool get)
++{
++	int offset;
++	u8 reg;
++	s32 value;
++	int func_offs[]    = {  F75_FUNC_GP10,
++				F75_FUNC_GP11,
++				F75_FUNC_GP12 };
++	int mode1_offs1x[] = {	F75_MODE1_GP14,
++				F75_MODE1_GP15,
++				F75_MODE1_GP16,
++				F75_MODE1_GP17 };
++	int mode1_offs2x[] = {	F75_MODE1_GP20,
++				F75_MODE1_GP21,
++				F75_MODE1_GP22 };
++	int mode2_offs[]   = {	F75_MODE2_GP23,
++				F75_MODE2_GP24,
++				F75_MODE2_GP25,
++				F75_MODE2_GP26 };
++
++	switch (pin) {
++	case F75111_GP10:
++	case F75111_GP12:
++	case F75111_GP11:
++		offset = func_offs[pin-F75111_GP10];
++		reg = F75_FUNC;
++		break;
++	case F75111_GP14:
++	case F75111_GP15:
++	case F75111_GP16:
++	case F75111_GP17:
++		offset = mode1_offs1x[pin-F75111_GP14];
++		reg = F75_MODE1;
++		break;
++	case F75111_GP20:
++	case F75111_GP21:
++	case F75111_GP22:
++		offset = mode1_offs2x[pin-F75111_GP20];
++		reg = F75_MODE1;
++		break;
++	case F75111_GP23:
++	case F75111_GP24:
++	case F75111_GP25:
++	case F75111_GP26:
++		offset = mode2_offs[pin-F75111_GP23];
++		reg = F75_MODE2;
++		break;
++	case F75111_GP27:
++		offset = F75_MODE1_GP27;
++		reg = F75_MODE1;
++	/* GP3X can do only I/O */
++	case F75111_GP30:
++	case F75111_GP31:
++	case F75111_GP32:
++	case F75111_GP33:
++		return 0;
++	default:
++		reg = 0;
++		break;
++	}
++	if (reg) {
++		value = read_byte(client, reg);
++		if (value < 0)
++			return value;
++
++		if (!get) {
++			if ((pin == F75111_GP10) || (pin == F75111_GP12)) {
++				value &= ~(3 << offset);
++				mode  &= 3;
++			} else {
++				value &= ~(1 << offset);
++				mode  &= 1;
++			}
++			value |= (mode << offset);
++			return write_byte(client, reg, value);
++		} else {
++			if ((pin == F75111_GP10) || (pin == F75111_GP12))
++				value = (value & (3 << offset)) >> offset;
++			else
++				value = (value & (1 << offset)) >> offset;
++			return value;
++		}
++	}
++
++	return -EINVAL;
++}
++static inline int f75111_setmode(struct i2c_client *client, u8 pin, u8 mode)
++{
++	return f75111_mode(client, pin, mode, 0);
++}
++
++static inline int f75111_getmode(struct i2c_client *client, u8 pin)
++{
++	return f75111_mode(client, pin, 0, 1);
++}
++
++/*
++ * set frequencies
++ */
++static int f75111_set_freq(struct i2c_client *client, u8 pin, u8 freq)
++{
++	int offset = 0;
++	u8 reg = -1;
++	s32 value;
++
++	if ((pin == F75111_GP13) || (pin > F75111_GP27))
++		return -EINVAL;
++
++	offset = (pin % 4) * 2;
++	reg = pin/4 + F75_FREQ1;
++	value = read_byte(client, reg);
++	if (value < 0)
++		return value;
++
++	value = value & ~(3 << offset);
++	value = value | (freq << offset);
++	return write_byte(client, reg, value);
++}
++
++/*
++ * Set/read i/o register 10-1C, 20-2C, 40-4C
++ * offset : pin
++ * reg    : register to write
++ * data   : data to write
++ * read   : 1 = read register value, 0 = set register with data
++ *
++ * if read is set, returns 0, 1, error code
++ * else return 0 or error code
++ */
++static int f75111_io(struct i2c_client *client,
++			unsigned offset, u8 reg, bool data, bool read)
++{
++	s32 value;
++
++	if (offset > F75111_GP33)
++		return -EINVAL;
++
++	offset += 010;
++
++	/* pin GP3{0,1,2,3}, regs are at 0x40 not 0x30 */
++	if (offset / 8 == 3)
++		reg += 0x10;
++
++	reg += (offset/8) * 0x10;
++	value = read_byte(client, reg);
++	if (value < 0)
++		return value;
++
++	if (read)
++		return value & (1 << (offset % 8)) ? 1 : 0;
++
++	/*
++	 * In led mode, only regs 6,7,8,9 can be used
++	 */
++	if (f75111_getmode(client, offset) == F75111_PIN_MODE_LED)
++		return 0;
++
++	value &= ~(1 << (offset % 8));
++	value |= (data << (offset % 8));
++	return write_byte(client, reg, value);
++}
++
++static int f75111_input(struct gpio_chip *chip, unsigned offset)
++{
++	struct f75111   *f75111 = container_of(chip, struct f75111, chip);
++	struct i2c_client *client = f75111->client;
++
++	return f75111_io(client, offset, F75111_GPIO_OUT_CTRL, 0, 0);
++}
++
++static int f75111_get(struct gpio_chip *chip, unsigned offset)
++{
++	struct f75111	*f75111 = container_of(chip, struct f75111, chip);
++	struct i2c_client *client = f75111->client;
++
++	/* get direction */
++        if (f75111_io(client, offset, F75111_GPIO_OUT_CTRL, 0, 1))
++                /* output */
++                return f75111_io(client, offset, F75111_GPIO_OUT_DATA, 0, 1);
++        else
++                /* input */
++                return f75111_io(client, offset, F75111_GPIO_INP_STATUS, 0, 1);
++}
++
++static int f75111_output(struct gpio_chip *chip, unsigned offset, int value)
++{
++	struct f75111   *f75111 = container_of(chip, struct f75111, chip);
++	struct i2c_client *client = f75111->client;
++	int ret;
++
++	/* set initial value */
++	ret = f75111_io(client, offset, F75111_GPIO_OUT_DATA, value ? 1 : 0, 0);
++	if (ret < 0)
++		return ret;
++
++	/* configure as output */
++	return f75111_io(client, offset, F75111_GPIO_OUT_CTRL, 1, 0);
++}
++
++static void f75111_set(struct gpio_chip *chip, unsigned offset, int data)
++{
++	struct f75111   *f75111 = container_of(chip, struct f75111, chip);
++	struct i2c_client *client = f75111->client;
++
++	/* power up the led or set/unset the output */
++	if (f75111_getmode(client, offset) == F75111_PIN_MODE_LED)
++		f75111_set_freq(client, offset,
++				data ? F75111_LED_TRISTATE : F75111_LED_LOW);
++	else
++		f75111_io(client, offset,
++				F75111_GPIO_OUT_DATA, data ? 1 : 0, 0);
++}
++
++/*
++ * Check chip id
++ */
++static inline int f75111_check_id(struct i2c_client *client)
++{
++	int retval = 0;
++	u16 chip_id, vendor_id;
++	u8 version;
++
++	chip_id  = read_byte(client, F75_CHIPID1) << 8;
++	chip_id |= read_byte(client, F75_CHIPID2);
++
++	version  = read_byte(client, F75_VERSION);
++
++	vendor_id  = read_byte(client, F75_VENDOR1) << 8;
++	vendor_id |= read_byte(client, F75_VENDOR2);
++
++	if ((chip_id != F75111_ID)
++	    || (version != F75111_VER)
++	    || (vendor_id != FINTEC_ID)) {
++		dev_err(&client->dev, "%s: Got %x %x %x, expected %x %x %x\n",
++			__func__,
++			chip_id, version, vendor_id,
++			F75111_ID, F75111_VER, FINTEC_ID);
++		retval = -ENODEV;
++	}
++
++	return retval;
++}
++
++#ifdef CONFIG_DEBUG_GPIO_REGS_SHOW
++
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++
++static void f75111_regs_show(struct seq_file *s, struct gpio_chip *chip)
++{
++	int i;
++	struct f75111   *f75111 = container_of(chip, struct f75111, chip);
++	struct i2c_client *client = f75111->client;
++
++	/* conf regs */
++	seq_printf(s, "  CONF: ");
++	for (i = 1 ; i < 9 ; i++)
++		seq_printf(s, "%02x ", read_byte(client, i));
++	seq_printf(s, "\n");
++
++	/* GPIO1X regs */
++	seq_printf(s, "  GPIO1X: ");
++	for (i = 0x10 ; i <= 0x1C ; i++)
++		seq_printf(s, "%02x ", read_byte(client, i));
++	seq_printf(s, "\n");
++
++	/* GPIO2X regs */
++	seq_printf(s, "  GPIO2X: ");
++	for (i = 0x20 ; i <= 0x2C ; i++)
++		seq_printf(s, "%02x ", read_byte(client, i));
++	seq_printf(s, "\n");
++
++	/* Watchdog regs */
++	seq_printf(s, "  WDT: ");
++	for (i = 0x34 ; i <= 0x37 ; i++)
++		seq_printf(s, "%02x ", read_byte(client, i));
++	seq_printf(s, "\n");
++
++	/* GPIO3X regs */
++	seq_printf(s, "  GPIO3X: ");
++	for (i = 0x40 ; i <= 0x4C ; i++)
++		seq_printf(s, "%02x ", read_byte(client, i));
++	seq_printf(s, "\n");
++
++	/* Chip infos */
++	seq_printf(s, "  INFO: ");
++	for (i = 0x5A ; i <= 0x5E ; i++)
++		seq_printf(s, "%02x ", read_byte(client, i));
++	seq_printf(s, "\n");
++}
++#else
++#define f75111_regs_show NULL
++#endif
++
++static void led_work(struct work_struct *work)
++{
++	struct f75111_led *led = container_of(work, struct f75111_led, work);
++
++	if (led->cdev.blink_set)
++		f75111_set_freq(led->client, led->gpio, led->value);
++	else
++		f75111_io(led->client, led->gpio, F75111_GPIO_OUT_DATA, led->value, 0);
++}
++
++static void f75111_led_set(struct led_classdev *cdev,
++				enum led_brightness value)
++{
++	struct f75111_led *led;
++	int level;
++
++	led = container_of(cdev, struct f75111_led, cdev);
++
++	if (value == LED_OFF)
++		level = 0;
++	else
++		level = 1;
++
++	if (led->active_low)
++		level = !level;
++
++	/* if blink_set exists, the gpio is in led mode */
++	if (cdev->blink_set)
++		led->value = level ? F75111_LED_TRISTATE : F75111_LED_LOW;
++	else
++		led->value = level;
++	queue_work(led->workqueue, &led->work);
++}
++
++static int f75111_led_blink(struct led_classdev *cdev,
++				unsigned long *delay_on,
++				unsigned long *delay_off)
++{
++	struct f75111_led *led;
++	int status = -EINVAL;
++
++	led = container_of(cdev, struct f75111_led, cdev);
++	if (*delay_on == 0 && *delay_off == 0) {
++		*delay_on = 1000;
++		*delay_off = 1000;
++		led->value = F75111_LED_HALF_HZ;
++		status = 0;
++	} else if (*delay_on == 500 && *delay_off == 500) {
++		/* blink the led with 1Hz */
++		led->value = F75111_LED_HZ;
++		status = 0;
++
++	} else if (*delay_on == 1000 && *delay_off == 1000) {
++		/* blink the led with 0.5Hz */
++		led->value = F75111_LED_HALF_HZ;
++		status = 0;
++	}
++
++	if (!status)
++		queue_work(led->workqueue, &led->work);
++
++	return status;
++}
++
++
++static int f75111_probe(struct i2c_client *client, const struct i2c_device_id *id)
++{
++	struct f75111 *f75111;
++	struct f75111_pdata *pdata;
++	struct f75111_gpio *pgpio;
++	struct f75111_led *leds, *led;
++	const struct gpio_led	*dat;
++	int err = -ENODEV;
++	int i, line;
++
++	pdata = client->dev.platform_data;
++	if (!pdata) {
++		dev_err(&client->dev, "%s: no  platform data !\n", __func__);
++		return err;
++	}
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE_DATA)) {
++		dev_err(&client->dev,
++			"%s: no smbus_byte support !\n", __func__);
++		return err;
++	}
++
++	/*
++	 * Check that there's a chip which additionnaly has the right id
++	 */
++	err = f75111_check_id(client);
++	if (err)
++		goto exit;
++
++	f75111 = kzalloc(sizeof(struct f75111), GFP_KERNEL);
++	if (!f75111) {
++		err = -ENOMEM;
++		goto exit;
++	}
++
++	/*
++	 * Configure pin according to the platform data
++	 */
++	line = __LINE__;
++	for (i = 0, pgpio = pdata->gpios; i < pdata->size; i++, pgpio++) {
++		err = f75111_setmode(client, pgpio->pin, pgpio->mode);
++		if (err < 0)
++			goto exit_kfree;
++	}
++
++	/*
++	 * Everything is configured, time to "add" the chip
++	 */
++	f75111->chip.base = pdata->gpio_base;
++	f75111->chip.can_sleep = 1;
++	f75111->chip.ngpio = F75111_GP33 - F75111_GP10 + 1;
++	f75111->chip.direction_input = f75111_input;
++	f75111->chip.get = f75111_get;
++	f75111->chip.direction_output = f75111_output;
++	f75111->chip.set = f75111_set;
++/*	f75111->chip.regs_show = f75111_regs_show; */
++	f75111->chip.label = client->name;
++	f75111->client = client;
++	i2c_set_clientdata(client, f75111);
++
++	dev_info(&client->dev,
++			"Registering %s base %d\n",
++			f75111->chip.label, f75111->chip.base);
++	line = __LINE__;
++	err = gpiochip_add(&f75111->chip);
++	if (err)
++		goto exit_kfree;
++
++	if (pdata->init) {
++		err = pdata->init(client, f75111->chip.base);
++		if (err < 0)
++			dev_dbg(&client->dev,
++				"%s: init() err %d\n", __func__, err);
++	}
++
++	/*
++	 * Configure the leds if needed
++	 */
++	if (pdata->leds_data && pdata->leds_data->num_leds >= 1) {
++		leds = kcalloc(pdata->leds_data->num_leds,
++				sizeof(*leds), GFP_KERNEL);
++		if (leds) {
++			for (i = 0; i < pdata->leds_data->num_leds; i++) {
++				led = leds + i;
++				dat = pdata->leds_data->leds + i;
++				led->cdev.name = dat->name;
++				led->cdev.brightness = LED_OFF;
++				led->cdev.brightness_set = f75111_led_set;
++				led->cdev.default_trigger = dat->default_trigger;
++				led->active_low = dat->active_low;
++				led->gpio = dat->gpio;
++				led->client = client;
++				led->workqueue = create_workqueue(led->cdev.name);
++				INIT_WORK(&led->work, led_work);
++				if (f75111_getmode(led->client, led->gpio) == F75111_PIN_MODE_LED)
++					led->cdev.blink_set = f75111_led_blink;
++				if (f75111_getmode(led->client, led->gpio) == F75111_PIN_MODE_GPIO)
++
++
++				err = gpio_request(led->gpio + f75111->chip.base, led->cdev.name);
++				if (!err) {
++					if (f75111_getmode(led->client, led->gpio) == F75111_PIN_MODE_GPIO)
++						gpio_direction_output(led->gpio + f75111->chip.base, led->active_low);
++					err = led_classdev_register(&client->dev, &led->cdev);
++				}
++				if (err)
++					dev_warn(&client->dev,
++						"%s: Error %d while configuring led %s\n",
++						__func__, err, led->cdev.name);
++			}
++			f75111->leds = leds;
++		}
++	}
++
++	return 0;
++
++exit_kfree:
++	kfree(f75111);
++	dev_err(&client->dev, "%s (%d): err %d\n", __func__, line, err);
++exit:
++	return err;
++}
++
++static int f75111_remove(struct i2c_client *client)
++{
++	struct f75111 *f75111 =  i2c_get_clientdata(client);
++	struct f75111_pdata *pdata = client->dev.platform_data;
++	struct f75111_led *leds = f75111->leds;
++	struct f75111_led *led;
++	int err, i;
++
++	if (leds) {
++		for (i = 0; i < pdata->leds_data->num_leds; i++) {
++			led = leds + i;
++			destroy_workqueue(led->workqueue);
++			led_classdev_unregister(&led->cdev);
++			gpio_free(led->gpio + f75111->chip.base);
++		}
++		kfree(leds);
++	}
++
++	if (pdata->exit) {
++		err = pdata->exit(client, f75111->chip.base);
++		if (err < 0)
++			goto err;
++	}
++
++	err = gpiochip_remove(&f75111->chip);
++	if (!err)
++		kfree(f75111);
++	else
++		goto err;
++
++	return 0;
++err:
++	dev_err(&client->dev, "%s: err %d\n", __func__, err);
++	return err;
++}
++
++static const struct i2c_device_id f75111_id[] = {
++	{ "f75111", 0 },
++	{ }
++};
++
++static struct i2c_driver f75111_driver = {
++	.driver = {
++		.name   = "f75111",
++		.owner	= THIS_MODULE,
++	},
++
++	.probe		= f75111_probe,
++	.remove		= f75111_remove,
++	.id_table	= f75111_id,
++};
++
++static int __init f75111_init(void)
++{
++	return i2c_add_driver(&f75111_driver);
++}
++
++static void __exit f75111_exit(void)
++{
++	i2c_del_driver(&f75111_driver);
++}
++
++module_init(f75111_init);
++module_exit(f75111_exit);
++
++MODULE_AUTHOR("Arnaud Patard <arnaud.patard@rtp-net.org>");
++MODULE_DESCRIPTION("F75111 driver");
++MODULE_LICENSE("GPL");
++MODULE_DEVICE_TABLE(i2c, f75111_id);
++
++
+diff --git a/include/linux/f75111.h b/include/linux/f75111.h
+new file mode 100644
+index 0000000..0b90e96
+--- /dev/null
++++ b/include/linux/f75111.h
+@@ -0,0 +1,127 @@
++#ifndef _DRIVERS_I2C_CHIPS_F75111_H
++#define _DRIVERS_I2C_CHIPS_F75111_H
++
++#define F75_CTRL			0x01
++#define F75_CTRL_INIT			(1<<7)
++#define F75_CTRL_EN_WDT10		(1<<5)
++#define F75_CTRL_SMART_PM		(1<<1)
++#define F75_CTRL_POWERDOWN		(1<<0)
++
++#define F75_STATUS			0x02
++#define F75_STATUS_POWERDOWN		(1<<3)
++#define F75_STATUS_I2C_ADDR		(1<<1)
++
++
++/*
++ * The datasheet is talking about pin and
++ * not gpio but to get more understandable
++ * I'm using gpio
++ */
++#define F75_FUNC			0x03
++#define F75_FUNC_IRQ_LEVEL		6
++#define F75_FUNC_IRQ_MODE		5
++#define F75_FUNC_GP12			3
++#define F75_FUNC_GP11			2
++#define F75_FUNC_GP10			0
++
++#define F75_MODE1			0x04
++#define F75_MODE1_GP27			7
++#define F75_MODE1_GP15			6
++#define F75_MODE1_GP14			5
++#define F75_MODE1_GP22			4
++#define F75_MODE1_GP21			3
++#define F75_MODE1_GP20			2
++#define F75_MODE1_GP17			1
++#define F75_MODE1_GP16			0
++
++#define F75_MODE2			0x05
++#define F75_MODE2_GP23			3
++#define F75_MODE2_GP24			2
++#define F75_MODE2_GP25			1
++#define F75_MODE2_GP26			0
++
++#define F75_FREQ1			0x06
++#define F75_FREQ2			0x07
++#define F75_FREQ3			0x08
++#define F75_FREQ4			0x09
++
++#define F75111_GPIO_OUT_CTRL		0x00
++#define F75111_GPIO_OUT_DATA		0x01
++#define F75111_GPIO_INP_STATUS		0x02
++#define F75111_GPIO_PULSE_CTRL		0x03
++#define F75111_GPIO_PULSE_WIDTH		0x04
++#define F75111_GPIO_PULLUP		0x05
++#define F75111_GPIO_INP_DB		0x06
++#define F75111_GPIO_PULSE_INV		0x07
++#define F75111_GPIO_EDGE_EN		0x08
++#define F75111_GPIO_EDGE_STATUS		0x09
++#define F75111_GPIO_SMI_EN		0x0A
++#define F75111_GPIO_OUT_DRIVE		0x0B
++#define F75111_GPIO_DB_TIME		0x0C
++
++#define F75_CHIPID1			0x5A
++#define F75_CHIPID2			0x5B
++#define F75_VERSION			0x5C
++#define F75_VENDOR1			0x5D
++#define F75_VENDOR2			0x5E
++
++#define F75111_ID			0x0300
++#define F75111_VER			0x12
++#define FINTEC_ID			0x1934
++
++
++/*
++ * GPXX with XX in octal.
++ */
++enum {
++	F75111_GP10 = 0,
++	F75111_GP11,
++	F75111_GP12,
++	F75111_GP13,
++	F75111_GP14,
++	F75111_GP15,
++	F75111_GP16,
++	F75111_GP17,
++	F75111_GP20,
++	F75111_GP21,
++	F75111_GP22,
++	F75111_GP23,
++	F75111_GP24,
++	F75111_GP25,
++	F75111_GP26,
++	F75111_GP27,
++	F75111_GP30,
++	F75111_GP31,
++	F75111_GP32,
++	F75111_GP33,
++};
++
++enum {
++	F75111_LED_TRISTATE = 0,
++	F75111_LED_HALF_HZ,
++	F75111_LED_HZ,
++	F75111_LED_LOW
++};
++enum {
++	F75111_PIN_MODE_GPIO = 0,
++	F75111_PIN_MODE_LED,
++	F75111_PIN_MODE_IRQ,
++	F75111_PIN_MODE_WDTOUT,
++	F75111_PIN_MODE_WD_OUT = 2
++};
++
++struct f75111_gpio {
++	unsigned char pin;
++	unsigned char mode;
++};
++
++struct f75111_pdata {
++	unsigned gpio_base;
++	struct f75111_gpio *gpios;
++	int size;
++	struct gpio_led_platform_data *leds_data;
++	int (*init)(struct i2c_client *client, int gpio_base);
++	int (*exit)(struct i2c_client *client, int gpio_base);
++};
++#endif
++
+-- 
+1.7.5.4
+
