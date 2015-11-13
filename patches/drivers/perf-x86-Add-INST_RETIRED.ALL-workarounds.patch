@@ -1,0 +1,150 @@
+From a8c2d14dc8795a9ecea4e5724b404ae865410d77 Mon Sep 17 00:00:00 2001
+From: Andi Kleen <ak@linux.intel.com>
+Date: Tue, 2 Sep 2014 11:44:14 -0700
+Subject: [PATCH 89/97] perf/x86: Add INST_RETIRED.ALL workarounds
+
+commit c46e665f037743bbce7887e7c55750713eb7fb09 upstream.
+
+On Broadwell INST_RETIRED.ALL cannot be used with any period
+that doesn't have the lowest 6 bits cleared. And the period
+should not be smaller than 128.
+
+Add a new callback to enforce this, and set it for Broadwell.
+
+This is erratum BDM57 and BDM11.
+
+How does this handle the case when an app requests a specific
+period with some of the bottom bits set
+
+The apps thinks it is sampling at X occurences per sample, when it is
+in fact at X - 63 (worst case).
+
+Short answer:
+
+Any useful instruction sampling period needs to be 4-6 orders
+of magnitude larger than 128, as an PMI every 128 instructions
+would instantly overwhelm the system and be throttled.
+So the +-64 error from this is really small compared to the
+period, much smaller than normal system jitter.
+
+Long answer:
+
+<write up by Peter:>
+
+IFF we guarantee perf_event_attr::sample_period >= 128.
+
+Suppose we start out with sample_period=192; then we'll set period_left
+to 192, we'll end up with left = 128 (we truncate the lower bits). We
+get an interrupt, find that period_left = 64 (>0 so we return 0 and
+don't get an overflow handler), up that to 128. Then we trigger again,
+at n=256. Then we find period_left = -64 (<=0 so we return 1 and do get
+an overflow). We increment with sample_period so we get left = 128. We
+fire again, at n=384, period_left = 0 (<=0 so we return 1 and get an
+overflow). And on and on.
+
+So while the individual interrupts are 'wrong' we get then with
+interval=256,128 in exactly the right ratio to average out at 192. And
+this works for everything >=128.
+
+So the num_samples*fixed_period thing is still entirely correct +- 127,
+which is good enough I'd say, as you already have that error anyhow.
+
+So no need to 'fix' the tools, al we need to do is refuse to create
+INST_RETIRED:ALL events with sample_period < 128.
+
+Signed-off-by: Andi Kleen <ak@linux.intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Kan Liang <kan.liang@intel.com>
+Cc: Maria Dimakopoulou <maria.n.dimakopoulou@gmail.com>
+Cc: Mark Davies <junk@eslaf.co.uk>
+Cc: Stephane Eranian <eranian@google.com>
+Link: http://lkml.kernel.org/r/1409683455-29168-4-git-send-email-andi@firstfloor.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ arch/x86/kernel/cpu/perf_event.c       |    9 +++++++++
+ arch/x86/kernel/cpu/perf_event.h       |    1 +
+ arch/x86/kernel/cpu/perf_event_intel.c |   19 +++++++++++++++++++
+ 3 files changed, 29 insertions(+), 0 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/perf_event.c b/arch/x86/kernel/cpu/perf_event.c
+index fb987dc..2bf0dcc 100644
+--- a/arch/x86/kernel/cpu/perf_event.c
++++ b/arch/x86/kernel/cpu/perf_event.c
+@@ -449,6 +449,12 @@ int x86_pmu_hw_config(struct perf_event *event)
+ 	if (event->attr.type == PERF_TYPE_RAW)
+ 		event->hw.config |= event->attr.config & X86_RAW_EVENT_MASK;
+ 
++	if (event->attr.sample_period && x86_pmu.limit_period) {
++		if (x86_pmu.limit_period(event, event->attr.sample_period) >
++				event->attr.sample_period)
++			return -EINVAL;
++	}
++
+ 	return x86_setup_perfctr(event);
+ }
+ 
+@@ -962,6 +968,9 @@ int x86_perf_event_set_period(struct perf_event *event)
+ 	if (left > x86_pmu.max_period)
+ 		left = x86_pmu.max_period;
+ 
++	if (x86_pmu.limit_period)
++		left = x86_pmu.limit_period(event, left);
++
+ 	per_cpu(pmc_prev_left[idx], smp_processor_id()) = left;
+ 
+ 	/*
+diff --git a/arch/x86/kernel/cpu/perf_event.h b/arch/x86/kernel/cpu/perf_event.h
+index cd15a8e..c902ec8 100644
+--- a/arch/x86/kernel/cpu/perf_event.h
++++ b/arch/x86/kernel/cpu/perf_event.h
+@@ -390,6 +390,7 @@ struct x86_pmu {
+ 	struct x86_pmu_quirk *quirks;
+ 	int		perfctr_second_write;
+ 	bool		late_ack;
++	unsigned	(*limit_period)(struct perf_event *event, unsigned l);
+ 
+ 	/*
+ 	 * sysfs attrs
+diff --git a/arch/x86/kernel/cpu/perf_event_intel.c b/arch/x86/kernel/cpu/perf_event_intel.c
+index b568d3c..3294a76 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel.c
++++ b/arch/x86/kernel/cpu/perf_event_intel.c
+@@ -1988,6 +1988,24 @@ hsw_get_event_constraints(struct cpu_hw_events *cpuc, struct perf_event *event)
+ 	return c;
+ }
+ 
++/*
++ * Broadwell:
++ * The INST_RETIRED.ALL period always needs to have lowest
++ * 6bits cleared (BDM57). It shall not use a period smaller
++ * than 100 (BDM11). We combine the two to enforce
++ * a min-period of 128.
++ */
++static unsigned bdw_limit_period(struct perf_event *event, unsigned left)
++{
++	if ((event->hw.config & INTEL_ARCH_EVENT_MASK) ==
++			X86_CONFIG(.event=0xc0, .umask=0x01)) {
++		if (left < 128)
++			left = 128;
++		left &= ~0x3fu;
++	}
++	return left;
++}
++
+ PMU_FORMAT_ATTR(event,	"config:0-7"	);
+ PMU_FORMAT_ATTR(umask,	"config:8-15"	);
+ PMU_FORMAT_ATTR(edge,	"config:18"	);
+@@ -2605,6 +2623,7 @@ __init int intel_pmu_init(void)
+ 		x86_pmu.hw_config = hsw_hw_config;
+ 		x86_pmu.get_event_constraints = hsw_get_event_constraints;
+ 		x86_pmu.cpu_events = hsw_events_attrs;
++		x86_pmu.limit_period = bdw_limit_period;
+ 		pr_cont("Broadwell events, ");
+ 		break;
+ 
+-- 
+1.7.5.4
+
