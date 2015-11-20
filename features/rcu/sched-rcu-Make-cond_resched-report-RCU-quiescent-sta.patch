@@ -1,0 +1,149 @@
+From 30c2f742e1e13ac4fdc806ec008c73b1aa3e115b Mon Sep 17 00:00:00 2001
+From: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Date: Thu, 19 Nov 2015 11:50:53 -0500
+Subject: [PATCH] sched,rcu: Make cond_resched() report RCU quiescent states
+
+commit ac1bea85781e9004da9b3e8a4b097c18492d857c upstream.
+
+Given a CPU running a loop containing cond_resched(), with no
+other tasks runnable on that CPU, RCU will eventually report RCU
+CPU stall warnings due to lack of quiescent states.  Fortunately,
+every call to cond_resched() is a perfectly good quiescent state.
+Unfortunately, invoking rcu_note_context_switch() is a bit heavyweight
+for cond_resched(), especially given the need to disable preemption,
+and, for RCU-preempt, interrupts as well.
+
+This commit therefore maintains a per-CPU counter that causes
+cond_resched(), cond_resched_lock(), and cond_resched_softirq() to call
+rcu_note_context_switch(), but only about once per 256 invocations.
+This ratio was chosen in keeping with the relative time constants of
+RCU grace periods.
+
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+Signed-off-by: Nam Ninh <nam.ninh@windriver.com>
+
+diff --git a/include/linux/rcupdate.h b/include/linux/rcupdate.h
+index 46dcf0fa8961..4459de736f3f 100644
+--- a/include/linux/rcupdate.h
++++ b/include/linux/rcupdate.h
+@@ -44,6 +44,7 @@
+ #include <linux/debugobjects.h>
+ #include <linux/bug.h>
+ #include <linux/compiler.h>
++#include <linux/percpu.h>
+ 
+ extern int rcu_expedited; /* for sysctl */
+ #ifdef CONFIG_RCU_TORTURE_TEST
+@@ -278,6 +279,41 @@ bool __rcu_is_watching(void);
+ #endif /* #if defined(CONFIG_DEBUG_LOCK_ALLOC) || defined(CONFIG_RCU_TRACE) || defined(CONFIG_SMP) */
+ 
+ /*
++ * Hooks for cond_resched() and friends to avoid RCU CPU stall warnings.
++ */
++
++#define RCU_COND_RESCHED_LIM 256	/* ms vs. 100s of ms. */
++DECLARE_PER_CPU(int, rcu_cond_resched_count);
++void rcu_resched(void);
++
++/*
++ * Is it time to report RCU quiescent states?
++ *
++ * Note unsynchronized access to rcu_cond_resched_count.  Yes, we might
++ * increment some random CPU's count, and possibly also load the result from
++ * yet another CPU's count.  We might even clobber some other CPU's attempt
++ * to zero its counter.  This is all OK because the goal is not precision,
++ * but rather reasonable amortization of rcu_note_context_switch() overhead
++ * and extremely high probability of avoiding RCU CPU stall warnings.
++ * Note that this function has to be preempted in just the wrong place,
++ * many thousands of times in a row, for anything bad to happen.
++ */
++static inline bool rcu_should_resched(void)
++{
++	return raw_cpu_inc_return(rcu_cond_resched_count) >=
++	       RCU_COND_RESCHED_LIM;
++}
++
++/*
++ * Report quiscent states to RCU if it is time to do so.
++ */
++static inline void rcu_cond_resched(void)
++{
++	if (unlikely(rcu_should_resched()))
++		rcu_resched();
++}
++
++/*
+  * Infrastructure to implement the synchronize_() primitives in
+  * TREE_RCU and rcu_barrier_() primitives in TINY_RCU.
+  */
+diff --git a/kernel/rcu/update.c b/kernel/rcu/update.c
+index 1d3dddf33a0e..6aa1290c495d 100644
+--- a/kernel/rcu/update.c
++++ b/kernel/rcu/update.c
+@@ -351,3 +351,21 @@ static int __init check_cpu_stall_init(void)
+ early_initcall(check_cpu_stall_init);
+ 
+ #endif /* #ifdef CONFIG_RCU_STALL_COMMON */
++
++/*
++ * Hooks for cond_resched() and friends to avoid RCU CPU stall warnings.
++ */
++
++DEFINE_PER_CPU(int, rcu_cond_resched_count);
++
++/*
++ * Report a set of RCU quiescent states, for use by cond_resched()
++ * and friends.  Out of line due to being called infrequently.
++ */
++void rcu_resched(void)
++{
++	preempt_disable();
++	__this_cpu_write(rcu_cond_resched_count, 0);
++	rcu_note_context_switch(smp_processor_id());
++	preempt_enable();
++}
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 74a0f1d048b0..9d8e0e3cf71c 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4632,6 +4632,7 @@ static void __cond_resched(void)
+ 
+ int __sched _cond_resched(void)
+ {
++	rcu_cond_resched();
+ 	if (should_resched()) {
+ 		__cond_resched();
+ 		return 1;
+@@ -4650,15 +4651,18 @@ EXPORT_SYMBOL(_cond_resched);
+  */
+ int __cond_resched_lock(spinlock_t *lock)
+ {
++	bool need_rcu_resched = rcu_should_resched();
+ 	int resched = should_resched();
+ 	int ret = 0;
+ 
+ 	lockdep_assert_held(lock);
+ 
+-	if (spin_needbreak(lock) || resched) {
++	if (spin_needbreak(lock) || resched || need_rcu_resched) {
+ 		spin_unlock(lock);
+ 		if (resched)
+ 			__cond_resched();
++		else if (unlikely(need_rcu_resched))
++			rcu_resched();
+ 		else
+ 			cpu_relax();
+ 		ret = 1;
+@@ -4673,6 +4677,7 @@ int __sched __cond_resched_softirq(void)
+ {
+ 	BUG_ON(!in_softirq());
+ 
++	rcu_cond_resched();  /* BH disabled OK, just recording QSes. */
+ 	if (should_resched()) {
+ 		local_bh_enable();
+ 		__cond_resched();
+-- 
+2.1.4
+
