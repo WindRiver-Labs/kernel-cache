@@ -1,0 +1,341 @@
+From 6df731caa872fc6cad3a852d4ec2e0f67c6c6d35 Mon Sep 17 00:00:00 2001
+From: Peter Swain <peter.swain@cavium.com>
+Date: Sat, 1 Feb 2014 13:46:59 -0800
+Subject: [PATCH 459/974] MIPS: octeon-hw-status refcount rework
+
+Reworked to correct several issues:
+
+Max possible refcount is 64^2 + epsilon.
+HWstat tree's roots are irq lines, each of which may
+have 64 detail bits, each of which expand thru 1-or-more levels
+of summary/enable/w1c to client-friendly bitmasks.
+So 255 was clearly not enough for INT_SUM1 case, which funnelled
+GMX/PSX/PSXX/etc. This was causing many-sgmii-iface systems to
+throw refcount overflow warnings.
+The current 2^12+2^6+1 limits is still too small, should increase
+to 2^16-1 to accomodate cn78xx. But 4k+e will accomodate 2 levels
+of summary, yet throw an overflow warning in early test if leaky.
+
+Recursive teardown now done properly.
+Decrement-and-free walks up the parent chain, and will free irqs.
+Old hack to force root_nodes->users++ (which prevented free_irq)
+now gone.  Was already unnecessary from previous commit which wrapped
+kmalloc sleep in u++;...;u-- to avoid race against other add;del.
+
+(!already_unlocked) idiom replaced by (locked)
+
+This now seems to have correct behavior: build with -DDEBUG and
+boot octeon_hw_status.count_debug=1 loglevel=9 shows
+refcounts no longer creep up over ifup/ifdown modprobe/rmmod cycles,
+watching a reboot we see final irq nodes freed, announcing
+"80011800b8001c80:12 refcount --0 @800000002e15f940, 2 levels freed"
+as the last registered client of an irq-node dismantles.
+
+Futures?
+Better performance and NUMA flexibility might be had by projecting
+the bit-space and W1C semantics of the registers into byte-range locks
+on a file object with size >= (8*register_space_size) so different
+fds can 'own' or 'monitor' different byte ranges (corresponding to
+bit ranges in the register-space).  The underlying 'file' need have
+no menaningful content, but the locks and notifiers serve to propagate
+events and optional veto efficiently to a possible mix of kernel,
+guest, user, SE, off-node & (via NLM protocols) off-cluster clients.
+
+Of particular importance here would be a class of clients owning
+one or two 64-byte lock ranges, notifying a chain of purely kernel clients.
+These model interrupts, and if the basic file-lock primitives of vfs
+were efficient enough this could be a good marriage: an fs gateway
+to hardware-region mapping and event-delivery. Restrictions apply,
+as user-level client have no veto or event-swallowing capability
+because they might sleep.  That's the same relationship as between
+skb-layer and tcpdump.
+Dumb fast SIGIO-delivering-fd-list epoll/interrupt/hw-status equivalence.
+[Original patch taken from Cavium SDK 3.1.2-568]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ arch/mips/cavium-octeon/octeon-hw-status.c | 170 ++++++++++++++++++-----------
+ 1 file changed, 106 insertions(+), 64 deletions(-)
+
+diff --git a/arch/mips/cavium-octeon/octeon-hw-status.c b/arch/mips/cavium-octeon/octeon-hw-status.c
+index d08dd87..7b2a58e 100644
+--- a/arch/mips/cavium-octeon/octeon-hw-status.c
++++ b/arch/mips/cavium-octeon/octeon-hw-status.c
+@@ -1,3 +1,4 @@
++#define DEBUG
+ /*
+  * This file is subject to the terms and conditions of the GNU General Public
+  * License.  See the file "COPYING" in the main directory of this archive
+@@ -6,7 +7,7 @@
+  * Copyright (C) 2012-2013 Cavium, Inc.
+  */
+ 
+-#define pr_fmt(fmt) "octeon-hw-status: " fmt
++#define pr_fmt(fmt) "octeon-hw-status: %s:%d " fmt, __func__, __LINE__
+ 
+ #include <linux/interrupt.h>
+ #include <linux/irqdomain.h>
+@@ -33,9 +34,23 @@ int octeon_hw_status_notifier_unregister(struct notifier_block *nb)
+ }
+ EXPORT_SYMBOL(octeon_hw_status_notifier_unregister);
+ 
++#ifdef DEBUG
+ static int count_debug;
+ module_param(count_debug, int, 0644);
+-#define ref_max_users 0xff
++#else
++# define count_debug 0
++#endif
++
++/*
++ * top-level of hw-status is a list of "roots", each corresponding to
++ * an irq-summary word.  Each bit of an irq-summary can correspond to
++ * a detailed 64bit summary/enable register pair.
++ * Each of these can potentially be registered for hw-status notifier.
++ * Count is inc'd during creation allowing concurrent add/remove in leaves
++ * while dropping lock for kmalloc().
++ * See INT_SUM1 for high-count example, where GMX/PCS/PCSX all add several bits.
++ */
++#define ref_max_users ((64 * 64) + 64 + 1)
+ 
+ struct octeon_hw_status_node {
+ 	struct octeon_hw_status_node *next; /* Child list */
+@@ -51,8 +66,8 @@ struct octeon_hw_status_node {
+ 			int irq;
+ 		};
+ 	};
++	u16 users;  /* Reference count. */
+ 	u8 bit;
+-	u8 users;  /* Reference count. */
+ 	u8 is_hwint:1;
+ 	u8 ack_w1c:1;
+ 	u8 own_irq:1;
+@@ -278,7 +293,6 @@ int octeon_hw_status_add_source(struct octeon_hw_status_reg *chain0)
+ 	bool oflow = false;
+ 	bool root_created = false;
+ 	bool created = false;
+-	int siblings = 0;
+ 	int rv = 0;
+ 
+ 	if (!chain->reg_is_hwint)
+@@ -329,7 +343,7 @@ int octeon_hw_status_add_source(struct octeon_hw_status_reg *chain0)
+ 				root->mask_reg = chain->mask_reg;
+ 			}
+ 
+-			/* roots never evaporate - count starts at 1 */
++			/* hold root until child attached */
+ 			root->users = 1;
+ 
+ 			root->next = octeon_hw_status_roots;
+@@ -362,6 +376,7 @@ int octeon_hw_status_add_source(struct octeon_hw_status_reg *chain0)
+ 				/*
+ 				 * drop lock to alloc, could potentially collide like
+ 				 * the root case, but simpler.
++				 * Bump the use-count while unlocked to avoid teardown.
+ 				 */
+ 				constructing = true;
+ 				w->users++;
+@@ -404,11 +419,10 @@ int octeon_hw_status_add_source(struct octeon_hw_status_reg *chain0)
+ 				w->child = n;
+ 				n->parent = w;
+ 
+-				/* parent ref-count */
++				/* up parent ref-count, unless created u=1 */
+ 				oflow = (w->users == ref_max_users);
+-				if (!oflow)
++				if (!oflow && !root_created)
+ 					w->users++;
+-				siblings = w->users;
+ 				created = true;
+ 			}
+ 		} while (!n);
+@@ -417,13 +431,13 @@ int octeon_hw_status_add_source(struct octeon_hw_status_reg *chain0)
+ 
+ 	write_unlock(&octeon_hw_status_lock);
+ 
+-	if (count_debug) {
++	if (count_debug && w) {
+ 		/* log last match only, not parents */
+-		if (match.r)
+-			pr_debug("%llx/%llx:%d i%d refcount %s%d @%p\n",
+-			       match.r->reg, match.r->mask_reg,
+-			       match.r->bit, match.r->is_hwint,
+-			       (created ? "++" : ""), siblings, match.r);
++		pr_debug("%llx/%llx:%d i%d refcount"
++			" parent %s%d @%p, child %d @%p\n",
++		       w->reg, w->mask_reg, w->bit, w->is_hwint,
++		       (created ? "++" : ""), w->parent->users,
++		       w->parent, (w ? w->users : 0), w);
+ 	}
+ 
+ 	WARN(oflow, pr_fmt("Reference count overflowed!\n"));
+@@ -501,60 +515,88 @@ unlock:
+ }
+ EXPORT_SYMBOL(octeon_hw_status_add_source);
+ 
+-/* Return true if we unlocked the lock because we did free_irq. */
+-static bool dispose_of_node(struct octeon_hw_status_node *n)
++/*
++ * unuse_node():
++ * Decrement use count, freeing when zero,
++ * recursing up parent chain as children freed.
++ * Count generations freed into *levp.
++ *
++ * Called with lock held.
++ * Returns 'locked', false if had to unlock to free irq-node.
++ * Work is complete at return, even in the unlocked-return case,
++ * because an irq-node never has a parent.
++ */
++static bool unuse_node(struct octeon_hw_status_node *n, bool *oflow, int *levp)
+ {
+-	bool rv = false;
++	bool locked = true;
+ 	struct octeon_hw_status_node *parent;
+ 	struct octeon_hw_status_node **pw;
+ 
+-	for (;;) {
++	for (; locked && n; n = parent) {
++		/* "Can't Happen": count over/underflowed, so unsafe */
++		*oflow |= (n->users == ref_max_users);
++		*oflow |= !n->users;
++
++		if (*oflow)
++			return locked;
++
++		if (--(n->users) > 0)
++			return locked;
++
++		/* n will be freed, but from which chain? */
+ 		parent = n->parent;
+ 		if (parent)
+ 			pw = &n->parent->child;
+ 		else
+ 			pw = &octeon_hw_status_roots;
+ 
+-		while (*pw) {
+-			if (*pw == n) {
+-				if (!n->is_hwint && n->mask_reg) {
+-					/* Disable the source if we are removing it. */
+-					u64 mask = 1ull << n->bit;
+-					u64 csr = cvmx_read_csr(n->mask_reg);
+-					csr &= ~mask;
+-					cvmx_write_csr(n->mask_reg, csr);
+-				}
+-
+-				*pw = n->next;
+-				if (n->is_hwint && n->own_irq) {
+-					rv = true;
+-					write_unlock(&octeon_hw_status_lock);
+-					free_irq(n->irq, n);
+-				}
+-				kfree(n);
+-				if (rv)
+-					return rv;
++		/* walk parent's chain, to find unlink point */
++		for (; *pw; pw = &(*pw)->next)
++			if (*pw == n)
+ 				break;
+-			} else {
+-				pw = &(*pw)->next;
+-			}
++
++		/* if sum/mask, remove from mask */
++		if (!n->is_hwint && n->mask_reg) {
++			u64 mask = 1ull << n->bit;
++			u64 csr = cvmx_read_csr(n->mask_reg);
++			csr &= ~mask;
++			cvmx_write_csr(n->mask_reg, csr);
+ 		}
+-		/* Stop at the root or if there are more children. */
+-		if (!parent || parent->child)
+-			break;
+-		n = parent;
++
++		/* edit self out of chain */
++		if (pw)
++			*pw = n->next;
++
++		if (n->is_hwint && n->own_irq) {
++			write_unlock(&octeon_hw_status_lock);
++			locked = false;
++			free_irq(n->irq, n);
++		}
++
++		if (!pw) {
++			/* "Can't Happen", so log */
++			if (locked)
++				write_unlock(&octeon_hw_status_lock);
++			locked = false;
++			pr_err("%s(%p .i%d .r%llx) but no parent!\n",
++				__func__, n, n->is_hwint, n->reg);
++		}
++
++		kfree(n);
++		levp[0]++;
+ 	}
+-	return rv;
++
++	return locked;
+ }
+ 
+ int octeon_hw_status_remove_source(struct octeon_hw_status_reg *leaf)
+ {
+ 	int rv = 0;
+-	bool already_unlocked = false;
++	bool locked = true;
+ 	struct octeon_hw_status_node *n;
+ 	struct find_node_cb_data d = { .warn  = false, };
+ 	bool oflow = false;
+-	bool gone = false;
++	int levels = 0;
+ 
+ 	write_lock(&octeon_hw_status_lock);
+ 
+@@ -564,28 +606,28 @@ int octeon_hw_status_remove_source(struct octeon_hw_status_reg *leaf)
+ 		goto out;
+ 	}
+ 
+-	/* Can't Happen: count overflowed, so decrement unsafe */
+-	oflow = (n->users == ref_max_users);
+-	if (!oflow) {
+-		n->users--;
+-		if (n->users == 0) {
+-			gone = true;
+-			/* should clear & free empty ancestors */
+-			already_unlocked = dispose_of_node(n);
+-		}
+-	}
++	locked = unuse_node(n, &oflow, &levels);
+ out:
+-	if (!already_unlocked)
++	if (locked)
+ 		write_unlock(&octeon_hw_status_lock);
+ 
+ 	warn_mismatch(&d);
+ 
+-	if (count_debug && gone)
+-		pr_debug("%llx:%d gone\n",
+-			d.r->reg, d.r->bit);
+-	else if (count_debug)
+-		pr_debug("%llx:%d refcount --%d@%p\n",
+-			d.r->reg, d.r->bit, n->users, n);
++	if (count_debug) {
++		if (!n)
++			pr_err("%s(i%d %llx:%d) ENOENT\n",
++				__func__, leaf->reg_is_hwint,
++				leaf->reg, leaf->bit);
++		else if (levels)
++			/* n freed, but can safely print _address_ for cross-ref */
++			pr_debug("%llx:%d refcount --0 @%p, %d levels freed\n",
++				leaf->reg, leaf->bit, n, levels);
++		else
++			pr_debug("%llx:%d refcount parent --%d @%p, child %d @%p\n",
++				n->reg, n->bit,
++				(n->parent ? n->parent->users : 999),
++				n->parent, n->users, n);
++	}
+ 
+ 	return rv;
+ }
+-- 
+2.6.2
+

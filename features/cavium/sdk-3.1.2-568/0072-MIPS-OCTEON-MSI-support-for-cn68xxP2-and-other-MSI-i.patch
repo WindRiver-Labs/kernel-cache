@@ -1,0 +1,423 @@
+From 14e2ea68e7f1fabed1e223a032f08158d75e29d3 Mon Sep 17 00:00:00 2001
+From: David Daney <david.daney@cavium.com>
+Date: Thu, 5 Apr 2012 16:59:07 -0700
+Subject: [PATCH 072/974] MIPS: OCTEON: MSI support for cn68xxP2 and other MSI
+ improvements.
+
+Allow affinity for MSI to be set, also handle the per-CPU routing
+available on cn68xxP2.
+
+Signed-off-by: David Daney <david.daney@cavium.com>
+[Original patch taken from Cavium SDK 3.1.2-568]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ arch/mips/pci/msi-octeon.c | 309 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 298 insertions(+), 11 deletions(-)
+
+diff --git a/arch/mips/pci/msi-octeon.c b/arch/mips/pci/msi-octeon.c
+index d37be36..da7853d 100644
+--- a/arch/mips/pci/msi-octeon.c
++++ b/arch/mips/pci/msi-octeon.c
+@@ -3,19 +3,22 @@
+  * License.  See the file "COPYING" in the main directory of this archive
+  * for more details.
+  *
+- * Copyright (C) 2005-2009, 2010 Cavium Networks
++ * Copyright (C) 2005-2012 Cavium Inc.
+  */
++#include <linux/interrupt.h>
++#include <linux/spinlock.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
++#include <linux/cpu.h>
+ #include <linux/msi.h>
+-#include <linux/spinlock.h>
+-#include <linux/interrupt.h>
+ 
+ #include <asm/octeon/octeon.h>
+ #include <asm/octeon/cvmx-npi-defs.h>
+ #include <asm/octeon/cvmx-pci-defs.h>
+ #include <asm/octeon/cvmx-npei-defs.h>
+ #include <asm/octeon/cvmx-pexp-defs.h>
++#include <asm/octeon/cvmx-sli-defs.h>
++#include <asm/octeon/cvmx-ciu2-defs.h>
+ #include <asm/octeon/pci-octeon.h>
+ 
+ /*
+@@ -161,6 +164,11 @@ msi_irq_allocated:
+ 		msg.address_lo = (0 + CVMX_NPEI_PCIE_MSI_RCV) & 0xffffffff;
+ 		msg.address_hi = (0 + CVMX_NPEI_PCIE_MSI_RCV) >> 32;
+ 		break;
++	case OCTEON_DMA_BAR_TYPE_PCIE2:
++		/* When using PCIe2, Bar 0 is based at 0 */
++		msg.address_lo = (0 + CVMX_SLI_PCIE_MSI_RCV) & 0xffffffff;
++		msg.address_hi = (0 + CVMX_SLI_PCIE_MSI_RCV) >> 32;
++		break;
+ 	default:
+ 		panic("arch_setup_msi_irq: Invalid octeon_dma_bar_type");
+ 	}
+@@ -220,14 +228,13 @@ void arch_teardown_msi_irq(unsigned int irq)
+ 	int irq0;
+ 
+ 	if ((irq < OCTEON_IRQ_MSI_BIT0)
+-		|| (irq > msi_irq_size + OCTEON_IRQ_MSI_BIT0))
+-		panic("arch_teardown_msi_irq: Attempted to teardown illegal "
+-		      "MSI interrupt (%d)", irq);
++		|| (irq > msi_irq_size + OCTEON_IRQ_MSI_BIT0 - 1))
++		panic("arch_teardown_msi_irq: Attempted to teardown illegal MSI interrupt (%d)",
++		      irq);
+ 
+ 	irq -= OCTEON_IRQ_MSI_BIT0;
+ 	index = irq / 64;
+ 	irq0 = irq % 64;
+-
+ 	/*
+ 	 * Count the number of IRQs we need to free by looking at the
+ 	 * msi_multiple_irq_bitmask. Each bit set means that the next
+@@ -244,8 +251,8 @@ void arch_teardown_msi_irq(unsigned int irq)
+ 	/* Shift the mask to the correct bit location */
+ 	bitmask <<= irq0;
+ 	if ((msi_free_irq_bitmask[index] & bitmask) != bitmask)
+-		panic("arch_teardown_msi_irq: Attempted to teardown MSI "
+-		      "interrupt (%d) not in use", irq);
++		panic("arch_teardown_msi_irq: Attempted to teardown MSI interrupt (%d) not in use",
++		      irq);
+ 
+ 	/* Checks are done, update the in use bitmask */
+ 	spin_lock(&msi_free_irq_bitmask_lock);
+@@ -259,6 +266,90 @@ static DEFINE_RAW_SPINLOCK(octeon_irq_msi_lock);
+ static u64 msi_rcv_reg[4];
+ static u64 mis_ena_reg[4];
+ 
++static int (*octeon_irq_msi_to_irq)(int);
++static int (*octeon_irq_iqr_to_msi)(int);
++
++static int octeon_irq_msi_to_irq_linear(int msi)
++{
++	return msi + OCTEON_IRQ_MSI_BIT0;
++}
++
++static int octeon_irq_iqr_to_msi_linear(int irq)
++{
++	return irq - OCTEON_IRQ_MSI_BIT0;
++}
++
++static int octeon_irq_msi_to_irq_scatter(int msi)
++{
++	return (((msi >> 6) & 0x3) | ((msi << 2) & 0xfc)) + OCTEON_IRQ_MSI_BIT0;
++}
++
++static int octeon_irq_iqr_to_msi_scatter(int irq)
++{
++	int t = irq - OCTEON_IRQ_MSI_BIT0;
++	return ((t << 6) & 0xc0) | ((t >> 2) & 0x3f);
++}
++
++static atomic_t affinity_in_progress[4] = {
++	ATOMIC_INIT(1),
++	ATOMIC_INIT(1),
++	ATOMIC_INIT(1),
++	ATOMIC_INIT(1)};
++
++static int octeon_irq_msi_set_affinity_pcie(struct irq_data *data,
++					    const struct cpumask *dest,
++					    bool force)
++{
++	int msi = octeon_irq_iqr_to_msi(data->irq);
++	int index = msi >> 6;
++	int bit;
++	int r;
++
++	/*
++	 * If we are in the middle of updating the set, the first call
++	 * takes care of everything, do nothing successfully.
++	 */
++	if (atomic_sub_if_positive(1, affinity_in_progress + index) < 0)
++		return 0;
++
++	r = irq_set_affinity(OCTEON_IRQ_PCI_MSI0 + index, dest);
++
++	for (bit = 0; bit < 64; bit++) {
++		int partner = octeon_irq_msi_to_irq(64 * index + bit);
++		if (partner != data->irq)
++			irq_set_affinity(partner, dest);
++	}
++	atomic_add(1, affinity_in_progress + index);
++	return r;
++}
++
++static int octeon_irq_msi_set_affinity_pci(struct irq_data *data,
++					   const struct cpumask *dest,
++					   bool force)
++{
++	int msi = octeon_irq_iqr_to_msi(data->irq);
++	int index = msi >> 4;
++	int bit;
++	int r;
++
++	/*
++	 * If we are in the middle of updating the set, the first call
++	 * takes care of everything, do nothing successfully.
++	 */
++	if (atomic_sub_if_positive(1, affinity_in_progress + index) < 0)
++		return 0;
++
++	r = irq_set_affinity(OCTEON_IRQ_PCI_MSI0 + index, dest);
++
++	for (bit = 0; bit < 16; bit++) {
++		int partner = octeon_irq_msi_to_irq(16 * index + bit);
++		if (partner != data->irq)
++			irq_set_affinity(partner, dest);
++	}
++	atomic_add(1, affinity_in_progress + index);
++	return r;
++}
++
+ static void octeon_irq_msi_enable_pcie(struct irq_data *data)
+ {
+ 	u64 en;
+@@ -295,6 +386,9 @@ static struct irq_chip octeon_irq_chip_msi_pcie = {
+ 	.name = "MSI",
+ 	.irq_enable = octeon_irq_msi_enable_pcie,
+ 	.irq_disable = octeon_irq_msi_disable_pcie,
++#ifdef CONFIG_SMP
++	.irq_set_affinity = octeon_irq_msi_set_affinity_pcie,
++#endif
+ };
+ 
+ static void octeon_irq_msi_enable_pci(struct irq_data *data)
+@@ -317,6 +411,9 @@ static struct irq_chip octeon_irq_chip_msi_pci = {
+ 	.name = "MSI",
+ 	.irq_enable = octeon_irq_msi_enable_pci,
+ 	.irq_disable = octeon_irq_msi_disable_pci,
++#ifdef CONFIG_SMP
++	.irq_set_affinity = octeon_irq_msi_set_affinity_pci,
++#endif
+ };
+ 
+ /*
+@@ -356,6 +453,161 @@ OCTEON_MSI_INT_HANDLER_X(1);
+ OCTEON_MSI_INT_HANDLER_X(2);
+ OCTEON_MSI_INT_HANDLER_X(3);
+ 
++static void octeon_msi_ciu2_enable_on_cpu(unsigned int irq, int cpu)
++{
++	int core;
++	int msi = irq - OCTEON_IRQ_MSI_BIT0;
++	union cvmx_ciu2_msi_selx sel;
++
++	core = octeon_coreid_for_cpu(cpu);
++
++	sel.u64 = 0;
++	sel.s.pp_num = core;
++	sel.s.ip_num = 2; /* IP4 */
++	sel.s.en = 1;
++	cvmx_write_csr(CVMX_CIU2_MSI_SELX(msi), sel.u64);
++	/* Read back some CSR for write to complete. */
++	cvmx_read_csr(CVMX_CIU2_SUM_PPX_IP2(core));
++}
++
++static void octeon_msi_ciu2_enable(struct irq_data *data)
++{
++	int cpu;
++
++#ifdef CONFIG_SMP
++	cpu = cpumask_first(data->affinity);
++#else
++	cpu = 0;
++#endif
++	octeon_msi_ciu2_enable_on_cpu(data->irq, cpu);
++}
++
++static void octeon_msi_ciu2_disable(struct irq_data *data)
++{
++	int msi = data->irq - OCTEON_IRQ_MSI_BIT0;
++	union cvmx_ciu2_msi_selx sel;
++
++	sel.u64 = cvmx_read_csr(CVMX_CIU2_MSI_SELX(msi));
++	sel.s.en = 0;
++	cvmx_write_csr(CVMX_CIU2_MSI_SELX(msi), sel.u64);
++	cvmx_read_csr(CVMX_CIU2_INTR_CIU_READY);
++}
++
++static void octeon_msi_ciu2_ack(struct irq_data *data)
++{
++	int msi = data->irq - OCTEON_IRQ_MSI_BIT0;
++
++	cvmx_write_csr(CVMX_CIU2_MSI_RCVX(msi), 0);
++	cvmx_read_csr(CVMX_CIU2_INTR_CIU_READY);
++}
++
++#ifdef CONFIG_SMP
++static int octeon_msi_ciu2_set_affinity(struct irq_data *data,
++					const struct cpumask *dest,
++					bool force)
++{
++	int cpu = cpumask_first(dest);
++
++	/*
++	 * For CIU2-MSI, we will allow only single CPU affinity.
++	 * This .
++	 */
++	if (cpumask_weight(dest) != 1)
++		return -EINVAL;
++
++	octeon_msi_ciu2_enable_on_cpu(data->irq, cpu);
++
++	return 0;
++}
++#endif
++
++static struct irq_chip octeon_msi_chip_ciu2 = {
++	.name = "CIU2-MSI",
++	.irq_enable = octeon_msi_ciu2_enable,
++	.irq_disable = octeon_msi_ciu2_disable,
++	.irq_ack = octeon_msi_ciu2_ack,
++	.irq_mask = octeon_msi_ciu2_disable,
++	.irq_unmask = octeon_msi_ciu2_enable,
++#ifdef CONFIG_SMP
++	.irq_set_affinity = octeon_msi_ciu2_set_affinity,
++	.irq_cpu_offline = octeon_irq_cpu_offline_ciu,
++#endif
++};
++
++static void octeon_msi_ip4(void)
++{
++	union cvmx_ciu2_msired_ppx_ip4 msired;
++	int core = cvmx_get_core_num();
++
++	msired.u64 = cvmx_read_csr(CVMX_CIU2_MSIRED_PPX_IP4(core));
++
++	if (msired.s.intr)
++		do_IRQ(msired.s.msi_num + OCTEON_IRQ_MSI_BIT0);
++	else
++		spurious_interrupt();
++}
++
++static int octeon_msi_cpu_callback(struct notifier_block *nfb,
++				   unsigned long action, void *hcpu)
++{
++	unsigned int cpu = (unsigned long)hcpu;
++
++	switch (action) {
++	case CPU_DOWN_PREPARE:
++		cvmx_write_csr(CVMX_CIU2_EN_PPX_IP4_IO_W1C(cpu_logical_map(cpu)),
++			       1<<12);
++		break;
++	case CPU_ONLINE:
++	case CPU_DOWN_FAILED:
++		cvmx_write_csr(CVMX_CIU2_EN_PPX_IP4_IO_W1S(cpu_logical_map(cpu)),
++			       1<<12);
++		break;
++	default:
++		break;
++	}
++	return NOTIFY_OK;
++}
++
++static struct notifier_block octeon_msi_cpu_notifier = {
++	.notifier_call = octeon_msi_cpu_callback,
++};
++
++int __init octeon_msi_68XX_init(void)
++{
++	int i;
++	int cpu;
++
++	/* Disable legacy handling. */
++	cvmx_write_csr(CVMX_PEXP_SLI_MSI_ENB0, 0);
++	cvmx_write_csr(CVMX_PEXP_SLI_MSI_ENB1, 0);
++	cvmx_write_csr(CVMX_PEXP_SLI_MSI_ENB2, 0);
++	cvmx_write_csr(CVMX_PEXP_SLI_MSI_ENB3, 0);
++
++	/* Disable CIU2_MSI */
++	for (i = 0; i < 256; i++)
++		cvmx_write_csr(CVMX_CIU2_MSI_SELX(i), 0);
++
++	for (i = OCTEON_IRQ_MSI_BIT0; i <= OCTEON_IRQ_MSI_LAST; i++)
++		irq_set_chip_and_handler(i, &octeon_msi_chip_ciu2, handle_edge_irq);
++
++	octeon_irq_set_ip4_handler(octeon_msi_ip4);
++	/* Enable MSIRED interrupt */
++#ifdef CONFIG_SMP
++	for_each_online_cpu(cpu)
++		cvmx_write_csr(CVMX_CIU2_EN_PPX_IP4_IO_W1S(cpu_logical_map(cpu)),
++			       1<<12);
++#else
++	cvmx_write_csr(CVMX_CIU2_EN_PPX_IP4_IO_W1S(cvmx_get_core_num()),
++			       1<<12);
++#endif
++	cvmx_read_csr(CVMX_CIU2_SUM_PPX_IP2(cvmx_get_core_num()));
++
++	register_hotcpu_notifier(&octeon_msi_cpu_notifier);
++
++	msi_irq_size = 256;
++	return 0;
++}
++
+ /*
+  * Initializes the MSI interrupt handling code
+  */
+@@ -363,8 +615,25 @@ int __init octeon_msi_initialize(void)
+ {
+ 	int irq;
+ 	struct irq_chip *msi;
+-
+-	if (octeon_dma_bar_type == OCTEON_DMA_BAR_TYPE_PCIE) {
++	u64 msi_map_reg;
++
++	if (OCTEON_IS_MODEL(OCTEON_CN68XX) && !OCTEON_IS_MODEL(OCTEON_CN68XX_PASS1_X))
++		return octeon_msi_68XX_init();
++
++	if (octeon_dma_bar_type == OCTEON_DMA_BAR_TYPE_PCIE2) {
++		msi_rcv_reg[0] = CVMX_PEXP_SLI_MSI_RCV0;
++		msi_rcv_reg[1] = CVMX_PEXP_SLI_MSI_RCV1;
++		msi_rcv_reg[2] = CVMX_PEXP_SLI_MSI_RCV2;
++		msi_rcv_reg[3] = CVMX_PEXP_SLI_MSI_RCV3;
++		mis_ena_reg[0] = CVMX_PEXP_SLI_MSI_ENB0;
++		mis_ena_reg[1] = CVMX_PEXP_SLI_MSI_ENB1;
++		mis_ena_reg[2] = CVMX_PEXP_SLI_MSI_ENB2;
++		mis_ena_reg[3] = CVMX_PEXP_SLI_MSI_ENB3;
++		msi = &octeon_irq_chip_msi_pcie;
++		octeon_irq_msi_to_irq = octeon_irq_msi_to_irq_scatter;
++		octeon_irq_iqr_to_msi = octeon_irq_iqr_to_msi_scatter;
++		msi_map_reg = CVMX_PEXP_SLI_MSI_WR_MAP;
++	} else if (octeon_dma_bar_type == OCTEON_DMA_BAR_TYPE_PCIE) {
+ 		msi_rcv_reg[0] = CVMX_PEXP_NPEI_MSI_RCV0;
+ 		msi_rcv_reg[1] = CVMX_PEXP_NPEI_MSI_RCV1;
+ 		msi_rcv_reg[2] = CVMX_PEXP_NPEI_MSI_RCV2;
+@@ -374,6 +643,9 @@ int __init octeon_msi_initialize(void)
+ 		mis_ena_reg[2] = CVMX_PEXP_NPEI_MSI_ENB2;
+ 		mis_ena_reg[3] = CVMX_PEXP_NPEI_MSI_ENB3;
+ 		msi = &octeon_irq_chip_msi_pcie;
++		octeon_irq_msi_to_irq = octeon_irq_msi_to_irq_scatter;
++		octeon_irq_iqr_to_msi = octeon_irq_iqr_to_msi_scatter;
++		msi_map_reg = CVMX_PEXP_NPEI_MSI_WR_MAP;
+ 	} else {
+ 		msi_rcv_reg[0] = CVMX_NPI_NPI_MSI_RCV;
+ #define INVALID_GENERATE_ADE 0x8700000000000000ULL;
+@@ -385,6 +657,21 @@ int __init octeon_msi_initialize(void)
+ 		mis_ena_reg[2] = INVALID_GENERATE_ADE;
+ 		mis_ena_reg[3] = INVALID_GENERATE_ADE;
+ 		msi = &octeon_irq_chip_msi_pci;
++		octeon_irq_msi_to_irq = octeon_irq_msi_to_irq_linear;
++		octeon_irq_iqr_to_msi = octeon_irq_iqr_to_msi_linear;
++		msi_map_reg = 0;
++	}
++
++	if (msi_map_reg) {
++		int msi;
++		int ciu;
++		u64 e;
++
++		for (msi = 0; msi < 256; msi++) {
++			ciu = (msi >> 2) | ((msi << 6) & 0xc0);
++			e = (ciu << 8) | msi;
++			cvmx_write_csr(msi_map_reg, e);
++		}
+ 	}
+ 
+ 	for (irq = OCTEON_IRQ_MSI_BIT0; irq <= OCTEON_IRQ_MSI_LAST; irq++)
+-- 
+2.6.2
+

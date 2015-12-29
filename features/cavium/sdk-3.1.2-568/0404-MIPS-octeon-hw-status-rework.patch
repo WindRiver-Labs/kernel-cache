@@ -1,0 +1,619 @@
+From ae3270daa3ad4c0429fab8597d0a8f6d9140c8b5 Mon Sep 17 00:00:00 2001
+From: Peter Swain <peter.swain@cavium.com>
+Date: Mon, 11 Nov 2013 15:31:08 -0800
+Subject: [PATCH 404/974] MIPS: octeon-hw-status rework
+
+Problem: octeon-irq & -hw-status both claiming CIB irq, incompatibly.
+Solution: hw-status checks for existing handler, before registering.
+  More work is needed here for a fallback path for unhandled-by-CIB
+  conditions to be passed to error-tree handler.
+  Still cannot register for IRQs already handled by other drivers,
+  but clash should only impact hw_status scan, not other drivers.
+  Potential clash on cn7xxx with later-loading modules using CIB,
+  but I don't believe we have any.
+
+Problem: hw-status hard to debug.
+Solutions:
+- for post-boot inspection, use /sys/kernel/debug/hwstat to dump state
+- for boot-time debug, use bootparam  octeon_hw_status.count_debug=1
+- Added a match-counter mode to find_node_cb(), to help debug.
+  When octeon_hw_status.count_debug, octeon_hw_status_add_source() self-checks
+  by re-walking tree when done, logging any instance when the added objects
+  are not reachable exactly once.
+
+Problem: kmalloc called under rwlock, where sleep would be fatal.
+Solution: drop lock to kmalloc when either a new root or new child needed,
+  and re-scan when lock re-acquired, because another thread may have already
+  added the desired object.
+  Inc ref-counts during this unlock/relock, to avoid use-after-free should
+  another thread add/remove child. Note this "constructing" state to suppress
+  spurious warning when scans notice this inconsistency.
+
+Problem: WARN() called under rwlock, where sleep would be fatal.
+Solution: note problems during scans, by adding fields to scanner's callback
+  function's state object.  Complain of inconsistencies _after_ scan, unlocked.
+
+Problem: octeon_hw_status_add_source() did not increment parent->users.
+Solution: avoid over-dismantling when an object removed, but siblings remain,
+  by maintaining parent's user count.
+[Original patch taken from Cavium SDK 3.1.2-568]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ arch/mips/cavium-octeon/octeon-hw-status.c | 381 +++++++++++++++++++++++------
+ arch/mips/cavium-octeon/octeon-irq.c       |   3 +-
+ 2 files changed, 305 insertions(+), 79 deletions(-)
+
+diff --git a/arch/mips/cavium-octeon/octeon-hw-status.c b/arch/mips/cavium-octeon/octeon-hw-status.c
+index ba0f9df..9abcfc6 100644
+--- a/arch/mips/cavium-octeon/octeon-hw-status.c
++++ b/arch/mips/cavium-octeon/octeon-hw-status.c
+@@ -1,16 +1,21 @@
++#define DEBUG
+ /*
+  * This file is subject to the terms and conditions of the GNU General Public
+  * License.  See the file "COPYING" in the main directory of this archive
+  * for more details.
+  *
+- * Copyright (C) 2012 Cavium, Inc.
++ * Copyright (C) 2012-2013 Cavium, Inc.
+  */
+ 
++#define pr_fmt(fmt) "octeon-hw-status: " fmt
++
+ #include <linux/interrupt.h>
+ #include <linux/irqdomain.h>
+ #include <linux/notifier.h>
+ #include <linux/export.h>
+ #include <linux/slab.h>
++#include <linux/moduleparam.h>
++#include <linux/irqdesc.h>
+ 
+ #include <asm/octeon/octeon-hw-status.h>
+ #include <asm/octeon/octeon.h>
+@@ -29,6 +34,10 @@ int octeon_hw_status_notifier_unregister(struct notifier_block *nb)
+ }
+ EXPORT_SYMBOL(octeon_hw_status_notifier_unregister);
+ 
++static int count_debug;
++module_param(count_debug, int, 0644);
++#define ref_max_users 0xff
++
+ struct octeon_hw_status_node {
+ 	struct octeon_hw_status_node *next; /* Child list */
+ 	struct octeon_hw_status_node *child;
+@@ -49,10 +58,18 @@ struct octeon_hw_status_node {
+ 	u8 ack_w1c:1;
+ };
+ 
+-/* Protects octeon_hw_status_roots */
++/* Protects octeon_hw_status_roots & their trees */
+ static DEFINE_RWLOCK(octeon_hw_status_lock);
+ static struct octeon_hw_status_node *octeon_hw_status_roots;
+ 
++/*
++ * when constructing tree, _lock may be dropped to kmalloc, but new parent
++ * does .users++ to reflect _intended_ child, to avoid a sibling'd dealloc
++ * causing the parent.users-- to free the parent.
++ * This state is visible to deflect a WARN() by passing scans while unlocked.
++ */
++static bool constructing;
++
+ /* call cb on each node.  stop if cb returns true. */
+ static int visit_leaves(struct octeon_hw_status_node *s, bool visit_sibs,
+ 			  int (*cb)(struct octeon_hw_status_node *, void *),
+@@ -107,8 +124,21 @@ static int visit_leaves(struct octeon_hw_status_node *s, bool visit_sibs,
+ struct find_node_cb_data {
+ 	struct octeon_hw_status_node *r;
+ 	struct octeon_hw_status_reg *sr;
++	bool warn:1;
++	bool count:1;
++	u32 found;
+ };
+ 
++static void warn_mismatch(struct find_node_cb_data *cbd)
++{
++	WARN(cbd->warn,
++		pr_fmt("Mismatched properties"
++			" %llx:%llx %p/%d %d/%d\n"),
++		 cbd->r->reg, cbd->sr->mask_reg,
++		 cbd->r->child, cbd->sr->has_child,
++		 cbd->r->ack_w1c, cbd->sr->ack_w1c);
++}
++
+ static int find_node_cb(struct octeon_hw_status_node *n, void *arg)
+ {
+ 	struct find_node_cb_data *d = arg;
+@@ -124,24 +154,36 @@ static int find_node_cb(struct octeon_hw_status_node *n, void *arg)
+ 		}
+ 	}
+ 	return 0;
++
+ found:
+-	WARN((n->child != NULL) != sr->has_child || n->ack_w1c != sr->ack_w1c,
+-	     "Mismatched properties %p, %d, %d, %d",
+-	     n->child, sr->has_child, n->ack_w1c, sr->ack_w1c);
+ 	d->r = n;
++	d->warn = (!constructing && !!n->child != sr->has_child);
++	d->warn |= (n->ack_w1c != sr->ack_w1c);
++
++	if (d->count) {
++		/* continue, summing hits */
++		d->found++;
++		return 0;
++	}
++
+ 	return 1;
+ }
+ 
+ static struct octeon_hw_status_node *find_node(struct octeon_hw_status_node *r,
+-					       struct octeon_hw_status_reg *sr)
++					       struct octeon_hw_status_reg *sr,
++					       struct find_node_cb_data *np)
+ {
+-	struct find_node_cb_data d;
+-	d.r = NULL;
+-	d.sr = sr;
++	struct find_node_cb_data d = { .warn  = false, };
++
++	if (!np)
++		np = &d;
++
++	np->r = NULL;
++	np->sr = sr;
+ 
+-	visit_leaves(r, true, find_node_cb, &d);
++	visit_leaves(r, true, find_node_cb, np);
+ 
+-	return d.r;
++	return np->r;
+ }
+ 
+ struct irq_cb_data {
+@@ -195,103 +237,255 @@ static irqreturn_t octeon_hw_status_irq(int irq, void *dev)
+ 	return d.handled_one ? IRQ_HANDLED : IRQ_NONE;
+ }
+ 
++/* find the root node containing a given child */
+ static struct octeon_hw_status_node *find_child(struct octeon_hw_status_node *r,
+-						struct octeon_hw_status_reg *sr)
++						struct octeon_hw_status_reg *sr,
++						struct find_node_cb_data  *np)
+ {
+ 	struct octeon_hw_status_node *cw = r->child;
+ 	struct find_node_cb_data cbd;
+-	cbd.r = NULL;
+-	cbd.sr = sr;
++
++	if (!np)
++		np = &cbd;
++	np->r = NULL;
++	np->sr = sr;
++	np->warn = false;
+ 	while (cw) {
+-		if (find_node_cb(cw, &cbd))
++		if (find_node_cb(cw, np))
+ 			break;
+ 		cw = cw->next;
+ 	}
+ 	return cw;
+ }
+ 
+-int octeon_hw_status_add_source(struct octeon_hw_status_reg *chain)
++static bool irq_handled(int irq)
++{
++	struct irq_desc *desc = irq_to_desc(irq);
++
++	if (!desc || !desc->action)
++		return false;
++	return (desc->action->handler || desc->action->thread_fn);
++}
++
++int octeon_hw_status_add_source(struct octeon_hw_status_reg *chain0)
+ {
++	struct octeon_hw_status_reg *chain = chain0;
+ 	struct octeon_hw_status_data ohsd;
+-	struct octeon_hw_status_node *root;
+-	struct octeon_hw_status_node *n;
++	struct octeon_hw_status_node *root = NULL;
+ 	struct octeon_hw_status_node *w;
++	struct octeon_hw_status_node *new_root = NULL;
++	struct find_node_cb_data match = {.warn = false, };
++	bool oflow = false;
+ 	bool root_created = false;
++	bool created = false;
++	int siblings = 0;
+ 	int rv = 0;
+ 
+ 	if (!chain->reg_is_hwint)
+ 		return -EINVAL;
+ 
+ 	write_lock(&octeon_hw_status_lock);
+-	/* Find the root */
+-	root = octeon_hw_status_roots;
+-	while (root && root->hwint != chain->reg)
+-		root = root->next;
+-
+-	if (!root) {
+-		root = kzalloc(sizeof(struct octeon_hw_status_node),
+-			       GFP_KERNEL);
++
++	/*
++	 * Find-or-create matching root object,
++	 * repeating scan if must drop lock to alloc,
++	 * as other players could insert root while unlocked.
++	 */
++	do {
++		for (root = octeon_hw_status_roots; root; root = root->next) {
++			BUG_ON(!root->is_hwint);
++			if (root->hwint == chain->reg)
++				break;
++		}
++
++		if (!(root || new_root)) {
++			write_unlock(&octeon_hw_status_lock);
++			new_root =
++			    kzalloc(sizeof(struct octeon_hw_status_node),
++				    GFP_KERNEL);
++			WARN(!new_root,
++			     pr_fmt("ENOMEM inserting root %llx/%llx:%u\n"),
++			     chain->reg, chain->mask_reg, chain->bit);
++			if (!new_root)
++				return -ENOMEM;
++			write_lock(&octeon_hw_status_lock);
++			/* rescan, a new root may have appeared when unlocked */
++			continue;
++		}
++
+ 		if (!root) {
+-			rv = -ENOMEM;
+-			goto out;
++			root = new_root;
++			new_root = NULL;
++
++			root->is_hwint = chain->reg_is_hwint;
++			root->ack_w1c = chain->ack_w1c;
++
++			if (root->is_hwint) {
++				root->hwint = chain->reg;
++				if (irq_handled(chain->reg))
++					root->irq = chain->reg;
++			} else {
++				root->reg = chain->reg;
++				root->mask_reg = chain->mask_reg;
++			}
++
++			root->next = octeon_hw_status_roots;
++			octeon_hw_status_roots = root;
++			root_created = true;
+ 		}
+-		root->hwint = chain->reg;
+-		root->is_hwint = 1;
+-		root->ack_w1c = chain->ack_w1c;
+-		root->next = octeon_hw_status_roots;
+-		octeon_hw_status_roots = root;
+-		root_created = true;
+-	}
++	} while (!root);
++
++	/* now lay out the children under that root ... */
+ 	w = root;
+ 	while (chain->has_child) {
++		struct octeon_hw_status_node *n;
++		struct octeon_hw_status_node *n2 = NULL;
++
+ 		chain++;
+-		n = find_child(w, chain);
+-		if (!n) {
+-			n = kzalloc(sizeof(struct octeon_hw_status_node),
+-				    GFP_KERNEL);
+-			if (!n) {
+-				rv = -ENOMEM;
+-				goto out;
++		created = false;
++
++		do {
++			/* existing root containing this chain? */
++			n = find_child(w, chain, &match);
++
++			/* somebody added it while sleeping on alloc? */
++			if (n && n2) {
++				kfree(n2);
++				n2 = NULL;
++				break;
+ 			}
+-			n->is_hwint = chain->reg_is_hwint;
+-			n->ack_w1c = chain->ack_w1c;
+-			if (n->is_hwint) {
+-				n->hwint = chain->reg;
+-			} else {
+-				n->reg = chain->reg;
+-				n->mask_reg = chain->mask_reg;
++
++			if (!n && !n2) {
++				/*
++				 * drop lock to alloc, could potentially collide like
++				 * the root case, but simpler.
++				 */
++				constructing = true;
++				w->users++;
++				write_unlock(&octeon_hw_status_lock);
++				n2 = kzalloc(sizeof
++					     (struct octeon_hw_status_node),
++					     GFP_KERNEL);
++				WARN(!n2, pr_fmt("ENOMEM inserting child"
++						 " %llx/%llx:%u\n"),
++					 chain->reg, chain->mask_reg,
++					 chain->bit);
++				write_lock(&octeon_hw_status_lock);
++				w->users--;
++				constructing = false;
++
++				if (!n2) {
++					rv = -ENOMEM;
++					goto unlock;
++				}
++			} else if (!n) {
++				/* create node: n2 alloc'd, no match in tree */
++				n = n2;
++				match.r = n;
++				n->is_hwint = chain->reg_is_hwint;
+ 				n->bit = chain->bit;
++				n->ack_w1c = chain->ack_w1c;
++				n->users = 1;
++
++				if (n->is_hwint) {
++					n->hwint = chain->reg;
++					if (irq_handled(chain->reg))
++						n->irq = chain->reg;
++				} else {
++					n->reg = chain->reg;
++					n->mask_reg = chain->mask_reg;
++				}
++
++				/* attach to parent */
++				n->next = w->child;
++				w->child = n;
++				n->parent = w;
++
++				/* parent ref-count */
++				oflow = (w->users == ref_max_users);
++				if (!oflow)
++					w->users++;
++				siblings = w->users;
++				created = true;
+ 			}
+-			n->next = w->child;
+-			w->child = n;
+-			n->parent = w;
+-		}
++		} while (!n);
+ 		w = n;
+ 	}
+-	w->users++;
+-	WARN(w->users == 0, "Reference count overflowed!");
+ 
+ 	write_unlock(&octeon_hw_status_lock);
+ 
+-	if (root_created) {
++	if (count_debug) {
++		/* log last match only, not parents */
++		if (match.r)
++			pr_debug("%llx/%llx:%d i%d refcount %s%d @%p\n",
++			       match.r->reg, match.r->mask_reg,
++			       match.r->bit, match.r->is_hwint,
++			       (created ? "++" : ""), siblings, match.r);
++	}
++
++	WARN(oflow, pr_fmt("Reference count overflowed!\n"));
++	warn_mismatch(&match);
++
++	if (root_created && !root->irq) {
++		WARN(rv, pr_fmt("handler for irq %d already set\n",
++			root->irq);
++	} else if (root_created) {
+ 		/* register an interrupt handler */
+ 		root->irq = irq_create_mapping(NULL, root->hwint);
+-		if (!root->irq)
+-			return -ENXIO;
++		if (!root->irq) {
++			rv = -ENXIO;
++			goto bye;
++		}
+ 
+ 		rv = request_threaded_irq(root->irq, NULL, octeon_hw_status_irq,
+-					  IRQF_ONESHOT, "octeon-hw-status", root);
+-		WARN(rv, "request_threaded_irq failed: %d", rv);
++					  IRQF_ONESHOT, "octeon-hw-status",
++					  root);
++		WARN(rv, pr_fmt("request_threaded_irq failed: irq %d, err %d\n",
++			root->irq, rv);
+ 	}
+ 
++	if (count_debug && root_created)
++		pr_debug("%d/%d created root\n",
++		       (int)root->hwint, root->irq);
++
++	/* notifies on leaf creation, not intermediate nodes */
+ 	ohsd.reg = w->reg;
+ 	ohsd.bit = w->bit;
+ 	raw_notifier_call_chain(&octeon_hw_status_notifiers,
+ 				OCTEON_HW_STATUS_SOURCE_ADDED, &ohsd);
+-	return 0;
+-out:
+-	write_unlock(&octeon_hw_status_lock);
++	rv = 0;
++bye:
++	if (new_root)
++		kfree(new_root);
++	if (rv && count_debug)
++		pr_debug("%llx/%llx:%d err %d\n",
++		       chain->reg, chain->mask_reg, chain->bit, rv);
++
++	/* final sanity-check to ensure all are findable */
++	for (; count_debug && chain0; chain0++) {
++		struct octeon_hw_status_reg targ = *chain0;
++		struct find_node_cb_data counter = {.count = true, };
++
++		if (count_debug > 1)
++			pr_debug("check %llx/%llx:%d i%d\n",
++			       targ.reg, targ.mask_reg,
++			       targ.bit, targ.reg_is_hwint);
++
++		find_node(octeon_hw_status_roots, &targ, &counter);
++
++		if (counter.found != 1)
++			pr_debug("%llx/%llx:%d inserted %d times\n",
++			       targ.reg, targ.mask_reg, targ.bit,
++			       counter.found);
++
++		if (!chain0->has_child)
++			break;
++	}
++
+ 	return rv;
++unlock:
++	write_unlock(&octeon_hw_status_lock);
++	goto bye;
+ }
+ EXPORT_SYMBOL(octeon_hw_status_add_source);
+ 
+@@ -346,21 +540,41 @@ int octeon_hw_status_remove_source(struct octeon_hw_status_reg *leaf)
+ 	int rv = 0;
+ 	bool already_unlocked = false;
+ 	struct octeon_hw_status_node *n;
++	struct find_node_cb_data d = { .warn  = false, };
++	bool oflow = false;
++	bool gone = false;
+ 
+ 	write_lock(&octeon_hw_status_lock);
+ 
+-	n = find_node(octeon_hw_status_roots, leaf);
++	n = find_node(octeon_hw_status_roots, leaf, &d);
+ 	if (!n) {
+ 		rv = -ENODEV;
+ 		goto out;
+ 	}
+ 
+-	n->users--;
+-	if (n->users == 0)
+-		already_unlocked = dispose_of_node(n);
++	/* Can't Happen: count overflowed, so decrement unsafe */
++	oflow = (n->users == ref_max_users);
++	if (!oflow) {
++		n->users--;
++		if (n->users == 0) {
++			gone = true;
++			/* should clear & free empty ancestors */
++			already_unlocked = dispose_of_node(n);
++		}
++	}
+ out:
+ 	if (!already_unlocked)
+ 		write_unlock(&octeon_hw_status_lock);
++
++	warn_mismatch(&d);
++
++	if (count_debug && gone)
++		pr_debug("%llx:%d gone\n",
++			d.r->reg, d.r->bit);
++	else if (count_debug)
++		pr_debug("%llx:%d refcount --%d@%p\n",
++			d.r->reg, d.r->bit, n->users, n);
++
+ 	return rv;
+ }
+ EXPORT_SYMBOL(octeon_hw_status_remove_source);
+@@ -371,6 +585,7 @@ struct enable_cb_data {
+ 	u64 requested_mask;
+ 	u64 mask_reg;
+ 	u64 valid_mask;
++	u64 warn_mask;
+ };
+ 
+ static int enable_cb(struct octeon_hw_status_node *n, void *arg)
+@@ -379,9 +594,11 @@ static int enable_cb(struct octeon_hw_status_node *n, void *arg)
+ 
+ 	if (n->reg == d->reg && (d->requested_mask & (1ul << n->bit))) {
+ 		d->valid_mask |= (1ul << n->bit);
+-		WARN(d->mask_reg && d->mask_reg != n->mask_reg,
+-		     "mask reg mismatch %llu", n->reg);
+-		d->mask_reg = n->mask_reg;
++		if (n->mask_reg) {
++			if (d->mask_reg)
++				d->warn_mask |= (d->mask_reg ^ n->mask_reg);
++			d->mask_reg = n->mask_reg;
++		}
+ 	}
+ 	return 0;
+ }
+@@ -405,6 +622,10 @@ int octeon_hw_status_enable(u64 reg, u64 bit_mask)
+ 	}
+ 
+ 	read_unlock(&octeon_hw_status_lock);
++
++	WARN(cbd.warn_mask, pr_fmt("mask reg mismatch %llx %llx\n"),
++		cbd.reg, cbd.warn_mask);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(octeon_hw_status_enable);
+@@ -428,6 +649,10 @@ int octeon_hw_status_disable(u64 reg, u64 bit_mask)
+ 	}
+ 
+ 	read_unlock(&octeon_hw_status_lock);
++
++	WARN(cbd.warn_mask, pr_fmt("mask reg mismatch %llx %llx\n"),
++		cbd.reg, cbd.warn_mask);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(octeon_hw_status_disable);
+@@ -448,16 +673,16 @@ static int hwstat_show_node(struct octeon_hw_status_node *n, void *data)
+ {
+ 	struct seq_file *s = (struct seq_file *)data;
+ 
+-	seq_printf(s, "%p@%p: u%d ",
+-		n, n->parent, n->users);
++	if (count_debug)
++		seq_printf(s, "%p@%p: u%d i%d ",
++			n, n->parent, n->users, n->is_hwint);
++
+ 	if (n->is_hwint)
+-		seq_printf(s, "i%d %d/%d\n",
+-			n->is_hwint, (int)n->hwint, n->irq);
++		seq_printf(s, "%d/%d\n",
++			(int)n->hwint, n->irq);
+ 	else
+-		seq_printf(s, "i%d %llx/%llx:%d a%d\n",
+-			n->is_hwint,
+-			n->reg, n->mask_reg, n->bit,
+-			n->ack_w1c);
++		seq_printf(s, "%llx/%llx:%d a%d\n",
++			n->reg, n->mask_reg, n->bit, n->ack_w1c);
+ 	return 0;
+ }
+ 
+diff --git a/arch/mips/cavium-octeon/octeon-irq.c b/arch/mips/cavium-octeon/octeon-irq.c
+index a0abe03..e04ee48 100644
+--- a/arch/mips/cavium-octeon/octeon-irq.c
++++ b/arch/mips/cavium-octeon/octeon-irq.c
+@@ -20,6 +20,7 @@
+ #include <asm/octeon/octeon.h>
+ #include <asm/octeon/cvmx-ciu2-defs.h>
+ #include <asm/octeon/cvmx-ciu3-defs.h>
++#include <asm/octeon/octeon-hw-status.h>
+ 
+ static DEFINE_PER_CPU(unsigned long, octeon_irq_ciu0_en_mirror);
+ static DEFINE_PER_CPU(unsigned long, octeon_irq_ciu1_en_mirror);
+@@ -2761,7 +2762,7 @@ static int __init octeon_irq_init_cib(struct device_node *ciu_node,
+ 		pr_err("request_irq cib failed %d\n", r);
+ 		return r;
+ 	}
+-	pr_info("CIB interrupt controller probed: %llx %d\n",
++	pr_info("CIB interrupt controller probed: %llx %d bits\n",
+ 		host_data->raw_reg, host_data->max_bits);
+ 	return 0;
+ }
+-- 
+2.6.2
+

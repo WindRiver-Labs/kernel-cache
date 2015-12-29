@@ -1,0 +1,328 @@
+From c3cfadda46dd94589c37ff5f8d7dffe7a5aa36bd Mon Sep 17 00:00:00 2001
+From: David Daney <david.daney@cavium.com>
+Date: Sun, 23 Feb 2014 13:46:59 -0800
+Subject: [PATCH 493/974] netdev: octeon3-ethernet: Move some init code to
+ .ndo_init()
+
+Signed-off-by: David Daney <david.daney@cavium.com>
+[Original patch taken from Cavium SDK 3.1.2-568]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ drivers/net/ethernet/octeon/octeon3-ethernet.c | 218 +++++++++++++------------
+ 1 file changed, 118 insertions(+), 100 deletions(-)
+
+diff --git a/drivers/net/ethernet/octeon/octeon3-ethernet.c b/drivers/net/ethernet/octeon/octeon3-ethernet.c
+index 99291cd..f0e6646 100644
+--- a/drivers/net/ethernet/octeon/octeon3-ethernet.c
++++ b/drivers/net/ethernet/octeon/octeon3-ethernet.c
+@@ -55,11 +55,13 @@ struct octeon3_ethernet {
+ 	struct device *bgx_dev;
+ 	struct net_device *netdev;
+ 	struct napi_struct napi;
+-	int pki_channel;
+ 	int pki_laura;
+ 	int pko_queue;
+ 	int numa_node;
++	int xiface;
++	int port_index;
+ 	int tx_complete_gaura;
++	int rx_buf_count;
+ 	int rx_grp;
+ 	int rx_irq;
+ 	int tx_complete_grp;
+@@ -83,7 +85,16 @@ struct octeon3_ethernet_node {
+ 	struct kthread_work tx_complete_work;
+ };
+ 
+-struct octeon3_ethernet_node octeon3_eth_node[OCTEON3_ETH_MAX_NUMA_NODES];
++static int num_packet_buffers = 128;
++module_param(num_packet_buffers, int, 0444);
++MODULE_PARM_DESC(num_packet_buffers, "Number of packet buffers to allocate per port.");
++
++static int packet_buffer_size = 2048;
++module_param(packet_buffer_size, int, 0444);
++MODULE_PARM_DESC(packet_buffer_size, "Size of each RX packet buffer.");
++
++
++static struct octeon3_ethernet_node octeon3_eth_node[OCTEON3_ETH_MAX_NUMA_NODES];
+ static struct kmem_cache *octeon3_eth_sso_pko_cache;
+ static struct kmem_cache *octeon3_eth_tx_complete_cache;
+ 
+@@ -442,7 +453,7 @@ static void octeon3_eth_replentish_rx(struct octeon3_ethernet *priv, int count)
+ 
+ 	for (i = 0; i < count; i++) {
+ 		void **buf;
+-		skb = __alloc_skb(2048 + 128, GFP_ATOMIC, 0, priv->numa_node);
++		skb = __alloc_skb(packet_buffer_size, GFP_ATOMIC, 0, priv->numa_node);
+ 		if (!skb) {
+ 			pr_err("WARNING: octeon3_eth_replentish_rx out of memory\n");
+ 			break;
+@@ -481,6 +492,14 @@ static int octeon3_eth_napi(struct napi_struct *napi, int budget)
+ static int octeon3_eth_ndo_init(struct net_device *netdev)
+ {
+ 	struct octeon3_ethernet *priv = netdev_priv(netdev);
++	struct octeon3_ethernet_node *nd = octeon3_eth_node + priv->numa_node;
++	struct cvmx_pki_port_config pki_prt_cfg;
++	struct cvmx_pki_prt_schd *prt_schd = NULL;
++	int laura;
++	int ipd_port, node_dq;
++	struct cvmx_xport xdq;
++	int r;
++	int i;
+ 	const u8 *mac;
+ 
+ 	netif_carrier_off(netdev);
+@@ -497,8 +516,90 @@ static int octeon3_eth_ndo_init(struct net_device *netdev)
+ #endif
+ 		;
+ 
+-	netif_napi_add(netdev, &priv->napi, octeon3_eth_napi, 32);
+-	napi_enable(&priv->napi);
++	priv->rx_buf_count = num_packet_buffers;
++
++	ipd_port = cvmx_helper_get_ipd_port(priv->xiface, priv->port_index);
++	cvmx_helper_interface_enumerate(priv->xiface);
++	cvmx_helper_interface_probe(priv->xiface);
++	r =  __cvmx_pko3_config_gen_interface(priv->xiface, priv->port_index, 1, false);
++	if (r)
++		return -ENODEV;
++
++	r = __cvmx_pko3_helper_dqs_activate(priv->xiface, priv->port_index);
++	if (r < 0)
++		return -ENODEV;
++
++	r = cvmx_pko3_interface_options(priv->xiface, priv->port_index,
++					__cvmx_helper_get_has_fcs(priv->xiface),
++					__cvmx_helper_get_pko_padding(priv->xiface), 0);
++	if (r)
++		return -ENODEV;
++
++	node_dq = cvmx_pko3_get_queue_base(ipd_port);
++	xdq = cvmx_helper_ipd_port_to_xport(node_dq);
++
++	priv->pko_queue = xdq.port;
++	priv->pki_laura = cvmx_fpa3_allocate_aura(priv->numa_node);
++	octeon3_eth_fpa_aura_init(priv->numa_node, nd->pki_packet_pool, priv->pki_laura, 1024);
++
++	priv->rx_grp = cvmx_sso_allocate_group(priv->numa_node);
++	priv->tx_complete_grp = nd->tx_complete_grp;
++	dev_err(netdev->dev.parent, "rx sso grp:%d aura:%d pknd:%d\n",
++		priv->rx_grp, priv->pki_laura, cvmx_helper_get_pknd(priv->xiface, priv->port_index));
++	if (priv->rx_grp < 0) {
++		dev_err(netdev->dev.parent, "Failed to allocated SSO group\n");
++		return -ENODEV;
++	}
++
++	prt_schd = kzalloc(sizeof(*prt_schd), GFP_KERNEL);
++	if (!prt_schd) {
++		r = -ENOMEM;
++		goto err;
++	}
++	prt_schd->style = -1; /* Allocate net style per port */
++	prt_schd->aura_per_prt = true;
++	prt_schd->aura = priv->pki_laura;
++	prt_schd->sso_grp_per_prt = true;
++	prt_schd->sso_grp = priv->rx_grp;
++	prt_schd->qpg_qos = CVMX_PKI_QPG_QOS_NONE;
++
++	cvmx_helper_pki_init_port(ipd_port, prt_schd);
++	cvmx_pki_get_port_config(ipd_port, &pki_prt_cfg);
++
++	pki_prt_cfg.style_cfg.parm_cfg.ip6_udp_opt = false;
++	pki_prt_cfg.style_cfg.parm_cfg.lenerr_en = true;
++	pki_prt_cfg.style_cfg.parm_cfg.maxerr_en = true;
++	pki_prt_cfg.style_cfg.parm_cfg.minerr_en = true;
++	pki_prt_cfg.style_cfg.parm_cfg.ip6_udp_opt = false;
++	pki_prt_cfg.style_cfg.parm_cfg.ip6_udp_opt = false;
++	pki_prt_cfg.style_cfg.parm_cfg.wqe_skip = 1 * 128;
++	pki_prt_cfg.style_cfg.parm_cfg.first_skip = 8 * 21;
++	pki_prt_cfg.style_cfg.parm_cfg.later_skip = 8 * 16;
++	pki_prt_cfg.style_cfg.parm_cfg.pkt_lend = false;
++	pki_prt_cfg.style_cfg.parm_cfg.tag_type = CVMX_SSO_TAG_TYPE_UNTAGGED;
++	pki_prt_cfg.style_cfg.parm_cfg.qpg_dis_grptag = true;
++	pki_prt_cfg.style_cfg.parm_cfg.dis_wq_dat = false;
++	pki_prt_cfg.style_cfg.parm_cfg.mbuff_size = packet_buffer_size - 128;
++
++	cvmx_pki_config_port(ipd_port, &pki_prt_cfg);
++
++	laura = cvmx_fpa3_allocate_aura(priv->numa_node);
++	if (laura < 0) {
++		r = -ENODEV;
++		goto err;
++	}
++	priv->tx_complete_gaura = cvmx_fpa3_arua_to_guara(priv->numa_node, laura);
++	octeon3_eth_fpa_aura_init(priv->numa_node, nd->tx_complete_pool, laura, 1024);
++	for (i = 0; i < 1024; i++) {
++		void *mem;
++		mem = kmem_cache_alloc_node(octeon3_eth_tx_complete_cache, GFP_KERNEL, priv->numa_node);
++		if (!mem) {
++			r = -ENOMEM;
++			goto err;
++		}
++		cvmx_fpa3_free_aura(mem, priv->numa_node, laura, 0);
++	}
++
+ 
+ 	mac = bgx_port_get_mac(priv->bgx_dev);
+ 	if (mac && is_valid_ether_addr(mac)) {
+@@ -509,8 +610,14 @@ static int octeon3_eth_ndo_init(struct net_device *netdev)
+ 	}
+ 	bgx_port_set_rx_filtering(netdev, priv->bgx_dev);
+ 
++	netif_napi_add(netdev, &priv->napi, octeon3_eth_napi, 32);
++	napi_enable(&priv->napi);
++
+ 	netdev_info(netdev, "octeon3_eth_ndo_init\n");
+ 	return 0;
++err:
++	kfree(prt_schd);
++	return r;
+ }
+ 
+ static void octeon3_eth_ndo_uninit(struct net_device *netdev)
+@@ -550,7 +657,7 @@ static int octeon3_eth_ndo_open(struct net_device *netdev)
+ 	if (r)
+ 		goto err;
+ 
+-	octeon3_eth_replentish_rx(priv, 100);
++	octeon3_eth_replentish_rx(priv, priv->rx_buf_count);
+ 
+ 	netif_carrier_on(netdev);
+ 	return 0;
+@@ -720,15 +827,9 @@ static const struct net_device_ops octeon3_eth_netdev_ops = {
+ 
+ static int octeon3_eth_probe(struct platform_device *pdev)
+ {
+-	struct cvmx_pki_port_config pki_prt_cfg;
+-	struct cvmx_pki_prt_schd *prt_schd = NULL;
+ 	struct octeon3_ethernet *priv;
+ 	struct net_device *netdev;
+-	struct octeon3_ethernet_node *nd;
+-	int xiface, ipd_port, node_dq;
+-	struct cvmx_xport xdq;
+-	int laura;
+-	int i, r;
++	int r;
+ 
+ 	struct bgx_platform_data *pd = dev_get_platdata(&pdev->dev);
+ 
+@@ -736,27 +837,7 @@ static int octeon3_eth_probe(struct platform_device *pdev)
+ 	if (r)
+ 		return r;
+ 
+-	nd = octeon3_eth_node + pd->numa_node;
+-
+ 	dev_err(&pdev->dev, "Probing %d-%d:%d\n", pd->numa_node, pd->interface, pd->port);
+-	xiface = cvmx_helper_node_interface_to_xiface(pd->numa_node, pd->interface);
+-	ipd_port = cvmx_helper_get_ipd_port(xiface, pd->port);
+-	cvmx_helper_interface_enumerate(xiface);
+-	cvmx_helper_interface_probe(xiface);
+-	r =  __cvmx_pko3_config_gen_interface(xiface, pd->port, 1, false);
+-	if (r)
+-		return r;
+-
+-	r = __cvmx_pko3_helper_dqs_activate(xiface, pd->port);
+-	if (r < 0)
+-		return r;
+-
+-	r = cvmx_pko3_interface_options(xiface, pd->port,
+-					__cvmx_helper_get_has_fcs(xiface),
+-					__cvmx_helper_get_pko_padding(xiface), 0);
+-	if (r)
+-		return r;
+-
+ 	netdev = alloc_etherdev(sizeof(struct octeon3_ethernet));
+ 	if (!netdev) {
+ 		dev_err(&pdev->dev, "Failed to allocated ethernet device\n");
+@@ -765,84 +846,21 @@ static int octeon3_eth_probe(struct platform_device *pdev)
+ 	SET_NETDEV_DEV(netdev, &pdev->dev);
+ 	dev_set_drvdata(&pdev->dev, netdev);
+ 
+-	node_dq = cvmx_pko3_get_queue_base(ipd_port);
+-	xdq = cvmx_helper_ipd_port_to_xport(node_dq);
+-
+ 
+ 	priv = netdev_priv(netdev);
+ 	priv->bgx_dev = pdev->dev.parent;
+ 	priv->netdev = netdev;
+-	priv->pki_channel = 0;
+-	priv->pko_queue = xdq.port;
+-	priv->pki_laura = cvmx_fpa3_allocate_aura(pd->numa_node);
+-	octeon3_eth_fpa_aura_init(pd->numa_node, nd->pki_packet_pool, priv->pki_laura, 1024);
+-	priv->rx_grp = cvmx_sso_allocate_group(pd->numa_node);
+-	priv->tx_complete_grp = octeon3_eth_node[pd->numa_node].tx_complete_grp;
+-	dev_err(&pdev->dev, "rx sso grp:%d aura:%d pknd:%d\n", priv->rx_grp, priv->pki_laura, cvmx_helper_get_pknd(xiface, pd->port));
+-	if (priv->rx_grp < 0) {
+-		dev_err(&pdev->dev, "Failed to allocated SSO group\n");
+-		return -ENODEV;
+-	}
+-
+-	prt_schd = kzalloc(sizeof(*prt_schd), GFP_KERNEL);
+-	if (!prt_schd) {
+-		r = -ENOMEM;
+-		goto err;
+-	}
+-	prt_schd->style = -1; /* Allocate net style per port */
+-	prt_schd->aura_per_prt = true;
+-	prt_schd->aura = priv->pki_laura;
+-	prt_schd->sso_grp_per_prt = true;
+-	prt_schd->sso_grp = priv->rx_grp;
+-	prt_schd->qpg_qos = CVMX_PKI_QPG_QOS_NONE;
+-
+-	cvmx_helper_pki_init_port(ipd_port, prt_schd);
+-	cvmx_pki_get_port_config(ipd_port, &pki_prt_cfg);
+-
+-	pki_prt_cfg.style_cfg.parm_cfg.ip6_udp_opt = false;
+-	pki_prt_cfg.style_cfg.parm_cfg.lenerr_en = true;
+-	pki_prt_cfg.style_cfg.parm_cfg.maxerr_en = true;
+-	pki_prt_cfg.style_cfg.parm_cfg.minerr_en = true;
+-	pki_prt_cfg.style_cfg.parm_cfg.ip6_udp_opt = false;
+-	pki_prt_cfg.style_cfg.parm_cfg.ip6_udp_opt = false;
+-	pki_prt_cfg.style_cfg.parm_cfg.wqe_skip = 1 * 128;
+-	pki_prt_cfg.style_cfg.parm_cfg.first_skip = 8 * 21;
+-	pki_prt_cfg.style_cfg.parm_cfg.later_skip = 8 * 16;
+-	pki_prt_cfg.style_cfg.parm_cfg.pkt_lend = false;
+-	pki_prt_cfg.style_cfg.parm_cfg.tag_type = CVMX_SSO_TAG_TYPE_UNTAGGED;
+-	pki_prt_cfg.style_cfg.parm_cfg.qpg_dis_grptag = true;
+-	pki_prt_cfg.style_cfg.parm_cfg.dis_wq_dat = false;
+-	pki_prt_cfg.style_cfg.parm_cfg.mbuff_size = 2048;
+-
+-	cvmx_pki_config_port(ipd_port, &pki_prt_cfg);
++	priv->numa_node = pd->numa_node;
++	priv->xiface = cvmx_helper_node_interface_to_xiface(pd->numa_node, pd->interface);
++	priv->port_index = pd->port;
+ 
+ 	netdev->netdev_ops = &octeon3_eth_netdev_ops;
+ 
+-	laura = cvmx_fpa3_allocate_aura(pd->numa_node);
+-	if (laura < 0) {
+-		r = -ENODEV;
+-		goto err;
+-	}
+-	priv->tx_complete_gaura = cvmx_fpa3_arua_to_guara(pd->numa_node, laura);
+-	octeon3_eth_fpa_aura_init(pd->numa_node, nd->tx_complete_pool, laura, 1024);
+-	for (i = 0; i < 1024; i++) {
+-		void *mem;
+-		mem = kmem_cache_alloc_node(octeon3_eth_tx_complete_cache, GFP_KERNEL, pd->numa_node);
+-		if (!mem) {
+-			r = -ENOMEM;
+-			goto err;
+-		}
+-		cvmx_fpa3_free_aura(mem, pd->numa_node, laura, 0);
+-	}
+-
+ 	if (register_netdev(netdev) < 0) {
+ 		dev_err(&pdev->dev, "Failed to register ethernet device\n");
+ 		free_netdev(netdev);
+ 	}
+-	r = 0;
+-err:
+-	kfree(prt_schd);
+-	return r;
++	return 0;
+ }
+ 
+ static int octeon3_eth_remove(struct platform_device *pdev)
+-- 
+2.6.2
+

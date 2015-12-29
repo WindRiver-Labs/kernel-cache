@@ -1,0 +1,196 @@
+From a74f21ef32da821d87660fa87bc7b641f8ca7f07 Mon Sep 17 00:00:00 2001
+From: David Daney <david.daney@cavium.com>
+Date: Thu, 13 Feb 2014 13:46:59 -0800
+Subject: [PATCH 538/974] MIPS: OCTEON: Implement PCI INTA interrupts for
+ cn78XX
+
+Pass 1 silicon needs a funky chaining interrupt thing so that it can
+properly implement level triggering semantics.
+
+Signed-off-by: David Daney <david.daney@cavium.com>
+[Original patch taken from Cavium SDK 3.1.2-568]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ arch/mips/pci/pcie-octeon.c | 145 ++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 132 insertions(+), 13 deletions(-)
+
+diff --git a/arch/mips/pci/pcie-octeon.c b/arch/mips/pci/pcie-octeon.c
+index 0d4db2e..a02befe 100644
+--- a/arch/mips/pci/pcie-octeon.c
++++ b/arch/mips/pci/pcie-octeon.c
+@@ -33,6 +33,132 @@ module_param(pcie_disable, int, S_IRUGO);
+ static int enable_pcie_14459_war;
+ static int enable_pcie_bus_num_war[CVMX_PCIE_MAX_PORTS];
+ 
++struct octeon_pcie_interface {
++	struct pci_controller controller;
++	struct resource mem;
++	struct resource io;
++	char mem_name[20];
++	char io_name[20];
++	int node;
++	int pem;
++};
++
++struct pcie_17400_chip_data {
++	int node;
++	int pem;
++	int pin;
++	int parent_irq;
++	int irq;
++	unsigned int intsn;
++};
++
++
++static void pcie_17400_enable(struct irq_data *data)
++{
++	struct pcie_17400_chip_data *cd = irq_data_get_irq_chip_data(data);
++	enable_irq(cd->parent_irq);
++}
++
++static void pcie_17400_disable(struct irq_data *data)
++{
++	struct pcie_17400_chip_data *cd = irq_data_get_irq_chip_data(data);
++	disable_irq(cd->parent_irq);
++}
++
++static int pcie_17400_set_affinity(struct irq_data *data,
++				   const struct cpumask *dest, bool force)
++{
++	struct pcie_17400_chip_data *cd = irq_data_get_irq_chip_data(data);
++	return irq_set_affinity(cd->parent_irq, dest);
++}
++
++static struct irq_chip pcie_17400_chip = {
++	.name = "PCI-WAR",
++	.irq_enable = pcie_17400_enable,
++	.irq_disable = pcie_17400_disable,
++#ifdef CONFIG_SMP
++	.irq_set_affinity = pcie_17400_set_affinity,
++#endif
++};
++
++static irqreturn_t pcie_17400_handler(int irq, void *data)
++{
++	u64 int_sum;
++	struct pcie_17400_chip_data *cd = data;
++	generic_handle_irq(cd->irq);
++
++	int_sum = cvmx_read_csr_node(cd->node, CVMX_PEMX_INT_SUM(cd->pem));
++	if (int_sum & (1ull << (60 + cd->pin))) {
++		/* retrigger the irq */
++		u64 w1s = CVMX_CIU3_ISCX_W1S(cd->intsn);
++		cvmx_write_csr_node(cd->node, w1s, 1);
++		cvmx_read_csr_node(cd->node, w1s);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int __init octeon_pcie78xx_pcibios_map_irq(const struct pci_dev *dev,
++					      u8 slot, u8 pin)
++{
++	struct pci_controller *c;
++	struct octeon_pcie_interface *pcie;
++	unsigned int intsn;
++	struct irq_domain *d;
++	struct pcie_17400_chip_data *cd = NULL;
++	int irq;
++	int rv;
++	/*
++	 * Iterate all the way up the device chain and find
++	 * the root bus.
++	 */
++	while (dev->bus && dev->bus->parent)
++		dev = to_pci_dev(dev->bus->bridge);
++
++	c = dev->bus->sysdata;
++	pcie = container_of(c, struct octeon_pcie_interface, controller);
++
++	intsn = 0xc003c + pin + (0x1000 * pcie->pem);
++
++	d = octeon_irq_get_block_domain(pcie->node, intsn >> 12);
++
++	irq = irq_create_mapping(d, intsn);
++
++	if (!OCTEON_IS_MODEL(OCTEON_CN78XX_PASS1_X))
++		return irq;
++	/* Else use the PCIE-17400 WAR */
++	cd = kzalloc_node(sizeof(*cd), GFP_KERNEL, pcie->node);
++	if (!cd)
++		return -ENOMEM;
++	cd->node = pcie->node;
++	cd->pem = pcie->pem;
++	cd->pin = pin;
++	cd->parent_irq = irq;
++	cd->intsn = intsn;
++
++	cd->irq = irq_alloc_descs(-1, 1, 1, pcie->node);
++	if (WARN(cd->irq < 0, "Unable to find a free irq\n")) {
++		rv = -ENOSPC;
++		goto err;
++	}
++
++	irqd_set_trigger_type(irq_get_irq_data(irq), IRQ_TYPE_EDGE_RISING);
++
++	irq_set_status_flags(irq, IRQ_NOAUTOEN);
++	rv = request_irq(irq, pcie_17400_handler, 0, "inta-war", cd);
++	if (WARN(rv, "request_irq failed.\n"))
++		goto err;
++
++	irq_set_chip_and_handler(cd->irq, &pcie_17400_chip, handle_simple_irq);
++	irq_set_chip_data(cd->irq, cd);
++
++	return cd->irq;
++
++err:
++	kfree(cd);
++	return rv;
++}
++
+ /**
+  * Map a PCI device to the appropriate interrupt line
+  *
+@@ -44,8 +170,8 @@ static int enable_pcie_bus_num_war[CVMX_PCIE_MAX_PORTS];
+  *		 as it goes through each bridge.
+  * Returns Interrupt number for the device
+  */
+-int __init octeon_pcie_pcibios_map_irq(const struct pci_dev *dev,
+-				       u8 slot, u8 pin)
++static int __init octeon_pcie_pcibios_map_irq(const struct pci_dev *dev,
++					      u8 slot, u8 pin)
+ {
+ 	/*
+ 	 * The EBH5600 board with the PCI to PCIe bridge mistakenly
+@@ -352,16 +478,6 @@ static struct pci_ops octeon_pcie_ops = {
+ 	octeon_pcie_write_config,
+ };
+ 
+-struct octeon_pcie_interface {
+-	struct pci_controller controller;
+-	struct resource mem;
+-	struct resource io;
+-	char mem_name[20];
+-	char io_name[20];
+-	int node;
+-	int pem;
+-};
+-
+ static struct octeon_pcie_interface octeon_pcie[3];
+ 
+ static void octeon_pcie_interface_init(struct octeon_pcie_interface *iface, int node, int pem)
+@@ -438,7 +554,10 @@ static int __init octeon_pcie_setup(void)
+ 		return 0;
+ 
+ 	/* Point pcibios_map_irq() to the PCIe version of it */
+-	octeon_pcibios_map_irq = octeon_pcie_pcibios_map_irq;
++	if (octeon_has_feature(OCTEON_FEATURE_CIU3))
++		octeon_pcibios_map_irq = octeon_pcie78xx_pcibios_map_irq;
++	else
++		octeon_pcibios_map_irq = octeon_pcie_pcibios_map_irq;
+ 
+ 	/*
+ 	 * PCIe I/O range. It is based on port 0 but includes up until
+-- 
+2.6.2
+

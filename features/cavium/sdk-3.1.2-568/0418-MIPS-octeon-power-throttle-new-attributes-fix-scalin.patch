@@ -1,0 +1,418 @@
+From 2b1d98a9848a9aca3cf6a48dbcfbe14dd5c3df26 Mon Sep 17 00:00:00 2001
+From: Peter Swain <peter.swain@cavium.com>
+Date: Sat, 23 Nov 2013 13:59:02 -0800
+Subject: [PATCH 418/974] MIPS: octeon-power-throttle: new attributes, fix
+ scaling
+
+Added per-cpu 'overclock' property (directly tied to hw .ovrrd) which allows
+power throttle to exceed the default maximum (.maxpow-.hwpowadj).
+By setting overclock=1, percentage can be set in range 0..100, not restricted
+to 0..default.
+
+Added 'default' property to expose this default maximum.
+
+"default" (or d_anything) is allowed as a write value for 'percentage',
+which restores the default power limit.
+
+Original attempt at boot_powlim logic did not scale to N% of maxpow, but set
+throttle at N% of maximum range (0xff).
+
+With these new sysfs properies, logic becomes simpler if all the attribute
+get/set logic is combined, with common handlers doing switch(attr->name[0])
+inside all the access logic: the size of the common logic exceeds that of
+the per-attribute logic.
+
+Added a read-only 'state' property to show all useful fields,
+both in raw format, and translated to percent of rated max power (maxpow-adj).
+
+Added read-write 'cycles' property to set throttle period.
+(note that /period would have clashed in name[0])
+Either the 0..3 register notation or a cycle count is allowed
+on write (rounding down to closest supported period).
+
+Attributes now read as
+~ # grep ^ /sys/devices/system/cpu/cpu0/power_throttle/*
+/sys/devices/system/cpu/cpu0/power_throttle/cycles:256
+/sys/devices/system/cpu/cpu0/power_throttle/default:75
+/sys/devices/system/cpu/cpu0/power_throttle/override:0
+/sys/devices/system/cpu/cpu0/power_throttle/percentage:75
+/sys/devices/system/cpu/cpu0/power_throttle/state:recent power:         7
+/sys/devices/system/cpu/cpu0/power_throttle/state:recent throttle:      110
+/sys/devices/system/cpu/cpu0/power_throttle/state:power limit:          75% 83
+/sys/devices/system/cpu/cpu0/power_throttle/state:default limit:        75% 83
+/sys/devices/system/cpu/cpu0/power_throttle/state:boot_powlim:          25%
+/sys/devices/system/cpu/cpu0/power_throttle/state:adjustment cycles:    256
+/sys/devices/system/cpu/cpu0/power_throttle/state:throttle_range:       0..110
+/sys/devices/system/cpu/cpu0/power_throttle/state:allow override:       N
+/sys/devices/system/cpu/cpu0/power_throttle/state:raw:                  6e076e1b02536e00
+[Original patch taken from Cavium SDK 3.1.2-568]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ arch/mips/cavium-octeon/octeon-power-throttle.c | 262 +++++++++++++++++-------
+ 1 file changed, 191 insertions(+), 71 deletions(-)
+
+diff --git a/arch/mips/cavium-octeon/octeon-power-throttle.c b/arch/mips/cavium-octeon/octeon-power-throttle.c
+index b6a7067..9400dfa 100644
+--- a/arch/mips/cavium-octeon/octeon-power-throttle.c
++++ b/arch/mips/cavium-octeon/octeon-power-throttle.c
+@@ -9,7 +9,7 @@
+  * PowThrottle register.  If set to 100% for that particular cpu, it
+  * may consume maximum power.
+  *
+- * Copyright (C) 2012 Cavium, Inc.
++ * Copyright (C) 2012-2013 Cavium, Inc.
+  *
+  * Copyright (C) 2012 MontaVista LLC.
+  * Author: Philby John <pjohn@mvista.com>
+@@ -59,12 +59,13 @@ union octeon_power_throttle_bits {
+ 
+ /*
+  * Boot-time power limit as percentage,
+- * set with bootparam: octeon_power_throttle.start=85
++ * settable by bootparam: octeon_power_throttle.start=85
+  * Useful for situations where full-throttle boot would exceed power budget.
+  * Individual cores' power can be throttled up/down after boot.
++ * Default of -1 retains reset/bootloader powlim setting.
+  */
+-static int boot_powlim = 100;
+-module_param_named(start, boot_powlim, int, 0444);
++static long boot_powlim = -1;
++module_param_named(start, boot_powlim, long, 0444);
+ 
+ /* IPI calls to ask target CPU to access own registers ... */
+ static inline void read_my_power_throttle(void *info)
+@@ -80,137 +81,256 @@ static inline void write_my_power_throttle(void *info)
+ /*
+  * Read/Write POW_THROTTLE.
+  */
+-static void octeon_power_throttle_csr_op(int cpu,
++static int throttle_op(int cpu,
+ 	union octeon_power_throttle_bits *r, bool write)
+ {
++	int err =
+ 	smp_call_function_single(cpu, 
+ 		(write ? write_my_power_throttle
+ 		       : read_my_power_throttle),
+ 		r, 1);
++	return err;
++}
++
++/* get default max power, unscaled */
++static int get_powbase(union octeon_power_throttle_bits r)
++{
++	int lim = r.s.maxpow;
++	int adj = r.s.hrmpowadj;
++
++	if (!OCTEON_IS_MODEL(OCTEON_CN63XX))
++		lim -= adj;
++
++	return lim;
+ }
+ 
+ /*
+- * Throttle given CPU's power (or all, if cpu < 0)
++ * Throttle given core's power
+  */
+ static void octeon_power_throttle_init_cpu(int cpu)
+ {
+ 	union octeon_power_throttle_bits r;
+-	octeon_power_throttle_csr_op(cpu, &r, false);
++
++	if (throttle_op(cpu, &r, false))
++		return;
+ 
+ 	r.s.ovrrd = 0;		/* MBZ */
+ 	r.s.distag = 0;		/* MBZ */
+ 	r.s.period = 2;		/* 256 cycles */
+ 	r.s.minthr = 0;
+-	/* start at max allowed speed, subject to bootparams */
+-	r.s.maxthr = 0xff;
+-	r.s.powlim = 0xff * boot_powlim / 100;
+ 
+-	octeon_power_throttle_csr_op(cpu, &r, true);
++	/*
++	 * allow instantaneous power to peak above HRM default
++	 * of (maxpow - adj), even if powlim holds average to that.
++	 */
++	r.s.maxthr = r.s.maxpow;
++
++	/* limit average power to boot_powlim% of max power */
++	if (boot_powlim >= 0)
++		r.s.powlim = (r.s.maxpow * boot_powlim) / 100;
++	else
++		r.s.powlim = get_powbase(r);
++
++	throttle_op(cpu, &r, true);
+ }
+ 
+-/*
+- * Get the POWLIM field as percentage% of the MAXPOW field in r.
+- */
+-static int octeon_power_throttle_get_powlim(unsigned int cpu)
++/* scale a throttle value as percentage of max power */
++static int scaled(union octeon_power_throttle_bits r, int val)
+ {
+-	int t, rv;
+-	union octeon_power_throttle_bits r;
++	int base = r.s.maxpow;
+ 
+-	octeon_power_throttle_csr_op(cpu, &r, false);
+-	t = r.s.maxpow;
+-	if (!OCTEON_IS_MODEL(OCTEON_CN63XX)) {
+-		if (t < r.s.hrmpowadj)
+-			return -EINVAL;
+-		t -= r.s.hrmpowadj;
+-	}
+-	if (t > 0)
+-		rv = (r.s.powlim * 100) / t;
+-	else
+-		rv = 100;
+-
+-	return rv > 100 ? 100 : rv;
++	if (base <= 0)
++		return 100;
++	return ((val * 100) / base);
+ }
+ 
+ /*
+  * Set the POWLIM field as percentage% of the MAXPOW field in r.
+  */
+-static u64 octeon_power_throttle_set_powlim(int cpu, unsigned long percentage)
++static int set_powlim(union octeon_power_throttle_bits *r, unsigned long percentage)
+ {
+-	u64 t;
+-	u64 ret = 0;
+-	union octeon_power_throttle_bits r;
++	int maxpow = r->s.maxpow;	/* max with override */
++	int base = get_powbase(*r);	/* max without override */
++	int newlim;
++	int ret = 0;
+ 
+-	if (percentage > 100)
+-		return -EINVAL;
++	if (percentage < 0)
++		percentage = 0;
+ 
+-	get_online_cpus();
+-	if (cpu_online(cpu)) {
+-		octeon_power_throttle_csr_op(cpu, &r, false);
+-		t = r.s.maxpow;
+-		if (!OCTEON_IS_MODEL(OCTEON_CN63XX)) {
+-			if (t < r.s.hrmpowadj)
+-				ret = -EINVAL;
+-			else
+-				t -= r.s.hrmpowadj;
+-		}
+-		r.s.powlim = percentage > 0 ? percentage * t / 100 : 0;
+-		r.s.ovrrd = 0;		/* MBZ */
+-		r.s.distag = 0;		/* MBZ */
+-		if (!ret)
+-			octeon_power_throttle_csr_op(cpu, &r, true);
+-	}
+-	put_online_cpus();
++	newlim = (maxpow * percentage) / 100;
++
++	if (newlim > maxpow)
++		newlim = maxpow;
++	if (newlim > base && !r->s.ovrrd)
++		newlim = base;
+ 
+-	return 0;
++	r->s.powlim = newlim;
++
++	return ret;
+ }
+ 
+-static ssize_t octeon_power_throttle_show_percentage(
++/* read actor for all throttle attributes */
++static ssize_t show(
+ 	struct device *dev,
+ 	struct device_attribute *attr,
+ 	char *buf)
+ {
++	union octeon_power_throttle_bits r;
+ 	unsigned int cpu = dev->id;
+-	ssize_t ret;
++	int ret = -EBUSY;
+ 
+ 	get_online_cpus();
+-	if (cpu_online(cpu))
++	if (!cpu_online(cpu))
++		goto bye;
++	ret = throttle_op(cpu, &r, false);
++	if (ret)
++		goto bye;
++
++	switch (attr->attr.name[0]) {
++	case 'p': /* percent */
++		ret = sprintf(buf, "%d\n", scaled(r, r.s.powlim));
++		break;
++
++	case 'd': /* default */
++		ret = sprintf(buf, "%d\n", scaled(r, get_powbase(r)));
++		break;
++
++	case 'o': /* override */
+ 		ret = sprintf(buf, "%d\n",
+-			      octeon_power_throttle_get_powlim(cpu));
+-	else
+-		ret = 0;
++			OCTEON_IS_MODEL(OCTEON_CN63XX) ? 0 : r.s.ovrrd);
++		break;
++
++	case 'c': /* cycles */
++		ret = sprintf(buf, "%d\n", (1024 >> r.s.period));
++		break;
++
++	case 's':
++		ret = sprintf(buf,
++			"recent power:         %d\n"
++			"recent throttle:      %d\n"
++			"power limit:          %d%% %d\n"
++			"default limit:        %d%% %d\n"
++			"boot_powlim:          %ld%%\n"
++			"adjustment cycles:    %d\n"
++			"throttle_range:       %d..%d\n"
++			"allow override:       %c\n"
++			"raw:                  %llx\n",
++			r.s.powe,
++			r.s.thrott,
++			scaled(r, r.s.powlim), r.s.powlim,
++			scaled(r, get_powbase(r)), get_powbase(r),
++			(boot_powlim >= 0 ? boot_powlim : get_powbase(r)),
++			(1024 >> r.s.period),
++			r.s.minthr, r.s.maxthr,
++			"NY"[r.s.ovrrd],
++			r.raw);
++		break;
++
++	default:
++		ret = -ENXIO;
++		break;
++	}
++
++bye:
+ 	put_online_cpus();
+ 
+-	return ret;
++	return (ssize_t) ret;
+ }
+ 
+-static ssize_t octeon_power_throttle_store_percentage(
++/*
++ * write actor for all writeable throttle attributes.
++ * Generally take a single decimal input,
++ * but percentage allows 'd...' to reset to base-power default.
++ */
++static ssize_t store(
+ 	struct device *dev,
+ 	struct device_attribute *attr,
+ 	const char *buf,
+ 	size_t size)
+ {
+ 	unsigned int cpu = dev->id;
+-	unsigned long val;
+-	int error;
++	unsigned long val = 0;
++	union octeon_power_throttle_bits r;
++	int error = 0;
++	bool restore_default_powlim =
++		(buf[0] == 'd' && attr->attr.name[0] == 'p');
++	
++	if (!restore_default_powlim)
++		error = kstrtoul(buf, 0, &val);
+ 
+-	error = kstrtoul(buf, 0, &val);
+ 	if (error)
+ 		return error;
+ 
+ 	get_online_cpus();
+-	if (cpu_online(cpu))
+-		octeon_power_throttle_set_powlim(cpu, val);
++	error = -EBUSY;
++	if (!cpu_online(cpu))
++		goto bye;
++	error = throttle_op(cpu, &r, false);
++	if (error)
++		goto bye;
++
++	switch (attr->attr.name[0]) {
++	case 'p': /* percent */
++		if (restore_default_powlim)
++			val = get_powbase(r);
++		error = set_powlim(&r, val);
++		break;
++
++	case 'o': /* override */
++		if (val < 0 || val > 1 ||
++		    OCTEON_IS_MODEL(OCTEON_CN63XX)) {
++			error = -EINVAL;
++		} else {
++			if (r.s.ovrrd && r.s.powlim > get_powbase(r))
++				r.s.powlim = get_powbase(r);
++			r.s.ovrrd = val;
++		}
++		break;
++
++	case 'c': /* cycles */
++		/* set throttle period, either cycles or 0..3 encoding */
++		if (val >= 0 && val <= 3)
++			r.s.period = val;
++		else if (val >= 1024)
++			r.s.period = 0;
++		else if (val >= 512)
++			r.s.period = 1;
++		else if (val >= 256)
++			r.s.period = 2;
++		else if (val >= 128)
++			r.s.period = 3;
++		else
++			error = -EINVAL;
++		break;
++
++	default:
++		error = -EINVAL;
++		break;
++	}
++
++	if (!error)
++		error = throttle_op(cpu, &r, true);
++
++bye:
+ 	put_online_cpus();
+ 
++	if (error)
++		return error;
+ 	return size;
+ }
+ 
+-static DEVICE_ATTR(percentage, S_IRUGO | S_IWUSR,
+-		   octeon_power_throttle_show_percentage,
+-		   octeon_power_throttle_store_percentage);
++static DEVICE_ATTR(percentage, S_IRUGO | S_IWUSR, show, store); 
++static DEVICE_ATTR(override, S_IRUGO | S_IWUSR, show, store); 
++static DEVICE_ATTR(cycles, S_IRUGO | S_IWUSR, show, store); 
++static DEVICE_ATTR(default, S_IRUGO, show, NULL);
++static DEVICE_ATTR(state, S_IRUGO, show, NULL);
+ 
+ static struct attribute *octeon_power_throttle_attrs[] = {
+ 	&dev_attr_percentage.attr,
++	&dev_attr_override.attr,
++	&dev_attr_cycles.attr,
++	&dev_attr_default.attr,
++	&dev_attr_state.attr,
+ 	NULL
+ };
+ 
+@@ -236,7 +356,7 @@ static __init int octeon_power_throttle_init(void)
+ 
+ 	get_online_cpus();
+ 	/* connect live CPUs to sysfs */
+-	for_each_present_cpu(cpu) {
++	for_each_online_cpu(cpu) {
+ 		err = octeon_power_throttle_add_dev(get_cpu_device(cpu));
+ 		if (err) {
+ 			pr_err("Error: octeon_power_throttle_add_dev() failed\n");
+-- 
+2.6.2
+

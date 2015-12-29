@@ -1,0 +1,616 @@
+From 80d6860d1d4320de80e495b584f146d3c84e528b Mon Sep 17 00:00:00 2001
+From: Ananth Jasty <ajasty@caviumnetworks.com>
+Date: Sun, 13 Jul 2014 18:05:50 -0700
+Subject: [PATCH 715/974] netdev: octeon-pow-ethernet: Add support for CN78XX
+ devices.
+
+Signed-off-by: Ananth Jasty <ajasty@caviumnetworks.com>
+[Original patch taken from Cavium SDK 3.1.2-568]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ drivers/net/ethernet/octeon/octeon-pow-ethernet.c | 350 ++++++++++++++--------
+ 1 file changed, 230 insertions(+), 120 deletions(-)
+
+diff --git a/drivers/net/ethernet/octeon/octeon-pow-ethernet.c b/drivers/net/ethernet/octeon/octeon-pow-ethernet.c
+index c2ab83b..28bfa2c 100644
+--- a/drivers/net/ethernet/octeon/octeon-pow-ethernet.c
++++ b/drivers/net/ethernet/octeon/octeon-pow-ethernet.c
+@@ -20,12 +20,15 @@
+ #include <asm/octeon/octeon.h>
+ #include <asm/octeon/cvmx.h>
+ #include <asm/octeon/cvmx-fpa1.h>
++#include <asm/octeon/cvmx-fpa3.h>
++#include <asm/octeon/cvmx-fpa.h>
+ #include <asm/octeon/cvmx-pow.h>
+ #include <asm/octeon/cvmx-wqe.h>
+ #include <asm/octeon/cvmx-pow-defs.h>
+ #include <asm/octeon/cvmx-sso-defs.h>
+ 
+ #define VIRTUAL_PORT    63	/* Value to put in work->ipprt */
++#define CN78XX_SSO_INTSN_EXE 0x61
+ 
+ #define DEBUGPRINT(format, ...) do {					\
+ 		if (printk_ratelimit())					\
+@@ -62,13 +65,16 @@ MODULE_PARM_DESC(ptp_tx_group,
+ 		 "For the PTP POW device, 0-64 POW group to transmit packets to.\n"
+ 		 "\t\tIf you don't specify a value, the 'pow0' device will not be created\n.");
+ 
++static int pki_packet_pool = 0;
++module_param(pki_packet_pool, int, 0644);
++MODULE_PARM_DESC(pki_packet_pool,
++		 "Pool to use for transmit/receive buffer alloc/frees.\n");
++
+ static int reverse_endian;
+ module_param(reverse_endian, int, 0444);
+ MODULE_PARM_DESC(reverse_endian,
+ 		 "Link partner is running with different endianness (set on only one end of the link).\n");
+ 
+-
+-
+ static void *memcpy_re_to(void *d, const void *s, size_t n)
+ {
+ 	u8 *dst = d;
+@@ -106,6 +112,8 @@ struct octeon_pow {
+ 	u64 tx_mask;
+ 	int rx_group;
+ 	bool is_ptp;
++	int rx_irq;
++	int numa_node;
+ };
+ 
+ static int fpa_wqe_pool = 1;	/* HW FPA pool to use for work queue entries */
+@@ -115,6 +123,11 @@ static struct net_device *octeon_pow_oct_dev;
+ static struct net_device *octeon_pow_ptp_dev;
+ static int octeon_pow_num_groups;
+ 
++void *work_to_skb(void *work)
++{
++	return work - (octeon_has_feature(OCTEON_FEATURE_PKI) ? 0x80 : 0);
++}
++
+ /*
+  * Given a packet data address, return a pointer to the
+  * beginning of the packet buffer.
+@@ -125,20 +138,39 @@ static void *get_buffer_ptr(union cvmx_buf_ptr packet_ptr)
+ 			     packet_ptr.s.back) << 7);
+ }
+ 
++uint64_t oct_get_packet_ptr(cvmx_wqe_t *work)
++{
++	if (octeon_has_feature(OCTEON_FEATURE_PKI)) {
++		return cvmx_wqe_get_pki_pkt_ptr(work).u64;
++	} else {
++		if ((work->word2.s.bufs > 0) || (work->word2.s.software))
++		    return work->packet_ptr.s.addr;
++		return (cvmx_ptr_to_phys(work) + 32);
++	}
++}
++
+ static int octeon_pow_free_work(cvmx_wqe_t *work)
+ {
+-	int segments = work->word2.s.bufs;
+-	union cvmx_buf_ptr segment_ptr = work->packet_ptr;
+-
+-	while (segments--) {
+-		union cvmx_buf_ptr next_ptr =
+-			*(union cvmx_buf_ptr *)phys_to_virt(segment_ptr.s.addr - 8);
+-		if (unlikely(!segment_ptr.s.i))
+-			cvmx_fpa1_free(get_buffer_ptr(segment_ptr),
+-				 segment_ptr.s.pool, 0);
+-		segment_ptr = next_ptr;
++	int segments = cvmx_wqe_get_bufs(work);
++
++	if (octeon_has_feature(OCTEON_FEATURE_PKI)) {
++		/* FIXME */
++		int segments = cvmx_wqe_get_bufs(work);
++		if (segments > 1) pr_warn(DEV_NAME " WARNING: segments > 1 not yet supported.\n");
++
++		cvmx_fpa_free(work_to_skb(work), cvmx_wqe_get_aura(work), 0);
++	} else {
++		while (segments--) {
++			union cvmx_buf_ptr segment_ptr = work->packet_ptr;
++			union cvmx_buf_ptr next_ptr =
++				*(union cvmx_buf_ptr *)phys_to_virt(segment_ptr.s.addr - 8);
++			if (unlikely(!segment_ptr.s.i))
++				cvmx_fpa_free(get_buffer_ptr(segment_ptr),
++					     segment_ptr.s.pool, 0);
++			segment_ptr = next_ptr;
++		}
++		cvmx_fpa_free(work, fpa_wqe_pool, 0);
+ 	}
+-	cvmx_fpa1_free(work, fpa_wqe_pool, 0);
+ 
+ 	return 0;
+ }
+@@ -163,6 +195,7 @@ static int octeon_pow_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	else
+ 		send_group_mask = priv->tx_mask;
+ 
++	/* Remove self from group mask */
+ 	send_group_mask &= ~(1 << priv->rx_group);
+ 
+ 	/* It is ugly, but we need to send multiple times for
+@@ -175,7 +208,8 @@ static int octeon_pow_xmit(struct sk_buff *skb, struct net_device *dev)
+ 			continue;
+ 
+ 		/* Get a work queue entry */
+-		work = cvmx_fpa1_alloc(fpa_wqe_pool);
++		work = cvmx_fpa_alloc(fpa_wqe_pool) +
++			(octeon_has_feature(OCTEON_FEATURE_FPA3) ? 0x80 : 0);
+ 		if (unlikely(work == NULL)) {
+ 			DEBUGPRINT("%s: Failed to allocate a work queue entry\n",
+ 				   dev->name);
+@@ -183,7 +217,11 @@ static int octeon_pow_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		}
+ 
+ 		/* Get a packet buffer */
+-		packet_buffer = cvmx_fpa1_alloc(fpa_packet_pool);
++		if (octeon_has_feature(OCTEON_FEATURE_PKI))
++			/* octeon3-ethernet uses a different fpa/packet system */
++			packet_buffer = ((void*)work) + 0x80;
++		else
++			packet_buffer = cvmx_fpa_alloc(fpa_packet_pool);
+ 		if (unlikely(packet_buffer == NULL)) {
+ 			DEBUGPRINT("%s: Failed to allocate a packet buffer\n",
+ 				   dev->name);
+@@ -218,71 +256,69 @@ static int octeon_pow_xmit(struct sk_buff *skb, struct net_device *dev)
+ #if 0
+ 		work->hw_chksum = skb->csum;
+ #endif
+-		work->word1.len = skb->len;
++
++		cvmx_wqe_set_len(work, skb->len);
+ 		cvmx_wqe_set_port(work, VIRTUAL_PORT);
+ 		cvmx_wqe_set_qos(work, 0);
+ 		cvmx_wqe_set_grp(work, send_group);
+-		work->word1.tag_type = 2;
+-		work->word1.tag = 0;
+-
+-		work->word2.s.bufs = 1;
+-		work->packet_ptr.u64 = 0;
+-		work->packet_ptr.s.addr = virt_to_phys(copy_location);
+-		work->packet_ptr.s.pool = fpa_packet_pool;
+-		work->packet_ptr.s.size = fpa_packet_pool_size;
+-		work->packet_ptr.s.back = (copy_location - packet_buffer) >> 7;
+-
++		cvmx_wqe_set_tt(work, 2);
++		cvmx_wqe_set_tag(work, 0);
++
++		cvmx_wqe_set_bufs(work, 1);
++		cvmx_wqe_set_aura(work, fpa_wqe_pool);
++
++		if (octeon_has_feature(OCTEON_FEATURE_CN78XX_WQE)) {
++			/* We use a 78xx format wqe where necessary */
++			union cvmx_buf_ptr_pki pki_ptr;
++			cvmx_wqe_78xx_t *wqe = (cvmx_wqe_78xx_t*) work;
++			pki_ptr.u64 = 0;
++			pki_ptr.addr = virt_to_phys(copy_location);
++			pki_ptr.packet_outside_wqe = 0;
++			pki_ptr.size = skb->len;
++			wqe->packet_ptr.u64 = pki_ptr.u64;
++			/* Mark errata as handled to prevent additional byteswap */
++			wqe->pki_errata20776 = 1;
++		} else {
++			work->packet_ptr.u64 = 0;
++			work->packet_ptr.s.addr = virt_to_phys(copy_location);
++			work->packet_ptr.s.pool = fpa_packet_pool;
++			work->packet_ptr.s.size = fpa_packet_pool_size;
++			work->packet_ptr.s.back = (copy_location - packet_buffer) >> 7;
++		}
+ 		if (skb->protocol == htons(ETH_P_IP)) {
+-			work->word2.s.ip_offset = 14;
+-			#if 0
++			cvmx_wqe_set_l3_offset(work, 14);
++			cvmx_wqe_set_l4_udp(work, ip_hdr(skb)->protocol == IPPROTO_UDP);
++			if (octeon_has_feature(OCTEON_FEATURE_CN78XX_WQE) ||
++				(ip_hdr(skb)->protocol == IPPROTO_TCP))
++				cvmx_wqe_set_l4_tcp(work, ip_hdr(skb)->protocol == IPPROTO_TCP);
++			cvmx_wqe_set_l3_frag(work, !((ip_hdr(skb)->frag_off == 0)
++						     || (ip_hdr(skb)->frag_off ==
++							 1 << 14)));
++			cvmx_wqe_set_l2_bcast(work, skb->pkt_type == PACKET_BROADCAST);
++			cvmx_wqe_set_l2_mcast(work, skb->pkt_type == PACKET_MULTICAST);
++#if 0
+ 			work->word2.s.vlan_valid = 0;	/* FIXME */
+ 			work->word2.s.vlan_cfi = 0;	/* FIXME */
+ 			work->word2.s.vlan_id = 0;	/* FIXME */
+ 			work->word2.s.dec_ipcomp = 0;	/* FIXME */
+-			#endif
+-			work->word2.s.tcp_or_udp =
+-				(ip_hdr(skb)->protocol == IPPROTO_TCP) ||
+-				(ip_hdr(skb)->protocol == IPPROTO_UDP);
+-			#if 0
+-			work->word2.s.dec_ipsec = 0; /* FIXME */
+-			work->word2.s.is_v6 = 0; /* We only support IPv4
+-						    right now */
+-			work->word2.s.software = 0; /* Hardware would set to
+-						       zero */
+-			work->word2.s.L4_error = 0; /* No error, packet is
+-						       internal */
+-			#endif
+-			work->word2.s.is_frag = !((ip_hdr(skb)->frag_off == 0)
+-						  || (ip_hdr(skb)->frag_off ==
+-						      1 << 14));
+-			#if 0
++			if (!octeon_has_feature(OCTEON_FEATURE_CN78XX_WQE))
++				work->word2.s.IP_exc = 0; /* Assume Linux is sending
++							     a good packet */
+ 			work->word2.s.IP_exc = 0; /* Assume Linux is sending
+ 						     a good packet */
+-			#endif
+-			work->word2.s.is_bcast =
+-				(skb->pkt_type == PACKET_BROADCAST);
+-			work->word2.s.is_mcast =
+-				(skb->pkt_type == PACKET_MULTICAST);
+-			#if 0
+ 			work->word2.s.not_IP = 0; /* This is an IP packet */
+ 			work->word2.s.rcv_error = 0; /* No error, packet is
+ 							internal */
+ 			work->word2.s.err_code = 0;  /* No error, packet is
+ 							internal */
+-			#endif
++#endif
+ 
+ 			/* When copying the data, include 4 bytes of the
+ 			   ethernet header to align the same way hardware does */
+ 			octeon_pow_copy_to(work->packet_data, skb->data + 10,
+ 			       sizeof(work->packet_data));
+ 		} else {
+-			#if 0
+-			work->word2.snoip.vlan_valid = 0; /* FIXME */
+-			work->word2.snoip.vlan_cfi = 0;   /* FIXME */
+-			work->word2.snoip.vlan_id = 0;    /* FIXME */
+-			work->word2.snoip.software = 0;   /* Hardware would
+-							     set to zero */
+-			#endif
++#if 0
+ 			work->word2.snoip.is_rarp =
+ 				skb->protocol == htons(ETH_P_RARP);
+ 			work->word2.snoip.is_arp =
+@@ -291,13 +327,8 @@ static int octeon_pow_xmit(struct sk_buff *skb, struct net_device *dev)
+ 				(skb->pkt_type == PACKET_BROADCAST);
+ 			work->word2.snoip.is_mcast =
+ 				(skb->pkt_type == PACKET_MULTICAST);
+-			work->word2.snoip.not_IP = 1;	/* IP was done up above */
+-			#if 0
+-			work->word2.snoip.rcv_error = 0; /* No error, packet
+-							    is internal */
+-			work->word2.snoip.err_code = 0;  /* No error, packet
+-							    is internal */
+-			#endif
++#endif
++			cvmx_wqe_set_l3_ipv4(work, 0);
+ 			octeon_pow_copy_to(work->packet_data, skb->data,
+ 			       sizeof(work->packet_data));
+ 		}
+@@ -309,7 +340,10 @@ static int octeon_pow_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		 * qos: 0
+ 		 * grp: send_group
+ 		 */
+-		cvmx_pow_work_submit(work, 0, 2, 0, send_group);
++		if (octeon_has_feature(OCTEON_FEATURE_PKI))
++			cvmx_pow_work_submit_node(work, 0, 2, send_group, priv->numa_node);
++		else
++			cvmx_pow_work_submit(work, 0, 2, 0, send_group);
+ 		work = NULL;
+ 		packet_buffer = NULL;
+ 	}
+@@ -321,9 +355,9 @@ static int octeon_pow_xmit(struct sk_buff *skb, struct net_device *dev)
+ 
+ fail:
+ 	if (work)
+-		cvmx_fpa1_free(work, fpa_wqe_pool, 0);
+-	if (packet_buffer)
+-		cvmx_fpa1_free(packet_buffer, fpa_packet_pool, 0);
++		cvmx_fpa_free(work_to_skb(work), fpa_wqe_pool, 0);
++	if (packet_buffer && !octeon_has_feature(OCTEON_FEATURE_PKI))
++		cvmx_fpa_free(packet_buffer, fpa_packet_pool, 0);
+ 	dev->stats.tx_dropped++;
+ 	dev_kfree_skb(skb);
+ 	return NETDEV_TX_OK;
+@@ -344,7 +378,7 @@ static irqreturn_t octeon_pow_interrupt(int cpl, void *dev_id)
+ 	const uint64_t coreid = cvmx_get_core_num();
+ 	struct net_device *dev = (struct net_device *) dev_id;
+ 	struct octeon_pow *priv;
+-	uint64_t old_group_mask;
++	uint64_t old_group_mask = 0;
+ 	cvmx_wqe_t *work;
+ 	struct sk_buff *skb;
+ 
+@@ -353,7 +387,9 @@ static irqreturn_t octeon_pow_interrupt(int cpl, void *dev_id)
+ 	/* Make sure any userspace operations are complete */
+ 	asm volatile ("synciobdma" : : : "memory");
+ 
+-	if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
++	if (octeon_has_feature(OCTEON_FEATURE_PKI)) {
++		/* Can get-work from group explicitly here */
++	} else if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
+ 		/* Only allow work for our group */
+ 		old_group_mask = cvmx_read_csr(CVMX_SSO_PPX_GRP_MSK(coreid));
+ 		cvmx_write_csr(CVMX_SSO_PPX_GRP_MSK(coreid),
+@@ -366,7 +402,11 @@ static irqreturn_t octeon_pow_interrupt(int cpl, void *dev_id)
+ 		cvmx_write_csr(CVMX_POW_PP_GRP_MSKX(coreid), 1 << priv->rx_group);
+ 	}
+ 	while (1) {
+-		work = cvmx_pow_work_request_sync(0);
++		if (octeon_has_feature(OCTEON_FEATURE_PKI))
++			work = cvmx_sso_work_request_grp_sync_nocheck(priv->rx_group,
++				CVMX_POW_NO_WAIT);
++		else
++			work = cvmx_pow_work_request_sync(0);
+ 		if (work == NULL)
+ 			break;
+ 
+@@ -377,16 +417,16 @@ static irqreturn_t octeon_pow_interrupt(int cpl, void *dev_id)
+ 		}
+ 
+ 		/* Throw away all packets with receive errors */
+-		if (unlikely(work->word2.snoip.rcv_error)) {
++		if (unlikely(cvmx_wqe_get_rcv_err(work))) {
+ 			DEBUGPRINT("%s: Receive error code %d, packet dropped\n",
+-				   dev->name, work->word2.snoip.err_code);
++				   dev->name, cvmx_wqe_get_rcv_err(work));
+ 			octeon_pow_free_work(work);
+ 			dev->stats.rx_errors++;
+ 			continue;
+ 		}
+ 
+ 		/* We have to copy the packet. First allocate an skbuff for it */
+-		skb = dev_alloc_skb(work->word1.len);
++		skb = dev_alloc_skb(cvmx_wqe_get_len(work));
+ 		if (!skb) {
+ 			DEBUGPRINT("%s: Failed to allocate skbuff, packet dropped\n",
+ 				   dev->name);
+@@ -398,40 +438,55 @@ static irqreturn_t octeon_pow_interrupt(int cpl, void *dev_id)
+ 		/* Check if we've received a packet that was entirely
+ 		 * stored the work entry. This is untested
+ 		 */
+-		if (unlikely(work->word2.s.bufs == 0)) {
++		if (unlikely(cvmx_wqe_get_bufs(work) == 0)) {
++			int len = cvmx_wqe_get_len(work);
+ 			DEBUGPRINT("%s: Received a work with work->word2.s.bufs=0, untested\n",
+ 				   dev->name);
+-			octeon_pow_copy_from(skb_put(skb, work->word1.len), work->packet_data,
+-			       work->word1.len);
++			octeon_pow_copy_from(skb_put(skb, len),
++					     phys_to_virt(oct_get_packet_ptr(work)), len);
+ 		} else {
+-			int segments = work->word2.s.bufs;
+-			union cvmx_buf_ptr segment_ptr = work->packet_ptr;
+-			int len = work->word1.len;
++			int segments = cvmx_wqe_get_bufs(work);
++			uint64_t buf_desc = oct_get_packet_ptr(work);
++			int len = cvmx_wqe_get_len(work);
+ 			while (segments--) {
+-				union cvmx_buf_ptr next_ptr =
+-					*(union cvmx_buf_ptr *)phys_to_virt(segment_ptr.s.addr - 8);
+-				/* Octeon Errata PKI-100: The segment size is
+-				   wrong. Until it is fixed, calculate the
+-				   segment size based on the packet pool buffer
+-				   size. When it is fixed, the following line
+-				   should be replaced with this one: int
+-				   segment_size = segment_ptr.s.size; */
+-				int segment_size =
+-					fpa_packet_pool_size -
+-					(segment_ptr.s.addr -
+-					 (((segment_ptr.s.addr >> 7) -
+-					   segment_ptr.s.back) << 7));
+-				/* Don't copy more than what is left in the
+-				   packet */
++				int segment_size;
++				uint64_t pkt_ptr;
++				if (octeon_has_feature(OCTEON_FEATURE_PKI)) {
++					cvmx_buf_ptr_pki_t pki_ptr;
++					pki_ptr.u64 = buf_desc;
++					segment_size = pki_ptr.size;
++					pkt_ptr = pki_ptr.addr;
++					buf_desc = *((uint64_t*)phys_to_virt(pki_ptr.addr - 8));
++				} else {
++					cvmx_buf_ptr_t buf_ptr;
++					union cvmx_buf_ptr next_ptr;
++					buf_ptr.u64 = buf_desc;
++					next_ptr = *(union cvmx_buf_ptr *)
++						phys_to_virt(buf_ptr.s.addr - 8);
++					/* Octeon Errata PKI-100: The segment size is
++					   wrong. Until it is fixed, calculate the
++					   segment size based on the packet pool buffer
++					   size. When it is fixed, the following line
++					   should be replaced with this one: int
++					   segment_size = segment_ptr.s.size; */
++					segment_size =
++						fpa_packet_pool_size -
++						(buf_ptr.s.addr -
++						 (((buf_ptr.s.addr >> 7) -
++						   buf_ptr.s.back) << 7));
++					/* Don't copy more than what is left in the
++					   packet */
++					pkt_ptr = buf_ptr.s.addr;
++					buf_desc = next_ptr.u64;
++				}
+ 				if (segment_size > len)
+ 					segment_size = len;
+ 				/* Copy the data into the packet */
+ 				octeon_pow_copy_from(skb_put(skb, segment_size),
+-				       phys_to_virt(segment_ptr.s.addr),
+-				       segment_size);
++						     phys_to_virt(pkt_ptr),
++						     segment_size);
+ 				/* Reduce the amount of bytes left to copy */
+ 				len -= segment_size;
+-				segment_ptr = next_ptr;
+ 			}
+ 		}
+ 		octeon_pow_free_work(work);
+@@ -443,7 +498,10 @@ static irqreturn_t octeon_pow_interrupt(int cpl, void *dev_id)
+ 		netif_rx(skb);
+ 	}
+ 
+-	if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
++	if (octeon_has_feature(OCTEON_FEATURE_PKI)) {
++		/* Clear interrupt */
++		cvmx_write_csr_node(priv->numa_node, CVMX_SSO_GRPX_INT(priv->rx_group), 2);
++	} else if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
+ 		/* Restore the original POW group mask */
+ 		cvmx_write_csr(CVMX_SSO_PPX_GRP_MSK(coreid), old_group_mask);
+ 		/* Read it back so it takes effect before ?? */
+@@ -473,16 +531,40 @@ static int octeon_pow_open(struct net_device *dev)
+ {
+ 	int r;
+ 	struct octeon_pow *priv = netdev_priv(dev);
++
+ 	/* Clear the statistics whenever the interface is brought up */
+ 	memset(&dev->stats, 0, sizeof(dev->stats));
+ 
++	if (octeon_has_feature(OCTEON_FEATURE_PKI)) {
++		int sso_intsn = (CN78XX_SSO_INTSN_EXE << 12) | priv->rx_group;
++		struct irq_domain *d = octeon_irq_get_block_domain(priv->numa_node,
++								   sso_intsn);
++		priv->rx_irq = irq_create_mapping(d, sso_intsn);
++		if (!priv->rx_irq) {
++			netdev_err(dev, "ERROR: Couldn't map hwirq: %x\n",
++				   sso_intsn);
++			return -EINVAL;
++		}
++	} else
++		priv->rx_irq = OCTEON_IRQ_WORKQ0 + priv->rx_group;
+ 	/* Register an IRQ hander for to receive POW interrupts */
+-	r = request_irq(OCTEON_IRQ_WORKQ0 + priv->rx_group, octeon_pow_interrupt, 0, dev->name, dev);
++	r = request_irq(priv->rx_irq, octeon_pow_interrupt, 0, dev->name, dev);
+ 	if (r)
+ 		return r;
+ 
+ 	/* Enable POW interrupt when our port has at least one packet */
+-	if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
++	if (octeon_has_feature(OCTEON_FEATURE_PKI)) {
++		union cvmx_sso_grpx_int_thr thr;
++		union cvmx_sso_grpx_int grp_int;
++		thr.u64 = 0;
++		thr.cn78xx.ds_thr = 1;
++		thr.cn78xx.iaq_thr = 1;
++		cvmx_write_csr_node(priv->numa_node, CVMX_SSO_GRPX_INT_THR(priv->rx_group),
++				    thr.u64);
++		grp_int.u64 = 0;
++		grp_int.s.exe_int = 1;
++		cvmx_write_csr_node(priv->numa_node, CVMX_SSO_GRPX_INT(priv->rx_group), grp_int.u64);
++	} else if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
+ 		union cvmx_sso_wq_int_thrx thr;
+ 		thr.u64 = 0;
+ 		thr.s.iq_thr = 1;
+@@ -504,13 +586,15 @@ static int octeon_pow_stop(struct net_device *dev)
+ 	struct octeon_pow *priv = netdev_priv(dev);
+ 
+ 	/* Disable POW interrupt */
+-	if (OCTEON_IS_MODEL(OCTEON_CN68XX))
++	if (octeon_has_feature(OCTEON_FEATURE_PKI))
++		cvmx_write_csr_node(priv->numa_node, CVMX_SSO_GRPX_INT_THR(priv->rx_group), 0);
++	else if (OCTEON_IS_MODEL(OCTEON_CN68XX))
+ 		cvmx_write_csr(CVMX_SSO_WQ_INT_THRX(priv->rx_group), 0);
+ 	else
+ 		cvmx_write_csr(CVMX_POW_WQ_INT_THRX(priv->rx_group), 0);
+ 
+ 	/* Free the interrupt handler */
+-	free_irq(OCTEON_IRQ_WORKQ0 + priv->rx_group, dev);
++	free_irq(priv->rx_irq, dev);
+ 	return 0;
+ }
+ 
+@@ -532,6 +616,7 @@ static int octeon_pow_init(struct net_device *dev)
+ 	dev->dev_addr[3] = 0;
+ 	dev->dev_addr[4] = priv->is_ptp ? 3 : 1;
+ 	dev->dev_addr[5] = priv->rx_group;
++	priv->numa_node = cvmx_get_node_num();
+ 	return 0;
+ }
+ 
+@@ -565,7 +650,11 @@ static int __init octeon_pow_mod_init(void)
+ 		octeon_pow_copy_from = memcpy;
+ 	}
+ 
+-	if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
++	if (octeon_has_feature(OCTEON_FEATURE_PKI)) {
++		/* Actually 256 groups total, only 64 currently supported */
++		octeon_pow_num_groups = 64;
++		allowed_group_mask = 0xffffffffffffffffull;
++	} else if (OCTEON_IS_MODEL(OCTEON_CN68XX)) {
+ 		octeon_pow_num_groups = 64;
+ 		allowed_group_mask = 0xffffffffffffffffull;
+ 	} else {
+@@ -616,6 +705,10 @@ static int __init octeon_pow_mod_init(void)
+ 		return -1;
+ 	}
+ 
++	if (octeon_has_feature(OCTEON_FEATURE_PKI) && (pki_packet_pool == 0)) {
++		pr_err(DEV_NAME " ERROR: pki_packet_pool must be specified for CN78XX.\n");
++	}
++
+ 	pr_info("Octeon POW only ethernet driver\n");
+ 
+ 	/* Setup is complete, create the virtual ethernet devices */
+@@ -632,25 +725,42 @@ static int __init octeon_pow_mod_init(void)
+ 	priv = netdev_priv(octeon_pow_oct_dev);
+ 	priv->rx_group = receive_group;
+ 	priv->tx_mask = broadcast_groups;
++	priv->numa_node = cvmx_get_node_num();
+ 
+-	/* Spin waiting for another core to setup all the hardware */
+-	printk("Waiting for another core to setup the IPD hardware...");
+-	while ((cvmx_read_csr(CVMX_IPD_CTL_STATUS) & 1) == 0)
+-		mdelay(100);
+ 
+-	printk("Done\n");
++	if (octeon_has_feature(OCTEON_FEATURE_PKI)) {
++		/* Spin waiting for another core to setup all the hardware */
++		printk("Waiting for another core to setup the PKI hardware...");
++		while ((cvmx_read_csr_node(priv->numa_node, CVMX_PKI_BUF_CTL) & 1) == 0)
++			mdelay(100);
+ 
+-	/* Read the configured size of the FPA packet buffers. This
+-	 * way we don't need changes if someone chooses to use a
+-	 * different buffer size
+-	 */
+-	fpa_packet_pool_size = (cvmx_read_csr(CVMX_IPD_PACKET_MBUFF_SIZE) & 0xfff) * 8;
++		printk("Done\n");
++		fpa_packet_pool_size = 2048;
++		fpa_packet_pool = fpa_wqe_pool = pki_packet_pool;
+ 
+-	/* Read the work queue pool */
+-	fpa_wqe_pool = cvmx_read_csr(CVMX_IPD_WQE_FPA_QUEUE) & 7;
++		if (fpa_packet_pool < 0) {
++			netdev_err(octeon_pow_oct_dev, "ERROR: Failed to initialize fpa pool\n");
++			return -1;
++		}
++	} else {
++		/* Spin waiting for another core to setup all the hardware */
++		printk("Waiting for another core to setup the IPD hardware...");
++		while ((cvmx_read_csr(CVMX_IPD_CTL_STATUS) & 1) == 0)
++			mdelay(100);
++
++		printk("Done\n");
++		/* Read the configured size of the FPA packet buffers. This
++		 * way we don't need changes if someone chooses to use a
++		 * different buffer size
++		 */
++		fpa_packet_pool_size = (cvmx_read_csr(CVMX_IPD_PACKET_MBUFF_SIZE) & 0xfff) * 8;
++
++		/* Read the work queue pool */
++		fpa_packet_pool = fpa_wqe_pool = cvmx_read_csr(CVMX_IPD_WQE_FPA_QUEUE) & 7;
++	}
+ 
+ 	if (register_netdev(octeon_pow_oct_dev) < 0) {
+-		pr_err(DEV_NAME " ERROR: Failed to register ethernet device\n");
++		netdev_err(octeon_pow_oct_dev, "ERROR: Failed to register ethernet device\n");
+ 		free_netdev(octeon_pow_oct_dev);
+ 		return -1;
+ 	}
+@@ -675,7 +785,7 @@ static int __init octeon_pow_mod_init(void)
+ 	priv->is_ptp = true;
+ 
+ 	if (register_netdev(octeon_pow_ptp_dev) < 0) {
+-		pr_err(DEV_NAME " ERROR: Failed to register ethernet device\n");
++		netdev_err(octeon_pow_ptp_dev, "ERROR: Failed to register ethernet device\n");
+ 		free_netdev(octeon_pow_ptp_dev);
+ 		return -1;
+ 	}
+-- 
+2.6.2
+

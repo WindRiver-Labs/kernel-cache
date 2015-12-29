@@ -1,0 +1,146 @@
+From e358e84dfd03dbc30ad8a9fd08854dfca85038fb Mon Sep 17 00:00:00 2001
+From: Peter Swain <pswain@cavium.com>
+Date: Mon, 2 Nov 2015 11:25:00 -0800
+Subject: [PATCH 956/974] mips: i2c_octeon: robust bus-unhang
+
+Several changes to allow i2c_octeon to detect collisions & back out,
+or to actively free up bus if the state persists ...
+
+When octeon_i2c_start() sees invalid state, cycle through successively more
+disruptive attempts a bus-reset (send STP, hand-cranked unblock, low-level
+reset) until an idle condition is seen.
+
+When octeon_i2c_unblock() hand-cranks an 8+ACK bit frame to cure a suspected
+hung i2c device, stop as soon as another master is seen -- that is when
+SDA/SCL are seen to _not_ float high when released.
+
+Refine the acceptable protocol states in octeon_i2c_start() according to
+the 'first' parameter - if Start seen where ReStart expected (or the reverse)
+return -EAGAIN to force retry from beginning.
+
+These changes seems to reliably unhang bus in ways that the old driver
+(and u-boot) could not, when bad multi-master behavior by MCU on some Cavium
+boards had left some target device in a partly-clocked-out state.
+
+Signed-off-by: Peter Swain <pswain@cavium.com>
+[Original patch taken from Cavium SDK 3.1.2-568]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ drivers/i2c/busses/i2c-octeon.c | 63 ++++++++++++++++++++++++++++++++---------
+ 1 file changed, 49 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-octeon.c b/drivers/i2c/busses/i2c-octeon.c
+index 23081b8..6c7a0a2 100644
+--- a/drivers/i2c/busses/i2c-octeon.c
++++ b/drivers/i2c/busses/i2c-octeon.c
+@@ -300,12 +300,18 @@ static void octeon_i2c_unblock(struct octeon_i2c *i2c)
+ 	dev_dbg(i2c->dev, "%s\n", __func__);
+ 	octeon_i2c_disable_hlc(i2c);
+ 
++	/* cycle 8+1 clocks with SDA high */
+ 	for (i = 0; i < 9; i++) {
++		int state;
+ 		octeon_i2c_write_int(i2c, 0);
+ 		udelay(5);
++		state = __raw_readq(i2c->twsi_base + TWSI_INT);
++		if (state & (SDA|SCL))
++			break;
+ 		octeon_i2c_write_int(i2c, SCL_OVR);
+ 		udelay(5);
+ 	}
++	/* hand-crank a STOP */
+ 	octeon_i2c_write_int(i2c, SDA_OVR | SCL_OVR);
+ 	udelay(5);
+ 	octeon_i2c_write_int(i2c, SDA_OVR);
+@@ -533,7 +539,14 @@ static int octeon_i2c_start(struct octeon_i2c *i2c, bool first)
+ 
+ 		switch (data) {
+ 		case STAT_START_08:
++			if (!first)
++				return -EAGAIN;
++			reset_how = 0;
++			return 0;
++
+ 		case STAT_RSTART_10:
++			if (first)
++				return -EAGAIN;
+ 			reset_how = 0;
+ 			return 0;
+ 
+@@ -548,19 +561,40 @@ static int octeon_i2c_start(struct octeon_i2c *i2c, bool first)
+ 				return -EAGAIN;
+ unstick:
+ 			/*
+-			 * Controller refused to send start flag May
+-			 * be a client is holding SDA low - let's try
+-			 * to free it.
++			 * TWSI state seems stuck. Not sure if it's TWSI-engine
++			 * state or something else on bus.
++			 * The initial _stop() is always harmless, it just
++			 * resets state machine, does not _transmit_ STOP
++			 * unless engine was active
+ 			 */
+-			octeon_i2c_unblock(i2c);
+-			data = octeon_i2c_read_sw(i2c, SW_TWSI_EOP_TWSI_STAT);
+-		}
++			octeon_i2c_stop(i2c);
+ 
+-		if (result || ((data != STAT_START_08)
+-			    && (data != STAT_RSTART_10))) {
+-			dev_dbg(i2c->dev, "%s: bad status (0x%x) or err %d\n",
+-				__func__, data, result);
++			/*
++			 * response is escalated over successive calls,
++			 * as EAGAIN provokes retries from i2c/core
++			 */
++			switch (reset_how++ % 4) {
++			case 0:
++				/* just the _stop above */
++				break;
++			case 1:
++				/*
++				 * Controller refused to send start flag
++				 * May be a client is holding SDA low?
++				 * Let's try to free it.
++				 */
++				octeon_i2c_unblock(i2c);
++				break;
++
++			case 2:
++				/* re-init our TWSI hardware */
++				octeon_i2c_initlowlevel(i2c);
++				break;
++			default:
++				/* retry in caller */
++				reset_how = 0;
+ 			return -EAGAIN;
++			}
+ 		}
+ 	}
+ }
+@@ -724,7 +758,8 @@ static int octeon_i2c_hlc_wait(struct octeon_i2c *i2c)
+ 						  octeon_i2c_hlc_test_ready(i2c),
+ 						  i2c->adap.timeout);
+ 	i2c->hlc_int_dis(i2c);
+-	octeon_i2c_hlc_int_clear(i2c);
++	if (!result)
++		octeon_i2c_hlc_int_clear(i2c);
+ 
+ 
+ 	if (result <= 0 && OCTEON_IS_MODEL(OCTEON_CN38XX) &&
+@@ -1091,9 +1126,9 @@ static int octeon_i2c_initlowlevel(struct octeon_i2c *i2c)
+ 	}
+ 
+ 
+-	/* disable high level controller, enable bus access */
+-	octeon_i2c_write_sw(i2c, SW_TWSI_EOP_TWSI_CTL, TWSI_CTL_ENAB);
+-	i2c->octeon_i2c_hlc_enabled = false;
++	/* toggle twice to force both teardowns */
++	octeon_i2c_enable_hlc(i2c);
++	octeon_i2c_disable_hlc(i2c);
+ 
+ 	return 0;
+ }
+-- 
+2.6.2
+

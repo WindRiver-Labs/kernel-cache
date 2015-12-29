@@ -1,0 +1,477 @@
+From 61d222eb12f9c229110dcc851f75097c6333e72e Mon Sep 17 00:00:00 2001
+From: David Daney <david.daney@cavium.com>
+Date: Tue, 29 Oct 2013 11:33:56 -0700
+Subject: [PATCH 364/974] mmc: octeon_mmc: Handler multiple slots, and fix
+ bugs.
+
+Get rid of unneeded bus resets, multi-block DMA not supported, and fix
+power GPIO things.
+
+Signed-off-by: David Daney <david.daney@cavium.com>
+[Original patch taken from Cavium SDK 3.1.2-568]
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ drivers/mmc/host/octeon_mmc.c | 200 +++++++++++++++++++++++++++++-------------
+ 1 file changed, 140 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/mmc/host/octeon_mmc.c b/drivers/mmc/host/octeon_mmc.c
+index 6550855..1ed27ca 100644
+--- a/drivers/mmc/host/octeon_mmc.c
++++ b/drivers/mmc/host/octeon_mmc.c
+@@ -34,7 +34,6 @@
+ #include <asm/octeon/cvmx-mio-defs.h>
+ 
+ #define DRV_NAME	"octeon_mmc"
+-#define DRV_VERSION	"1.0"
+ 
+ #define OCTEON_MAX_MMC			4
+ 
+@@ -61,7 +60,8 @@ struct octeon_mmc_host {
+ 	spinlock_t		lock;
+ 	u64	base;
+ 	u64	ndf_base;
+-	u64	last_emm_switch;
++	u64	emm_cfg;
++	int	last_slot;
+ 
+ 	struct mmc_request	*current_req;
+ 	struct sg_mapping_iter smi;
+@@ -69,6 +69,8 @@ struct octeon_mmc_host {
+ 	bool dma_active;
+ 
+ 	struct platform_device	*pdev;
++	int global_pwr_gpio;
++	bool global_pwr_gpio_low;
+ 
+ 	struct octeon_mmc_slot	*slot[OCTEON_MAX_MMC];
+ };
+@@ -80,14 +82,17 @@ struct octeon_mmc_slot {
+ 	unsigned int		clock;
+ 	unsigned int		sclock;
+ 
++	u64			cached_switch;
++	u64			cached_rca;
++
+ 	int			bus_width;
+ 	int			bus_id;
+ 	int			ro_gpio;
+ 	int			cd_gpio;
+-	int			power_gpio;
+-	bool			cd_gpio_active_low;
+-	bool			ro_gpio_active_low;
+-	bool			power_gpio_active_low;
++	int			pwr_gpio;
++	bool			cd_gpio_low;
++	bool			ro_gpio_low;
++	bool			pwr_gpio_low;
+ };
+ 
+ struct octeon_mmc_cr_type {
+@@ -230,7 +235,7 @@ static bool octeon_mmc_switch_val_changed(struct octeon_mmc_slot *slot,
+ {
+ 	/* Match BUS_ID, HS_TIMING, BUS_WIDTH, POWER_CLASS, CLK_HI, CLK_LO */
+ 	u64 m = 0x3001070fffffffffull;
+-	return (slot->host->last_emm_switch & m) != (new_val & m);
++	return (slot->cached_switch & m) != (new_val & m);
+ }
+ 
+ static unsigned int octeon_mmc_timeout_to_wdog(struct octeon_mmc_slot *slot,
+@@ -413,6 +418,29 @@ out:
+ 	return IRQ_RETVAL(emm_int.u64 != 0);
+ }
+ 
++static void octeon_mmc_switch_to(struct octeon_mmc_slot	*slot)
++{
++	struct octeon_mmc_host	*host = slot->host;
++	struct octeon_mmc_slot	*old_slot;
++	union cvmx_mio_emm_switch sw;
++
++	if (host->last_slot < 0 || slot->bus_id == host->last_slot)
++		goto out;
++
++	old_slot = host->slot[host->last_slot];
++	old_slot->cached_switch = cvmx_read_csr(host->base + OCT_MIO_EMM_SWITCH);
++	old_slot->cached_rca = cvmx_read_csr(host->base + OCT_MIO_EMM_RCA);
++
++	cvmx_write_csr(host->base + OCT_MIO_EMM_RCA, slot->cached_rca);
++	sw.u64 = slot->cached_switch;
++	sw.s.bus_id = 0;
++	cvmx_write_csr(host->base + OCT_MIO_EMM_SWITCH, sw.u64);
++	sw.s.bus_id = slot->bus_id;
++	cvmx_write_csr(host->base + OCT_MIO_EMM_SWITCH, sw.u64);
++out:
++	host->last_slot = slot->bus_id;
++}
++
+ static void octeon_mmc_dma_request(struct mmc_host *mmc,
+ 				   struct mmc_request *mrq)
+ {
+@@ -441,6 +469,8 @@ static void octeon_mmc_dma_request(struct mmc_host *mmc,
+ 	/* Only a single user of the bootbus at a time. */
+ 	down(&octeon_bootbus_sem);
+ 
++	octeon_mmc_switch_to(slot);
++
+ 	data = mrq->data;
+ 
+ 	if (data->timeout_ns) {
+@@ -514,6 +544,8 @@ static void octeon_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
+ 	/* Only a single user of the bootbus at a time. */
+ 	down(&octeon_bootbus_sem);
+ 
++	octeon_mmc_switch_to(slot);
++
+ 	spin_lock_irqsave(&host->lock, flags);
+ 	WARN_ON(host->current_req);
+ 	host->current_req = mrq;
+@@ -609,7 +641,7 @@ static void octeon_mmc_reset_bus(struct octeon_mmc_slot *slot, int preserve)
+ 	}
+ 
+ 	/* Reset the bus */
+-	emm_cfg.u64 &= ~(1 << slot->bus_id);
++	emm_cfg.u64 &= ~0xfull;
+ 	cvmx_write_csr(slot->host->base + OCT_MIO_EMM_CFG, emm_cfg.u64);
+ 	msleep(10);  /* Wait 10ms */
+ 	emm_cfg.u64 |= 1 << slot->bus_id;
+@@ -623,13 +655,17 @@ static void octeon_mmc_reset_bus(struct octeon_mmc_slot *slot, int preserve)
+ 		emm_switch.s.switch_err0 = 0;
+ 		emm_switch.s.switch_err1 = 0;
+ 		emm_switch.s.switch_err2 = 0;
+-		slot->host->last_emm_switch = emm_switch.u64;
+-		cvmx_write_csr(slot->host->base + OCT_MIO_EMM_SWITCH,
+-			       emm_switch.u64);
++		emm_switch.s.bus_id = 0;
++		cvmx_write_csr(slot->host->base + OCT_MIO_EMM_SWITCH, emm_switch.u64);
++		emm_switch.s.bus_id = slot->bus_id;
++		cvmx_write_csr(slot->host->base + OCT_MIO_EMM_SWITCH, emm_switch.u64);
++
++		slot->cached_switch = emm_switch.u64;
++
+ 		msleep(10);
+ 		cvmx_write_csr(slot->host->base + OCT_MIO_EMM_WDOG, wdog);
+ 	} else {
+-		slot->host->last_emm_switch = 0;
++		slot->cached_switch = 0;
+ 	}
+ }
+ 
+@@ -652,6 +688,8 @@ static void octeon_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+ 	/* Only a single user of the bootbus at a time. */
+ 	down(&octeon_bootbus_sem);
+ 
++	octeon_mmc_switch_to(slot);
++
+ 	pr_debug("Calling set_ios: slot: clk = 0x%x, bus_width = %d\n",
+ 		 slot->clock, slot->bus_width);
+ 	pr_debug("Calling set_ios: ios: clk = 0x%x, vdd = %u, bus_width = %u, power_mode = %u, timing = %u\n",
+@@ -665,13 +703,13 @@ static void octeon_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+ 	 */
+ 	if (ios->power_mode == MMC_POWER_OFF) {
+ 		octeon_mmc_reset_bus(slot, 1);
+-		if (slot->power_gpio >= 0)
+-			gpio_set_value_cansleep(slot->power_gpio,
+-						slot->power_gpio_active_low);
++		if (slot->pwr_gpio >= 0)
++			gpio_set_value_cansleep(slot->pwr_gpio,
++						slot->pwr_gpio_low);
+ 	} else {
+-		if (slot->power_gpio >= 0)
+-			gpio_set_value_cansleep(slot->power_gpio,
+-						!slot->power_gpio_active_low);
++		if (slot->pwr_gpio >= 0)
++			gpio_set_value_cansleep(slot->pwr_gpio,
++						!slot->pwr_gpio_low);
+ 	}
+ 
+ 	switch (ios->bus_width) {
+@@ -702,7 +740,6 @@ static void octeon_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+ 		clk_period = (octeon_get_io_clock_rate() + clock - 1) / (2 * clock);
+ 
+ 		emm_switch.u64 = 0;
+-		emm_switch.s.bus_id = slot->bus_id;
+ 		emm_switch.s.hs_timing = hs_timing;
+ 		emm_switch.s.bus_width = bus_width;
+ 		emm_switch.s.power_class = power_class;
+@@ -720,8 +757,11 @@ static void octeon_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+ 		cvmx_write_csr(host->base + OCT_MIO_EMM_WDOG,
+ 			       ((u64)clock * 850ull) / 1000ull);
+ 		pr_debug("Writing 0x%llx to mio_emm_switch\n", emm_switch.u64);
++
++		cvmx_write_csr(host->base + OCT_MIO_EMM_SWITCH, emm_switch.u64);
++		emm_switch.s.bus_id = slot->bus_id;
+ 		cvmx_write_csr(host->base + OCT_MIO_EMM_SWITCH, emm_switch.u64);
+-		slot->host->last_emm_switch = emm_switch.u64;
++		slot->cached_switch = emm_switch.u64;
+ 
+ 		do {
+ 			emm_sts.u64 = cvmx_read_csr(host->base + OCT_MIO_EMM_RSP_STS);
+@@ -748,7 +788,7 @@ static int octeon_mmc_get_ro(struct mmc_host *mmc)
+ 		int pin = gpio_get_value_cansleep(slot->ro_gpio);
+ 		if (pin < 0)
+ 			return pin;
+-		if (slot->ro_gpio_active_low)
++		if (slot->ro_gpio_low)
+ 			pin = !pin;
+ 		return pin;
+ 	} else {
+@@ -764,7 +804,7 @@ static int octeon_mmc_get_cd(struct mmc_host *mmc)
+ 		int pin = gpio_get_value_cansleep(slot->cd_gpio);
+ 		if (pin < 0)
+ 			return pin;
+-		if (slot->cd_gpio_active_low)
++		if (slot->cd_gpio_low)
+ 			pin = !pin;
+ 		return pin;
+ 	} else {
+@@ -788,24 +828,27 @@ static void octeon_mmc_set_clock(struct octeon_mmc_slot *slot,
+ 	slot->clock = clock;
+ }
+ 
+-static int octeon_mmc_initlowlevel(struct octeon_mmc_slot *slot, int id,
+-			int bus_width)
++static int octeon_mmc_initlowlevel(struct octeon_mmc_slot *slot,
++				   int bus_width)
+ {
+ 	union cvmx_mio_emm_switch emm_switch;
+ 	struct octeon_mmc_host *host = slot->host;
+ 
+-	octeon_mmc_reset_bus(slot, 0);
+-
++	host->emm_cfg |= 1ull << slot->bus_id;
++	cvmx_write_csr(slot->host->base + OCT_MIO_EMM_CFG, host->emm_cfg);
+ 	octeon_mmc_set_clock(slot, 400000);
+ 
+ 	/* Program initial clock speed and power */
+ 	emm_switch.u64 = 0;
+-	emm_switch.s.bus_id = id;
+ 	emm_switch.s.power_class = 10;
+ 	emm_switch.s.clk_hi = (slot->sclock / slot->clock) / 2;
+ 	emm_switch.s.clk_lo = (slot->sclock / slot->clock) / 2;
+-	slot->host->last_emm_switch = emm_switch.u64;
++
+ 	cvmx_write_csr(host->base + OCT_MIO_EMM_SWITCH, emm_switch.u64);
++	emm_switch.s.bus_id = slot->bus_id;
++	cvmx_write_csr(host->base + OCT_MIO_EMM_SWITCH, emm_switch.u64);
++	slot->cached_switch = emm_switch.u64;
++
+ 	cvmx_write_csr(host->base + OCT_MIO_EMM_WDOG,
+ 		       ((u64)slot->clock * 850ull) / 1000ull);
+ 	cvmx_write_csr(host->base + OCT_MIO_EMM_STS_MASK, 0xe4f90080ull);
+@@ -815,7 +858,7 @@ static int octeon_mmc_initlowlevel(struct octeon_mmc_slot *slot, int id,
+ 
+ static int __init octeon_init_slot(struct octeon_mmc_host *host, int id,
+ 				      int bus_width, int max_freq,
+-				      int ro_gpio, int cd_gpio, int power_gpio,
++				      int ro_gpio, int cd_gpio, int pwr_gpio,
+ 				      bool ro_low, bool cd_low, bool power_low)
+ {
+ 	struct mmc_host *mmc;
+@@ -827,7 +870,7 @@ static int __init octeon_init_slot(struct octeon_mmc_host *host, int id,
+ 	 */
+ 	mmc = mmc_alloc_host(sizeof(struct octeon_mmc_slot), &host->pdev->dev);
+ 	if (!mmc) {
+-		pr_debug("alloc host failed\n");
++		dev_err(&host->pdev->dev, "alloc host failed\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -836,10 +879,10 @@ static int __init octeon_init_slot(struct octeon_mmc_host *host, int id,
+ 	slot->host = host;
+ 	slot->ro_gpio = ro_gpio;
+ 	slot->cd_gpio = cd_gpio;
+-	slot->power_gpio = power_gpio;
+-	slot->ro_gpio_active_low = ro_low;
+-	slot->cd_gpio_active_low = cd_low;
+-	slot->power_gpio_active_low = power_low;
++	slot->pwr_gpio = pwr_gpio;
++	slot->ro_gpio_low = ro_low;
++	slot->cd_gpio_low = cd_low;
++	slot->pwr_gpio_low = power_low;
+ 
+ 	if (slot->ro_gpio >= 0) {
+ 		ret = gpio_request(slot->ro_gpio, "mmc_ro");
+@@ -862,12 +905,12 @@ static int __init octeon_init_slot(struct octeon_mmc_host *host, int id,
+ 		}
+ 		gpio_direction_input(slot->cd_gpio);
+ 	}
+-	if (slot->power_gpio >= 0) {
+-		ret = gpio_request(slot->power_gpio, "mmc_power");
++	if (slot->pwr_gpio >= 0) {
++		ret = gpio_request(slot->pwr_gpio, "mmc_power");
+ 		if (ret) {
+ 			dev_err(&host->pdev->dev,
+ 				"Could not request mmc_power GPIO %d\n",
+-				slot->power_gpio);
++				slot->pwr_gpio);
+ 			if (slot->ro_gpio >= 0)
+ 				gpio_free(slot->ro_gpio);
+ 			if (slot->cd_gpio)
+@@ -875,9 +918,9 @@ static int __init octeon_init_slot(struct octeon_mmc_host *host, int id,
+ 			return ret;
+ 		}
+ 		pr_debug("%s: Shutting off power to slot %d via gpio %d\n",
+-			 DRV_NAME, slot->bus_id, slot->power_gpio);
+-		gpio_direction_output(slot->power_gpio,
+-				      slot->power_gpio_active_low);
++			 DRV_NAME, slot->bus_id, slot->pwr_gpio);
++		gpio_direction_output(slot->pwr_gpio,
++				      slot->pwr_gpio_low);
+ 	}
+ 	/*
+ 	 * Set up host parameters.
+@@ -892,7 +935,7 @@ static int __init octeon_init_slot(struct octeon_mmc_host *host, int id,
+ 			 MMC_VDD_30_31 | MMC_VDD_31_32 | MMC_VDD_32_33 |
+ 			 MMC_VDD_33_34 | MMC_VDD_34_35 | MMC_VDD_35_36;
+ 
+-	mmc->max_segs = 64;
++	mmc->max_segs = 1;
+ 	mmc->max_seg_size = (1 << 23) - 8;
+ 	mmc->max_req_size = mmc->max_seg_size;
+ 	mmc->max_blk_size = 512;
+@@ -905,8 +948,14 @@ static int __init octeon_init_slot(struct octeon_mmc_host *host, int id,
+ 	slot->bus_width = bus_width;
+ 	slot->bus_id = id;
+ 
++	/* Only a single user of the bootbus at a time. */
++	down(&octeon_bootbus_sem);
++
++	octeon_mmc_switch_to(slot);
+ 	/* Initialize MMC Block. */
+-	octeon_mmc_initlowlevel(slot, id, bus_width);
++	octeon_mmc_initlowlevel(slot, bus_width);
++
++	up(&octeon_bootbus_sem);
+ 
+ 	host->slot[id] = slot;
+ 	ret = mmc_add_host(mmc);
+@@ -922,8 +971,9 @@ static int octeon_mmc_probe(struct platform_device *pdev)
+ 	struct resource	*res;
+ 	int mmc_irq, dma_irq;
+ 	int ret = 0;
+-	struct device_node *node;
++	struct device_node *node = pdev->dev.of_node;
+ 	int found = 0;
++	enum of_gpio_flags f;
+ 
+ 	mmc_irq = platform_get_irq(pdev, 0);
+ 	if (mmc_irq < 0)
+@@ -939,6 +989,7 @@ static int octeon_mmc_probe(struct platform_device *pdev)
+ 		ret = -ENOMEM;
+ 		goto err;
+ 	}
++	host->last_slot = -1;
+ 
+ 	host->pdev = pdev;
+ 
+@@ -996,6 +1047,26 @@ static int octeon_mmc_probe(struct platform_device *pdev)
+ 	}
+ 
+ 
++	ret = of_get_named_gpio_flags(node, "power-gpios", 0, &f);
++	if (ret == -EPROBE_DEFER)
++		goto err;
++
++	host->global_pwr_gpio = ret;
++	host->global_pwr_gpio_low = (host->global_pwr_gpio >= 0 && f == OF_GPIO_ACTIVE_LOW);
++
++	if (host->global_pwr_gpio >= 0) {
++		ret = gpio_request(host->global_pwr_gpio, "mmc global power");
++		if (ret) {
++			dev_err(&pdev->dev,
++				"Could not request mmc global power gpio %d\n",
++				host->global_pwr_gpio);
++			goto err;
++		}
++		dev_dbg(&pdev->dev, "Global power on\n");
++		gpio_direction_output(host->global_pwr_gpio,
++				      !host->global_pwr_gpio_low);
++	}
++
+ 	spin_lock_init(&host->lock);
+ 
+ 	platform_set_drvdata(pdev, host);
+@@ -1008,17 +1079,13 @@ static int octeon_mmc_probe(struct platform_device *pdev)
+ 
+ 		data = of_get_property(node, "reg", &size);
+ 		if (data) {
+-			enum of_gpio_flags f;
+-			int ro_gpio, cd_gpio, power_gpio;
+-			bool ro_low, cd_low, power_low;
++			int ro_gpio, cd_gpio, pwr_gpio;
++			bool ro_low, cd_low, pwr_low;
+ 			int bus_width, max_freq;
+ 			int slot = be32_to_cpu(*data);
+-			data = of_get_property(node,
+-					       "cavium,bus-max-width",
+-					       &size);
++			data = of_get_property(node, "cavium,bus-max-width", &size);
+ 			if (!data || size != 4) {
+-				pr_info("Bus width not found for slot %d\n",
+-					slot);
++				pr_info("Bus width not found for slot %d\n", slot);
+ 				bus_width = 8;
+ 			} else {
+ 				bus_width = be32_to_cpup(data);
+@@ -1047,12 +1114,12 @@ static int octeon_mmc_probe(struct platform_device *pdev)
+ 			ro_low = (ro_gpio >= 0 && f == OF_GPIO_ACTIVE_LOW);
+ 			cd_gpio = of_get_named_gpio_flags(node, "cd-gpios", 0, &f);
+ 			cd_low = (cd_gpio >= 0 && f == OF_GPIO_ACTIVE_LOW);
+-			power_gpio = of_get_named_gpio_flags(node, "power-gpios", 0, &f);
+-			power_low = (power_gpio >= 0 && f == OF_GPIO_ACTIVE_LOW);
++			pwr_gpio = of_get_named_gpio_flags(node, "power-gpios", 0, &f);
++			pwr_low = (pwr_gpio >= 0 && f == OF_GPIO_ACTIVE_LOW);
+ 
+ 			ret = octeon_init_slot(host, slot, bus_width, max_freq,
+-					       ro_gpio, cd_gpio, power_gpio,
+-					       ro_low, cd_low, power_low);
++					       ro_gpio, cd_gpio, pwr_gpio,
++					       ro_low, cd_low, pwr_low);
+ 			pr_debug("init slot %d, ret = %d\n", slot, ret);
+ 			if (ret)
+ 				goto err;
+@@ -1066,6 +1133,14 @@ err:
+ 	/* Disable MMC controller */
+ 	emm_cfg.s.bus_ena = 0;
+ 	cvmx_write_csr(host->base + OCT_MIO_EMM_CFG, emm_cfg.u64);
++
++	if (host->global_pwr_gpio >= 0) {
++		dev_dbg(&pdev->dev, "Global power off\n");
++		gpio_set_value_cansleep(host->global_pwr_gpio,
++					host->global_pwr_gpio_low);
++		gpio_free(host->global_pwr_gpio);
++	}
++
+ 	return ret;
+ }
+ 
+@@ -1098,12 +1173,18 @@ static int octeon_mmc_remove(struct platform_device *pdev)
+ 				gpio_free(slot->ro_gpio);
+ 			if (slot->cd_gpio >= 0)
+ 				gpio_free(slot->cd_gpio);
+-			if (slot->power_gpio >= 0) {
+-				gpio_set_value_cansleep(slot->power_gpio,
+-							slot->power_gpio_active_low);
+-				gpio_free(slot->power_gpio);
++			if (slot->pwr_gpio >= 0) {
++				gpio_set_value_cansleep(slot->pwr_gpio,
++							slot->pwr_gpio_low);
++				gpio_free(slot->pwr_gpio);
+ 			}
+ 		}
++		if (host->global_pwr_gpio >= 0) {
++			dev_dbg(&pdev->dev, "Global power off\n");
++			gpio_set_value_cansleep(host->global_pwr_gpio,
++						host->global_pwr_gpio_low);
++			gpio_free(host->global_pwr_gpio);
++		}
+ 	}
+ 
+ 	platform_set_drvdata(pdev, NULL);
+@@ -1155,4 +1236,3 @@ module_exit(octeon_mmc_cleanup);
+ MODULE_AUTHOR("Cavium Inc. <support@caviumn.com>");
+ MODULE_DESCRIPTION("low-level driver for Cavium OCTEON MMC/SSD card");
+ MODULE_LICENSE("GPL");
+-MODULE_VERSION(DRV_VERSION);
+-- 
+2.6.2
+
