@@ -1,0 +1,200 @@
+From a0137f79c96b34d99dae1a83ef87f6b5bd979c40 Mon Sep 17 00:00:00 2001
+From: Zhipeng Gong <zhipeng.gong@intel.com>
+Date: Tue, 3 Nov 2015 00:51:15 -0500
+Subject: [PATCH 13/14] drm/i915: address the thundering i915_wait_request
+ herd
+
+For transcode cases, there are a number of threads waiting on a
+certain seqno. When an interrupt is comming, it will wake up all
+the threads, which cause a thread thundering herd issue.
+This patch keep the waiter on the seqno in a rbtree, and wake up the
+necessary waiter, which reduces the cpu utilization.
+
+[Original patch was taken from Intel MediaSDK]
+
+Signed-off-by: Zhipeng Gong <zhipeng.gong@intel.com>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    7 ++++-
+ drivers/gpu/drm/i915/i915_gem.c         |   41 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_irq.c         |    2 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   23 +++++++++++++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    4 +++
+ 5 files changed, 75 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index ee7d586..295165e 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1434,6 +1434,12 @@ struct i915_frontbuffer_tracking {
+ 	unsigned flip_bits;
+ };
+ 
++struct drm_i915_seqno_waiter{
++	struct rb_node node;
++	uint32_t seqno;
++	struct task_struct *waiter;
++};
++
+ struct drm_i915_private {
+ 	struct drm_device *dev;
+ 	struct kmem_cache *slab;
+@@ -1448,7 +1454,6 @@ struct drm_i915_private {
+ 
+ 	struct intel_gmbus gmbus[GMBUS_NUM_PORTS];
+ 
+-
+ 	/** gmbus_mutex protects against concurrent usage of the single hw gmbus
+ 	 * controller on different i2c buses. */
+ 	struct mutex gmbus_mutex;
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index b0d5377..e53d4f4 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1133,6 +1133,31 @@ static bool can_wait_boost(struct drm_i915_file_private *file_priv)
+ 	return !atomic_xchg(&file_priv->rps_wait_boost, true);
+ }
+ 
++static void seqno_waiter_insert(struct drm_i915_seqno_waiter *node, struct rb_root *root)
++{
++	struct rb_node **new = &root->rb_node;
++	struct rb_node *parent = NULL;
++	struct drm_i915_seqno_waiter *test = NULL;
++	uint32_t seqno = node->seqno;
++
++	while (*new) {
++		parent = *new;
++		test = rb_entry(parent, struct drm_i915_seqno_waiter, node);
++		if (i915_seqno_passed(test->seqno, seqno))
++			new = &parent->rb_left;
++		else
++			new = &parent->rb_right;
++	}
++
++	rb_link_node(&node->node, parent, new);
++	rb_insert_color(&node->node, root);
++}
++
++static inline void seqno_waiter_erase(struct drm_i915_seqno_waiter *node, struct rb_root *root)
++{
++	rb_erase(&node->node, root);
++}
++
+ /**
+  * __wait_seqno - wait until execution of seqno has finished
+  * @ring: the ring expected to report seqno
+@@ -1165,12 +1190,20 @@ static int __wait_seqno(struct intel_engine_cs *ring, u32 seqno,
+ 	DEFINE_WAIT(wait);
+ 	unsigned long timeout_expire;
+ 	int ret;
++	struct drm_i915_seqno_waiter *node;
+ 
+ 	WARN(!intel_irqs_enabled(dev_priv), "IRQs disabled");
+ 
+ 	if (i915_seqno_passed(ring->get_seqno(ring, true), seqno))
+ 		return 0;
+ 
++	node = kmalloc(sizeof(*node), GFP_KERNEL);
++	if (node == NULL)
++		return -ENOMEM;
++
++	node->seqno = seqno;
++	node->waiter = current;
++
+ 	timeout_expire = timeout ? jiffies + timespec_to_jiffies_timeout(timeout) : 0;
+ 
+ 	if (INTEL_INFO(dev)->gen >= 6 && ring->id == RCS && can_wait_boost(file_priv)) {
+@@ -1184,6 +1217,10 @@ static int __wait_seqno(struct intel_engine_cs *ring, u32 seqno,
+ 	if (!irq_test_in_progress && WARN_ON(!ring->irq_get(ring)))
+ 		return -ENODEV;
+ 
++	spin_lock(&ring->lock);
++	seqno_waiter_insert(node, &ring->seqno_waiter_rb_root);
++	spin_unlock(&ring->lock);
++
+ 	/* Record current time in case interrupted by signal, or wedged */
+ 	trace_i915_gem_request_wait_begin(ring, seqno);
+ 	getrawmonotonic(&before);
+@@ -1238,6 +1275,10 @@ static int __wait_seqno(struct intel_engine_cs *ring, u32 seqno,
+ 	getrawmonotonic(&now);
+ 	trace_i915_gem_request_wait_end(ring, seqno);
+ 
++	spin_lock(&ring->lock);
++	seqno_waiter_erase(node, &ring->seqno_waiter_rb_root);
++	spin_unlock(&ring->lock);
++
+ 	if (!irq_test_in_progress)
+ 		ring->irq_put(ring);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index e78c1a1..50a834a 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1263,7 +1263,7 @@ static void notify_ring(struct drm_device *dev,
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET))
+ 		intel_notify_mmio_flip(ring);
+ 
+-	wake_up_all(&ring->irq_queue);
++	schedule_work(&ring->seqno_dispatcher);
+ 	i915_queue_hangcheck(dev);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index ff5886d..724f07b 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1755,6 +1755,25 @@ err_unref:
+ 	return ret;
+ }
+ 
++static void i915_seqno_dispatch_work_func(struct work_struct *work)
++{
++	struct rb_node *node;
++	struct drm_i915_seqno_waiter *waiter;
++
++	struct intel_engine_cs *ring =
++		container_of(work, struct intel_engine_cs, seqno_dispatcher);
++
++	spin_lock(&ring->lock);
++	for (node = rb_first(&ring->seqno_waiter_rb_root); node; node = rb_next(node)) {
++		waiter = rb_entry(node, struct drm_i915_seqno_waiter, node);
++		if (i915_seqno_passed(ring->get_seqno(ring, false), waiter->seqno))
++			wake_up_process(waiter->waiter);
++		else
++			break;
++	}
++	spin_unlock(&ring->lock);
++}
++
+ static int intel_init_ring_buffer(struct drm_device *dev,
+ 				  struct intel_engine_cs *ring)
+ {
+@@ -1777,6 +1796,10 @@ static int intel_init_ring_buffer(struct drm_device *dev,
+ 	memset(ring->semaphore.sync_seqno, 0, sizeof(ring->semaphore.sync_seqno));
+ 
+ 	init_waitqueue_head(&ring->irq_queue);
++	ring->seqno_waiter_rb_root= RB_ROOT;
++	INIT_WORK(&ring->seqno_dispatcher, i915_seqno_dispatch_work_func);
++	spin_lock_init(&ring->lock);
++
+ 
+ 	if (I915_NEED_GFX_HWS(dev)) {
+ 		ret = init_status_page(ring);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index cbeb933..d91aaa75 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -315,6 +315,10 @@ struct  intel_engine_cs {
+ 	 * to encode the command length in the header).
+ 	 */
+ 	u32 (*get_cmd_length_mask)(u32 cmd_header);
++
++	struct work_struct seqno_dispatcher;
++	struct rb_root seqno_waiter_rb_root;
++	spinlock_t lock;
+ };
+ 
+ bool intel_ring_initialized(struct intel_engine_cs *ring);
+-- 
+1.7.5.4
+
