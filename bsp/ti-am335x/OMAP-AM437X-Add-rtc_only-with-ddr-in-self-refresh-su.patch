@@ -1,0 +1,522 @@
+From 4003f14773ded2c93f913cff0899ab31292a0cf6 Mon Sep 17 00:00:00 2001
+From: Keerthy <j-keerthy@ti.com>
+Date: Thu, 6 Aug 2015 10:23:49 +0530
+Subject: [PATCH 401/800] OMAP: AM437X: Add rtc_only with ddr in self-refresh
+ support
+
+During RTC-only suspend, power is lost to the wkup domain, so we need to
+save and restore the state of that domain. We also need to store some
+information within the RTC registers so that u-boot can do the right thing
+at powerup.
+
+The state is entered by getting the RTC to bring the pmic_power_en line low
+which will instruct the PMIC to disable the appropriate power rails after
+putting DDR into self-refresh mode. To bring pmic_power_en low, we need to
+get an ALARM2 event. Since we are running from SRAM at that point, it means
+calculating what the next second is (via ASM) and programming that into the
+RTC.
+
+Note: Patch also removes a prior duplicate inclusion of pm.h header file
+
+Signed-off-by: Keerthy <j-keerthy@ti.com>
+[zou: Original patch taken from PROCESSOR-SDK-LINUX-AM335X 02_00_01_07]
+Signed-off-by: zou cao <cao.zou@windriver.com>
+---
+ arch/arm/mach-omap2/Kconfig       |    2 +-
+ arch/arm/mach-omap2/iomap.h       |    7 ++
+ arch/arm/mach-omap2/pm.h          |    8 ++
+ arch/arm/mach-omap2/pm33xx-core.c |  105 ++++++++++++++++++++++-
+ arch/arm/mach-omap2/pm33xx.c      |  168 +++++++++++++++++++++++++++++++++----
+ 5 files changed, 270 insertions(+), 20 deletions(-)
+
+diff --git a/arch/arm/mach-omap2/Kconfig b/arch/arm/mach-omap2/Kconfig
+index 92f763a..892ac78 100644
+--- a/arch/arm/mach-omap2/Kconfig
++++ b/arch/arm/mach-omap2/Kconfig
+@@ -272,7 +272,7 @@ config OMAP3_SDRC_AC_TIMING
+ config AMX3_PM
+ 	tristate "AMx3 Power Management"
+ 	depends on SOC_AM33XX || SOC_AM43XX
+-	depends on WKUP_M3_IPC && TI_EMIF_SRAM
++	depends on WKUP_M3_IPC && TI_EMIF_SRAM && RTC_DRV_OMAP
+ 	default y
+ 	help
+ 	  Enable power management on am335x and am437x. Required for suspend to mem
+diff --git a/arch/arm/mach-omap2/iomap.h b/arch/arm/mach-omap2/iomap.h
+index 6191d24..0436ada 100644
+--- a/arch/arm/mach-omap2/iomap.h
++++ b/arch/arm/mach-omap2/iomap.h
+@@ -119,6 +119,13 @@
+ #define L4_WK_AM33XX_SIZE	SZ_4M   /* 1MB of 128MB used, want 1MB sect */
+ 
+ /*
++ * ----------------------------------------------------------------------------
++ * AM43XX specific IO mapping
++ * ----------------------------------------------------------------------------
++ */
++#define AM43XX_GIC_DIST_BASE	0x48241000
++
++/*
+  * Need to look at the Size 4M for L4.
+  * VPOM3430 was not working for Int controller
+  */
+diff --git a/arch/arm/mach-omap2/pm.h b/arch/arm/mach-omap2/pm.h
+index 1e9bb1f..8d31e06 100644
+--- a/arch/arm/mach-omap2/pm.h
++++ b/arch/arm/mach-omap2/pm.h
+@@ -115,6 +115,12 @@ struct am33xx_pm_ops {
+ 	int	(*soc_suspend)(unsigned int state, int (*fn)(unsigned long),
+ 			       unsigned long args);
+ 	int	(*cpu_suspend)(int (*fn)(unsigned long), unsigned long args);
++	void (*save_context)(void);
++	void (*restore_context)(void);
++	void (*prepare_rtc_suspend)(void);
++	void (*prepare_rtc_resume)(void);
++	int (*check_off_mode_enable)(void);
++	void __iomem *(*get_rtc_base_addr)(void);
+ };
+ 
+ /* for sharing asm function addrs with amx3 pm modules */
+@@ -123,6 +129,8 @@ struct am33xx_pm_sram_addr {
+ 	unsigned long *do_wfi_sz;
+ 	unsigned long *resume_offset;
+ 	unsigned long *emif_sram_table;
++	unsigned long *rtc_base_virt;
++	phys_addr_t rtc_resume_phys_addr;
+ };
+ 
+ struct am33xx_pm_ops *amx3_get_pm_ops(void);
+diff --git a/arch/arm/mach-omap2/pm33xx-core.c b/arch/arm/mach-omap2/pm33xx-core.c
+index 2f314db..6ba7c85 100644
+--- a/arch/arm/mach-omap2/pm33xx-core.c
++++ b/arch/arm/mach-omap2/pm33xx-core.c
+@@ -14,11 +14,16 @@
+  * GNU General Public License for more details.
+  */
+ 
++#include <linux/platform_data/gpio-omap.h>
++#include <linux/pinctrl/pinmux.h>
++#include <linux/wkup_m3_ipc.h>
++#include <linux/of.h>
++#include <linux/rtc.h>
++
+ #include <asm/smp_scu.h>
+ #include <asm/suspend.h>
+ 
+ #include "control.h"
+-#include "pm.h"
+ #include "cm33xx.h"
+ #include "pm.h"
+ #include "prm33xx.h"
+@@ -33,6 +38,9 @@
+ static struct powerdomain *cefuse_pwrdm, *gfx_pwrdm, *per_pwrdm, *mpu_pwrdm;
+ static struct clockdomain *gfx_l4ls_clkdm;
+ static void __iomem *scu_base;
++static struct omap_hwmod *rtc_oh;
++
++static struct pinctrl_dev *pmx_dev;
+ 
+ static int __init am43xx_map_scu(void)
+ {
+@@ -44,6 +52,11 @@ static int __init am43xx_map_scu(void)
+ 	return 0;
+ }
+ 
++static int am43xx_check_off_mode_enable(void)
++{
++	return enable_off_mode;
++}
++
+ static int amx3_common_init(void)
+ {
+ 	gfx_pwrdm = pwrdm_lookup("gfx_pwrdm");
+@@ -87,6 +100,8 @@ static int am43xx_suspend_init(void (*do_sram_cpuidle)(u32 wfi_flags))
+ {
+ 	int ret = 0;
+ 
++	pmx_dev = get_pinctrl_dev_from_devname("44e10800.pinmux");
++
+ 	ret = am43xx_map_scu();
+ 	if (ret) {
+ 		pr_err("PM: Could not ioremap SCU\n");
+@@ -95,6 +110,11 @@ static int am43xx_suspend_init(void (*do_sram_cpuidle)(u32 wfi_flags))
+ 
+ 	am437x_idle_init();
+ 
++	if (ret) {
++		pr_err("PM: Could not ioremap GIC\n");
++		return ret;
++	}
++
+ 	ret = amx3_common_init();
+ 
+ 	return ret;
+@@ -112,6 +132,7 @@ static void amx3_post_suspend_common(void)
+ 	 * Because gfx_pwrdm is the only one under MPU control,
+ 	 * comment on transition status
+ 	 */
++
+ 	status = pwrdm_read_pwrst(gfx_pwrdm);
+ 	if (status != PWRDM_POWER_OFF)
+ 		pr_err("PM: GFX domain did not transition: %x\n", status);
+@@ -149,7 +170,9 @@ static int am43xx_suspend(unsigned int state, int (*fn)(unsigned long),
+ 	scu_power_mode(scu_base, SCU_PM_POWEROFF);
+ 	ret = cpu_suspend(args, fn);
+ 	scu_power_mode(scu_base, SCU_PM_NORMAL);
+-	amx3_post_suspend_common();
++
++	if (!am43xx_check_off_mode_enable())
++		amx3_post_suspend_common();
+ 
+ 	return ret;
+ }
+@@ -163,15 +186,93 @@ static int am33xx_cpu_suspend(int (*fn)(unsigned long), unsigned long args)
+ 	return ret;
+ }
+ 
++static void common_save_context(void)
++{
++	omap2_gpio_prepare_for_idle(1);
++	pinmux_save_context(pmx_dev, "am33xx_pmx_per");
++	clks_save_context();
++	pwrdms_save_context();
++	omap_hwmods_save_context();
++	clkdm_save_context();
++}
++
++static void common_restore_context(void)
++{
++	clks_restore_context();
++	clkdm_restore_context();
++	pwrdms_restore_context();
++	omap_hwmods_restore_context();
++	pinmux_restore_context(pmx_dev, "am33xx_pmx_per");
++	pwrdms_lost_power();
++	omap2_gpio_resume_after_idle();
++}
++
++static void am33xx_save_context(void)
++{
++	common_save_context();
++	omap_intc_save_context();
++	am33xx_control_save_context();
++}
++
++static void am33xx_restore_context(void)
++{
++	common_restore_context();
++	am33xx_control_restore_context();
++	omap_intc_restore_context();
++}
++
++static void am43xx_save_context(void)
++{
++	common_save_context();
++	am43xx_control_save_context();
++}
++
++static void am43xx_restore_context(void)
++{
++	common_restore_context();
++	am43xx_control_restore_context();
++
++	writel_relaxed(0x0, AM33XX_L4_WK_IO_ADDRESS(0x44df2e14));
++}
++
++static void am43xx_prepare_rtc_suspend(void)
++{
++	omap_hwmod_enable(rtc_oh);
++}
++
++static void am43xx_prepare_rtc_resume(void)
++{
++	omap_hwmod_idle(rtc_oh);
++}
++
++void __iomem *am43xx_get_rtc_base_addr(void)
++{
++	rtc_oh = omap_hwmod_lookup("rtc");
++
++	return omap_hwmod_get_mpu_rt_va(rtc_oh);
++}
++
+ static struct am33xx_pm_ops am33xx_ops = {
+ 	.init = am33xx_suspend_init,
+ 	.soc_suspend = am33xx_suspend,
+ 	.cpu_suspend = am33xx_cpu_suspend,
++	.save_context = am33xx_save_context,
++	.restore_context = am33xx_restore_context,
++	.prepare_rtc_suspend = am43xx_prepare_rtc_suspend,
++	.prepare_rtc_resume = am43xx_prepare_rtc_resume,
++	.check_off_mode_enable = am43xx_check_off_mode_enable,
++	.get_rtc_base_addr = am43xx_get_rtc_base_addr,
+ };
+ 
+ static struct am33xx_pm_ops am43xx_ops = {
+ 	.init = am43xx_suspend_init,
+ 	.soc_suspend = am43xx_suspend,
++	.save_context = am43xx_save_context,
++	.restore_context = am43xx_restore_context,
++	.prepare_rtc_suspend = am43xx_prepare_rtc_suspend,
++	.prepare_rtc_resume = am43xx_prepare_rtc_resume,
++	.check_off_mode_enable = am43xx_check_off_mode_enable,
++	.get_rtc_base_addr = am43xx_get_rtc_base_addr,
+ };
+ 
+ struct am33xx_pm_ops *amx3_get_pm_ops(void)
+diff --git a/arch/arm/mach-omap2/pm33xx.c b/arch/arm/mach-omap2/pm33xx.c
+index 46fc213..c358ed6 100644
+--- a/arch/arm/mach-omap2/pm33xx.c
++++ b/arch/arm/mach-omap2/pm33xx.c
+@@ -26,6 +26,7 @@
+ #include <linux/suspend.h>
+ #include <linux/ti-emif-sram.h>
+ #include <linux/wkup_m3_ipc.h>
++#include <linux/rtc.h>
+ 
+ #include <asm/fncpy.h>
+ #include <asm/proc-fns.h>
+@@ -33,16 +34,62 @@
+ #include <asm/system_misc.h>
+ 
+ #include "pm.h"
++#include "omap_hwmod.h"
++#include "iomap.h"
+ 
++#define RTC_SCRATCH_RESUME_REG	0
++#define RTC_SCRATCH_MAGIC_REG	1
++#define RTC_REG_BOOT_MAGIC	0x8cd0 /* RTC */
++#define GIC_INT_SET_PENDING_BASE 0x200
++
++static u32 rtc_magic_val;
+ static int (*am33xx_do_wfi_sram)(unsigned long unused);
+ static phys_addr_t am33xx_do_wfi_sram_phys;
+ 
+ static struct gen_pool *sram_pool;
+ static phys_addr_t ocmcram_location;
+-
++static struct rtc_device *omap_rtc;
+ static struct am33xx_pm_ops *pm_ops;
++static void __iomem *gic_dist_base;
+ static struct am33xx_pm_sram_addr *pm_sram;
++
+ static unsigned long suspend_wfi_flags;
++static int rtc_only_idle;
++static int retrigger_irq;
++
++static struct wkup_m3_wakeup_src wakeup_src = {.irq_nr = 0,
++	.src = "Unknown",
++};
++
++static struct wkup_m3_wakeup_src rtc_alarm_wakeup = {
++	.irq_nr = 108, .src = "RTC Alarm",
++};
++
++static struct wkup_m3_wakeup_src rtc_ext_wakeup = {
++	.irq_nr = 0, .src = "Ext wakeup",
++};
++
++/*
++ * Push the minimal suspend-resume code to SRAM
++ */
++int am33xx_push_sram_idle(void)
++{
++	am33xx_do_wfi_sram = (void *)fncpy((void *)ocmcram_location,
++						pm_sram->do_wfi,
++						*pm_sram->do_wfi_sz);
++
++	return 0;
++}
++
++static int __init am43xx_map_gic(void)
++{
++	gic_dist_base = ioremap(AM43XX_GIC_DIST_BASE, SZ_4K);
++
++	if (!gic_dist_base)
++		return -ENOMEM;
++
++	return 0;
++}
+ 
+ static void am33xx_do_sram_idle(u32 wfi_flags)
+ {
+@@ -55,12 +102,54 @@ static void am33xx_do_sram_idle(u32 wfi_flags)
+ }
+ 
+ #ifdef CONFIG_SUSPEND
++struct wkup_m3_wakeup_src rtc_wake_src(void)
++{
++	u32 i;
++
++	i = __raw_readl(pm_ops->get_rtc_base_addr() + 0x44) & 0x40;
++
++	if (i) {
++		retrigger_irq = rtc_alarm_wakeup.irq_nr;
++		return rtc_alarm_wakeup;
++	}
++
++	retrigger_irq = rtc_ext_wakeup.irq_nr;
++
++	return rtc_ext_wakeup;
++}
++
++int am33xx_rtc_only_idle(unsigned long wfi_flags)
++{
++	rtc_power_off_program(omap_rtc);
++	am33xx_do_wfi_sram(wfi_flags);
++	return 0;
++}
++
+ static int am33xx_pm_suspend(suspend_state_t suspend_state)
+ {
+ 	int i, ret = 0;
+ 
+-	ret = pm_ops->soc_suspend(suspend_state, am33xx_do_wfi_sram,
++	if (suspend_state == PM_SUSPEND_MEM &&
++	    pm_ops->check_off_mode_enable()) {
++		rtc_only_idle = 1;
++		pm_ops->prepare_rtc_suspend();
++		rtc_write_scratch(omap_rtc, RTC_SCRATCH_MAGIC_REG,
++				  rtc_magic_val);
++		pm_ops->save_context();
++		suspend_wfi_flags |= WFI_FLAG_RTC_ONLY;
++		ret = pm_ops->soc_suspend(suspend_state, am33xx_rtc_only_idle,
++					  suspend_wfi_flags);
++		suspend_wfi_flags &= ~WFI_FLAG_RTC_ONLY;
++
++		if (!ret) {
++			pm_ops->restore_context();
++			wkup_m3_set_rtc_only_mode();
++			am33xx_push_sram_idle();
++		}
++	} else {
++		ret = pm_ops->soc_suspend(suspend_state, am33xx_do_wfi_sram,
+ 				  suspend_wfi_flags);
++	}
+ 
+ 	if (ret) {
+ 		pr_err("PM: Kernel suspend failure\n");
+@@ -79,8 +168,15 @@ static int am33xx_pm_suspend(suspend_state_t suspend_state)
+ 			pr_err("PM: CM3 returned unknown result = %d\n", i);
+ 			ret = -1;
+ 		}
+-
+-		pr_info("PM: Wakeup source %s\n", wkup_m3_request_wake_src());
++		/* print the wakeup reason */
++		if (rtc_only_idle) {
++			wakeup_src = rtc_wake_src();
++			pm_ops->prepare_rtc_resume();
++			pr_info("PM: Wakeup source %s\n", wakeup_src.src);
++		} else {
++			pr_info("PM: Wakeup source %s\n",
++				wkup_m3_request_wake_src());
++		}
+ 	}
+ 
+ 	return ret;
+@@ -121,6 +217,23 @@ static int am33xx_pm_begin(suspend_state_t state)
+ static void am33xx_pm_end(void)
+ {
+ 	wkup_m3_finish_low_power();
++
++	if (rtc_only_idle) {
++		if (retrigger_irq)
++			/*
++			 * 32 bits of Interrupt Set-Pending correspond to 32
++			 * 32 interupts. Compute the bit offset of the
++			 * Interrupt and set that particular bit.
++			 * Compute the register offset by dividing interrupt
++			 * number by 32 and mutiplying by 4
++			 */
++			writel_relaxed(1 << (retrigger_irq & 31),
++				       gic_dist_base + GIC_INT_SET_PENDING_BASE
++				       + retrigger_irq / 32 * 4);
++		rtc_write_scratch(omap_rtc, RTC_SCRATCH_MAGIC_REG, 0);
++	}
++
++	rtc_only_idle = 0;
+ 	cpu_idle_poll_ctrl(false);
+ }
+ 
+@@ -206,14 +319,27 @@ static int am33xx_prepare_push_sram_idle(void)
+ 	return 0;
+ }
+ 
+-/*
+- * Push the minimal suspend-resume code to SRAM
+- */
+-int am33xx_push_sram_idle(void)
++static int am33xx_pm_rtc_setup(void)
+ {
+-	am33xx_do_wfi_sram = (void *)fncpy((void *)ocmcram_location,
+-					   pm_sram->do_wfi,
+-					   *pm_sram->do_wfi_sz);
++	struct device_node *np;
++
++	np = of_find_node_by_name(NULL, "rtc");
++
++	if (of_device_is_available(np)) {
++		omap_rtc = rtc_class_open("rtc0");
++		rtc_read_scratch(omap_rtc, RTC_SCRATCH_MAGIC_REG,
++				 &rtc_magic_val);
++
++		if ((rtc_magic_val & 0xffff) != RTC_REG_BOOT_MAGIC)
++				pr_warn("PM: bootloader does not support rtc-only!\n");
++
++		pm_sram->rtc_base_virt = pm_ops->get_rtc_base_addr();
++		rtc_write_scratch(omap_rtc, RTC_SCRATCH_MAGIC_REG, 0);
++		rtc_write_scratch(omap_rtc, RTC_SCRATCH_RESUME_REG,
++				  pm_sram->rtc_resume_phys_addr);
++	} else {
++		pr_warn("PM: no-rtc available, rtc-only mode disabled.\n");
++	}
+ 
+ 	return 0;
+ }
+@@ -226,29 +352,37 @@ int am33xx_pm_init(void)
+ 	    !of_machine_is_compatible("ti,am43"))
+ 		return -ENODEV;
+ 
++	ret = am43xx_map_gic();
++	if (ret) {
++		pr_err("PM: Could not ioremap SCU\n");
++		return ret;
++	}
++
+ 	pm_sram = amx3_get_sram_addrs();
+ 	if (!pm_sram) {
+ 		pr_err("PM: Cannot get PM asm function addresses!!\n");
+ 		return -ENODEV;
+ 	}
+ 
++	pm_ops = amx3_get_pm_ops();
++	if (!pm_ops) {
++		pr_err("PM: Cannot get core PM ops!\n");
++		return -ENODEV;
++	}
++
+ 	ret = am33xx_prepare_push_sram_idle();
+ 	if (ret)
+ 		return ret;
+ 
++	am33xx_pm_rtc_setup();
+ 	am33xx_push_sram_idle();
++
+ 	am33xx_pm_set_ipc_ops();
+ 
+ #ifdef CONFIG_SUSPEND
+ 	suspend_set_ops(&am33xx_pm_ops);
+ #endif /* CONFIG_SUSPEND */
+ 
+-	pm_ops = amx3_get_pm_ops();
+-	if (!pm_ops) {
+-		pr_err("PM: Cannot get core PM ops!\n");
+-		return -ENODEV;
+-	}
+-
+ 	suspend_wfi_flags = 0;
+ 	suspend_wfi_flags |= WFI_FLAG_SELF_REFRESH;
+ 	suspend_wfi_flags |= WFI_FLAG_SAVE_EMIF;
+-- 
+1.7.5.4
+
