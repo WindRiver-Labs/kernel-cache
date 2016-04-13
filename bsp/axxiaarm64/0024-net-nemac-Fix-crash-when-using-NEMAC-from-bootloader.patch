@@ -1,0 +1,698 @@
+From 9adb24a103c30c0b8b73037d257e383a8b8332da Mon Sep 17 00:00:00 2001
+From: Anders Berg <anders.berg@intel.com>
+Date: Thu, 23 Apr 2015 15:10:26 +0200
+Subject: [PATCH 024/131] net: nemac: Fix crash when using NEMAC from
+ bootloader.
+
+Fix the descriptor setup to handle the case when the bootloader has
+previously initialized and used the device.  Also added a couple of
+sysfs entries to read various counters for diagnostic purposes.
+
+Signed-off-by: Anders Berg <anders.berg@intel.com>
+[Original patch is from linux-yocto-4.1 axxia/base branch.]
+Signed-off-by: Yanjiang Jin <yanjiang.jin@windriver.com>
+---
+ drivers/net/ethernet/intel/axxia/nemac.c | 405 +++++++++++++++++++------------
+ 1 file changed, 256 insertions(+), 149 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/axxia/nemac.c b/drivers/net/ethernet/intel/axxia/nemac.c
+index 9d92d53..ee6a240 100644
+--- a/drivers/net/ethernet/intel/axxia/nemac.c
++++ b/drivers/net/ethernet/intel/axxia/nemac.c
+@@ -40,10 +40,22 @@ module_param(tx_num_desc, int, S_IRUSR);
+ MODULE_PARM_DESC(tx_num_desc, "Number of transmit descriptors");
+ 
+ /**
+- * struct dma_desc - NEMAC DMA descriptor
++ * struct dma_desc - NEMAC hardware DMA descriptor.
++ *
++ * @ctrl: Field to hold control flags, transfer length and PDU length. The
++ * transfter length field is written by sw for both TX and RX and is the number
++ * of bytes pointer to by the bufptr field. The PDU length is written by sw for
++ * TX descriptors and hold the total PDU length (that may span multiple
++ * descriptors). For RX descriptors, the PDU length field is written by hw
++ * indicating the actual length of the frame.
++ *
++ * @bufptr: Holds the DMA address of the buffer. The top bits of this field is
++ * ignored (and preserved) by the hardware. This driver uses the top 16 bits as
++ * a cookie to be able to associate a struct sk_buff with each descriptor
++ * entry.
+  */
+ struct dma_desc {
+-	u32 ctrl;
++	u64 ctrl;
+ #define D_SOP		(1 << 3)
+ #define D_EOP		(1 << 4)
+ #define D_INTR		(1 << 5)
+@@ -51,12 +63,73 @@ struct dma_desc {
+ #define D_TX_NEGCRC	(1 << 6)
+ #define D_SWAP		(1 << 7)
+ #define D_TX_CRC	(1 << 8)
+-	u16 xfer_len;
+-	u16 pdu_len;
++#define D_CTRL_SHIFT	0
++#define D_CTRL_MASK	0x00000000ffffffffUL
++#define D_XFER_SHIFT	32
++#define D_XFER_MASK	0x0000ffff00000000UL
++#define D_PDU_SHIFT	48
++#define D_PDU_MASK	0xffff000000000000UL
+ 	u64 bufptr;
++#define D_PTR_SHIFT	0
++#define D_PTR_MASK	0x0000ffffffffffffUL
++#define D_IDX_SHIFT	48
++#define D_IDX_MASK	0xffff000000000000UL
+ };
+ 
+-#define desc_idx(_desc) (int)(((((u64)(_desc)) >> 4) & 0xff))
++static u32 desc_get_ctrl(const struct dma_desc *desc)
++{
++	return (desc->ctrl & D_CTRL_MASK) >> D_CTRL_SHIFT;
++}
++
++static u32 desc_get_xferlen(const struct dma_desc *desc)
++{
++	return (desc->ctrl & D_XFER_MASK) >> D_XFER_SHIFT;
++}
++
++static u32 desc_get_pdulen(const struct dma_desc *desc)
++{
++	return (desc->ctrl & D_PDU_MASK) >> D_PDU_SHIFT;
++}
++
++static int desc_get_idx(const struct dma_desc *desc)
++{
++	return (desc->bufptr & D_IDX_MASK) >> D_IDX_SHIFT;
++}
++
++static u64 desc_get_bufptr(const struct dma_desc *desc)
++{
++	return (desc->bufptr & D_PTR_MASK) >> D_PTR_SHIFT;
++}
++
++static void desc_set_ctrl(struct dma_desc *desc, u32 ctrl)
++{
++	desc->ctrl = ((desc->ctrl & ~D_CTRL_MASK) |
++		      ((u64)ctrl << D_CTRL_SHIFT));
++}
++
++static void desc_set_xferlen(struct dma_desc *desc, u32 len)
++{
++	desc->ctrl = ((desc->ctrl & ~D_XFER_MASK) |
++		      ((u64)len << D_XFER_SHIFT));
++}
++
++static void desc_set_pdulen(struct dma_desc *desc, u32 len)
++{
++	desc->ctrl = ((desc->ctrl & ~D_PDU_MASK) |
++		      ((u64)len << D_PDU_SHIFT));
++}
++
++static void desc_set_idx(struct dma_desc *desc, int idx)
++{
++	desc->bufptr = ((desc->bufptr & ~D_IDX_MASK) |
++			((u64)idx << D_IDX_SHIFT));
++}
++
++static void desc_set_bufptr(struct dma_desc *desc, u64 bufptr)
++{
++	desc->bufptr = ((desc->bufptr & ~D_PTR_MASK) |
++			(bufptr << D_PTR_SHIFT));
++}
+ 
+ /**
+  * struct queue_ptr - Holds the state of the RX or TX queue
+@@ -70,13 +143,29 @@ struct dma_desc {
+  * @hw_tail_reg: Address to hardware tail pointer (updated by hardware). Points
+  * to the next descriptor to be used for reception or transmission.
+  *
+- * @tail: Driver tail pointer. Follows hw_tail and points to next descriptor to
+- * be completed.
++ * @hw_tail_reg - Pointer to hw register containing next descriptor to be
++ * processed by hardware.
+  *
+- * @head: Head pointer where the drivers puts the new buffers queued for
+- * transmission, and the where fresh RX buffers are added.
++ * @tail - Oldest descriptor, i.e. the next descriptor to be processed by RX/TX
++ * interrupt. This pointer is only used by the driver (no corresponding
++ * hardware register). The interrupt handler will process descriptors from tail
++ * to hw_tail.
++ *
++ * @head - Newest descriptor. This is where the driver adds new descriptors
++ * (either fresh rx buffers or tx buffers queued for transmission) and the
++ * pointer is updated in hardware via the DMAREG_[RX|TX]_HEAD register. The
++ * hardware will process descriptors from hw_tail to head. When hw_tail ==
++ * head, the ring is empty.
+  *
+  * @size: Size in bytes of the descriptor ring.
++ *
++ *		tail	hw_tail		head
++ *		|	|		|
++ *		V	V		V
++ *      +-----+ +-----+ +-----+ +-----+ +-----+ +-----+
++ *      |     | |     | |     | |     | |     | |     |
++ *      +-----+ +-----+ +-----+ +-----+ +-----+ +-----+
++ *
+  */
+ struct queue_ptr {
+ 	struct dma_desc	*ring;
+@@ -134,32 +223,6 @@ nemac_clr(const struct nemac_priv *priv, u32 offset, u32 bits)
+ 	writel(tmp & ~bits, priv->reg + offset);
+ }
+ 
+-/* RX/TX-ring
+- *
+- * tail - Oldest descriptor, i.e. the next descriptor to be processed by RX/TX
+- * interrupt. This pointer is only used by the driver (no corresponding
+- * hardware register). The interrupt handler will process descriptors from tail
+- * to hw_tail.
+- *
+- * hw_tail - Next descriptor to be processed by hardware. The memory location
+- * is updated by the hardware when it switches descriptor (via DMA). A copy of
+- * this value is also available in the DMAREG_[RX|TX]_TAIL register.
+- *
+- * head - Newest descriptor. This is where the driver adds new descriptors
+- * (either fresh rx buffers or tx buffers queued for transmission) and the
+- * pointer is updated in hardware via the DMAREG_[RX|TX]_HEAD register. The
+- * hardware will process descriptors from hw_tail to head. When hw_tail ==
+- * head, the ring is empty.
+- *
+- *		tail	hw_tail		head
+- *		|	|		|
+- *		V	V		V
+- *      +-----+ +-----+ +-----+ +-----+ +-----+ +-----+
+- *      |     | |     | |     | |     | |     | |     |
+- *      +-----+ +-----+ +-----+ +-----+ +-----+ +-----+
+- *
+- */
+-
+ /**
+  * queue_get_head - Return next DMA descriptor from head of queue.
+  */
+@@ -189,7 +252,7 @@ static inline void
+ queue_set_skb(const struct queue_ptr *q, const struct dma_desc *desc,
+ 	      struct sk_buff *skb)
+ {
+-	q->skb[desc_idx(desc)] = skb;
++	q->skb[desc_get_idx(desc)] = skb;
+ }
+ 
+ /**
+@@ -198,7 +261,7 @@ queue_set_skb(const struct queue_ptr *q, const struct dma_desc *desc,
+ static inline struct sk_buff *
+ queue_get_skb(const struct queue_ptr *q, const struct dma_desc *desc)
+ {
+-	return q->skb[desc_idx(desc)];
++	return q->skb[desc_get_idx(desc)];
+ }
+ 
+ /**
+@@ -252,42 +315,38 @@ static inline void
+ pr_desc(const char *tag, const struct dma_desc *desc)
+ {
+ 	pr_debug("%s #%-3u flags=%#x len=%u/%u buf=%#llx\n",
+-		 tag, desc_idx(desc),
+-		 le32_to_cpu(desc->ctrl),
+-		 le16_to_cpu(desc->xfer_len),
+-		 le16_to_cpu(desc->pdu_len),
+-		 le64_to_cpu(desc->bufptr));
++		 tag, desc_get_idx(desc),
++		 desc_get_ctrl(desc),
++		 desc_get_xferlen(desc),
++		 desc_get_pdulen(desc),
++		 desc_get_bufptr(desc));
+ }
+ 
+-static int
+-nemac_alloc_rx_buf(struct nemac_priv *priv, struct queue_ptr *q, int idx)
++static struct sk_buff *
++nemac_alloc_rx_buf(struct nemac_priv *priv, struct dma_desc *desc)
+ {
+ 	struct device *dev = priv->dev;
+-	struct dma_desc *desc = &priv->rxq.ring[idx];
+ 	struct sk_buff *skb;
+ 	dma_addr_t p;
+ 
+-	BUG_ON(desc_idx(desc) != idx);
+-
+ 	skb = netdev_alloc_skb(priv->netdev, priv->rxbuf_sz);
+ 	if (!skb) {
+ 		pr_err("SKB alloc failed (%zu)\n", priv->rxbuf_sz);
+-		return -ENOMEM;
++		return NULL;
+ 	}
+ 
+ 	p = dma_map_single(dev, skb->data, priv->rxbuf_sz, DMA_FROM_DEVICE);
+ 	if (dma_mapping_error(dev, p) != 0) {
+ 		pr_err("SKB map failed\n");
+ 		dev_kfree_skb_any(skb);
+-		return -ENOMEM;
++		return NULL;
+ 	}
+-	desc->ctrl = cpu_to_le32(D_INTR | D_SWAP);
+-	desc->xfer_len = cpu_to_le16(priv->rxbuf_sz);
+-	desc->pdu_len = cpu_to_le16(priv->rxbuf_sz);
+-	desc->bufptr = cpu_to_le64(p);
+-	queue_set_skb(q, desc, skb);
++	desc_set_ctrl(desc, D_INTR | D_SWAP);
++	desc_set_xferlen(desc, priv->rxbuf_sz);
++	desc_set_pdulen(desc, 0);
++	desc_set_bufptr(desc, p);
+ 
+-	return 0;
++	return skb;
+ }
+ 
+ static u64
+@@ -306,7 +365,18 @@ nemac_tx_stat_counter(struct nemac_priv *priv, int counter)
+ 	return (result << 32) | (result >> 32);
+ }
+ 
+-#ifdef NEMAC_DUMP_STAT
++static int
++nemac_stats_snapshot(struct nemac_priv *priv)
++{
++	const unsigned long tmo = msecs_to_jiffies(20);
++
++	/* Request a snapshot of the counters and wait for the interrupt
++	 * handler to signal completion.
++	 */
++	reinit_completion(&priv->stats_rdy);
++	writel(MAC(0), priv->reg + NEM_STATS_SNAPSHOT_R);
++	return wait_for_completion_interruptible_timeout(&priv->stats_rdy, tmo);
++}
+ 
+ static const char * const tx_stat_names[] = {
+ 	"TX_OCTETS", "TX_BAD_OCTETS", "TX_FRM", "TX_BAD_FRM", "TX_MCAST",
+@@ -324,26 +394,76 @@ static const char * const rx_stat_names[] = {
+ 	"RX_JAB", "RX_DROP", "RX_CARRIER", "RX_ORUN", "RX_STAT_OVFL",
+ };
+ 
+-static void
+-dump_stats(struct nemac_priv *priv)
++static ssize_t nemac_show_counters(struct device *d,
++				   struct device_attribute *attr,
++				   char *buf)
+ {
++	struct nemac_priv *priv = netdev_priv(to_net_dev(d));
++	ssize_t n = 0;
+ 	int i;
+ 
++	if (nemac_stats_snapshot(priv) <= 0)
++		return sprintf(buf, "snapshot failed\n");
++
+ 	for (i = 0; i < ARRAY_SIZE(rx_stat_names); ++i) {
+ 		u64 x = nemac_rx_stat_counter(priv, i);
+ 
+ 		if (x)
+-			pr_info("  %13s = %12llx\n", rx_stat_names[i], x);
++			n += sprintf(&buf[n], "%-13s = %12llx\n",
++				     rx_stat_names[i], x);
+ 	}
+ 	for (i = 0; i < ARRAY_SIZE(tx_stat_names); ++i) {
+ 		u64 x = nemac_tx_stat_counter(priv, i);
+ 
+ 		if (x)
+-			pr_info("  %13s = %12llx\n", tx_stat_names[i], x);
++			n += sprintf(&buf[n], "%-13s = %12llx\n",
++				     tx_stat_names[i], x);
++	}
++	return n;
++}
++static DEVICE_ATTR(counters, S_IRUGO, nemac_show_counters, NULL);
++
++static ssize_t nemac_show_pti(struct device *d,
++			      struct device_attribute *attr,
++			      char *buf)
++{
++	struct nemac_priv *priv = netdev_priv(to_net_dev(d));
++	ssize_t n = 0;
++	int i;
++
++	static const struct pti_regs {
++		const char * const name;
++		u32 offset;
++	} pti_regs[] = {
++		{ "TX_FIFO_STAT", NEM_PTI_TX_FIFO_STAT_R },
++		{ "TX_MAX_USED",  NEM_PTI_TX_MAX_USED_R },
++		{ "TX_TRUNCATED", NEM_PTI_TX_TRUNCATED_R },
++		{ "TX_OVERRUNS",  NEM_PTI_TX_OVERRUNS_R },
++		{ "RX_FIFO_STAT", NEM_PTI_RX_FIFO_STAT_R },
++		{ "RX_MAX_USED",  NEM_PTI_RX_MAX_USED_R },
++		{ "RX_TRUNCATED", NEM_PTI_RX_TRUNCATED_R },
++		{ "RX_DROPPED",   NEM_PTI_RX_DROPPED_R }
++	};
++
++	for (i = 0; i < ARRAY_SIZE(pti_regs); ++i) {
++		u32 x = readl(priv->reg + pti_regs[i].offset);
++
++		n += sprintf(&buf[n], "%-13s = 0x%08x\n", pti_regs[i].name, x);
+ 	}
++	return n;
+ }
++static DEVICE_ATTR(pti, S_IRUGO, nemac_show_pti, NULL);
++
++static struct attribute *nemac_attrs[] = {
++	&dev_attr_counters.attr,
++	&dev_attr_pti.attr,
++	NULL,
++};
+ 
+-#endif
++static struct attribute_group nemac_group = {
++	.name = "nemac",
++	.attrs = nemac_attrs,
++};
+ 
+ static void
+ nemac_enable_dma_int(struct nemac_priv *priv)
+@@ -392,13 +512,11 @@ nemac_link_up(struct nemac_priv *priv)
+ 		nemac_set(priv, NEM_GMAC_ENABLE_R,
+ 			  GMAC_RX_PAUSE_EN | GMAC_TX_PAUSE_EN);
+ 		nemac_set(priv, NEM_DMA_CTL, DMACTL_ALLOW_TX_PAUSE);
+-		pr_debug("Enable PAUSE\n");
+ 	} else {
+ 		/* Disable use of PAUSE frames */
+ 		nemac_clr(priv, NEM_GMAC_ENABLE_R,
+ 			  GMAC_RX_PAUSE_EN | GMAC_TX_PAUSE_EN);
+ 		nemac_clr(priv, NEM_DMA_CTL, DMACTL_ALLOW_TX_PAUSE);
+-		pr_debug("Disable PAUSE\n");
+ 	}
+ 
+ 	/* Enable RX */
+@@ -492,10 +610,10 @@ static netdev_tx_t nemac_xmit(struct sk_buff *skb, struct net_device *ndev)
+ 	queue_set_skb(&priv->txq, desc, skb);
+ 
+ 	addr = dma_map_single(priv->dev, skb->data, skb->len, DMA_TO_DEVICE);
+-	desc->ctrl = cpu_to_le32(D_INTR | D_SOP | D_EOP | D_SWAP | D_TX_CRC);
+-	desc->xfer_len = cpu_to_le16(skb->len);
+-	desc->pdu_len = desc->xfer_len;
+-	desc->bufptr = cpu_to_le64(addr);
++	desc_set_ctrl(desc, D_INTR | D_SOP | D_EOP | D_SWAP | D_TX_CRC);
++	desc_set_xferlen(desc, skb->len);
++	desc_set_pdulen(desc, skb->len);
++	desc_set_bufptr(desc, addr);
+ 	pr_desc("TX", desc);
+ 	writel(queue_inc_head(&priv->txq), priv->reg + NEM_DMA_TXHEAD_PTR);
+ 	spin_unlock_irqrestore(&priv->txlock, flags);
+@@ -513,7 +631,6 @@ static int nemac_stop(struct net_device *ndev)
+ {
+ 	struct nemac_priv *priv = netdev_priv(ndev);
+ 
+-	pr_info("stop\n");
+ 	writel(0, priv->reg + NEM_DMA_INTE_MASK);
+ 	writel(0, priv->reg + NEM_DMA_ENABLE);
+ 	netif_stop_queue(ndev);
+@@ -523,24 +640,6 @@ static int nemac_stop(struct net_device *ndev)
+ }
+ 
+ /**
+- * nemac_get_sta_address - Read the STA address from NEMAC registers
+- */
+-static void
+-nemac_get_sta_address(struct nemac_priv *priv, u8 *addr)
+-{
+-	u32 upper, lower;
+-
+-	upper = readl(priv->reg + NEM_GMAC_STA_ADDR_UPPER_R);
+-	lower = readl(priv->reg + NEM_GMAC_STA_ADDR_R);
+-	addr[0] = (upper >>  8) & 0xff;
+-	addr[1] = (upper >>  0) & 0xff;
+-	addr[2] = (lower >> 24) & 0xff;
+-	addr[3] = (lower >> 16) & 0xff;
+-	addr[4] = (lower >>  8) & 0xff;
+-	addr[5] = (lower >>  0) & 0xff;
+-}
+-
+-/**
+  * nemac_set_mac_address - Write Ethernet address to NEMAC registers (specified
+  * via offsets to both lower and upper part)
+  */
+@@ -630,8 +729,8 @@ nemac_tx_cleanup(struct nemac_priv *priv)
+ 	while ((desc = queue_get_tail(&priv->txq)) != NULL) {
+ 		struct sk_buff *skb = queue_get_skb(&priv->txq, desc);
+ 
+-		dma_unmap_single(priv->dev, le64_to_cpu(desc->bufptr),
+-				 le16_to_cpu(desc->xfer_len), DMA_TO_DEVICE);
++		dma_unmap_single(priv->dev, desc_get_bufptr(desc),
++				 desc_get_xferlen(desc), DMA_TO_DEVICE);
+ 		dev_kfree_skb_any(skb);
+ 		queue_inc_tail(&priv->txq);
+ 		pr_queue("TX-DONE", &priv->txq);
+@@ -653,17 +752,15 @@ nemac_rx_packet(struct nemac_priv *priv)
+ 	struct sk_buff *skb;
+ 	u32 ctrl;
+ 
+-	pr_queue("RXQ", &priv->rxq);
+-
+ 	desc = queue_get_tail(&priv->rxq);
+ 	if (!desc)
+ 		return -1;
+ 	queue_inc_tail(&priv->rxq);
+ 
+-	dma_unmap_single(priv->dev, le64_to_cpu(desc->bufptr),
++	dma_unmap_single(priv->dev, desc_get_bufptr(desc),
+ 			 priv->rxbuf_sz, DMA_FROM_DEVICE);
+ 	skb = queue_get_skb(&priv->rxq, desc);
+-	ctrl = cpu_to_le32(desc->ctrl);
++	ctrl = desc_get_ctrl(desc);
+ 	if (ctrl & D_RX_ERR) {
+ 		pr_desc("RX-ERR", desc);
+ 		dev_kfree_skb_any(skb);
+@@ -673,19 +770,23 @@ nemac_rx_packet(struct nemac_priv *priv)
+ 	} else {
+ 		/* No error, pass sk_buff to upper layer */
+ 		pr_desc("RX", desc);
+-		skb_put(skb, le32_to_cpu(desc->pdu_len));
++		skb_put(skb, desc_get_pdulen(desc));
+ 		skb->protocol = eth_type_trans(skb, priv->netdev);
+ 		netif_receive_skb(skb);
+ 	}
+ 
+-	/* Add new RX buffers */
+-	desc = queue_get_head(&priv->rxq);
+-	if (nemac_alloc_rx_buf(priv, &priv->rxq, desc_idx(desc))) {
+-		pr_warn_ratelimited("No buffer\n");
+-		return -1;
++	/* Allocate and re-initialize descriptors at the head of the queue with
++	 * new RX buffers. There is usually only one slot available here,
++	 * but there may be more in case of a previous allocation failure.
++	 */
++	while ((desc = queue_get_head(&priv->rxq)) != NULL) {
++		skb = nemac_alloc_rx_buf(priv, desc);
++		if (!skb)
++			break;
++		queue_set_skb(&priv->rxq, desc, skb);
++		writel(queue_inc_head(&priv->rxq),
++		       priv->reg + NEM_DMA_RXHEAD_PTR);
+ 	}
+-	/* Advance RX-HEAD pointer */
+-	writel(queue_inc_head(&priv->rxq), priv->reg + NEM_DMA_RXHEAD_PTR);
+ 	return 0;
+ }
+ 
+@@ -695,17 +796,24 @@ nemac_rx_packet(struct nemac_priv *priv)
+ static int nemac_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct nemac_priv *priv = container_of(napi, struct nemac_priv, napi);
++	u32 status = readl(priv->reg + NEM_DMA_INTE_NOMASK);
+ 	int num_rx = 0;
+ 
+-	writel(INTE_RX_DONE | INTE_TX_DONE, priv->reg + NEM_DMA_INTE_STATUS);
++	/* Clear interrupt status */
++	writel(status & (INTE_RX_DONE | INTE_TX_DONE),
++	       priv->reg + NEM_DMA_INTE_STATUS);
+ 
+-	if (nemac_tx_cleanup(priv) > 0)
+-		netif_wake_queue(priv->netdev);
++	if (status & INTE_TX_DONE)
++		if (nemac_tx_cleanup(priv) > 0)
++			netif_wake_queue(priv->netdev);
+ 
+-	while (num_rx < budget) {
+-		if (nemac_rx_packet(priv) != 0)
+-			break;
+-		++num_rx;
++	if (status & INTE_RX_DONE) {
++		pr_queue("RXQ", &priv->rxq);
++		while (num_rx < budget) {
++			if (nemac_rx_packet(priv) != 0)
++				break;
++			++num_rx;
++		}
+ 	}
+ 
+ 	if (num_rx < budget) {
+@@ -724,22 +832,10 @@ static struct rtnl_link_stats64*
+ nemac_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *s)
+ {
+ 	struct nemac_priv *priv = netdev_priv(dev);
+-	const unsigned long tmo = msecs_to_jiffies(20);
+-	int ret;
+ 
+-	/* Request a snapshot of the counters and wait for the interrupt
+-	 * handler to signal completion.
+-	 */
+-	reinit_completion(&priv->stats_rdy);
+-	writel(MAC(0), priv->reg + NEM_STATS_SNAPSHOT_R);
+-	ret = wait_for_completion_interruptible_timeout(&priv->stats_rdy, tmo);
+-	if (ret <= 0)
++	if (nemac_stats_snapshot(priv) <= 0)
+ 		return NULL;
+ 
+-#ifdef NEMAC_DUMP_STAT
+-	dump_stats(priv);
+-#endif
+-
+ 	s->rx_packets = nemac_rx_stat_counter(priv, RX_FRM);
+ 	s->tx_packets = nemac_tx_stat_counter(priv, TX_FRM);
+ 	s->rx_bytes = nemac_rx_stat_counter(priv, RX_OCTETS);
+@@ -792,13 +888,14 @@ nemac_hw_init(const struct nemac_priv *priv)
+ 
+ 	/* Initialize GMAC */
+ 	tmp = readl(priv->reg + NEM_GMAC_ENABLE_R);
+-	tmp |= PORT_ENABLE | GMII_BYPASS_MODE | RGMII_MODE;
++	tmp |= PORT_ENABLE;
++	tmp |= GMII_BYPASS_MODE | RGMII_MODE;
++	tmp |= MAC_PAUSE_QUANTA(8);
+ 	writel(tmp, priv->reg + NEM_GMAC_ENABLE_R);
+ 
+ 	/* Initialize STATS */
+ 	writel(STATS_INT_SNAPSHOT_RDY, priv->reg + NEM_STATS_INT_ENABLE_R);
+-	writel(STATS_MAC_RAW | MAX_LENGTH(1518),
+-	       priv->reg + NEM_STATS_CONFIG_R);
++	writel(MAX_LENGTH(1518), priv->reg + NEM_STATS_CONFIG_R);
+ 
+ 	return 0;
+ }
+@@ -807,11 +904,15 @@ static int
+ nemac_alloc_dma_ring(struct device *dev, struct queue_ptr *q, u32 num_descr,
+ 		     void __iomem *hw_tail)
+ {
++	int i;
++
+ 	q->hw_tail_reg = hw_tail;
+-	q->head = readl(hw_tail);
++	q->tail = readl(hw_tail);
+ 	q->head = q->tail;
+ 	q->size = num_descr * sizeof(struct dma_desc);
+ 	q->ring = dma_alloc_coherent(dev, q->size, &q->phys_addr, GFP_KERNEL);
++	for (i = 0; i < num_descr; ++i)
++		desc_set_idx(&q->ring[i], i);
+ 	q->skb = kmalloc_array(num_descr, sizeof(void *), GFP_KERNEL);
+ 	return q->ring == NULL || q->skb == NULL ? -ENOMEM : 0;
+ }
+@@ -826,6 +927,7 @@ static int
+ nemac_setup_descriptors(struct nemac_priv *priv)
+ {
+ 	struct device *dev = priv->dev;
++	struct dma_desc *desc;
+ 	int i;
+ 	int ret;
+ 
+@@ -840,32 +942,41 @@ nemac_setup_descriptors(struct nemac_priv *priv)
+ 	/* Initialize RX ring */
+ 	ret = nemac_alloc_dma_ring(dev, &priv->rxq, rx_num_desc,
+ 				   priv->reg + NEM_DMA_RXTAIL_PTR);
+-	if (ret == 0) {
+-		writeq(priv->rxq.phys_addr, priv->reg + NEM_DMA_RXQ_ADDR);
+-		writel(priv->rxq.size / 1024, priv->reg + NEM_DMA_RXQ_SIZE);
+-		writel(priv->rxq.head, priv->reg + NEM_DMA_RXHEAD_PTR);
+-	}
++	if (ret != 0)
++		return ret;
++
++	writeq(priv->rxq.phys_addr, priv->reg + NEM_DMA_RXQ_ADDR);
++	writel(priv->rxq.size / 1024, priv->reg + NEM_DMA_RXQ_SIZE);
++	writel(priv->rxq.head, priv->reg + NEM_DMA_RXHEAD_PTR);
+ 
+ 	/* Initialize TX ring */
+ 	ret = nemac_alloc_dma_ring(dev, &priv->txq, tx_num_desc,
+ 				   priv->reg + NEM_DMA_TXTAIL_PTR);
+-	if (ret == 0) {
+-		writeq(priv->txq.phys_addr, priv->reg + NEM_DMA_TXQ_ADDR);
+-		writel(priv->txq.size / 1024, priv->reg + NEM_DMA_TXQ_SIZE);
+-		writel(priv->txq.head, priv->reg + NEM_DMA_TXHEAD_PTR);
+-	}
++	if (ret != 0)
++		return ret;
++
++	writeq(priv->txq.phys_addr, priv->reg + NEM_DMA_TXQ_ADDR);
++	writel(priv->txq.size / 1024, priv->reg + NEM_DMA_TXQ_SIZE);
++	writel(priv->txq.head, priv->reg + NEM_DMA_TXHEAD_PTR);
++	pr_queue("Initial-TXQ", &priv->txq);
+ 
+ 	priv->rxbuf_sz = ALIGN(priv->netdev->mtu + ETH_HLEN + ETH_FCS_LEN, 64);
+ 	pr_debug("rxbuf_sz = %zu\n", priv->rxbuf_sz);
+ 
+ 	/* Initialize the descriptors */
+-	for (i = 0; i < rx_num_desc - 1; ++i) {
+-		nemac_alloc_rx_buf(priv, &priv->rxq, i);
++	i = 0;
++	while ((desc = queue_get_head(&priv->rxq)) != NULL) {
++		struct sk_buff *skb;
++
++		skb = nemac_alloc_rx_buf(priv, desc);
++		queue_set_skb(&priv->rxq, desc, skb);
+ 		writel(queue_inc_head(&priv->rxq),
+ 		       priv->reg + NEM_DMA_RXHEAD_PTR);
++		++i;
+ 	}
++	pr_queue("Initial-RXQ", &priv->rxq);
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static void
+@@ -883,9 +994,10 @@ nemac_stats_interrupt(struct nemac_priv *priv)
+ static void
+ nemac_gmac_interrupt(struct nemac_priv *priv)
+ {
++	/* Register is cleared on read */
+ 	u32 status_c37 = readl(priv->reg + NEM_GMAC_ANEG_STATUS_R);
+ 
+-	pr_info("status_c37 = %#x\n", status_c37);
++	pr_debug("status_c37 = %#x\n", status_c37);
+ }
+ 
+ static irqreturn_t
+@@ -997,23 +1109,16 @@ nemac_probe(struct platform_device *pdev)
+ 
+ 	/* Initialize Ethernet MAC address
+ 	 *
+-	 * Read current MAC address (STA) from HW register and use this unless
+-	 * overridden by device-tree. If neither of these are a valid, use a
+-	 * randomized address
++	 * Read our MAC address from the device-tree. If not valid, use a
++	 * randomized address.
+ 	 */
+ 
+ 	macaddr_dt = of_get_mac_address(dn);
+ 	if (macaddr_dt && is_valid_ether_addr(macaddr_dt)) {
+ 		ether_addr_copy(ndev->dev_addr, macaddr_dt);
+-		dev_info(dev, "DT address %pM\n", ndev->dev_addr);
+ 	} else {
+-		nemac_get_sta_address(priv, ndev->dev_addr);
+-		if (is_valid_ether_addr(ndev->dev_addr)) {
+-			dev_info(dev, "Current address %pM\n", ndev->dev_addr);
+-		} else {
+-			random_ether_addr(ndev->dev_addr);
+-			dev_info(dev, "Random address %pM\n", ndev->dev_addr);
+-		}
++		random_ether_addr(ndev->dev_addr);
++		dev_info(dev, "Using random address %pM\n", ndev->dev_addr);
+ 	}
+ 
+ 	ret = nemac_hw_init(priv);
+@@ -1055,6 +1160,8 @@ nemac_probe(struct platform_device *pdev)
+ 
+ 	writel(INT_GROUP_GMAC0 | INT_GROUP_STATS, priv->reg + NEM_INT_ENABLE_R);
+ 
++	ndev->sysfs_groups[0] = &nemac_group;
++
+ 	ret = register_netdev(ndev);
+ 	if (ret) {
+ 		dev_err(dev, "failed to register net_device\n");
+-- 
+2.8.1
+
