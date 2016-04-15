@@ -1,0 +1,162 @@
+From 21c768639bf9352870212c39e6cf1ea3e40f65f6 Mon Sep 17 00:00:00 2001
+From: Alexandru Moise <alexandru.moise@windriver.com>
+Date: Tue, 12 Apr 2016 13:48:23 +0300
+Subject: [PATCH 9/9] futexes: Avoid taking the hb->lock if there's nothing to
+ wake up
+
+commit b0c29f79ecea0b6fbcefc999e70f2843ae8306db upstream
+
+In futex_wake() there is clearly no point in taking the hb->lock
+if we know beforehand that there are no tasks to be woken. While
+the hash bucket's plist head is a cheap way of knowing this, we
+cannot rely 100% on it as there is a racy window between the
+futex_wait call and when the task is actually added to the
+plist. To this end, we couple it with the spinlock check as
+tasks trying to enter the critical region are most likely
+potential waiters that will be added to the plist, thus
+preventing tasks sleeping forever if wakers don't acknowledge
+all possible waiters.
+
+Furthermore, the futex ordering guarantees are preserved,
+ensuring that waiters either observe the changed user space
+value before blocking or is woken by a concurrent waker. For
+wakers, this is done by relying on the barriers in
+get_futex_key_refs() -- for archs that do not have implicit mb
+in atomic_inc(), we explicitly add them through a new
+futex_get_mm function. For waiters we rely on the fact that
+spin_lock calls already update the head counter, so spinners
+are visible even if the lock hasn't been acquired yet.
+
+For more details please refer to the updated comments in the
+code and related discussion:
+
+  https://lkml.org/lkml/2013/11/26/556
+
+Special thanks to tglx for careful review and feedback.
+
+Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+Reviewed-by: Darren Hart <dvhart@linux.intel.com>
+Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Davidlohr Bueso <davidlohr@hp.com>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Jeff Mahoney <jeffm@suse.com>
+Cc: Scott Norton <scott.norton@hp.com>
+Cc: Tom Vaden <tom.vaden@hp.com>
+Cc: Aswin Chandramouleeswaran <aswin@hp.com>
+Cc: Waiman Long <Waiman.Long@hp.com>
+Cc: Jason Low <jason.low2@hp.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Link:
+http://lkml.kernel.org/r/1389569486-25487-5-git-send-email-davidlohr@hp.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Alexandru Moise <alexandru.moise@windriver.com>
+---
+ kernel/futex.c |   45 +++++++++++++++++++++++++++++++++++++++++----
+ 1 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/futex.c b/kernel/futex.c
+index ffbd4a1..d5be219 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -154,6 +154,36 @@ struct futex_hash_bucket {
+ 
+ static struct futex_hash_bucket futex_queues[1<<FUTEX_HASHBITS];
+ 
++static inline void futex_get_mm(union futex_key *key)
++{
++	atomic_inc(&key->private.mm->mm_count);
++	/*
++	 * Ensure futex_get_mm() implies a full barrier such that
++	 * get_futex_key() implies a full barrier. This is relied upon
++	 * as full barrier (B), see the ordering comment above.
++	 */
++	smp_mb__after_atomic_inc();
++}
++
++static inline bool hb_waiters_pending(struct futex_hash_bucket *hb)
++{
++#ifdef CONFIG_SMP
++	/*
++	 * Tasks trying to enter the critical region are most likely
++	 * potential waiters that will be added to the plist. Ensure
++	 * that wakers won't miss to-be-slept tasks in the window between
++	 * the wait call and the actual plist_add.
++	 */
++	if (spin_is_locked(&hb->lock))
++		return true;
++	smp_rmb(); /* Make sure we check the lock state first */
++
++	return !plist_head_empty(&hb->chain);
++#else
++	return true;
++#endif
++}
++
+ /*
+  * We hash on the keys returned from get_futex_key (see below).
+  */
+@@ -188,10 +218,11 @@ static void get_futex_key_refs(union futex_key *key)
+ 
+ 	switch (key->both.offset & (FUT_OFF_INODE|FUT_OFF_MMSHARED)) {
+ 	case FUT_OFF_INODE:
+-		ihold(key->shared.inode);
++		ihold(key->shared.inode); /* implies MB (B) */
+ 		break;
+ 	case FUT_OFF_MMSHARED:
+ 		atomic_inc(&key->private.mm->mm_count);
++		futex_get_mm(key); /* implies MB (B) */
+ 		break;
+ 	default:
+ 		smp_mb(); /* explicit MB (B) */
+@@ -266,7 +297,7 @@ get_futex_key(u32 __user *uaddr, int fshared, union futex_key *key, int rw)
+ 			return -EFAULT;
+ 		key->private.mm = mm;
+ 		key->private.address = address;
+-		get_futex_key_refs(key);
++		get_futex_key_refs(key);  /* implies MB (B) */
+ 		return 0;
+ 	}
+ 
+@@ -373,7 +404,7 @@ again:
+ 		key->shared.pgoff = basepage_index(page);
+ 	}
+ 
+-	get_futex_key_refs(key);
++	get_futex_key_refs(key); /* implies MB (B) */
+ 
+ out:
+ 	unlock_page(page_head);
+@@ -1091,6 +1122,11 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
+ 		goto out;
+ 
+ 	hb = hash_futex(&key);
++
++	/* Make sure we really have tasks to wakeup */
++	if (!hb_waiters_pending(hb))
++		goto out_put_key;
++
+ 	spin_lock(&hb->lock);
+ 	head = &hb->chain;
+ 
+@@ -1112,6 +1148,7 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
+ 	}
+ 
+ 	spin_unlock(&hb->lock);
++out_put_key:
+ 	put_futex_key(&key);
+ out:
+ 	return ret;
+@@ -1612,7 +1649,7 @@ static inline struct futex_hash_bucket *queue_lock(struct futex_q *q)
+ 	hb = hash_futex(&q->key);
+ 	q->lock_ptr = &hb->lock;
+ 
+-	spin_lock(&hb->lock);
++	spin_lock(&hb->lock); /* implies MB (A) */
+ 	return hb;
+ }
+ 
+-- 
+1.7.5.4
+
