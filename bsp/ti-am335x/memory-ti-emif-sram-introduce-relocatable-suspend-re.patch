@@ -1,0 +1,724 @@
+From 2d2790bd976266504d1f52126548f1e6ff01c531 Mon Sep 17 00:00:00 2001
+From: Dave Gerlach <d-gerlach@ti.com>
+Date: Wed, 17 Jun 2015 14:52:10 -0500
+Subject: [PATCH 190/800] memory: ti-emif-sram: introduce relocatable
+ suspend/resume handlers
+
+Certain SoCs like Texas Instruments AM335x and AM437x require parts
+of the EMIF PM code to run late in the suspend sequence from SRAM,
+such as saving and restoring the EMIF context and placing the memory
+into self-refresh.
+
+One requirement for these SoC's to suspend and enter it's lowest power
+mode, called DeepSleep0, is that the PER power domain must be shut
+off. Because the EMIF (DDR Controller) resides within this power
+domain, it will lose context during a suspend operation, so we must
+save it to restore once we resume. However, we cannot execute this
+code from external memory, as it is not available at this point, so
+the code must be executed late in the suspend path from SRAM.
+
+This patch introduces a ti-emif-sram driver that includes several
+functions written in ARM ASM that are relocatable so the PM SRAM
+code can use them. It can export a table containing the absolute
+addresses of the available PM functions so that other SRAM code
+can branch to them. This code is required for suspend/resume on
+AM335x and AM437x to work.
+
+Signed-off-by: Dave Gerlach <d-gerlach@ti.com>
+[zou: Original patch taken from PROCESSOR-SDK-LINUX-AM335X 02_00_01_07]
+Signed-off-by: zou cao <cao.zou@windriver.com>
+---
+ drivers/memory/Kconfig           |   10 +
+ drivers/memory/Makefile          |    4 +
+ drivers/memory/emif.h            |   13 ++
+ drivers/memory/ti-emif-pm.c      |  232 +++++++++++++++++++++++++
+ drivers/memory/ti-emif-sram-pm.S |  345 ++++++++++++++++++++++++++++++++++++++
+ include/linux/ti-emif-sram.h     |   22 +++
+ 6 files changed, 626 insertions(+), 0 deletions(-)
+ create mode 100644 drivers/memory/ti-emif-pm.c
+ create mode 100644 drivers/memory/ti-emif-sram-pm.S
+ create mode 100644 include/linux/ti-emif-sram.h
+
+diff --git a/drivers/memory/Kconfig b/drivers/memory/Kconfig
+index 868036f..00643b6 100644
+--- a/drivers/memory/Kconfig
++++ b/drivers/memory/Kconfig
+@@ -49,6 +49,16 @@ config OMAP_GPMC
+ 	  interfacing to a variety of asynchronous as well as synchronous
+ 	  memory drives like NOR, NAND, OneNAND, SRAM.
+ 
++config TI_EMIF_SRAM
++	tristate "Texas Instruments EMIF SRAM driver"
++	depends on SOC_AM33XX || SOC_AM43XX || SRAM
++	help
++	  This driver is for the EMIF module available on Texas Instruments
++	  AM33XX SoCs and is required for PM. Certain parts of the EMIF PM
++	  code must run from on-chip SRAM late in the suspend sequence so
++	  this driver provides several relocatable PM functions for the SoC
++	  PM code to use.
++
+ config MVEBU_DEVBUS
+ 	bool "Marvell EBU Device Bus Controller"
+ 	default y
+diff --git a/drivers/memory/Makefile b/drivers/memory/Makefile
+index b670441..021ebda 100644
+--- a/drivers/memory/Makefile
++++ b/drivers/memory/Makefile
+@@ -16,3 +16,7 @@ obj-$(CONFIG_TEGRA20_MC)	+= tegra20-mc.o
+ obj-$(CONFIG_JZ4780_NEMC)	+= jz4780-nemc.o
+ 
+ obj-$(CONFIG_TEGRA_MC)		+= tegra/
++obj-$(CONFIG_TI_EMIF_SRAM)	+= ti-emif-sram.o
++ti-emif-sram-objs		:= ti-emif-pm.o ti-emif-sram-pm.o
++
++AFLAGS_ti-emif-sram-pm.o	:=-Wa,-march=armv7-a
+diff --git a/drivers/memory/emif.h b/drivers/memory/emif.h
+index bfe08ba..1d842df 100644
+--- a/drivers/memory/emif.h
++++ b/drivers/memory/emif.h
+@@ -555,6 +555,9 @@
+ #define READ_LATENCY_SHDW_SHIFT				0
+ #define READ_LATENCY_SHDW_MASK				(0x1f << 0)
+ 
++#define EMIF_SRAM_AM33_REG_LAYOUT			0x00000000
++#define EMIF_SRAM_AM43_REG_LAYOUT			0x00000001
++
+ #ifndef __ASSEMBLY__
+ /*
+  * Structure containing shadow of important registers in EMIF
+@@ -585,5 +588,15 @@ struct emif_regs {
+ 	u32 ext_phy_ctrl_3_shdw;
+ 	u32 ext_phy_ctrl_4_shdw;
+ };
++
++struct ti_emif_pm_functions;
++
++extern unsigned int ti_emif_sram;
++extern unsigned int ti_emif_sram_sz;
++extern void __iomem *ti_emif_base_addr_virt;
++extern phys_addr_t ti_emif_base_addr_phys;
++extern struct ti_emif_pm_functions ti_emif_pm;
++extern unsigned long ti_emif_sram_config;
++
+ #endif /* __ASSEMBLY__ */
+ #endif /* __EMIF_H */
+diff --git a/drivers/memory/ti-emif-pm.c b/drivers/memory/ti-emif-pm.c
+new file mode 100644
+index 0000000..34749f3
+--- /dev/null
++++ b/drivers/memory/ti-emif-pm.c
+@@ -0,0 +1,232 @@
++/*
++ * TI AM33XX SRAM EMIF Driver
++ *
++ * Copyright (C) 2015 Texas Instruments Inc.
++ *          Dave Gerlach <d-gerlach@ti.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/err.h>
++#include <linux/genalloc.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++
++#include <asm/fncpy.h>
++
++#include "emif.h"
++
++#define EMIF_POWER_MGMT_WAIT_SELF_REFRESH_8192_CYCLES		0x00a0
++
++struct ti_emif_pm_functions {
++	u32 save_context;
++	u32 restore_context;
++	u32 enter_sr;
++	u32 exit_sr;
++	u32 abort_sr;
++} __packed;
++
++static struct gen_pool *sram_pool;
++static phys_addr_t ti_emif_sram_phys;
++static void __iomem *ti_emif_sram_virt;
++static unsigned long ocmcram_location;
++
++static u32 sram_suspend_address(unsigned long fn_offset)
++{
++	return (unsigned long)ti_emif_sram_virt + fn_offset;
++}
++
++static phys_addr_t sram_resume_address(unsigned long fn_offset)
++{
++	return ti_emif_sram_phys + fn_offset;
++}
++
++static int ti_emif_push_sram(struct device *dev)
++{
++	struct device_node *np = dev->of_node;
++
++	sram_pool = of_get_named_gen_pool(np, "sram", 0);
++
++	if (!sram_pool) {
++		dev_err(dev, "Unable to get sram pool for ocmcram\n");
++		return -ENODEV;
++	}
++
++	ocmcram_location = gen_pool_alloc(sram_pool, ti_emif_sram_sz);
++	if (!ocmcram_location) {
++		dev_err(dev, "Unable to allocate memory from ocmcram\n");
++		return -EINVAL;
++	}
++
++	/* Save physical address to calculate resume offset during pm init */
++	ti_emif_sram_phys = gen_pool_virt_to_phys(sram_pool,
++						  ocmcram_location);
++	ti_emif_sram_virt = fncpy((void *)ocmcram_location,
++				  &ti_emif_sram,
++				  ti_emif_sram_sz);
++
++	/*
++	 * These functions are called during suspend path while MMU is
++	 * still on so add virtual base to offset for absolute address
++	 */
++	ti_emif_pm.save_context = sram_suspend_address(ti_emif_pm.save_context);
++	ti_emif_pm.enter_sr = sram_suspend_address(ti_emif_pm.enter_sr);
++	ti_emif_pm.abort_sr = sram_suspend_address(ti_emif_pm.abort_sr);
++
++	/*
++	 * These are called during resume path when MMU is not enabled
++	 * so physical address is used instead
++	 */
++	ti_emif_pm.restore_context =
++		sram_resume_address(ti_emif_pm.restore_context);
++	ti_emif_pm.exit_sr = sram_resume_address(ti_emif_pm.exit_sr);
++
++	return 0;
++}
++
++/*
++ * Due to Usage Note 3.1.2 "DDR3: JEDEC Compliance for Maximum
++ * Self-Refresh Command Limit" found in AM335x Silicon Errata
++ * (Document SPRZ360F Revised November 2013) we must configure
++ * the self refresh delay timer to 0xA (8192 cycles) to avoid
++ * generating too many refresh command from the EMIF.
++ */
++static void ti_emif_configure_sr_delay(void)
++{
++	writel(EMIF_POWER_MGMT_WAIT_SELF_REFRESH_8192_CYCLES,
++	       (ti_emif_base_addr_virt +
++		EMIF_POWER_MANAGEMENT_CONTROL));
++
++	writel(EMIF_POWER_MGMT_WAIT_SELF_REFRESH_8192_CYCLES,
++	       (ti_emif_base_addr_virt +
++		EMIF_POWER_MANAGEMENT_CTRL_SHDW));
++}
++
++/**
++ * ti_emif_copy_pm_function_table - copy mapping of pm funcs in sram
++ * @dst: void * to address that table should be copied
++ *
++ * Returns 0 if success other error code if table is not available
++ */
++int ti_emif_copy_pm_function_table(void *dst)
++{
++	if (!ti_emif_sram_virt)
++		return -EINVAL;
++
++	memcpy_toio(dst, &ti_emif_pm, sizeof(ti_emif_pm));
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ti_emif_copy_pm_function_table);
++
++/**
++ * ti_emif_get_mem_type - return type for memory type in use
++ *
++ * Returns memory type value read from EMIF or error code if fails
++ */
++int ti_emif_get_mem_type(void)
++{
++	unsigned long temp;
++
++	if (!ti_emif_base_addr_virt || IS_ERR(ti_emif_base_addr_virt))
++		return -ENODEV;
++
++	temp = readl(ti_emif_base_addr_virt + EMIF_SDRAM_CONFIG);
++
++	temp = (temp & SDRAM_TYPE_MASK) >> SDRAM_TYPE_SHIFT;
++	return temp;
++}
++EXPORT_SYMBOL_GPL(ti_emif_get_mem_type);
++
++static const struct of_device_id ti_emif_of_match[] = {
++	{ .compatible = "ti,emif-am3352", .data =
++					(void *)EMIF_SRAM_AM33_REG_LAYOUT, },
++	{ .compatible = "ti,emif-am4372", .data =
++					(void *)EMIF_SRAM_AM43_REG_LAYOUT, },
++	{},
++};
++
++static int ti_emif_probe(struct platform_device *pdev)
++{
++	int ret = -ENODEV;
++	struct resource *res;
++	struct device *dev = &pdev->dev;
++	const struct of_device_id *match;
++
++	match = of_match_device(ti_emif_of_match, &pdev->dev);
++	if (!match)
++		return -ENODEV;
++
++	ti_emif_sram_config = (u32)match->data;
++
++	pm_runtime_enable(dev);
++	ret = pm_runtime_get_sync(dev);
++
++	if (IS_ERR_VALUE(ret)) {
++		dev_err(dev, "pm_runtime_get_sync() failed\n");
++		goto fail_runtime_put;
++	}
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	ti_emif_base_addr_virt = devm_ioremap_resource(dev, res);
++	if (IS_ERR(ti_emif_base_addr_virt)) {
++		dev_err(dev, "could not ioremap emif mem\n");
++		ret =  PTR_ERR(ti_emif_base_addr_virt);
++		goto fail_runtime_put;
++	}
++
++	ti_emif_base_addr_phys = res->start;
++
++	ti_emif_configure_sr_delay();
++
++	ret = ti_emif_push_sram(dev);
++	if (ret)
++		goto fail_runtime_put;
++
++	return 0;
++
++fail_runtime_put:
++	pm_runtime_put_sync(dev);
++	return ret;
++}
++
++static int ti_emif_remove(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++
++	pm_runtime_put_sync(dev);
++	pm_runtime_disable(dev);
++
++	gen_pool_free(sram_pool, ocmcram_location,
++		      ti_emif_sram_sz);
++
++	return 0;
++}
++
++static struct platform_driver ti_emif_driver = {
++	.probe = ti_emif_probe,
++	.remove = ti_emif_remove,
++	.driver = {
++		.name = KBUILD_MODNAME,
++		.of_match_table = of_match_ptr(ti_emif_of_match),
++	},
++};
++
++module_platform_driver(ti_emif_driver);
++
++MODULE_AUTHOR("Dave Gerlach <d-gerlach@ti.com>");
++MODULE_DESCRIPTION("Texas Instruments SRAM EMIF driver");
++MODULE_LICENSE("GPL v2");
++MODULE_ALIAS("platform:" KBUILD_MODNAME);
+diff --git a/drivers/memory/ti-emif-sram-pm.S b/drivers/memory/ti-emif-sram-pm.S
+new file mode 100644
+index 0000000..7b5ce44
+--- /dev/null
++++ b/drivers/memory/ti-emif-sram-pm.S
+@@ -0,0 +1,345 @@
++/*
++ * Low level PM code for TI EMIF
++ *
++ * Copyright (C) 2015 Texas Instruments Incorporated - http://www.ti.com/
++ *	Dave Gerlach
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed "as is" WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/linkage.h>
++#include <asm/memory.h>
++#include <asm/assembler.h>
++
++#include "emif.h"
++
++#define EMIF_POWER_MGMT_WAIT_SELF_REFRESH_8192_CYCLES	0x00a0
++#define EMIF_POWER_MGMT_SR_TIMER_MASK			0x00f0
++#define EMIF_POWER_MGMT_SELF_REFRESH_MODE		0x0200
++#define EMIF_POWER_MGMT_SELF_REFRESH_MODE_MASK		0x0700
++
++#define EMIF_SDCFG_TYPE_DDR2				0x2 << SDRAM_TYPE_SHIFT
++#define EMIF_STATUS_READY				0x4
++
++#define AM43XX_EMIF_PHY_CTRL_REG_COUNT                  0x120
++
++#define EMIF_AM437X_REGISTERS				0x1
++
++	.text
++	.align 3
++
++ENTRY(ti_emif_sram)
++
++/*
++ * void ti_emif_save_context(void)
++ *
++ * Used during suspend to save the context of all required EMIF registers
++ * to local memory if the EMIF is going to lose context during the sleep
++ * transition. Operates on the VIRTUAL address of the EMIF.
++ */
++ENTRY(ti_emif_save_context)
++	stmfd   sp!, {r4 - r11, lr}     @ save registers on stack
++
++	ldr	r0, ti_emif_base_addr_virt
++
++	/* Save EMIF configuration */
++	ldr	r1, [r0, #EMIF_SDRAM_CONFIG]
++	str	r1, emif_sdcfg_val
++	ldr	r1, [r0, #EMIF_SDRAM_REFRESH_CONTROL]
++	str	r1, emif_ref_ctrl_val
++	ldr	r1, [r0, #EMIF_SDRAM_TIMING_1]
++	str	r1, emif_timing1_val
++	ldr	r1, [r0, #EMIF_SDRAM_TIMING_2]
++	str	r1, emif_timing2_val
++	ldr	r1, [r0, #EMIF_SDRAM_TIMING_3]
++	str	r1, emif_timing3_val
++	ldr	r1, [r0, #EMIF_POWER_MANAGEMENT_CONTROL]
++	str	r1, emif_pmcr_val
++	ldr	r1, [r0, #EMIF_POWER_MANAGEMENT_CTRL_SHDW]
++	str	r1, emif_pmcr_shdw_val
++	ldr	r1, [r0, #EMIF_SDRAM_OUTPUT_IMPEDANCE_CALIBRATION_CONFIG]
++	str	r1, emif_zqcfg_val
++	ldr	r1, [r0, #EMIF_DDR_PHY_CTRL_1]
++	str	r1, emif_ddr_phy_ctlr_1
++
++	ldr	r2, ti_emif_sram_config
++	cmp	r2, #EMIF_SRAM_AM43_REG_LAYOUT
++	bne	emif_skip_save_extra_regs
++
++	ldr	r1, [r0, #EMIF_READ_WRITE_LEVELING_RAMP_CONTROL]
++	str	r1, emif_rd_wr_level_ramp_ctrl
++	ldr	r1, [r0, #EMIF_READ_WRITE_EXECUTION_THRESHOLD]
++	str	r1, emif_rd_wr_exec_thresh
++	ldr	r1, [r0, #EMIF_COS_CONFIG]
++	str	r1, emif_cos_config
++	ldr	r1, [r0, #EMIF_PRIORITY_TO_CLASS_OF_SERVICE_MAPPING]
++	str	r1, emif_priority_to_cos_mapping
++	ldr	r1, [r0, #EMIF_CONNECTION_ID_TO_CLASS_OF_SERVICE_1_MAPPING]
++	str	r1, emif_connect_id_serv_1_map
++	ldr	r1, [r0, #EMIF_CONNECTION_ID_TO_CLASS_OF_SERVICE_2_MAPPING]
++	str	r1, emif_connect_id_serv_2_map
++	ldr	r1, [r0, #EMIF_LPDDR2_NVM_TIMING]
++	str	r1, emif_lpddr2_nvm_tim
++	ldr	r1, [r0, #EMIF_LPDDR2_NVM_TIMING_SHDW]
++	str	r1, emif_lpddr2_nvm_tim_shdw
++	ldr	r1, [r0, #EMIF_OCP_CONFIG]
++	str	r1, emif_ocp_config_val
++	ldr	r1, [r0, #EMIF_DLL_CALIB_CTRL]
++	str	r1, emif_dll_calib_ctrl_val
++	ldr	r1, [r0, #EMIF_DLL_CALIB_CTRL_SHDW]
++	str	r1, emif_dll_calib_ctrl_val_shdw
++
++	/* Loop and save entire block of emif phy regs */
++	mov	r2, #0x0
++	adrl	r4, emif_ext_phy_ctrl_vals
++	add	r3, r0, #EMIF_EXT_PHY_CTRL_1
++ddr_phy_ctrl_save:
++	ldr	r1, [r3, r2]
++	str	r1, [r4, r2]
++	add	r2,r2,#0x4
++	cmp	r2, #AM43XX_EMIF_PHY_CTRL_REG_COUNT
++	bne	ddr_phy_ctrl_save
++
++emif_skip_save_extra_regs:
++	ldmfd	sp!, {r4 - r11, pc}	@ restore regs and return
++ENDPROC(ti_emif_save_context)
++
++/*
++ * void ti_emif_restore_context(void)
++ *
++ * Used during resume to restore the context of all required EMIF registers
++ * from local memory after the EMIF has lost context during a sleep transition.
++ * Operates on the PHYSICAL address of the EMIF.
++ */
++ENTRY(ti_emif_restore_context)
++	stmfd   sp!, {r4 - r11, lr}     @ save registers on stack
++
++	ldr     r0, ti_emif_base_addr_phys
++
++	/* Config EMIF Timings */
++	ldr	r1, emif_ddr_phy_ctlr_1
++	str	r1, [r0, #EMIF_DDR_PHY_CTRL_1]
++	str	r1, [r0, #EMIF_DDR_PHY_CTRL_1_SHDW]
++	ldr	r1, emif_timing1_val
++	str	r1, [r0, #EMIF_SDRAM_TIMING_1]
++	str	r1, [r0, #EMIF_SDRAM_TIMING_1_SHDW]
++	ldr	r1, emif_timing2_val
++	str	r1, [r0, #EMIF_SDRAM_TIMING_2]
++	str	r1, [r0, #EMIF_SDRAM_TIMING_2_SHDW]
++	ldr	r1, emif_timing3_val
++	str	r1, [r0, #EMIF_SDRAM_TIMING_3]
++	str	r1, [r0, #EMIF_SDRAM_TIMING_3_SHDW]
++	ldr	r1, emif_ref_ctrl_val
++	str	r1, [r0, #EMIF_SDRAM_REFRESH_CONTROL]
++	str	r1, [r0, #EMIF_SDRAM_REFRESH_CTRL_SHDW]
++	ldr	r1, emif_pmcr_val
++	str	r1, [r0, #EMIF_POWER_MANAGEMENT_CTRL_SHDW]
++	ldr	r1, emif_pmcr_shdw_val
++	str	r1, [r0, #EMIF_POWER_MANAGEMENT_CTRL_SHDW]
++
++	ldr	r2, ti_emif_sram_config
++	cmp	r2, #EMIF_SRAM_AM43_REG_LAYOUT
++	bne	emif_skip_save_extra_regs
++
++	ldr     r1, emif_rd_wr_level_ramp_ctrl
++	str	r1, [r0, #EMIF_READ_WRITE_LEVELING_RAMP_CONTROL]
++	ldr	r1, emif_rd_wr_exec_thresh
++	str	r1, [r0, #EMIF_READ_WRITE_EXECUTION_THRESHOLD]
++	ldr	r1, emif_cos_config
++	str	r1, [r0, #EMIF_COS_CONFIG]
++	ldr	r1, emif_priority_to_cos_mapping
++	str	r1, [r0, #EMIF_PRIORITY_TO_CLASS_OF_SERVICE_MAPPING]
++	ldr	r1, emif_connect_id_serv_1_map
++	str	r1, [r0, #EMIF_CONNECTION_ID_TO_CLASS_OF_SERVICE_1_MAPPING]
++	ldr	r1, emif_connect_id_serv_2_map
++	str	r1, [r0, #EMIF_CONNECTION_ID_TO_CLASS_OF_SERVICE_2_MAPPING]
++	ldr	r1, emif_lpddr2_nvm_tim
++	str	r1, [r0, #EMIF_LPDDR2_NVM_TIMING]
++	ldr	r1, emif_lpddr2_nvm_tim_shdw
++	str	r1, [r0, #EMIF_LPDDR2_NVM_TIMING_SHDW]
++	ldr	r1, emif_ocp_config_val
++	str	r1, [r0, #EMIF_OCP_CONFIG]
++	ldr	r1, emif_dll_calib_ctrl_val
++	str	r1, [r0, #EMIF_DLL_CALIB_CTRL]
++	ldr	r1, emif_dll_calib_ctrl_val_shdw
++	str	r1, [r0, #EMIF_DLL_CALIB_CTRL_SHDW]
++	ldr	r1, emif_zqcfg_val
++	str	r1, [r0, #EMIF_SDRAM_OUTPUT_IMPEDANCE_CALIBRATION_CONFIG]
++
++	/* Loop and restore entire block of emif phy regs */
++	mov	r2, #0x0
++	adrl	r3, emif_ext_phy_ctrl_vals
++	add	r4, r0, #EMIF_EXT_PHY_CTRL_1
++ddr_phy_ctrl_restore:
++	ldr	r1, [r3, r2]
++	str	r1, [r4, r2]
++	add	r2, r2, #0x4
++	cmp	r2, #AM43XX_EMIF_PHY_CTRL_REG_COUNT
++	bne	ddr_phy_ctrl_restore
++
++emif_skip_restore_extra_regs:
++	/*
++	 * Output impedence calib needed only for DDR3
++	 * but since the initial state of this will be
++	 * disabled for DDR2 no harm in restoring the
++	 * old configuration
++	 */
++	ldr	r1, emif_zqcfg_val
++	str	r1, [r0, #EMIF_SDRAM_OUTPUT_IMPEDANCE_CALIBRATION_CONFIG]
++
++	/* Write to sdcfg last for DDR2 only */
++	ldr	r1, emif_sdcfg_val
++	and	r2, r1, #SDRAM_TYPE_MASK
++	cmp	r2, #EMIF_SDCFG_TYPE_DDR2
++	streq	r1, [r0, #EMIF_SDRAM_CONFIG]
++
++	ldmfd	sp!, {r4 - r11, pc}	@ restore regs and return
++ENDPROC(ti_emif_restore_context)
++
++/*
++ * void ti_emif_enter_sr(void)
++ *
++ * Programs the EMIF to tell the SDRAM to enter into self-refresh
++ * mode during a sleep transition. Operates on the VIRTUAL address
++ * of the EMIF.
++ */
++ENTRY(ti_emif_enter_sr)
++	stmfd   sp!, {r4 - r11, lr}     @ save registers on stack
++
++	ldr	r0, ti_emif_base_addr_virt
++
++	ldr	r1, [r0, #EMIF_POWER_MANAGEMENT_CONTROL]
++	bic	r1, r1, #EMIF_POWER_MGMT_SELF_REFRESH_MODE_MASK
++	orr	r1, r1, #EMIF_POWER_MGMT_SELF_REFRESH_MODE
++	str	r1, [r0, #EMIF_POWER_MANAGEMENT_CONTROL]
++
++	ldmfd	sp!, {r4 - r11, pc}	@ restore regs and return
++ENDPROC(ti_emif_enter_sr)
++
++/*
++ * void ti_emif_exit_sr(void)
++ *
++ * Programs the EMIF to tell the SDRAM to exit self-refresh mode
++ * after a sleep transition. Operates on the PHYSICAL address of
++ * the EMIF.
++ */
++ENTRY(ti_emif_exit_sr)
++	stmfd   sp!, {r4 - r11, lr}     @ save registers on stack
++
++	ldr	r0, ti_emif_base_addr_phys
++
++	/*
++	 * Toggle EMIF to exit refresh mode:
++	 * if EMIF lost context, PWR_MGT_CTRL is currently 0, writing disable
++	 *   (0x0), wont do diddly squat! so do a toggle from SR(0x2) to disable
++	 *   (0x0) here.
++	 * *If* EMIF did not lose context, nothing broken as we write the same
++	 *   value(0x2) to reg before we write a disable (0x0).
++	 */
++	ldr	r1, emif_pmcr_val
++	bic	r1, r1, #EMIF_POWER_MGMT_SELF_REFRESH_MODE_MASK
++	orr	r1, r1, #EMIF_POWER_MGMT_SELF_REFRESH_MODE
++	str	r1, [r0, #EMIF_POWER_MANAGEMENT_CONTROL]
++	bic	r1, r1, #EMIF_POWER_MGMT_SELF_REFRESH_MODE_MASK
++	str	r1, [r0, #EMIF_POWER_MANAGEMENT_CONTROL]
++
++        /* Wait for EMIF to become ready */
++1:	ldr     r1, [r0, #EMIF_STATUS]
++	tst     r1, #EMIF_STATUS_READY
++	beq     1b
++
++	ldmfd	sp!, {r4 - r11, pc}	@ restore regs and return
++ENDPROC(ti_emif_exit_sr)
++
++/*
++ * void ti_emif_abort_sr(void)
++ *
++ * Disables self-refresh after a failed transition to a low-power
++ * state so the kernel can jump back to DDR and follow abort path.
++ * Operates on the VIRTUAL address of the EMIF.
++ */
++ENTRY(ti_emif_abort_sr)
++	stmfd   sp!, {r4 - r11, lr}     @ save registers on stack
++
++	ldr	r0, ti_emif_base_addr_virt
++
++	ldr	r1, emif_pmcr_val
++	bic	r1, r1, #EMIF_POWER_MGMT_SELF_REFRESH_MODE_MASK
++	str	r1, [r0, #EMIF_POWER_MANAGEMENT_CONTROL]
++
++	/* Wait for EMIF to become ready */
++1:	ldr     r1, [r0, #EMIF_STATUS]
++	tst     r1, #EMIF_STATUS_READY
++	beq     1b
++
++	ldmfd	sp!, {r4 - r11, pc}	@ restore regs and return
++ENDPROC(ti_emif_abort_sr)
++
++	.align 3
++/* DDR related defines */
++emif_rd_lat_val:
++	.word	0xDEADBEEF
++emif_timing1_val:
++	.word	0xDEADBEEF
++emif_timing2_val:
++	.word	0xDEADBEEF
++emif_timing3_val:
++	.word	0xDEADBEEF
++emif_sdcfg_val:
++	.word	0xDEADBEEF
++emif_ref_ctrl_val:
++	.word	0xDEADBEEF
++emif_zqcfg_val:
++	.word	0xDEADBEEF
++emif_pmcr_val:
++	.word	0xDEADBEEF
++emif_pmcr_shdw_val:
++	.word	0xDEADBEEF
++emif_rd_wr_level_ramp_ctrl:
++	.word	0xDEADBEEF
++emif_rd_wr_exec_thresh:
++	.word	0xDEADBEEF
++emif_cos_config:
++	.word	0xDEADBEEF
++emif_priority_to_cos_mapping:
++	.word	0xDEADBEEF
++emif_connect_id_serv_1_map:
++	.word	0xDEADBEEF
++emif_connect_id_serv_2_map:
++	.word	0xDEADBEEF
++emif_ocp_config_val:
++	.word	0xDEADBEEF
++emif_lpddr2_nvm_tim:
++	.word	0xDEADBEEF
++emif_lpddr2_nvm_tim_shdw:
++	.word	0xDEADBEEF
++emif_dll_calib_ctrl_val:
++	.word	0xDEADBEEF
++emif_dll_calib_ctrl_val_shdw:
++	.word	0xDEADBEEF
++emif_ddr_phy_ctlr_1:
++	.word	0xDEADBEEF
++emif_ext_phy_ctrl_vals:
++	.space	0x120
++
++ENTRY(ti_emif_base_addr_virt)
++        .word   0x00000000
++ENTRY(ti_emif_base_addr_phys)
++        .word   0x00000000
++ENTRY(ti_emif_pm)
++	.word	ti_emif_save_context - ti_emif_sram
++	.word	ti_emif_restore_context - ti_emif_sram
++	.word	ti_emif_enter_sr - ti_emif_sram
++	.word	ti_emif_exit_sr - ti_emif_sram
++	.word	ti_emif_abort_sr - ti_emif_sram
++ENTRY(ti_emif_sram_config)
++	.word	0x00000000
++ENTRY(ti_emif_sram_sz)
++        .word   . - ti_emif_save_context
+diff --git a/include/linux/ti-emif-sram.h b/include/linux/ti-emif-sram.h
+new file mode 100644
+index 0000000..8c7a2c7
+--- /dev/null
++++ b/include/linux/ti-emif-sram.h
+@@ -0,0 +1,22 @@
++/*
++ * TI AM33XX EMIF Routines
++ *
++ * Copyright (C) 2015 Texas Instruments Inc.
++ *          Dave Gerlach <d-gerlach@ti.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed "as is" WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++#ifndef __LINUX_TI_EMIF_H
++#define __LINUX_TI_EMIF_H
++
++int ti_emif_copy_pm_function_table(void *dst);
++int ti_emif_get_mem_type(void);
++
++#endif /* __LINUX_TI_EMIF_H */
+-- 
+1.7.5.4
+

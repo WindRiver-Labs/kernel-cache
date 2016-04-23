@@ -1,0 +1,278 @@
+From fbb22a3d31fb3b02ee343ba8a7e623017b899c96 Mon Sep 17 00:00:00 2001
+From: Andi Kleen <ak@linux.intel.com>
+Date: Sat, 18 Jul 2015 08:24:48 -0700
+Subject: [PATCH 5/8] perf report: Add infrastructure for a cycles histogram
+
+commit d4957633bf9dab70e566e7dbb2b8d0c61c3a2f1e upstream
+
+This adds the basic infrastructure to keep track of cycle counts per
+basic block for annotate. We allocate an array similar to the normal
+accounting, and then account branch cycles there.
+
+We handle two cases:
+
+cycles per basic block with start and cycles per branch (these are later
+used for either IPC or just cycles per BB)
+
+In the start case we cannot handle overlaps, so always the longest basic
+block wins.
+
+For the cycles per branch case everything is accurately accounted.
+
+v2: Remove unnecessary checks. Slight restructure. Move
+symbol__get_annotation to another patch. Move histogram allocation.
+v3: Merged with current tree
+
+Signed-off-by: Andi Kleen <ak@linux.intel.com>
+Acked-by: Jiri Olsa <jolsa@kernel.org>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Link: http://lkml.kernel.org/r/1437233094-12844-4-git-send-email-andi@firstfloor.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ tools/perf/builtin-annotate.c |    1 +
+ tools/perf/util/annotate.c    |  140 +++++++++++++++++++++++++++++++++++++++--
+ tools/perf/util/annotate.h    |   17 +++++
+ 3 files changed, 152 insertions(+), 6 deletions(-)
+
+diff --git a/tools/perf/builtin-annotate.c b/tools/perf/builtin-annotate.c
+index c434e12..507ccad 100644
+--- a/tools/perf/builtin-annotate.c
++++ b/tools/perf/builtin-annotate.c
+@@ -187,6 +187,7 @@ find_next:
+ 			 * symbol, free he->ms.sym->src to signal we already
+ 			 * processed this symbol.
+ 			 */
++			zfree(&notes->src->cycles_hist);
+ 			zfree(&notes->src);
+ 		}
+ 	}
+diff --git a/tools/perf/util/annotate.c b/tools/perf/util/annotate.c
+index 419e3eb..deb1d29 100644
+--- a/tools/perf/util/annotate.c
++++ b/tools/perf/util/annotate.c
+@@ -473,17 +473,73 @@ int symbol__alloc_hist(struct symbol *sym)
+ 	return 0;
+ }
+ 
++/* The cycles histogram is lazily allocated. */
++static int symbol__alloc_hist_cycles(struct symbol *sym)
++{
++	struct annotation *notes = symbol__annotation(sym);
++	const size_t size = symbol__size(sym);
++
++	notes->src->cycles_hist = calloc(size, sizeof(struct cyc_hist));
++	if (notes->src->cycles_hist == NULL)
++		return -1;
++	return 0;
++}
++
+ void symbol__annotate_zero_histograms(struct symbol *sym)
+ {
+ 	struct annotation *notes = symbol__annotation(sym);
+ 
+ 	pthread_mutex_lock(&notes->lock);
+-	if (notes->src != NULL)
++	if (notes->src != NULL) {
+ 		memset(notes->src->histograms, 0,
+ 		       notes->src->nr_histograms * notes->src->sizeof_sym_hist);
++		if (notes->src->cycles_hist)
++			memset(notes->src->cycles_hist, 0,
++				symbol__size(sym) * sizeof(struct cyc_hist));
++	}
+ 	pthread_mutex_unlock(&notes->lock);
+ }
+ 
++static int __symbol__account_cycles(struct annotation *notes,
++				    u64 start,
++				    unsigned offset, unsigned cycles,
++				    unsigned have_start)
++{
++	struct cyc_hist *ch;
++
++	ch = notes->src->cycles_hist;
++	/*
++	 * For now we can only account one basic block per
++	 * final jump. But multiple could be overlapping.
++	 * Always account the longest one. So when
++	 * a shorter one has been already seen throw it away.
++	 *
++	 * We separately always account the full cycles.
++	 */
++	ch[offset].num_aggr++;
++	ch[offset].cycles_aggr += cycles;
++
++	if (!have_start && ch[offset].have_start)
++		return 0;
++	if (ch[offset].num) {
++		if (have_start && (!ch[offset].have_start ||
++				   ch[offset].start > start)) {
++			ch[offset].have_start = 0;
++			ch[offset].cycles = 0;
++			ch[offset].num = 0;
++			if (ch[offset].reset < 0xffff)
++				ch[offset].reset++;
++		} else if (have_start &&
++			   ch[offset].start < start)
++			return 0;
++	}
++	ch[offset].have_start = have_start;
++	ch[offset].start = start;
++	ch[offset].cycles += cycles;
++	ch[offset].num++;
++	return 0;
++}
++
+ static int __symbol__inc_addr_samples(struct symbol *sym, struct map *map,
+ 				      struct annotation *notes, int evidx, u64 addr)
+ {
+@@ -506,6 +562,21 @@ static int __symbol__inc_addr_samples(struct symbol *sym, struct map *map,
+ 	return 0;
+ }
+ 
++static struct annotation *symbol__get_annotation(struct symbol *sym, bool cycles)
++{
++	struct annotation *notes = symbol__annotation(sym);
++
++	if (notes->src == NULL) {
++		if (symbol__alloc_hist(sym) < 0)
++			return NULL;
++	}
++	if (!notes->src->cycles_hist && cycles) {
++		if (symbol__alloc_hist_cycles(sym) < 0)
++			return NULL;
++	}
++	return notes;
++}
++
+ static int symbol__inc_addr_samples(struct symbol *sym, struct map *map,
+ 				    int evidx, u64 addr)
+ {
+@@ -513,14 +584,71 @@ static int symbol__inc_addr_samples(struct symbol *sym, struct map *map,
+ 
+ 	if (sym == NULL)
+ 		return 0;
++	notes = symbol__get_annotation(sym, false);
++	if (notes == NULL)
++		return -ENOMEM;
++	return __symbol__inc_addr_samples(sym, map, notes, evidx, addr);
++}
+ 
+-	notes = symbol__annotation(sym);
+-	if (notes->src == NULL) {
+-		if (symbol__alloc_hist(sym) < 0)
+-			return -ENOMEM;
++static int symbol__account_cycles(u64 addr, u64 start,
++				  struct symbol *sym, unsigned cycles)
++{
++	struct annotation *notes;
++	unsigned offset;
++
++	if (sym == NULL)
++		return 0;
++	notes = symbol__get_annotation(sym, true);
++	if (notes == NULL)
++		return -ENOMEM;
++	if (addr < sym->start || addr >= sym->end)
++		return -ERANGE;
++
++	if (start) {
++		if (start < sym->start || start >= sym->end)
++			return -ERANGE;
++		if (start >= addr)
++			start = 0;
+ 	}
++	offset = addr - sym->start;
++	return __symbol__account_cycles(notes,
++					start ? start - sym->start : 0,
++					offset, cycles,
++					!!start);
++}
+ 
+-	return __symbol__inc_addr_samples(sym, map, notes, evidx, addr);
++int addr_map_symbol__account_cycles(struct addr_map_symbol *ams,
++				    struct addr_map_symbol *start,
++				    unsigned cycles)
++{
++	unsigned long saddr = 0;
++	int err;
++
++	if (!cycles)
++		return 0;
++
++	/*
++	 * Only set start when IPC can be computed. We can only
++	 * compute it when the basic block is completely in a single
++	 * function.
++	 * Special case the case when the jump is elsewhere, but
++	 * it starts on the function start.
++	 */
++	if (start &&
++		(start->sym == ams->sym ||
++		 (ams->sym &&
++		   start->addr == ams->sym->start + ams->map->start)))
++		saddr = start->al_addr;
++	if (saddr == 0)
++		pr_debug2("BB with bad start: addr %lx start %lx sym %lx saddr %lx\n",
++			ams->addr,
++			start ? start->addr : 0,
++			ams->sym ? ams->sym->start + ams->map->start : 0,
++			saddr);
++	err = symbol__account_cycles(ams->al_addr, saddr, ams->sym, cycles);
++	if (err)
++		pr_debug2("account_cycles failed %d\n", err);
++	return err;
+ }
+ 
+ int addr_map_symbol__inc_samples(struct addr_map_symbol *ams, int evidx)
+diff --git a/tools/perf/util/annotate.h b/tools/perf/util/annotate.h
+index 52c15c4..14a7dd5 100644
+--- a/tools/perf/util/annotate.h
++++ b/tools/perf/util/annotate.h
+@@ -81,6 +81,17 @@ struct sym_hist {
+ 	u64		addr[0];
+ };
+ 
++struct cyc_hist {
++	u64	start;
++	u64	cycles;
++	u64	cycles_aggr;
++	u32	num;
++	u32	num_aggr;
++	u8	have_start;
++	/* 1 byte padding */
++	u16	reset;
++};
++
+ struct source_line_samples {
+ 	double		percent;
+ 	double		percent_sum;
+@@ -99,6 +110,7 @@ struct source_line {
+  * @histogram: Array of addr hit histograms per event being monitored
+  * @lines: If 'print_lines' is specified, per source code line percentages
+  * @source: source parsed from a disassembler like objdump -dS
++ * @cyc_hist: Average cycles per basic block
+  *
+  * lines is allocated, percentages calculated and all sorted by percentage
+  * when the annotation is about to be presented, so the percentages are for
+@@ -111,6 +123,7 @@ struct annotated_source {
+ 	struct source_line *lines;
+ 	int    		   nr_histograms;
+ 	int    		   sizeof_sym_hist;
++	struct cyc_hist	   *cycles_hist;
+ 	struct sym_hist	   histograms[0];
+ };
+ 
+@@ -132,6 +145,10 @@ static inline struct annotation *symbol__annotation(struct symbol *sym)
+ 
+ int addr_map_symbol__inc_samples(struct addr_map_symbol *ams, int evidx);
+ 
++int addr_map_symbol__account_cycles(struct addr_map_symbol *ams,
++				    struct addr_map_symbol *start,
++				    unsigned cycles);
++
+ int hist_entry__inc_addr_samples(struct hist_entry *he, int evidx, u64 addr);
+ 
+ int symbol__alloc_hist(struct symbol *sym);
+-- 
+1.7.5.4
+
