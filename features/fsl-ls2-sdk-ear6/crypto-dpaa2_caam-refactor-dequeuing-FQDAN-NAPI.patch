@@ -1,0 +1,196 @@
+From 44e61ffddff76d82613049a41087031e19467238 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Horia=20Geant=C4=83?= <horia.geanta@freescale.com>
+Date: Tue, 10 Nov 2015 17:10:40 +0200
+Subject: [PATCH 322/452] crypto: dpaa2_caam - refactor dequeuing (FQDAN +
+ NAPI)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fix the following problem in Rx / dequeue processing:
+->NAPI poll function cannot consume more than the store size
+in one go, i.e. without rearming FQDAN
+
+Signed-off-by: Horia Geantă <horia.geanta@freescale.com>
+[Xulin: Original patch taken from FSL LS2085 SDK EAR6.0,
+LS2085A-SDK-SOURCE-20160304-yocto.iso]
+Signed-off-by: Xulin Sun <xulin.sun@windriver.com>
+---
+ drivers/crypto/dpaa2-caam/dpaa2-caam.c |   97 +++++++++++++++++++++-----------
+ drivers/crypto/dpaa2-caam/dpaa2-caam.h |    6 +-
+ 2 files changed, 66 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/crypto/dpaa2-caam/dpaa2-caam.c b/drivers/crypto/dpaa2-caam/dpaa2-caam.c
+index 9fb32b1..04d931d 100644
+--- a/drivers/crypto/dpaa2-caam/dpaa2-caam.c
++++ b/drivers/crypto/dpaa2-caam/dpaa2-caam.c
+@@ -4730,16 +4730,8 @@ static struct caam_hash_alg *caam_hash_alloc(struct dpaa2_caam_priv *priv,
+ static void dpaa2_caam_fqdan_cb(struct dpaa2_io_notification_ctx *nctx)
+ {
+ 	struct dpaa2_caam_priv_per_cpu *ppriv;
+-	int err;
+ 
+ 	ppriv = container_of(nctx, struct dpaa2_caam_priv_per_cpu, nctx);
+-
+-	do {
+-		err = dpaa2_io_service_pull_fq(NULL, ppriv->rsp_fqid,
+-					       ppriv->store);
+-	} while (err);
+-
+-	ppriv->has_frames = true;
+ 	napi_schedule_irqoff(&ppriv->napi);
+ }
+ 
+@@ -4767,7 +4759,8 @@ static int __cold dpaa2_dpseci_dpio_setup(struct dpaa2_caam_priv *priv)
+ 			goto err;
+ 		}
+ 
+-		ppriv->store = dpaa2_io_store_create(16, dev);
++		ppriv->store = dpaa2_io_store_create(DPAA2_CAAM_STORE_SIZE,
++						     dev);
+ 		if (unlikely(!ppriv->store)) {
+ 			dev_err(dev, "dpaa2_io_store_create() failed\n");
+ 			goto err;
+@@ -4885,47 +4878,83 @@ static void dpaa2_caam_process_fd(struct dpaa2_caam_priv *priv,
+ 	req->cbk(req->ctx, err);
+ }
+ 
+-static int dpaa2_dpseci_poll(struct napi_struct *napi, int budget)
++static int dpaa2_caam_pull_fq(struct dpaa2_caam_priv_per_cpu *ppriv)
+ {
+-	struct dpaa2_caam_priv_per_cpu *ppriv;
+-	struct dpaa2_caam_priv *priv;
+-	struct dpaa2_dq *dq;
+-	int err, cleaned = 0, is_last = 0;
++	int err;
+ 
+-	ppriv = container_of(napi, struct dpaa2_caam_priv_per_cpu, napi);
++	/* Retry while portal is busy */
++	do {
++		err = dpaa2_io_service_pull_fq(NULL, ppriv->rsp_fqid,
++					       ppriv->store);
++	} while (err == -EBUSY);
+ 
+-	if (!ppriv->has_frames) {
+-		napi_complete_done(napi, cleaned);
+-		return 0;
+-	}
++	if (unlikely(err))
++		dev_err(ppriv->priv->dev, "dpaa2_io_service_pull err %d", err);
+ 
+-	priv = ppriv->priv;
+-	while (!is_last && cleaned < budget) {
+-		do {
+-			dq = dpaa2_io_store_next(ppriv->store, &is_last);
+-		} while (!is_last && !dq);
++	return err;
++}
++
++static int dpaa2_caam_store_consume(struct dpaa2_caam_priv_per_cpu *ppriv)
++{
++	struct dpaa2_dq *dq;
++	int cleaned = 0, is_last;
+ 
++	do {
++		dq = dpaa2_io_store_next(ppriv->store, &is_last);
+ 		if (unlikely(!dq)) {
+-			dev_err(priv->dev, "FQID %d returned no valid frames!\n",
+-				ppriv->rsp_fqid);
++			if (unlikely(!is_last)) {
++				dev_dbg(ppriv->priv->dev,
++					"FQ %d returned no valid frames\n",
++					ppriv->rsp_fqid);
++				/*
++				 * MUST retry until we get some sort of
++				 * valid response token (be it "empty dequeue"
++				 * or a valid frame).
++				 */
++				continue;
++			}
+ 			break;
+ 		}
+ 
+ 		/* Process FD */
+-		dpaa2_caam_process_fd(priv, dpaa2_dq_fd(dq));
++		dpaa2_caam_process_fd(ppriv->priv, dpaa2_dq_fd(dq));
+ 		cleaned++;
+-	}
++	} while (!is_last);
+ 
+-	/* Rearm if there are no more frames dequeued in store */
+-	if (is_last) {
+-		ppriv->has_frames = false;
+-		err = dpaa2_io_service_rearm(NULL, &ppriv->nctx);
++	return cleaned;
++}
++
++static int dpaa2_dpseci_poll(struct napi_struct *napi, int budget)
++{
++	struct dpaa2_caam_priv_per_cpu *ppriv;
++	struct dpaa2_caam_priv *priv;
++	int err, cleaned = 0, store_cleaned;
++
++	ppriv = container_of(napi, struct dpaa2_caam_priv_per_cpu, napi);
++	priv = ppriv->priv;
++
++	if (unlikely(dpaa2_caam_pull_fq(ppriv)))
++		return 0;
++
++	do {
++		store_cleaned = dpaa2_caam_store_consume(ppriv);
++		cleaned += store_cleaned;
++
++		if (store_cleaned == 0 ||
++		    cleaned > budget - DPAA2_CAAM_STORE_SIZE)
++			break;
++
++		/* Try to dequeue some more */
++		err = dpaa2_caam_pull_fq(ppriv);
+ 		if (unlikely(err))
+-			dev_err(priv->dev, "Notification rearm failed\n");
+-	}
++			break;
++	} while (1);
+ 
+ 	if (cleaned < budget)
+ 		napi_complete_done(napi, cleaned);
++		err = dpaa2_io_service_rearm(NULL, &ppriv->nctx);
++		if (unlikely(err))
++			dev_err(priv->dev, "Notification rearm failed\n");
+ 
+ 	return cleaned;
+ }
+diff --git a/drivers/crypto/dpaa2-caam/dpaa2-caam.h b/drivers/crypto/dpaa2-caam/dpaa2-caam.h
+index 7889af4..da90624 100644
+--- a/drivers/crypto/dpaa2-caam/dpaa2-caam.h
++++ b/drivers/crypto/dpaa2-caam/dpaa2-caam.h
+@@ -45,7 +45,9 @@
+ #define DPAA2_CAAM_MAX_QUEUE_PAIRS	NR_CPUS
+ #define DPAA2_CAAM_MAX_QUEUES		(2 * DPAA2_CAAM_MAX_QUEUE_PAIRS)
+ 
+-#define DPAA2_CAAM_NAPI_WEIGHT	63
++#define DPAA2_CAAM_STORE_SIZE	16
++/* NAPI weight *must* be a multiple of the store size. */
++#define DPAA2_CAAM_NAPI_WEIGHT	64
+ 
+ /**
+  * dpaa2_caam_priv - driver private data
+@@ -80,7 +82,6 @@ struct dpaa2_caam_priv {
+  * @prio: internal queue number - index for dpaa2_caam_priv.*_queue_attr
+  * @nctx: notification context of response FQ
+  * @store: where dequeued frames are stored
+- * @has_frames: indication that response FQ has frames to be dequeued
+  * @priv: backpointer to dpaa2_caam_priv
+  */
+ struct dpaa2_caam_priv_per_cpu {
+@@ -91,7 +92,6 @@ struct dpaa2_caam_priv_per_cpu {
+ 	int prio;
+ 	struct dpaa2_io_notification_ctx nctx;
+ 	struct dpaa2_io_store *store;
+-	bool has_frames;
+ 	struct dpaa2_caam_priv *priv;
+ };
+ 
+-- 
+1.7.5.4
+
