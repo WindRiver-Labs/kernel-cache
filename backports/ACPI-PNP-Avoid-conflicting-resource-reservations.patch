@@ -1,0 +1,333 @@
+From ff1168f2580325c5b2bf87374d26a15fc07ef1f7 Mon Sep 17 00:00:00 2001
+From: "Rafael J. Wysocki" <rafael.j.wysocki@intel.com>
+Date: Thu, 18 Jun 2015 18:32:02 +0200
+Subject: [PATCH 049/133] ACPI / PNP: Avoid conflicting resource reservations
+
+commit 0f1b414d190724617eb1cdd615592fa8cd9d0b50 upstream.
+
+Commit b9a5e5e18fbf "ACPI / init: Fix the ordering of
+acpi_reserve_resources()" overlooked the fact that the memory
+and/or I/O regions reserved by acpi_reserve_resources() may
+conflict with those reserved by the PNP "system" driver.
+
+If that conflict actually takes place, it causes the reservations
+made by the "system" driver to fail while before commit b9a5e5e18fbf
+all reservations made by it and by acpi_reserve_resources() would be
+successful.  In turn, that allows the resources that haven't been
+reserved by the "system" driver to be used by others (e.g. PCI) which
+sometimes leads to functional problems (up to and including boot
+failures).
+
+To fix that issue, introduce a common resource reservation routine,
+acpi_reserve_region(), to be used by both acpi_reserve_resources()
+and the "system" driver, that will track all resources reserved by
+it and avoid making conflicting requests.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=99831
+Link: http://marc.info/?t=143389402600001&r=1&w=2
+Fixes: b9a5e5e18fbf "ACPI / init: Fix the ordering of acpi_reserve_resources()"
+Reported-by: Roland Dreier <roland@purestorage.com>
+Cc: All applicable <stable@vger.kernel.org>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/acpi/osl.c      |   6 +-
+ drivers/acpi/resource.c | 160 ++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/pnp/system.c    |  35 ++++++++---
+ include/linux/acpi.h    |  10 +++
+ 4 files changed, 197 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/acpi/osl.c b/drivers/acpi/osl.c
+index 3fe6069..ef42b3e 100644
+--- a/drivers/acpi/osl.c
++++ b/drivers/acpi/osl.c
+@@ -175,11 +175,7 @@ static void __init acpi_request_region (struct acpi_generic_address *gas,
+ 	if (!addr || !length)
+ 		return;
+ 
+-	/* Resources are never freed */
+-	if (gas->space_id == ACPI_ADR_SPACE_SYSTEM_IO)
+-		request_region(addr, length, desc);
+-	else if (gas->space_id == ACPI_ADR_SPACE_SYSTEM_MEMORY)
+-		request_mem_region(addr, length, desc);
++	acpi_reserve_region(addr, length, gas->space_id, 0, desc);
+ }
+ 
+ static int __init acpi_reserve_resources(void)
+diff --git a/drivers/acpi/resource.c b/drivers/acpi/resource.c
+index f1c966e..6126d93 100644
+--- a/drivers/acpi/resource.c
++++ b/drivers/acpi/resource.c
+@@ -26,6 +26,7 @@
+ #include <linux/device.h>
+ #include <linux/export.h>
+ #include <linux/ioport.h>
++#include <linux/list.h>
+ #include <linux/slab.h>
+ 
+ #ifdef CONFIG_X86
+@@ -627,3 +628,162 @@ int acpi_dev_filter_resource_type(struct acpi_resource *ares,
+ 	return (type & types) ? 0 : 1;
+ }
+ EXPORT_SYMBOL_GPL(acpi_dev_filter_resource_type);
++
++struct reserved_region {
++	struct list_head node;
++	u64 start;
++	u64 end;
++};
++
++static LIST_HEAD(reserved_io_regions);
++static LIST_HEAD(reserved_mem_regions);
++
++static int request_range(u64 start, u64 end, u8 space_id, unsigned long flags,
++			 char *desc)
++{
++	unsigned int length = end - start + 1;
++	struct resource *res;
++
++	res = space_id == ACPI_ADR_SPACE_SYSTEM_IO ?
++		request_region(start, length, desc) :
++		request_mem_region(start, length, desc);
++	if (!res)
++		return -EIO;
++
++	res->flags &= ~flags;
++	return 0;
++}
++
++static int add_region_before(u64 start, u64 end, u8 space_id,
++			     unsigned long flags, char *desc,
++			     struct list_head *head)
++{
++	struct reserved_region *reg;
++	int error;
++
++	reg = kmalloc(sizeof(*reg), GFP_KERNEL);
++	if (!reg)
++		return -ENOMEM;
++
++	error = request_range(start, end, space_id, flags, desc);
++	if (error)
++		return error;
++
++	reg->start = start;
++	reg->end = end;
++	list_add_tail(&reg->node, head);
++	return 0;
++}
++
++/**
++ * acpi_reserve_region - Reserve an I/O or memory region as a system resource.
++ * @start: Starting address of the region.
++ * @length: Length of the region.
++ * @space_id: Identifier of address space to reserve the region from.
++ * @flags: Resource flags to clear for the region after requesting it.
++ * @desc: Region description (for messages).
++ *
++ * Reserve an I/O or memory region as a system resource to prevent others from
++ * using it.  If the new region overlaps with one of the regions (in the given
++ * address space) already reserved by this routine, only the non-overlapping
++ * parts of it will be reserved.
++ *
++ * Returned is either 0 (success) or a negative error code indicating a resource
++ * reservation problem.  It is the code of the first encountered error, but the
++ * routine doesn't abort until it has attempted to request all of the parts of
++ * the new region that don't overlap with other regions reserved previously.
++ *
++ * The resources requested by this routine are never released.
++ */
++int acpi_reserve_region(u64 start, unsigned int length, u8 space_id,
++			unsigned long flags, char *desc)
++{
++	struct list_head *regions;
++	struct reserved_region *reg;
++	u64 end = start + length - 1;
++	int ret = 0, error = 0;
++
++	if (space_id == ACPI_ADR_SPACE_SYSTEM_IO)
++		regions = &reserved_io_regions;
++	else if (space_id == ACPI_ADR_SPACE_SYSTEM_MEMORY)
++		regions = &reserved_mem_regions;
++	else
++		return -EINVAL;
++
++	if (list_empty(regions))
++		return add_region_before(start, end, space_id, flags, desc, regions);
++
++	list_for_each_entry(reg, regions, node)
++		if (reg->start == end + 1) {
++			/* The new region can be prepended to this one. */
++			ret = request_range(start, end, space_id, flags, desc);
++			if (!ret)
++				reg->start = start;
++
++			return ret;
++		} else if (reg->start > end) {
++			/* No overlap.  Add the new region here and get out. */
++			return add_region_before(start, end, space_id, flags,
++						 desc, &reg->node);
++		} else if (reg->end == start - 1) {
++			goto combine;
++		} else if (reg->end >= start) {
++			goto overlap;
++		}
++
++	/* The new region goes after the last existing one. */
++	return add_region_before(start, end, space_id, flags, desc, regions);
++
++ overlap:
++	/*
++	 * The new region overlaps an existing one.
++	 *
++	 * The head part of the new region immediately preceding the existing
++	 * overlapping one can be combined with it right away.
++	 */
++	if (reg->start > start) {
++		error = request_range(start, reg->start - 1, space_id, flags, desc);
++		if (error)
++			ret = error;
++		else
++			reg->start = start;
++	}
++
++ combine:
++	/*
++	 * The new region is adjacent to an existing one.  If it extends beyond
++	 * that region all the way to the next one, it is possible to combine
++	 * all three of them.
++	 */
++	while (reg->end < end) {
++		struct reserved_region *next = NULL;
++		u64 a = reg->end + 1, b = end;
++
++		if (!list_is_last(&reg->node, regions)) {
++			next = list_next_entry(reg, node);
++			if (next->start <= end)
++				b = next->start - 1;
++		}
++		error = request_range(a, b, space_id, flags, desc);
++		if (!error) {
++			if (next && next->start == b + 1) {
++				reg->end = next->end;
++				list_del(&next->node);
++				kfree(next);
++			} else {
++				reg->end = end;
++				break;
++			}
++		} else if (next) {
++			if (!ret)
++				ret = error;
++
++			reg = next;
++		} else {
++			break;
++		}
++	}
++
++	return ret ? ret : error;
++}
++EXPORT_SYMBOL_GPL(acpi_reserve_region);
+diff --git a/drivers/pnp/system.c b/drivers/pnp/system.c
+index 49c1720..515f338 100644
+--- a/drivers/pnp/system.c
++++ b/drivers/pnp/system.c
+@@ -7,6 +7,7 @@
+  *	Bjorn Helgaas <bjorn.helgaas@hp.com>
+  */
+ 
++#include <linux/acpi.h>
+ #include <linux/pnp.h>
+ #include <linux/device.h>
+ #include <linux/init.h>
+@@ -22,25 +23,41 @@ static const struct pnp_device_id pnp_dev_table[] = {
+ 	{"", 0}
+ };
+ 
++#ifdef CONFIG_ACPI
++static bool __reserve_range(u64 start, unsigned int length, bool io, char *desc)
++{
++	u8 space_id = io ? ACPI_ADR_SPACE_SYSTEM_IO : ACPI_ADR_SPACE_SYSTEM_MEMORY;
++	return !acpi_reserve_region(start, length, space_id, IORESOURCE_BUSY, desc);
++}
++#else
++static bool __reserve_range(u64 start, unsigned int length, bool io, char *desc)
++{
++	struct resource *res;
++
++	res = io ? request_region(start, length, desc) :
++		request_mem_region(start, length, desc);
++	if (res) {
++		res->flags &= ~IORESOURCE_BUSY;
++		return true;
++	}
++	return false;
++}
++#endif
++
+ static void reserve_range(struct pnp_dev *dev, struct resource *r, int port)
+ {
+ 	char *regionid;
+ 	const char *pnpid = dev_name(&dev->dev);
+ 	resource_size_t start = r->start, end = r->end;
+-	struct resource *res;
++	bool reserved;
+ 
+ 	regionid = kmalloc(16, GFP_KERNEL);
+ 	if (!regionid)
+ 		return;
+ 
+ 	snprintf(regionid, 16, "pnp %s", pnpid);
+-	if (port)
+-		res = request_region(start, end - start + 1, regionid);
+-	else
+-		res = request_mem_region(start, end - start + 1, regionid);
+-	if (res)
+-		res->flags &= ~IORESOURCE_BUSY;
+-	else
++	reserved = __reserve_range(start, end - start + 1, !!port, regionid);
++	if (!reserved)
+ 		kfree(regionid);
+ 
+ 	/*
+@@ -49,7 +66,7 @@ static void reserve_range(struct pnp_dev *dev, struct resource *r, int port)
+ 	 * have double reservations.
+ 	 */
+ 	dev_info(&dev->dev, "%pR %s reserved\n", r,
+-		 res ? "has been" : "could not be");
++		 reserved ? "has been" : "could not be");
+ }
+ 
+ static void reserve_resources_of_dev(struct pnp_dev *dev)
+diff --git a/include/linux/acpi.h b/include/linux/acpi.h
+index 4d8fcd3..81130e9 100644
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -342,6 +342,9 @@ int acpi_check_region(resource_size_t start, resource_size_t n,
+ 
+ int acpi_resources_are_enforced(void);
+ 
++int acpi_reserve_region(u64 start, unsigned int length, u8 space_id,
++			unsigned long flags, char *desc);
++
+ #ifdef CONFIG_HIBERNATION
+ void __init acpi_no_s4_hw_signature(void);
+ #endif
+@@ -537,6 +540,13 @@ static inline int acpi_check_region(resource_size_t start, resource_size_t n,
+ 	return 0;
+ }
+ 
++static inline int acpi_reserve_region(u64 start, unsigned int length,
++				      u8 space_id, unsigned long flags,
++				      char *desc)
++{
++	return -ENXIO;
++}
++
+ struct acpi_table_header;
+ static inline int acpi_table_parse(char *id,
+ 				int (*handler)(struct acpi_table_header *))
+-- 
+2.0.2
+

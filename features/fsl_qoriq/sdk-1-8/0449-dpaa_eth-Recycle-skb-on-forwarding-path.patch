@@ -1,0 +1,380 @@
+From 234f02d3eca2e6597744274f30702a5f5a69e8bd Mon Sep 17 00:00:00 2001
+From: "Lu.Jiang" <lu.jiang@windriver.com>
+Date: Thu, 11 Sep 2014 17:08:24 +0800
+Subject: [PATCH 449/987] dpaa_eth: Recycle skb on forwarding path
+
+[Original patch taken from QorIQ-SDK-V1.6-SOURCE-20140619-yocto.iso]
+
+Allocate skbuffs together with the Rx buffers, thus recycling them
+with the actual buffers. This eliminates unnecessary skb
+de/allocations on recyclable IPFWD traffic, improving throughput.
+The downside of it is an increased memory footprint for S/G traffic and
+a slight performance penalty for termination traffic.
+
+Signed-off-by: Ioana Radulescu <ruxandra.radulescu@freescale.com>
+Signed-off-by: Bogdan Hamciuc <bogdan.hamciuc@freescale.com>
+Reviewed-on: http://git.am.freescale.net:8181/7089
+Reviewed-by: Cristian-Constantin Sovaiala <Cristian.Sovaiala@freescale.com>
+Reviewed-by: Thomas Trefny <Tom.Trefny@freescale.com>
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Change-Id: I03711a947da1d39eda74c52557cb0a2a973272a4
+Reviewed-on: http://git.am.freescale.net:8181/7352
+Reviewed-by: Jose Rivera <German.Rivera@freescale.com>
+Reviewed-on: http://git.am.freescale.net:8181/7685
+Reviewed-by: Madalin-Cristian Bucur <madalin.bucur@freescale.com>
+Tested-by: Madalin-Cristian Bucur <madalin.bucur@freescale.com>
+Signed-off-by: Lu.Jiang <lu.jiang@windriver.com>
+---
+ drivers/net/ethernet/freescale/dpa/dpaa_eth_sg.c | 178 ++++++++++++-----------
+ 1 file changed, 94 insertions(+), 84 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/dpa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/dpa/dpaa_eth_sg.c
+index ac08dce..60bf3e0 100644
+--- a/drivers/net/ethernet/freescale/dpa/dpaa_eth_sg.c
++++ b/drivers/net/ethernet/freescale/dpa/dpaa_eth_sg.c
+@@ -45,6 +45,25 @@
+ 
+ #define DPA_SGT_MAX_ENTRIES 16 /* maximum number of entries in SG Table */
+ 
++/* Convenience macros for storing/retrieving the skb back-pointers. They must
++ * accomodate both recycling and confirmation paths - i.e. cases when the buf
++ * was allocated by ourselves, respectively by the stack. In the former case,
++ * we could store the skb at negative offset; in the latter case, we can't,
++ * so we'll use 0 as offset.
++ *
++ * NB: @off is an offset from a (struct sk_buff **) pointer!
++ */
++#define DPA_WRITE_SKB_PTR(skb, skbh, addr, off) \
++	{ \
++		skbh = (struct sk_buff **)addr; \
++		*(skbh + (off)) = skb; \
++	}
++#define DPA_READ_SKB_PTR(skb, skbh, addr, off) \
++	{ \
++		skbh = (struct sk_buff **)addr; \
++		skb = *(skbh + (off)); \
++	}
++
+ /* DMA map and add a page frag back into the bpool.
+  * @vaddr fragment must have been allocated with netdev_alloc_frag(),
+  * specifically for fitting into @dpa_bp.
+@@ -78,22 +97,36 @@ int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
+ 	dma_addr_t addr;
+ 	int i;
+ 	struct device *dev = dpa_bp->dev;
++	struct sk_buff *skb, **skbh;
+ 
+ 	for (i = 0; i < 8; i++) {
+-		new_buf = netdev_alloc_frag(DPA_BP_RAW_SIZE);
+-		if (likely(new_buf)) {
+-			new_buf = PTR_ALIGN(new_buf, SMP_CACHE_BYTES);
+-			addr = dma_map_single(dev, new_buf,
+-					dpa_bp->size, DMA_BIDIRECTIONAL);
+-			if (likely(!dma_mapping_error(dev, addr))) {
+-				bm_buffer_set64(&bmb[i], addr);
+-				continue;
+-			} else
+-				put_page(virt_to_head_page(new_buf));
++		/* We'll prepend the skb back-pointer; can't use the DPA
++		 * priv space, because FMan will overwrite it (from offset 0)
++		 * if it ends up being the second, third, etc. fragment
++		 * in a S/G frame.
++		 *
++		 * We only need enough space to store a pointer, but allocate
++		 * an entire cacheline for performance reasons.
++		 */
++		new_buf = netdev_alloc_frag(SMP_CACHE_BYTES + DPA_BP_RAW_SIZE);
++		if (unlikely(!new_buf))
++			goto netdev_alloc_failed;
++		new_buf = PTR_ALIGN(new_buf + SMP_CACHE_BYTES, SMP_CACHE_BYTES);
++
++		skb = build_skb(new_buf, DPA_SKB_SIZE(dpa_bp->size) +
++			SKB_DATA_ALIGN(sizeof(struct skb_shared_info)));
++		if (unlikely(!skb)) {
++			put_page(virt_to_head_page(new_buf));
++			goto build_skb_failed;
+ 		}
++		DPA_WRITE_SKB_PTR(skb, skbh, new_buf, -1);
++
++		addr = dma_map_single(dev, new_buf,
++				dpa_bp->size, DMA_BIDIRECTIONAL);
++		if (unlikely(dma_mapping_error(dev, addr)))
++			goto dma_map_failed;
+ 
+-		/* Something went wrong */
+-		goto bail_out;
++		bm_buffer_set64(&bmb[i], addr);
+ 	}
+ 
+ release_bufs:
+@@ -103,10 +136,13 @@ release_bufs:
+ 	 */
+ 	while (unlikely(bman_release(dpa_bp->pool, bmb, i, 0)))
+ 		cpu_relax();
+-
+ 	return i;
+ 
+-bail_out:
++dma_map_failed:
++	kfree_skb(skb);
++
++build_skb_failed:
++netdev_alloc_failed:
+ 	net_err_ratelimited("dpa_bp_add_8_bufs() failed\n");
+ 	WARN_ONCE(1, "Memory allocation failure on Rx\n");
+ 
+@@ -198,11 +234,11 @@ struct sk_buff *_dpa_cleanup_tx_fd(const struct dpa_priv_s *priv,
+ 	const enum dma_data_direction dma_dir = DMA_TO_DEVICE;
+ 	int nr_frags;
+ 
++	DPA_BUG_ON(fd->cmd & FM_FD_CMD_FCO);
+ 	dma_unmap_single(dpa_bp->dev, addr, dpa_bp->size, dma_dir);
+ 
+ 	/* retrieve skb back pointer */
+-	skbh = (struct sk_buff **)phys_to_virt(addr);
+-	skb = *skbh;
++	DPA_READ_SKB_PTR(skb, skbh, phys_to_virt(addr), 0);
+ 	nr_frags = skb_shinfo(skb)->nr_frags;
+ 
+ 	if (fd->format == qm_fd_sg) {
+@@ -237,11 +273,6 @@ struct sk_buff *_dpa_cleanup_tx_fd(const struct dpa_priv_s *priv,
+ 					sgt[i].length, dma_dir);
+ 		}
+ 
+-		/* TODO: dpa_bp_recycle_frag() ?
+-		 * We could put these in the pool, since we allocated them
+-		 * and we know they're not used by anyone else
+-		 */
+-
+ 		/* Free the page frag that we allocated on Tx */
+ 		put_page(virt_to_head_page(sgt));
+ 	}
+@@ -329,17 +360,17 @@ static struct sk_buff *__hot contig_fd_to_skb(const struct dpa_priv_s *priv,
+ 	dma_addr_t addr = qm_fd_addr(fd);
+ 	ssize_t fd_off = dpa_fd_offset(fd);
+ 	void *vaddr;
+-	struct dpa_bp *dpa_bp = priv->dpa_bp;
+ 	const fm_prs_result_t *parse_results;
+-	struct sk_buff *skb = NULL;
++	struct sk_buff *skb = NULL, **skbh;
+ 
+ 	vaddr = phys_to_virt(addr);
+ 	DPA_BUG_ON(!IS_ALIGNED((unsigned long)vaddr, SMP_CACHE_BYTES));
+ 
+-	/* Build the skb and adjust data and tail pointers */
+-	skb = build_skb(vaddr, dpa_bp->size + DPA_SKB_TAILROOM);
+-	if (unlikely(!skb))
+-		return NULL;
++	/* Retrieve the skb and adjust data and tail pointers, to make sure
++ 	 * forwarded skbs will have enough space on Tx if extra headers
++ 	 * are added.
++ 	 */
++	DPA_READ_SKB_PTR(skb, skbh, vaddr, -1);
+ 
+ #ifdef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
+ 	/* When using jumbo Rx buffers, we risk having frames dropped due to
+@@ -400,7 +431,7 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
+ 	int page_offset;
+ 	int i;
+ 	const fm_prs_result_t *parse_results;
+-	struct sk_buff *skb = NULL;
++	struct sk_buff *skb = NULL, *skb_tmp, **skbh;
+ 	int *count_ptr;
+ 
+ 	vaddr = phys_to_virt(addr);
+@@ -422,25 +453,11 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
+ 		DPA_BUG_ON(!IS_ALIGNED((unsigned long)sg_vaddr,
+ 				SMP_CACHE_BYTES));
+ 
++		dma_unmap_single(dpa_bp->dev, sg_addr, dpa_bp->size,
++				 DMA_BIDIRECTIONAL);
+ 		if (i == 0) {
+-			/* Tentatively access the first buffer, but don't unmap
+-			 * it until we're certain the skb allocation succeeds.
+-			 */
+-			dma_sync_single_for_cpu(dpa_bp->dev, sg_addr,
+-				dpa_bp->size, DMA_BIDIRECTIONAL);
+-
+-			/* This is the first S/G entry, so build the skb
+-			 * around its data buffer
+-			 */
+-			skb = build_skb(sg_vaddr, DPA_SKB_SIZE(dpa_bp->size) +
+-				SKB_DATA_ALIGN(sizeof(struct skb_shared_info)));
+-			if (unlikely(!skb))
+-				/* dpa_fd_release() will put the current frame
+-				 * back into the pool. DMA mapping status has
+-				 * not changed, nor have the pool counts.
+-				 */
+-				return NULL;
+-
++			DPA_READ_SKB_PTR(skb, skbh, sg_vaddr, -1);
++			DPA_BUG_ON(skb->head != sg_vaddr);
+ #ifdef CONFIG_FSL_DPAA_1588
+ 			if (priv->tsu && priv->tsu->valid &&
+ 			    priv->tsu->hwts_rx_en_ioctl)
+@@ -452,9 +469,6 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
+ 				dpa_get_ts(priv, RX, skb_hwtstamps(skb), vaddr);
+ #endif /* CONFIG_FSL_DPAA_TS */
+ 
+-			dma_unmap_single(dpa_bp->dev, sg_addr, dpa_bp->size,
+-				DMA_BIDIRECTIONAL);
+-
+ 			/* In the case of a SG frame, FMan stores the Internal
+ 			 * Context in the buffer containing the sgt.
+ 			 * Inspect the parse results before anything else.
+@@ -471,8 +485,6 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
+ 			skb_reserve(skb, fd_off);
+ 			skb_put(skb, sgt[i].length);
+ 		} else {
+-			dma_unmap_single(dpa_bp->dev, sg_addr, dpa_bp->size,
+-				DMA_BIDIRECTIONAL);
+ 			/* Not the first S/G entry; all data from buffer will
+ 			 * be added in an skb fragment; fragment index is offset
+ 			 * by one since first S/G entry was incorporated in the
+@@ -480,8 +492,16 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
+ 			 *
+ 			 * Caution: 'page' may be a tail page.
+ 			 */
++			DPA_READ_SKB_PTR(skb_tmp, skbh, sg_vaddr, -1);
+ 			page = virt_to_page(sg_vaddr);
+ 			head_page = virt_to_head_page(sg_vaddr);
++
++			/* Free (only) the skbuff shell because its data buffer
++			 * is already a frag in the main skb.
++			 */
++			get_page(head_page);
++			dev_kfree_skb(skb_tmp);
++
+ 			/* Compute offset in (possibly tail) page */
+ 			page_offset = ((unsigned long)sg_vaddr &
+ 					(PAGE_SIZE - 1)) +
+@@ -540,14 +560,9 @@ void __hot _dpa_rx(struct net_device *net_dev,
+ 	dpa_bp = priv->dpa_bp;
+ 	DPA_BUG_ON(dpa_bp != dpa_bpid2pool(fd->bpid));
+ 	count_ptr = __this_cpu_ptr(dpa_bp->percpu_count);
+-	/* Prepare to read from the buffer, but don't unmap it until
+-	 * we know the skb allocation succeeded. At this point we already
+-	 * own the buffer - i.e. FMan won't access it anymore.
+-	 */
+-	dma_sync_single_for_cpu(dpa_bp->dev, addr, dpa_bp->size,
+-		DMA_BIDIRECTIONAL);
+ 
+ 	/* prefetch the first 64 bytes of the frame or the SGT start */
++	dma_unmap_single(dpa_bp->dev, addr, dpa_bp->size, DMA_BIDIRECTIONAL);
+ 	prefetch(phys_to_virt(addr) + dpa_fd_offset(fd));
+ 
+ 	/* The only FD types that we may receive are contig and S/G */
+@@ -558,28 +573,17 @@ void __hot _dpa_rx(struct net_device *net_dev,
+ 		if (dpaa_eth_hooks.rx_default &&
+ 			dpaa_eth_hooks.rx_default((void *)fd, net_dev, fqid)
+ 						== DPAA_ETH_STOLEN) {
+-			/* It's safe to unmap the buffer now */
+-			dma_unmap_single(dpa_bp->dev, addr, dpa_bp->size,
+-					 DMA_BIDIRECTIONAL);
+ 			/* won't count the rx bytes in */
+ 			return;
+ 		}
+ 		skb = contig_fd_to_skb(priv, fd, &use_gro);
+ 	} else
+ 		skb = sg_fd_to_skb(priv, fd, &use_gro);
+-	if (unlikely(!skb))
+-		/* We haven't yet touched the DMA mapping or the pool count;
+-		 * dpa_fd_release() will just put the buffer back in the pool
+-		 */
+-		goto _release_frame;
+ 
+ 	/* Account for either the contig buffer or the SGT buffer (depending on
+ 	 * which case we were in) having been removed from the pool.
+-	 * Also, permanently unmap the buffer.
+ 	 */
+ 	(*count_ptr)--;
+-	dma_unmap_single(dpa_bp->dev, addr, dpa_bp->size, DMA_BIDIRECTIONAL);
+-
+ 	skb->protocol = eth_type_trans(skb, net_dev);
+ 
+ 	/* IP Reassembled frames are allowed to be larger than MTU */
+@@ -656,6 +660,8 @@ static int __hot skb_to_contig_fd(struct dpa_priv_s *priv,
+ 		DPA_BUG_ON(skb->data - buffer_start > DPA_MAX_FD_OFFSET);
+ 		fd->offset = (uint16_t)(skb->data - buffer_start);
+ 		dma_dir = DMA_BIDIRECTIONAL;
++
++		DPA_WRITE_SKB_PTR(skb, skbh, buffer_start, -1);
+ 	} else
+ #endif
+ 	{
+@@ -666,10 +672,13 @@ static int __hot skb_to_contig_fd(struct dpa_priv_s *priv,
+ 		buffer_start = skb->data - priv->tx_headroom;
+ 		fd->offset = priv->tx_headroom;
+ 		dma_dir = DMA_TO_DEVICE;
+-	}
+ 
+-	skbh = (struct sk_buff **)buffer_start;
+-	*skbh = skb;
++		/* The buffer will be Tx-confirmed, but the TxConf cb must
++		 * necessarily look at our Tx private data to retrieve the
++		 * skbuff. (In short: can't use DPA_WRITE_SKB_PTR() here.)
++		 */
++		DPA_WRITE_SKB_PTR(skb, skbh, buffer_start, 0);
++	}
+ 
+ 	/* Enable L3/L4 hardware checksum computation.
+ 	 *
+@@ -788,8 +797,10 @@ static int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
+ 
+ 	/* DMA map the SGT page */
+ 	buffer_start = (void *)sgt - dpa_fd_offset(fd);
+-	skbh = (struct sk_buff **)buffer_start;
+-	*skbh = skb;
++	/* Can't write at "negative" offset in buffer_start, because this skb
++	 * may not have been allocated by us.
++	 */
++	DPA_WRITE_SKB_PTR(skb, skbh, buffer_start, 0);
+ 
+ 	addr = dma_map_single(dpa_bp->dev, buffer_start,
+ 		skb_end_pointer(skb) - (unsigned char *)buffer_start, dma_dir);
+@@ -907,32 +918,31 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+ 		goto skb_to_fd_failed;
+ 
+ 	if (fd.cmd & FM_FD_CMD_FCO) {
+-		/* The buffer contained in this skb will be recycled. Update
+-		 * the buffer pool percpu count. Also bump up the usage count
+-		 * of the page containing the recycled buffer to make sure it
+-		 * doesn't get freed.
++		skb_recycle(skb);
++		/* skb_recycle() reserves NET_SKB_PAD as skb headroom,
++		 * but we need the skb to look as if returned by build_skb().
++		 * We need to manually adjust the tailptr as well.
+ 		 */
++		skb->data = skb->head;
++		skb_reset_tail_pointer(skb);
++
+ 		(*countptr)++;
+-		get_page(virt_to_head_page(skb->head));
+ 		percpu_priv->tx_returned++;
+ 	}
+ 
+ 	if (unlikely(dpa_xmit(priv, percpu_stats, queue_mapping, &fd) < 0))
+ 		goto xmit_failed;
+ 
+-	/* If we recycled the buffer, no need to hold on to the skb anymore */
+-	if (fd.cmd & FM_FD_CMD_FCO)
+-		dev_kfree_skb(skb);
+-
+ 	net_dev->trans_start = jiffies;
+-
+ 	return NETDEV_TX_OK;
+ 
+ xmit_failed:
+ 	if (fd.cmd & FM_FD_CMD_FCO) {
+ 		(*countptr)--;
+-		put_page(virt_to_head_page(skb->head));
+ 		percpu_priv->tx_returned--;
++		dpa_fd_release(net_dev, &fd);
++		percpu_stats->tx_errors++;
++		return NETDEV_TX_OK;
+ 	}
+ 	_dpa_cleanup_tx_fd(priv, &fd);
+ skb_to_fd_failed:
+-- 
+1.9.1
+

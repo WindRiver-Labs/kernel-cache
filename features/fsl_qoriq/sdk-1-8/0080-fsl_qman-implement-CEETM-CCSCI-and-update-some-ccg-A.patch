@@ -1,0 +1,600 @@
+From c2532015b01e8ac47c2c65e60bb6b2c46440b214 Mon Sep 17 00:00:00 2001
+From: Haiying Wang <Haiying.Wang@freescale.com>
+Date: Fri, 22 Mar 2013 15:11:58 -0400
+Subject: [PATCH 080/987] fsl_qman: implement CEETM CCSCI and update some ccg
+ APIs
+
+[Original patch taken from QorIQ-SDK-V1.6-SOURCE-20140619-yocto.iso]
+
+The CEETM congestion state change notification uses a seperate bit for CSCN
+interrupt in software portal's ISR register, and different command to query
+congestion state. This patch implmentes the CCSCI interrupt handling, and
+combines the ccg's swp setting into qman_ceetm_ccg_set(), because we can only
+register ccgr callback to the affine portal.
+
+Signed-off-by: Haiying Wang <Haiying.Wang@freescale.com>
+Change-Id: I246bd70ea33786d39b6a18ae90e03f9fa09c3912
+Reviewed-on: http://git.am.freescale.net:8181/1259
+Reviewed-by: Thorpe Geoff-R01361 <Geoff.Thorpe@freescale.com>
+Reviewed-by: Fleming Andrew-AFLEMING <AFLEMING@freescale.com>
+Tested-by: Fleming Andrew-AFLEMING <AFLEMING@freescale.com>
+---
+ drivers/staging/fsl_qbman/qman_driver.c  |   6 +-
+ drivers/staging/fsl_qbman/qman_high.c    | 219 ++++++++++++++++++++++---------
+ drivers/staging/fsl_qbman/qman_private.h |  65 +++++++++
+ include/linux/fsl_qman.h                 |  24 ++--
+ 4 files changed, 237 insertions(+), 77 deletions(-)
+
+diff --git a/drivers/staging/fsl_qbman/qman_driver.c b/drivers/staging/fsl_qbman/qman_driver.c
+index 90f85cc..ac03892 100644
+--- a/drivers/staging/fsl_qbman/qman_driver.c
++++ b/drivers/staging/fsl_qbman/qman_driver.c
+@@ -47,6 +47,8 @@ u16 qman_portal_max;
+ 
+ u32 qman_clk;
+ struct qm_ceetm qman_ceetms[QMAN_CEETM_MAX];
++/* the qman ceetm instances on the given SoC */
++u8 num_ceetms;
+ 
+ /* size of the fqd region in bytes */
+ #ifdef CONFIG_FSL_QMAN_FQ_LOOKUP
+@@ -596,7 +598,7 @@ static struct qman_portal *init_pcfg(struct qm_portal_config *pcfg)
+ 		/* Determine what should be interrupt-vs-poll driven */
+ #ifdef CONFIG_FSL_DPA_PIRQ_SLOW
+ 		irq_sources |= QM_PIRQ_EQCI | QM_PIRQ_EQRI | QM_PIRQ_MRI |
+-			       QM_PIRQ_CSCI;
++			       QM_PIRQ_CSCI | QM_PIRQ_CCSCI;
+ #endif
+ #ifdef CONFIG_FSL_DPA_PIRQ_FAST
+ 		irq_sources |= QM_PIRQ_DQRI;
+@@ -795,8 +797,10 @@ static __init int qman_init(void)
+ 	}
+ 
+ 	/* Parse CEETM */
++	num_ceetms = 0;
+ 	for_each_compatible_node(dn, NULL, "fsl,qman-ceetm") {
+ 		ret = fsl_ceetm_init(dn);
++		num_ceetms++;
+ 		if (ret)
+ 			return ret;
+ 	}
+diff --git a/drivers/staging/fsl_qbman/qman_high.c b/drivers/staging/fsl_qbman/qman_high.c
+index 50d0008..f033522 100644
+--- a/drivers/staging/fsl_qbman/qman_high.c
++++ b/drivers/staging/fsl_qbman/qman_high.c
+@@ -103,6 +103,12 @@ struct qman_portal {
+ 	struct list_head cgr_cbs;
+ 	/* list lock */
+ 	spinlock_t cgr_lock;
++	/* 2-element array. ccgrs[0] is mask, ccgrs[1] is snapshot. */
++	struct qman_ccgrs *ccgrs[QMAN_CEETM_MAX];
++	/* 256-element array, each is a linked-list of CCSCN handlers. */
++	struct list_head ccgr_cbs[QMAN_CEETM_MAX];
++	/* list lock */
++	spinlock_t ccgr_lock;
+ };
+ 
+ #ifdef CONFIG_FSL_DPA_PORTAL_SHARE
+@@ -275,11 +281,14 @@ static inline unsigned int __poll_portal_fast(struct qman_portal *p,
+ static irqreturn_t portal_isr(__always_unused int irq, void *ptr)
+ {
+ 	struct qman_portal *p = ptr;
+-	/* The CSCI source is cleared inside __poll_portal_slow(), because
++	/*
++	 * The CSCI/CCSCI source is cleared inside __poll_portal_slow(), because
+ 	 * it could race against a Query Congestion State command also given
+ 	 * as part of the handling of this interrupt source. We mustn't
+-	 * clear it a second time in this top-level function. */
+-	u32 clear = QM_DQAVAIL_MASK | (p->irq_sources & ~QM_PIRQ_CSCI);
++	 * clear it a second time in this top-level function.
++	 */
++	u32 clear = QM_DQAVAIL_MASK | (p->irq_sources & ~QM_PIRQ_CSCI) |
++					(p->irq_sources & ~QM_PIRQ_CCSCI);
+ 	u32 is = qm_isr_status_read(&p->p) & p->irq_sources;
+ 	/* DQRR-handling if it's interrupt-driven */
+ 	if (is & QM_PIRQ_DQRI)
+@@ -392,6 +401,18 @@ struct qman_portal *qman_create_affine_portal(
+ 		qman_cgrs_fill(&portal->cgrs[0]);
+ 	INIT_LIST_HEAD(&portal->cgr_cbs);
+ 	spin_lock_init(&portal->cgr_lock);
++	if (num_ceetms) {
++		for (ret = 0; ret < num_ceetms; ret++) {
++			portal->ccgrs[ret] = kmalloc(2 *
++				sizeof(struct qman_ccgrs), GFP_KERNEL);
++			if (!portal->ccgrs[ret])
++				goto fail_ccgrs;
++			qman_ccgrs_init(&portal->ccgrs[ret][1]);
++			qman_ccgrs_fill(&portal->ccgrs[ret][0]);
++			INIT_LIST_HEAD(&portal->ccgr_cbs[ret]);
++		}
++	}
++	spin_lock_init(&portal->ccgr_lock);
+ 	portal->bits = 0;
+ 	portal->slowpoll = 0;
+ #ifdef CONFIG_FSL_DPA_CAN_WAIT_SYNC
+@@ -476,6 +497,10 @@ fail_irq:
+ fail_devadd:
+ 	platform_device_put(portal->pdev);
+ fail_devalloc:
++	if (num_ceetms)
++		for (ret = 0; ret < num_ceetms; ret++)
++			kfree(portal->ccgrs[ret]);
++fail_ccgrs:
+ 	if (portal->cgrs)
+ 		kfree(portal->cgrs);
+ fail_cgrs:
+@@ -521,6 +546,7 @@ const struct qm_portal_config *qman_destroy_affine_portal(void)
+ 	struct qman_portal *qm = get_raw_affine_portal();
+ 	const struct qm_portal_config *pcfg;
+ 	int cpu;
++	int i;
+ #ifdef CONFIG_FSL_DPA_PORTAL_SHARE
+ 	if (qm->sharing_redirect) {
+ 		qm->sharing_redirect = NULL;
+@@ -542,6 +568,9 @@ const struct qm_portal_config *qman_destroy_affine_portal(void)
+ 	qm_eqcr_cce_update(&qm->p);
+ 	free_irq(pcfg->public_cfg.irq, qm);
+ 	kfree(qm->cgrs);
++	if (num_ceetms)
++		for (i = 0; i < num_ceetms; i++)
++			kfree(qm->ccgrs[i]);
+ 	qm_isr_finish(&qm->p);
+ 	qm_mc_finish(&qm->p);
+ 	qm_mr_finish(&qm->p);
+@@ -607,10 +636,12 @@ static u32 __poll_portal_slow(struct qman_portal *p, u32 is)
+ 		unsigned long irqflags __maybe_unused;
+ 
+ 		spin_lock_irqsave(&p->cgr_lock, irqflags);
+-		/* The CSCI bit must be cleared _before_ issuing the
++		/*
++		 * The CSCI bit must be cleared _before_ issuing the
+ 		 * Query Congestion State command, to ensure that a long
+ 		 * CGR State Change callback cannot miss an intervening
+-		 * state change. */
++		 * state change.
++		 */
+ 		qm_isr_status_clear(&p->p, QM_PIRQ_CSCI);
+ 
+ 		qm_mc_start(&p->p);
+@@ -630,6 +661,56 @@ static u32 __poll_portal_slow(struct qman_portal *p, u32 is)
+ 				cgr->cb(p, cgr, qman_cgrs_get(&rr, cgr->cgrid));
+ 		spin_unlock_irqrestore(&p->cgr_lock, irqflags);
+ 	}
++	if (is & QM_PIRQ_CCSCI) {
++		struct qman_ccgrs rr, c, congestion_result;
++		struct qm_mc_result *mcr;
++		struct qm_mc_command *mcc;
++		struct qm_ceetm_ccg *ccg;
++		unsigned long irqflags __maybe_unused;
++		int i, j;
++
++		spin_lock_irqsave(&p->ccgr_lock, irqflags);
++		/*
++		 * The CCSCI bit must be cleared _before_ issuing the
++		 * Query Congestion State command, to ensure that a long
++		 * CCGR State Change callback cannot miss an intervening
++		 * state change.
++		 */
++		qm_isr_status_clear(&p->p, QM_PIRQ_CCSCI);
++
++		for (i = 0; i < num_ceetms; i++) {
++			for (j = 0; j < 2; j++) {
++				mcc = qm_mc_start(&p->p);
++				mcc->ccgr_query.ccgrid =
++					CEETM_QUERY_CONGESTION_STATE | j;
++				mcc->ccgr_query.dcpid = i;
++				qm_mc_commit(&p->p, QM_CEETM_VERB_CCGR_QUERY);
++				while (!(mcr = qm_mc_result(&p->p)))
++					cpu_relax();
++				congestion_result.q[j] =
++					mcr->ccgr_query.congestion_state.state;
++			}
++			/* mask out the ones I'm not interested in */
++			qman_ccgrs_and(&rr, &congestion_result,
++							&p->ccgrs[i][0]);
++			/*
++			 * check previous snapshot for delta, enter/exit
++			 * congestion.
++			 */
++			qman_ccgrs_xor(&c, &rr, &p->ccgrs[i][1]);
++			/* update snapshot */
++			qman_ccgrs_cp(&p->ccgrs[i][1], &rr);
++			/* Invoke callback */
++			list_for_each_entry(ccg, &p->ccgr_cbs[i], cb_node)
++				if (ccg->cb && qman_ccgrs_get(&c,
++					(ccg->parent->idx << 4) | ccg->idx))
++					ccg->cb(ccg, ccg->cb_ctx,
++						qman_ccgrs_get(&rr,
++							(ccg->parent->idx << 4)
++							| ccg->idx));
++		}
++		spin_unlock_irqrestore(&p->ccgr_lock, irqflags);
++	}
+ 
+ #ifdef CONFIG_FSL_DPA_CAN_WAIT_SYNC
+ 	if (is & QM_PIRQ_EQCI) {
+@@ -718,9 +799,11 @@ mr_done:
+ 		qm_mr_cci_consume(&p->p, num);
+ 	}
+ 
+-	/* QM_PIRQ_CSCI has already been cleared, as part of its specific
++	/*
++	 * QM_PIRQ_CSCI/CCSCI has already been cleared, as part of its specific
+ 	 * processing. If that interrupt source has meanwhile been re-asserted,
+-	 * we mustn't clear it here (or in the top-level interrupt handler). */
++	 * we mustn't clear it here (or in the top-level interrupt handler).
++	 */
+ 	return is & (QM_PIRQ_EQCI | QM_PIRQ_EQRI | QM_PIRQ_MRI);
+ }
+ 
+@@ -4045,9 +4128,33 @@ EXPORT_SYMBOL(qman_ceetm_ccg_claim);
+ 
+ int qman_ceetm_ccg_release(struct qm_ceetm_ccg *ccg)
+ {
++	unsigned long irqflags __maybe_unused;
++	struct qm_ceetm_ccg *i;
++	struct qm_mcc_ceetm_ccgr_config config_opts;
++	int ret = 0;
++	struct qman_portal *p = get_affine_portal();
++
++	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_ccgr_config));
++	spin_lock_irqsave(&p->ccgr_lock, irqflags);
++	list_del(&ccg->cb_node);
++	/*
++	 * If there is no other CCG objects for this CCGID, update
++	 * CSCN_TARG_UPP_CTR accordingly.
++	 */
++	list_for_each_entry(i, &p->ccgr_cbs[ccg->parent->dcp_idx], cb_node)
++		if ((i->idx == ccg->idx) && i->cb)
++			goto release_lock;
++	config_opts.we_mask = QM_CCGR_WE_CSCN_TUPD;
++	config_opts.cm_config.cscn_tupd =
++			~QM_CGR_TARG_UDP_CTRL_WRITE_BIT | PORTAL_IDX(p);
++
++	ret = qman_ceetm_configure_ccgr(&config_opts);
++release_lock:
++	spin_unlock_irqrestore(&p->ccgr_lock, irqflags);
++
+ 	list_del(&ccg->node);
+ 	kfree(ccg);
+-	return 0;
++	return ret;
+ }
+ EXPORT_SYMBOL(qman_ceetm_ccg_release);
+ 
+@@ -4055,11 +4162,25 @@ int qman_ceetm_ccg_set(struct qm_ceetm_ccg *ccg, u16 we_mask,
+ 				const struct qm_ceetm_ccg_params *params)
+ {
+ 	struct qm_mcc_ceetm_ccgr_config config_opts;
++	unsigned long irqflags __maybe_unused;
++	int ret;
++	struct qman_portal *p;
++
++	if (((ccg->parent->idx << 4) | ccg->idx) >= (2 * __CGR_NUM))
++		return -EINVAL;
++
++	p = get_affine_portal();
++
++	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_ccgr_config));
++	spin_lock_irqsave(&p->ccgr_lock, irqflags);
+ 
+ 	config_opts.ccgrid = CEETM_CCGR_CM_CONFIGURE |
+ 				(ccg->parent->idx << 4) | ccg->idx;
+ 	config_opts.dcpid = ccg->parent->dcp_idx;
+ 	config_opts.we_mask = we_mask;
++	config_opts.we_mask |= QM_CCGR_WE_CSCN_TUPD;
++	config_opts.cm_config.cscn_tupd =
++			QM_CGR_TARG_UDP_CTRL_WRITE_BIT | PORTAL_IDX(p);
+ 	config_opts.cm_config.ctl = (params->wr_en_g << 6) |
+ 				(params->wr_en_y << 5) |
+ 				(params->wr_en_r << 4) |
+@@ -4074,8 +4195,17 @@ int qman_ceetm_ccg_set(struct qm_ceetm_ccg *ccg, u16 we_mask,
+ 	config_opts.cm_config.wr_parm_g = params->wr_parm_g;
+ 	config_opts.cm_config.wr_parm_y = params->wr_parm_y;
+ 	config_opts.cm_config.wr_parm_r = params->wr_parm_r;
++	ret = qman_ceetm_configure_ccgr(&config_opts);
++	if (ret) {
++		pr_err("Configure CCGR CM failed!\n");
++		goto release_lock;
++	}
+ 
+-	return qman_ceetm_configure_ccgr(&config_opts);
++	list_add(&ccg->cb_node, &p->ccgr_cbs[ccg->parent->dcp_idx]);
++release_lock:
++	spin_unlock_irqrestore(&p->ccgr_lock, irqflags);
++	put_affine_portal();
++	return ret;
+ }
+ EXPORT_SYMBOL(qman_ceetm_ccg_set);
+ 
+@@ -4147,54 +4277,15 @@ int qman_ceetm_ccg_get_reject_statistics(struct qm_ceetm_ccg *ccg, u32 flags,
+ }
+ EXPORT_SYMBOL(qman_ceetm_ccg_get_reject_statistics);
+ 
+-#define CEETM_CSCN_TARG_SWP	0
+-#define CEETM_CSCN_TARG_DCP	1
+-int qman_ceetm_cscn_swp_set(struct qm_ceetm_ccg *ccg,
+-				u16 swp_idx,
+-				unsigned int cscn_enabled,
+-				u16 we_mask,
+-				const struct qm_ceetm_ccg_params *params)
+-{
+-	struct qm_mcc_ceetm_ccgr_config config_opts;
+-	int ret;
+-
+-	config_opts.ccgrid = CEETM_CCGR_CM_CONFIGURE |
+-				(ccg->parent->idx << 4) | ccg->idx;
+-	config_opts.dcpid = ccg->parent->dcp_idx;
+-	config_opts.we_mask = we_mask | QM_CCGR_WE_CSCN_TUPD;
+-	config_opts.cm_config.cscn_tupd = (cscn_enabled << 15) |
+-					(CEETM_CSCN_TARG_SWP << 14) |
+-					swp_idx;
+-	config_opts.cm_config.ctl = (params->wr_en_g << 6) |
+-				(params->wr_en_y << 5) |
+-				(params->wr_en_r << 4) |
+-				(params->td_en << 3)   |
+-				(params->td_mode << 2) |
+-				(params->cscn_en << 1) |
+-				(params->mode);
+-	config_opts.cm_config.cs_thres = params->cs_thres_in;
+-	config_opts.cm_config.cs_thres_x = params->cs_thres_out;
+-	config_opts.cm_config.td_thres = params->td_thres;
+-	config_opts.cm_config.wr_parm_g = params->wr_parm_g;
+-	config_opts.cm_config.wr_parm_y = params->wr_parm_y;
+-	config_opts.cm_config.wr_parm_r = params->wr_parm_r;
+-
+-	ret = qman_ceetm_configure_ccgr(&config_opts);
+-	if (ret) {
+-		pr_err("Configure CSCN_TARG_SWP failed!\n");
+-		return -EINVAL;
+-	}
+-	return 0;
+-}
+-EXPORT_SYMBOL(qman_ceetm_cscn_swp_set);
+-
+ int qman_ceetm_cscn_swp_get(struct qm_ceetm_ccg *ccg,
+ 					u16 swp_idx,
+ 					unsigned int *cscn_enabled)
+ {
+ 	struct qm_mcc_ceetm_ccgr_query query_opts;
+ 	struct qm_mcr_ceetm_ccgr_query query_result;
++	int i;
+ 
++	DPA_ASSERT(swp_idx < 127);
+ 	query_opts.ccgrid = CEETM_CCGR_CM_QUERY |
+ 				(ccg->parent->idx << 4) | ccg->idx;
+ 	query_opts.dcpid = ccg->parent->dcp_idx;
+@@ -4204,12 +4295,11 @@ int qman_ceetm_cscn_swp_get(struct qm_ceetm_ccg *ccg,
+ 		return -EINVAL;
+ 	}
+ 
+-	if (swp_idx < 63)
+-		*cscn_enabled = (query_result.cm_query.cscn_targ_swp[0] >>
+-			(63 - swp_idx)) & 0x1;
+-	else
+-		*cscn_enabled = (query_result.cm_query.cscn_targ_swp[1] >>
+-			(127 - swp_idx)) & 0x1;
++	i = swp_idx / 32;
++	i = 3 - i;
++	*cscn_enabled = (query_result.cm_query.cscn_targ_swp[i] >>
++							(31 - swp_idx % 32));
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(qman_ceetm_cscn_swp_get);
+@@ -4230,8 +4320,7 @@ int qman_ceetm_cscn_dcp_set(struct qm_ceetm_ccg *ccg,
+ 	config_opts.we_mask = we_mask | QM_CCGR_WE_CSCN_TUPD | QM_CCGR_WE_CDV;
+ 	config_opts.cm_config.cdv = vcgid;
+ 	config_opts.cm_config.cscn_tupd = (cscn_enabled << 15) |
+-					(CEETM_CSCN_TARG_DCP << 14) |
+-					dcp_idx;
++					QM_CGR_TARG_UDP_CTRL_DCP | dcp_idx;
+ 	config_opts.cm_config.ctl = (params->wr_en_g << 6) |
+ 				(params->wr_en_y << 5) |
+ 				(params->wr_en_r << 4) |
+@@ -4279,21 +4368,22 @@ int qman_ceetm_cscn_dcp_get(struct qm_ceetm_ccg *ccg,
+ }
+ EXPORT_SYMBOL(qman_ceetm_cscn_dcp_get);
+ 
+-int qman_ceetm_querycongestion(u16 *ccg_state, unsigned int dcp_idx)
++int qman_ceetm_querycongestion(struct __qm_mcr_querycongestion *ccg_state,
++							unsigned int dcp_idx)
+ {
+ 	struct qm_mc_command *mcc;
+ 	struct qm_mc_result *mcr;
+ 	struct qman_portal *p;
+ 	unsigned long irqflags __maybe_unused;
+ 	u8 res;
+-	int i, j;
++	int i;
+ 
+ 	p = get_affine_portal();
+ 	PORTAL_IRQ_LOCK(p, irqflags);
+ 
+ 	mcc = qm_mc_start(&p->p);
+-	for (i = 0; i < 1 ; i++) {
+-		mcc->ccgr_query.ccgrid = i;
++	for (i = 0; i < 2 ; i++) {
++		mcc->ccgr_query.ccgrid = CEETM_QUERY_CONGESTION_STATE | i;
+ 		mcc->ccgr_query.dcpid = dcp_idx;
+ 		qm_mc_commit(&p->p, QM_CEETM_VERB_CCGR_QUERY);
+ 
+@@ -4303,9 +4393,8 @@ int qman_ceetm_querycongestion(u16 *ccg_state, unsigned int dcp_idx)
+ 						QM_CEETM_VERB_CCGR_QUERY);
+ 		res = mcr->result;
+ 		if (res == QM_MCR_RESULT_OK) {
+-			for (j = 0; j < 16; j++)
+-				*(ccg_state + j) =
+-				mcr->ccgr_query.congestion_state.ccg_state[j];
++			*(ccg_state + i) =
++				mcr->ccgr_query.congestion_state.state;
+ 		} else {
+ 			pr_err("QUERY CEETM CONGESTION STATE failed\n");
+ 			return -EIO;
+diff --git a/drivers/staging/fsl_qbman/qman_private.h b/drivers/staging/fsl_qbman/qman_private.h
+index 5945b34..b70a4d2 100644
+--- a/drivers/staging/fsl_qbman/qman_private.h
++++ b/drivers/staging/fsl_qbman/qman_private.h
+@@ -98,6 +98,70 @@ static inline void qman_cgrs_xor(struct qman_cgrs *dest,
+ 		*(_d++) = *(_a++) ^ *(_b++);
+ }
+ 
++	/* ----------------------- */
++	/* CEETM Congestion Groups */
++	/* ----------------------- */
++/* This wrapper represents a bit-array for the state of the 512 Qman CEETM
++ * congestion groups.
++ */
++struct qman_ccgrs {
++	struct __qm_mcr_querycongestion q[2];
++};
++static inline void qman_ccgrs_init(struct qman_ccgrs *c)
++{
++	memset(c, 0, sizeof(*c));
++}
++static inline void qman_ccgrs_fill(struct qman_ccgrs *c)
++{
++	memset(c, 0xff, sizeof(*c));
++}
++static inline int qman_ccgrs_get(struct qman_ccgrs *c, int num)
++{
++	if (num < __CGR_NUM)
++		return QM_MCR_QUERYCONGESTION(&c->q[0], num);
++	else
++		return QM_MCR_QUERYCONGESTION(&c->q[1], (num - __CGR_NUM));
++}
++static inline int qman_ccgrs_next(struct qman_ccgrs *c, int num)
++{
++	while ((++num < __CGR_NUM) && !qman_ccgrs_get(c, num))
++		;
++	return num;
++}
++static inline void qman_ccgrs_cp(struct qman_ccgrs *dest,
++					const struct qman_ccgrs *src)
++{
++	memcpy(dest, src, sizeof(*dest));
++}
++static inline void qman_ccgrs_and(struct qman_ccgrs *dest,
++			const struct qman_ccgrs *a, const struct qman_ccgrs *b)
++{
++	int ret, i;
++	u32 *_d;
++	const u32 *_a, *_b;
++	for (i = 0; i < 2; i++) {
++		_d = dest->q[i].__state;
++		_a = a->q[i].__state;
++		_b = b->q[i].__state;
++		for (ret = 0; ret < 8; ret++)
++			*(_d++) = *(_a++) & *(_b++);
++	}
++}
++static inline void qman_ccgrs_xor(struct qman_ccgrs *dest,
++			const struct qman_ccgrs *a, const struct qman_ccgrs *b)
++{
++	int ret, i;
++	u32 *_d;
++	const u32 *_a, *_b;
++	for (i = 0; i < 2; i++) {
++		_d = dest->q[i].__state;
++		_a = a->q[i].__state;
++		_b = b->q[i].__state;
++		for (ret = 0; ret < 8; ret++)
++			*(_d++) = *(_a++) ^ *(_b++);
++	}
++}
++
+ /* used by CCSR and portal interrupt code */
+ enum qm_isr_reg {
+ 	qm_isr_status = 0,
+@@ -288,6 +352,7 @@ int qman_setup_fq_lookup_table(size_t num_entries);
+ 
+ /* CEETM related */
+ #define QMAN_CEETM_MAX	2
++extern u8 num_ceetms;
+ extern struct qm_ceetm qman_ceetms[QMAN_CEETM_MAX];
+ int qman_sp_enable_ceetm_mode(enum qm_dc_portal portal, u16 sub_portal);
+ int qman_sp_disable_ceetm_mode(enum qm_dc_portal portal, u16 sub_portal);
+diff --git a/include/linux/fsl_qman.h b/include/linux/fsl_qman.h
+index 68a8768..82d02f2 100644
+--- a/include/linux/fsl_qman.h
++++ b/include/linux/fsl_qman.h
+@@ -57,6 +57,7 @@ enum qm_dc_portal {
+ };
+ 
+ /* Portal processing (interrupt) sources */
++#define QM_PIRQ_CCSCI	0x00200000	/* CEETM Congestion State Change */
+ #define QM_PIRQ_CSCI	0x00100000	/* Congestion State Change */
+ #define QM_PIRQ_EQCI	0x00080000	/* Enqueue Command Committed */
+ #define QM_PIRQ_EQRI	0x00040000	/* EQCR Ring (below threshold) */
+@@ -65,7 +66,7 @@ enum qm_dc_portal {
+ /* This mask contains all the interrupt sources that need handling except DQRI,
+  * ie. that if present should trigger slow-path processing. */
+ #define QM_PIRQ_SLOW	(QM_PIRQ_CSCI | QM_PIRQ_EQCI | QM_PIRQ_EQRI | \
+-			QM_PIRQ_MRI)
++			QM_PIRQ_MRI | QM_PIRQ_CCSCI)
+ 
+ /* --- Clock speed --- */
+ /* A qman driver instance may or may not know the current qman clock speed.
+@@ -1243,7 +1244,7 @@ struct qm_mcr_ceetm_ccgr_query {
+ 			u64 i_cnt:40;
+ 			u8 __reserved4[3];
+ 			u64 a_cnt:40;
+-			u64 cscn_targ_swp[2];
++			u32 cscn_targ_swp[4];
+ 		} __packed cm_query;
+ 		struct {
+ 			u8 dnc;
+@@ -1262,7 +1263,7 @@ struct qm_mcr_ceetm_ccgr_query {
+ 		} __packed dn_query;
+ 		struct {
+ 			u8 __reserved2[24];
+-			u16 ccg_state[16];
++			struct  __qm_mcr_querycongestion state;
+ 		} __packed congestion_state;
+ 
+ 	};
+@@ -1685,7 +1686,7 @@ int qman_poll_dqrr(unsigned int limit);
+ u32 qman_poll_slow(void);
+ 
+ /**
+- * qman_poll - legacey wrapper for qman_poll_dqrr() and qman_poll_slow()
++ * qman_poll - legacy wrapper for qman_poll_dqrr() and qman_poll_slow()
+  *
+  * Dispatcher logic on a cpu can use this to trigger any maintenance of the
+  * affine portal. There are two classes of portal processing in question;
+@@ -2346,6 +2347,7 @@ typedef void (*qman_cb_ccgr)(struct qm_ceetm_ccg *ccg, void *cb_ctx,
+ struct qm_ceetm_ccg {
+ 	struct qm_ceetm_channel *parent;
+ 	struct list_head node;
++	struct list_head cb_node;
+ 	qman_cb_ccgr cb;
+ 	void *cb_ctx;
+ 	unsigned int idx;
+@@ -3063,17 +3065,17 @@ struct qm_ceetm_ccg_params {
+ 	/* Boolean fields together in a single bitfield struct */
+ 	struct {
+ 		/* Whether to count bytes or frames. 1==frames */
+-		int mode:1;
++		u8 mode:1;
+ 		/* En/disable tail-drop. 1==enable */
+-		int td_en:1;
++		u8 td_en:1;
+ 		/* Tail-drop on congestion-state or threshold. 1=threshold */
+-		int td_mode:1;
++		u8 td_mode:1;
+ 		/* Generate congestion state change notifications. 1==enable */
+-		int cscn_en:1;
++		u8 cscn_en:1;
+ 		/* Enable WRED rejections (per colour). 1==enable */
+-		int wr_en_g:1;
+-		int wr_en_y:1;
+-		int wr_en_r:1;
++		u8 wr_en_g:1;
++		u8 wr_en_y:1;
++		u8 wr_en_r:1;
+ 	} __packed;
+ 	/* Tail-drop threshold. See qm_cgr_thres_[gs]et64(). */
+ 	struct qm_cgr_cs_thres td_thres;
+-- 
+1.9.1
+

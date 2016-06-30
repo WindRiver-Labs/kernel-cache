@@ -1,0 +1,168 @@
+From 9ae4e15cab745ee307e5d9d3217829867ffa24c1 Mon Sep 17 00:00:00 2001
+From: Kan Liang <kan.liang@intel.com>
+Date: Sun, 10 May 2015 15:13:14 -0400
+Subject: [PATCH 32/75] perf/x86/intel: Introduce PERF_RECORD_LOST_SAMPLES
+
+commit f38b0dbb491a6987e198aa6b428db8692a6480f8 upstream.
+
+After enlarging the PEBS interrupt threshold, there may be some mixed up
+PEBS samples which are discarded by the kernel.
+
+This patch makes the kernel emit a PERF_RECORD_LOST_SAMPLES record with
+the number of possible discarded records when it is impossible to demux
+the samples.
+
+It makes sure the user is not left in the dark about such discards.
+
+Signed-off-by: Kan Liang <kan.liang@intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: acme@infradead.org
+Cc: eranian@google.com
+Link: http://lkml.kernel.org/r/1431285195-14269-8-git-send-email-kan.liang@intel.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ arch/x86/kernel/cpu/perf_event_intel_ds.c | 20 ++++++++++++++++---
+ include/linux/perf_event.h                |  3 +++
+ include/uapi/linux/perf_event.h           | 12 +++++++++++
+ kernel/events/core.c                      | 33 +++++++++++++++++++++++++++++++
+ 4 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_ds.c b/arch/x86/kernel/cpu/perf_event_intel_ds.c
+index 266079a..34d0c48 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_ds.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_ds.c
+@@ -1126,6 +1126,7 @@ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs)
+ 	void *base, *at, *top;
+ 	int bit;
+ 	short counts[MAX_PEBS_EVENTS] = {};
++	short error[MAX_PEBS_EVENTS] = {};
+ 
+ 	if (!x86_pmu.pebs_active)
+ 		return;
+@@ -1169,20 +1170,33 @@ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs)
+ 			/* slow path */
+ 			pebs_status = p->status & cpuc->pebs_enabled;
+ 			pebs_status &= (1ULL << MAX_PEBS_EVENTS) - 1;
+-			if (pebs_status != (1 << bit))
++			if (pebs_status != (1 << bit)) {
++				u8 i;
++
++				for_each_set_bit(i, (unsigned long *)&pebs_status,
++						 MAX_PEBS_EVENTS)
++					error[i]++;
+ 				continue;
++			}
+ 		}
+ 		counts[bit]++;
+ 	}
+ 
+ 	for (bit = 0; bit < x86_pmu.max_pebs_events; bit++) {
+-		if (counts[bit] == 0)
++		if ((counts[bit] == 0) && (error[bit] == 0))
+ 			continue;
+ 		event = cpuc->events[bit];
+ 		WARN_ON_ONCE(!event);
+ 		WARN_ON_ONCE(!event->attr.precise_ip);
+ 
+-		__intel_pmu_pebs_event(event, iregs, base, top, bit, counts[bit]);
++		/* log dropped samples number */
++		if (error[bit])
++			perf_log_lost_samples(event, error[bit]);
++
++		if (counts[bit]) {
++			__intel_pmu_pebs_event(event, iregs, base,
++					       top, bit, counts[bit]);
++		}
+ 	}
+ }
+ 
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 89d3f4e..6569964 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -743,6 +743,9 @@ perf_event__output_id_sample(struct perf_event *event,
+ 			     struct perf_output_handle *handle,
+ 			     struct perf_sample_data *sample);
+ 
++extern void
++perf_log_lost_samples(struct perf_event *event, u64 lost);
++
+ static inline bool is_sampling_event(struct perf_event *event)
+ {
+ 	return event->attr.sample_period != 0;
+diff --git a/include/uapi/linux/perf_event.h b/include/uapi/linux/perf_event.h
+index 309211b..bab1938 100644
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@ -800,6 +800,18 @@ enum perf_event_type {
+ 	 */
+ 	PERF_RECORD_ITRACE_START		= 12,
+ 
++	/*
++	 * Records the dropped/lost sample number.
++	 *
++	 * struct {
++	 *	struct perf_event_header	header;
++	 *
++	 *	u64				lost;
++	 *	struct sample_id		sample_id;
++	 * };
++	 */
++	PERF_RECORD_LOST_SAMPLES		= 13,
++
+ 	PERF_RECORD_MAX,			/* non-ABI */
+ };
+ 
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 9395178..e786b00 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -6018,6 +6018,39 @@ void perf_event_aux_event(struct perf_event *event, unsigned long head,
+ }
+ 
+ /*
++ * Lost/dropped samples logging
++ */
++void perf_log_lost_samples(struct perf_event *event, u64 lost)
++{
++	struct perf_output_handle handle;
++	struct perf_sample_data sample;
++	int ret;
++
++	struct {
++		struct perf_event_header	header;
++		u64				lost;
++	} lost_samples_event = {
++		.header = {
++			.type = PERF_RECORD_LOST_SAMPLES,
++			.misc = 0,
++			.size = sizeof(lost_samples_event),
++		},
++		.lost		= lost,
++	};
++
++	perf_event_header__init_id(&lost_samples_event.header, &sample, event);
++
++	ret = perf_output_begin(&handle, event,
++				lost_samples_event.header.size);
++	if (ret)
++		return;
++
++	perf_output_put(&handle, lost_samples_event);
++	perf_event__output_id_sample(event, &handle, &sample);
++	perf_output_end(&handle);
++}
++
++/*
+  * IRQ throttle logging
+  */
+ 
+-- 
+2.0.2
+

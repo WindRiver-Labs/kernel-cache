@@ -1,0 +1,395 @@
+From dc6b2c211dc8fc0de9297db4edfa0f84602c90e8 Mon Sep 17 00:00:00 2001
+From: Claudiu Manoil <claudiu.manoil@freescale.com>
+Date: Mon, 5 Oct 2015 17:19:59 +0300
+Subject: [PATCH 4/5] gianfar: rt: Add WAKE_UCAST and "wake-on-filer" support
+
+commit 3e905b80b92146d8dd0bf2da3ade0944a3026597 upstream
+
+This enables eTSEC's filer (Rx parser) and the FGPI Rx
+interrupt (Filer General Purpose Interrupt) as a wakeup
+source event.
+
+Upon entering suspend state, the eTSEC filer is given
+a rule to match incoming L2 unicast packets.  A packet
+matching the rule will be enqueued in the Rx ring and
+a FGPI Rx interrupt will be asserted by the filer to
+wakeup the system.  Other packet types will be dropped.
+On resume the filer table is restored to the content
+before entering suspend state.
+The set of rules from gfar_filer_config_wol() could be
+extended to implement other WoL capabilities as well.
+
+The "fsl,wake-on-filer" DT binding enables this capability
+on certain platforms that feature the necessary power
+management infrastructure, targeting mainly printing and
+imaging applications.
+(refer to Power Management section of the SoC Ref Man)
+
+Cc: Li Yang <leoli@freescale.com>
+Cc: Zhao Chenhui <chenhui.zhao@freescale.com>
+
+Signed-off-by: Claudiu Manoil <claudiu.manoil@freescale.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+[Adjust some codes to suit RT base.]
+Signed-off-by: Yanjiang Jin <yanjiang.jin@windriver.com>
+---
+ drivers/net/ethernet/freescale/gianfar.c         | 155 +++++++++++++++++++++--
+ drivers/net/ethernet/freescale/gianfar.h         |  12 +-
+ drivers/net/ethernet/freescale/gianfar_ethtool.c |  43 +++++--
+ 3 files changed, 186 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/gianfar.c b/drivers/net/ethernet/freescale/gianfar.c
+index b4a7dfb..7cec9c2 100644
+--- a/drivers/net/ethernet/freescale/gianfar.c
++++ b/drivers/net/ethernet/freescale/gianfar.c
+@@ -904,6 +904,9 @@ static int gfar_of_init(struct platform_device *ofdev, struct net_device **pdev)
+ 	if (of_find_property(np, "fsl,magic-packet", NULL))
+ 		priv->device_flags |= FSL_GIANFAR_DEV_HAS_MAGIC_PACKET;
+ 
++	if (of_get_property(np, "fsl,wake-on-filer", NULL))
++		priv->device_flags |= FSL_GIANFAR_DEV_HAS_WAKE_ON_FILER;
++
+ 	priv->phy_node = of_parse_phandle(np, "phy-handle", 0);
+ 
+ 	/* In the case of a fixed PHY, the DT node associated
+@@ -1412,8 +1415,14 @@ static int gfar_probe(struct platform_device *ofdev)
+ 		goto register_fail;
+ 	}
+ 
+-	device_set_wakeup_capable(&dev->dev, priv->device_flags &
+-				  FSL_GIANFAR_DEV_HAS_MAGIC_PACKET);
++	if (priv->device_flags & FSL_GIANFAR_DEV_HAS_MAGIC_PACKET)
++		priv->wol_supported |= GFAR_WOL_MAGIC;
++
++	if ((priv->device_flags & FSL_GIANFAR_DEV_HAS_WAKE_ON_FILER) &&
++	    priv->rx_filer_enable)
++		priv->wol_supported |= GFAR_WOL_FILER_UCAST;
++
++	device_set_wakeup_capable(&ofdev->dev, priv->wol_supported);
+ 
+ 	/* fill out IRQ number and name fields */
+ 	for (i = 0; i < priv->num_grps; i++) {
+@@ -1476,15 +1485,122 @@ static int gfar_remove(struct platform_device *ofdev)
+ 
+ #ifdef CONFIG_PM
+ 
++static void __gfar_filer_disable(struct gfar_private *priv)
++{
++	struct gfar __iomem *regs = priv->gfargrp[0].regs;
++	u32 temp;
++
++	temp = gfar_read(&regs->rctrl);
++	temp &= ~(RCTRL_FILREN | RCTRL_PRSDEP_INIT);
++	gfar_write(&regs->rctrl, temp);
++}
++
++static void __gfar_filer_enable(struct gfar_private *priv)
++{
++	struct gfar __iomem *regs = priv->gfargrp[0].regs;
++	u32 temp;
++
++	temp = gfar_read(&regs->rctrl);
++	temp |= RCTRL_FILREN | RCTRL_PRSDEP_INIT;
++	gfar_write(&regs->rctrl, temp);
++}
++
++/* Filer rules implementing wol capabilities */
++static void gfar_filer_config_wol(struct gfar_private *priv)
++{
++	unsigned int i;
++	u32 rqfcr;
++
++	__gfar_filer_disable(priv);
++
++	/* clear the filer table, reject any packet by default */
++	rqfcr = RQFCR_RJE | RQFCR_CMP_MATCH;
++	for (i = 0; i <= MAX_FILER_IDX; i++)
++		gfar_write_filer(priv, i, rqfcr, 0);
++
++	i = 0;
++	if (priv->wol_opts & GFAR_WOL_FILER_UCAST) {
++		/* unicast packet, accept it */
++		struct net_device *ndev = priv->ndev;
++		/* get the default rx queue index */
++		u8 qindex = (u8)priv->gfargrp[0].rx_queue->qindex;
++		u32 dest_mac_addr = (ndev->dev_addr[0] << 16) |
++				    (ndev->dev_addr[1] << 8) |
++				     ndev->dev_addr[2];
++
++		rqfcr = (qindex << 10) | RQFCR_AND |
++			RQFCR_CMP_EXACT | RQFCR_PID_DAH;
++
++		gfar_write_filer(priv, i++, rqfcr, dest_mac_addr);
++
++		dest_mac_addr = (ndev->dev_addr[3] << 16) |
++				(ndev->dev_addr[4] << 8) |
++				 ndev->dev_addr[5];
++		rqfcr = (qindex << 10) | RQFCR_GPI |
++			RQFCR_CMP_EXACT | RQFCR_PID_DAL;
++		gfar_write_filer(priv, i++, rqfcr, dest_mac_addr);
++	}
++
++	__gfar_filer_enable(priv);
++}
++
++static void gfar_filer_restore_table(struct gfar_private *priv)
++{
++	u32 rqfcr, rqfpr;
++	unsigned int i;
++
++	__gfar_filer_disable(priv);
++
++	for (i = 0; i <= MAX_FILER_IDX; i++) {
++		rqfcr = priv->ftp_rqfcr[i];
++		rqfpr = priv->ftp_rqfpr[i];
++		gfar_write_filer(priv, i, rqfcr, rqfpr);
++	}
++
++	__gfar_filer_enable(priv);
++}
++
++/* gfar_start() for Rx only and with the FGPI filer interrupt enabled */
++static void gfar_start_wol_filer(struct gfar_private *priv)
++{
++	struct gfar __iomem *regs = priv->gfargrp[0].regs;
++	u32 tempval;
++	int i = 0;
++
++	/* Enable Rx hw queues */
++	gfar_write(&regs->rqueue, priv->rqueue);
++
++	/* Initialize DMACTRL to have WWR and WOP */
++	tempval = gfar_read(&regs->dmactrl);
++	tempval |= DMACTRL_INIT_SETTINGS;
++	gfar_write(&regs->dmactrl, tempval);
++
++	/* Make sure we aren't stopped */
++	tempval = gfar_read(&regs->dmactrl);
++	tempval &= ~DMACTRL_GRS;
++	gfar_write(&regs->dmactrl, tempval);
++
++	for (i = 0; i < priv->num_grps; i++) {
++		regs = priv->gfargrp[i].regs;
++		/* Clear RHLT, so that the DMA starts polling now */
++		gfar_write(&regs->rstat, priv->gfargrp[i].rstat);
++		/* enable the Filer General Purpose Interrupt */
++		gfar_write(&regs->imask, IMASK_FGPI);
++	}
++
++	/* Enable Rx DMA */
++	tempval = gfar_read(&regs->maccfg1);
++	tempval |= MACCFG1_RX_EN;
++	gfar_write(&regs->maccfg1, tempval);
++}
++
+ static int gfar_suspend(struct device *dev)
+ {
+ 	struct gfar_private *priv = dev_get_drvdata(dev);
+ 	struct net_device *ndev = priv->ndev;
+ 	struct gfar __iomem *regs = priv->gfargrp[0].regs;
+ 	u32 tempval;
+-	int magic_packet = priv->wol_en &&
+-			   (priv->device_flags &
+-			    FSL_GIANFAR_DEV_HAS_MAGIC_PACKET);
++	u16 wol = priv->wol_opts;
+ 
+ 	if (!netif_running(ndev))
+ 		return 0;
+@@ -1496,7 +1612,7 @@ static int gfar_suspend(struct device *dev)
+ 
+ 	gfar_halt(priv);
+ 
+-	if (magic_packet) {
++	if (wol & GFAR_WOL_MAGIC) {
+ 		/* Enable interrupt on Magic Packet */
+ 		gfar_write(&regs->imask, IMASK_MAG);
+ 
+@@ -1510,6 +1626,10 @@ static int gfar_suspend(struct device *dev)
+ 		tempval |= MACCFG1_RX_EN;
+ 		gfar_write(&regs->maccfg1, tempval);
+ 
++	} else if (wol & GFAR_WOL_FILER_UCAST) {
++		gfar_filer_config_wol(priv);
++		gfar_start_wol_filer(priv);
++
+ 	} else {
+ 		phy_stop(priv->phydev);
+ 	}
+@@ -1523,18 +1643,22 @@ static int gfar_resume(struct device *dev)
+ 	struct net_device *ndev = priv->ndev;
+ 	struct gfar __iomem *regs = priv->gfargrp[0].regs;
+ 	u32 tempval;
+-	int magic_packet = priv->wol_en &&
+-			   (priv->device_flags &
+-			    FSL_GIANFAR_DEV_HAS_MAGIC_PACKET);
++	u16 wol = priv->wol_opts;
+ 
+ 	if (!netif_running(ndev))
+ 		return 0;
+ 
+-	if (magic_packet) {
++	if (wol & GFAR_WOL_MAGIC) {
+ 		/* Disable Magic Packet mode */
+ 		tempval = gfar_read(&regs->maccfg2);
+ 		tempval &= ~MACCFG2_MPEN;
+ 		gfar_write(&regs->maccfg2, tempval);
++
++	} else if (wol & GFAR_WOL_FILER_UCAST) {
++		/* need to stop rx only, tx is already down */
++		gfar_halt(priv);
++		gfar_filer_restore_table(priv);
++
+ 	} else {
+ 		phy_start(priv->phydev);
+ 	}
+@@ -1995,6 +2119,8 @@ static int register_grp_irqs(struct gfar_priv_grp *grp)
+ 				  gfar_irq(grp, RX)->irq);
+ 			goto rx_irq_fail;
+ 		}
++		enable_irq_wake(gfar_irq(grp, RX)->irq);
++
+ 	} else {
+ 		err = request_irq(gfar_irq(grp, TX)->irq, gfar_interrupt, 0,
+ 				  gfar_irq(grp, TX)->name, grp);
+@@ -2737,7 +2863,14 @@ irqreturn_t gfar_receive(int irq, void *grp_id)
+ {
+ 	struct gfar_priv_grp *grp = (struct gfar_priv_grp *)grp_id;
+ 	unsigned long flags;
+-	u32 imask;
++	u32 imask, ievent;
++
++	ievent = gfar_read(&grp->regs->ievent);
++
++	if (unlikely(ievent & IEVENT_FGPI)) {
++		gfar_write(&grp->regs->ievent, IEVENT_FGPI);
++		return IRQ_HANDLED;
++	}
+ 
+ 	if (likely(napi_schedule_prep(&grp->napi_rx))) {
+ 		spin_lock_irqsave(&grp->grplock, flags);
+diff --git a/drivers/net/ethernet/freescale/gianfar.h b/drivers/net/ethernet/freescale/gianfar.h
+index 8c19948..f266b20 100644
+--- a/drivers/net/ethernet/freescale/gianfar.h
++++ b/drivers/net/ethernet/freescale/gianfar.h
+@@ -340,6 +340,7 @@ extern const char gfar_driver_version[];
+ #define IEVENT_MAG		0x00000800
+ #define IEVENT_GRSC		0x00000100
+ #define IEVENT_RXF0		0x00000080
++#define IEVENT_FGPI		0x00000010
+ #define IEVENT_FIR		0x00000008
+ #define IEVENT_FIQ		0x00000004
+ #define IEVENT_DPE		0x00000002
+@@ -372,6 +373,7 @@ extern const char gfar_driver_version[];
+ #define IMASK_MAG		0x00000800
+ #define IMASK_GRSC              0x00000100
+ #define IMASK_RXFEN0		0x00000080
++#define IMASK_FGPI		0x00000010
+ #define IMASK_FIR		0x00000008
+ #define IMASK_FIQ		0x00000004
+ #define IMASK_DPE		0x00000002
+@@ -540,6 +542,9 @@ extern const char gfar_driver_version[];
+ 
+ #define GFAR_INT_NAME_MAX	(IFNAMSIZ + 6)	/* '_g#_xx' */
+ 
++#define GFAR_WOL_MAGIC		0x00000001
++#define GFAR_WOL_FILER_UCAST	0x00000002
++
+ struct txbd8
+ {
+ 	union {
+@@ -917,6 +922,7 @@ struct gfar {
+ #define FSL_GIANFAR_DEV_HAS_BD_STASHING		0x00000200
+ #define FSL_GIANFAR_DEV_HAS_BUF_STASHING	0x00000400
+ #define FSL_GIANFAR_DEV_HAS_TIMER		0x00000800
++#define FSL_GIANFAR_DEV_HAS_WAKE_ON_FILER	0x00001000
+ 
+ #if (MAXGROUPS == 2)
+ #define DEFAULT_MAPPING 	0xAA
+@@ -1161,8 +1167,6 @@ struct gfar_private {
+ 		extended_hash:1,
+ 		bd_stash_en:1,
+ 		rx_filer_enable:1,
+-		/* Wake-on-LAN enabled */
+-		wol_en:1,
+ 		/* Enable priorty based Tx scheduling in Hw */
+ 		prio_sched_en:1,
+ 		/* Flow control flags */
+@@ -1191,6 +1195,10 @@ struct gfar_private {
+ 	u32 __iomem *hash_regs[16];
+ 	int hash_width;
+ 
++	/* wake-on-lan settings */
++	u16 wol_opts;
++	u16 wol_supported;
++
+ 	/*Filer table*/
+ 	unsigned int ftp_rqfpr[MAX_FILER_IDX + 1];
+ 	unsigned int ftp_rqfcr[MAX_FILER_IDX + 1];
+diff --git a/drivers/net/ethernet/freescale/gianfar_ethtool.c b/drivers/net/ethernet/freescale/gianfar_ethtool.c
+index a33e4a8..a367c35 100644
+--- a/drivers/net/ethernet/freescale/gianfar_ethtool.c
++++ b/drivers/net/ethernet/freescale/gianfar_ethtool.c
+@@ -644,28 +644,49 @@ static void gfar_get_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
+ {
+ 	struct gfar_private *priv = netdev_priv(dev);
+ 
+-	if (priv->device_flags & FSL_GIANFAR_DEV_HAS_MAGIC_PACKET) {
+-		wol->supported = WAKE_MAGIC;
+-		wol->wolopts = priv->wol_en ? WAKE_MAGIC : 0;
+-	} else {
+-		wol->supported = wol->wolopts = 0;
+-	}
++	wol->supported = 0;
++	wol->wolopts = 0;
++
++	if (priv->wol_supported & GFAR_WOL_MAGIC)
++		wol->supported |= WAKE_MAGIC;
++
++	if (priv->wol_supported & GFAR_WOL_FILER_UCAST)
++		wol->supported |= WAKE_UCAST;
++
++	if (priv->wol_opts & GFAR_WOL_MAGIC)
++		wol->wolopts |= WAKE_MAGIC;
++
++	if (priv->wol_opts & GFAR_WOL_FILER_UCAST)
++		wol->wolopts |= WAKE_UCAST;
+ }
+ 
+ static int gfar_set_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
+ {
+ 	struct gfar_private *priv = netdev_priv(dev);
++	u16 wol_opts = 0;
++	int err;
+ 
+-	if (!(priv->device_flags & FSL_GIANFAR_DEV_HAS_MAGIC_PACKET) &&
+-	    wol->wolopts != 0)
++	if (!priv->wol_supported && wol->wolopts)
+ 		return -EINVAL;
+ 
+-	if (wol->wolopts & ~WAKE_MAGIC)
++	if (wol->wolopts & ~(WAKE_MAGIC | WAKE_UCAST))
+ 		return -EINVAL;
+ 
+-	device_set_wakeup_enable(&dev->dev, wol->wolopts & WAKE_MAGIC);
++	if (wol->wolopts & WAKE_MAGIC) {
++		wol_opts |= GFAR_WOL_MAGIC;
++	} else {
++		if (wol->wolopts & WAKE_UCAST)
++			wol_opts |= GFAR_WOL_FILER_UCAST;
++	}
++
++	wol_opts &= priv->wol_supported;
++	priv->wol_opts = 0;
++
++	err = device_set_wakeup_enable(priv->dev, wol_opts);
++	if (err)
++		return err;
+ 
+-	priv->wol_en = !!device_may_wakeup(&dev->dev);
++	priv->wol_opts = wol_opts;
+ 
+ 	return 0;
+ }
+-- 
+2.8.1
+

@@ -1,0 +1,147 @@
+From f2fd8c3df4e66b9ccf7a54ee68f0036e1dd6a572 Mon Sep 17 00:00:00 2001
+From: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Date: Tue, 9 Jun 2015 13:03:26 +0300
+Subject: [PATCH 36/75] perf/x86/intel: Fix PMI handling for Intel PT
+
+commit 1b7b938f181742f899a2f31c280f79dabef6ddb6 upstream.
+
+Intel PT is a separate PMU and it is not using any of the x86_pmu
+code paths, which means in particular that the active_events counter
+remains intact when new PT events are created.
+
+However, PT uses the generic x86_pmu PMI handler for its PMI handling needs.
+
+The problem here is that the latter checks active_events and in case of it
+being zero, exits without calling the actual x86_pmu.handle_nmi(), which
+results in unknown NMI errors and massive data loss for PT.
+
+The effect is not visible if there are other perf events in the system
+at the same time that keep active_events counter non-zero, for instance
+if the NMI watchdog is running, so one needs to disable it to reproduce
+the problem.
+
+At the same time, the active_events counter besides doing what the name
+suggests also implicitly serves as a PMC hardware and DS area reference
+counter.
+
+This patch adds a separate reference counter for the PMC hardware, leaving
+active_events for actually counting the events and makes sure it also
+counts PT and BTS events.
+
+Signed-off-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Brian Gerst <brgerst@gmail.com>
+Cc: Denys Vlasenko <dvlasenk@redhat.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: acme@infradead.org
+Cc: adrian.hunter@intel.com
+Link: http://lkml.kernel.org/r/87k2v92t0s.fsf@ashishki-desk.ger.corp.intel.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ arch/x86/kernel/cpu/perf_event.c | 27 +++++++++++++++++++++++----
+ 1 file changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/perf_event.c b/arch/x86/kernel/cpu/perf_event.c
+index 33627bc..2210590 100644
+--- a/arch/x86/kernel/cpu/perf_event.c
++++ b/arch/x86/kernel/cpu/perf_event.c
+@@ -135,6 +135,7 @@ static int x86_pmu_extra_regs(u64 config, struct perf_event *event)
+ }
+ 
+ static atomic_t active_events;
++static atomic_t pmc_refcount;
+ static DEFINE_MUTEX(pmc_reserve_mutex);
+ 
+ #ifdef CONFIG_X86_LOCAL_APIC
+@@ -271,6 +272,7 @@ msr_fail:
+ static void hw_perf_event_destroy(struct perf_event *event)
+ {
+ 	x86_release_hardware();
++	atomic_dec(&active_events);
+ }
+ 
+ void hw_perf_lbr_event_destroy(struct perf_event *event)
+@@ -324,16 +326,16 @@ int x86_reserve_hardware(void)
+ {
+ 	int err = 0;
+ 
+-	if (!atomic_inc_not_zero(&active_events)) {
++	if (!atomic_inc_not_zero(&pmc_refcount)) {
+ 		mutex_lock(&pmc_reserve_mutex);
+-		if (atomic_read(&active_events) == 0) {
++		if (atomic_read(&pmc_refcount) == 0) {
+ 			if (!reserve_pmc_hardware())
+ 				err = -EBUSY;
+ 			else
+ 				reserve_ds_buffers();
+ 		}
+ 		if (!err)
+-			atomic_inc(&active_events);
++			atomic_inc(&pmc_refcount);
+ 		mutex_unlock(&pmc_reserve_mutex);
+ 	}
+ 
+@@ -342,7 +344,7 @@ int x86_reserve_hardware(void)
+ 
+ void x86_release_hardware(void)
+ {
+-	if (atomic_dec_and_mutex_lock(&active_events, &pmc_reserve_mutex)) {
++	if (atomic_dec_and_mutex_lock(&pmc_refcount, &pmc_reserve_mutex)) {
+ 		release_pmc_hardware();
+ 		release_ds_buffers();
+ 		mutex_unlock(&pmc_reserve_mutex);
+@@ -371,12 +373,24 @@ int x86_add_exclusive(unsigned int what)
+ 
+ out:
+ 	mutex_unlock(&pmc_reserve_mutex);
++
++	/*
++	 * Assuming that all exclusive events will share the PMI handler
++	 * (which checks active_events for whether there is work to do),
++	 * we can bump active_events counter right here, except for
++	 * x86_lbr_exclusive_lbr events that go through x86_pmu_event_init()
++	 * path, which already bumps active_events for them.
++	 */
++	if (!ret && what != x86_lbr_exclusive_lbr)
++		atomic_inc(&active_events);
++
+ 	return ret;
+ }
+ 
+ void x86_del_exclusive(unsigned int what)
+ {
+ 	atomic_dec(&x86_pmu.lbr_exclusive[what]);
++	atomic_dec(&active_events);
+ }
+ 
+ int x86_setup_perfctr(struct perf_event *event)
+@@ -557,6 +571,7 @@ static int __x86_pmu_event_init(struct perf_event *event)
+ 	if (err)
+ 		return err;
+ 
++	atomic_inc(&active_events);
+ 	event->destroy = hw_perf_event_destroy;
+ 
+ 	event->hw.idx = -1;
+@@ -1429,6 +1444,10 @@ perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
+ 	u64 finish_clock;
+ 	int ret;
+ 
++	/*
++	 * All PMUs/events that share this PMI handler should make sure to
++	 * increment active_events for their events.
++	 */
+ 	if (!atomic_read(&active_events))
+ 		return NMI_DONE;
+ 
+-- 
+2.0.2
+

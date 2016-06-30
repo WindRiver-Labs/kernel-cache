@@ -1,0 +1,170 @@
+From 97d3ed0b84664a072c830716c29bc7b8fd840761 Mon Sep 17 00:00:00 2001
+From: "Lu.Jiang" <lu.jiang@windriver.com>
+Date: Wed, 3 Sep 2014 16:34:32 +0800
+Subject: [PATCH 1237/1336] crypto: caam - use NAPI instead of tasklet
+
+[Original patch taken from QorIQ-SDK-V1.6-SOURCE-20140619-yocto.iso]
+
+This patch updates the current tasklet implementation to NAPI so as
+the system is more balanced in the terms that the packet submission
+and the packet forwarding after being processed can be done at
+the same priority
+
+Signed-off-by: Naveen Burmi <naveenburmi@freescale.com>
+
+rebased and tuned NAPI_WEIGHT.
+
+Signed-off-by: Kim Phillips <kim.phillips@freescale.com>
+(cherry picked from commit c74e14d7ff270f8d85c7988e9286f64b721f34ee)
+Change-Id: I3a31db49a1a6060b3ad5cd0fc4ee4044858438bc
+Reviewed-on: http://git.am.freescale.net:8181/520
+Reviewed-by: Fleming Andrew-AFLEMING <AFLEMING@freescale.com>
+Tested-by: Fleming Andrew-AFLEMING <AFLEMING@freescale.com>
+Signed-off-by: Lu.Jiang <lu.jiang@windriver.com>
+---
+ drivers/crypto/caam/Kconfig  |  2 +-
+ drivers/crypto/caam/intern.h |  5 ++++-
+ drivers/crypto/caam/jr.c     | 52 ++++++++++++++++++++++++++++++++++++--------
+ 3 files changed, 48 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/crypto/caam/Kconfig b/drivers/crypto/caam/Kconfig
+index e7555ff..279983b 100644
+--- a/drivers/crypto/caam/Kconfig
++++ b/drivers/crypto/caam/Kconfig
+@@ -75,7 +75,7 @@ config CRYPTO_DEV_FSL_CAAM_INTC_TIME_THLD
+ 
+ config CRYPTO_DEV_FSL_CAAM_CRYPTO_API
+ 	tristate "Register algorithm implementations with the Crypto API"
+-	depends on CRYPTO_DEV_FSL_CAAM && CRYPTO_DEV_FSL_CAAM_JR
++	depends on CRYPTO_DEV_FSL_CAAM && CRYPTO_DEV_FSL_CAAM_JR && NET
+ 	default y
+ 	select CRYPTO_ALGAPI
+ 	select CRYPTO_AUTHENC
+diff --git a/drivers/crypto/caam/intern.h b/drivers/crypto/caam/intern.h
+index 89b94cc..4c960ad 100644
+--- a/drivers/crypto/caam/intern.h
++++ b/drivers/crypto/caam/intern.h
+@@ -23,6 +23,8 @@
+ #define JOBR_INTC_COUNT_THLD 0
+ #endif
+ 
++#define CAAM_NAPI_WEIGHT	63
++
+ /*
+  * Storage for tracking each in-process entry moving across a ring
+  * Each entry on an output ring needs one of these
+@@ -41,7 +43,8 @@ struct caam_drv_private_jr {
+ 	struct device		*dev;
+ 	int ridx;
+ 	struct caam_job_ring __iomem *rregs;	/* JobR's register space */
+-	struct tasklet_struct irqtask;
++	struct napi_struct __percpu *irqtask;
++	struct net_device __percpu *net_dev;
+ 	int irq;			/* One per queue */
+ 
+ 	/* Number of scatterlist crypt transforms active on the JobR */
+diff --git a/drivers/crypto/caam/jr.c b/drivers/crypto/caam/jr.c
+index b8b5d47..9a3eb43 100644
+--- a/drivers/crypto/caam/jr.c
++++ b/drivers/crypto/caam/jr.c
+@@ -69,11 +69,17 @@ int caam_jr_shutdown(struct device *dev)
+ {
+ 	struct caam_drv_private_jr *jrp = dev_get_drvdata(dev);
+ 	dma_addr_t inpbusaddr, outbusaddr;
+-	int ret;
++	int i, ret;
+ 
+ 	ret = caam_reset_hw_jr(dev);
+ 
+-	tasklet_kill(&jrp->irqtask);
++	for_each_possible_cpu(i) {
++		napi_disable(per_cpu_ptr(jrp->irqtask, i));
++		netif_napi_del(per_cpu_ptr(jrp->irqtask, i));
++	}
++
++	free_percpu(jrp->irqtask);
++	free_percpu(jrp->net_dev);
+ 
+ 	/* Release interrupt */
+ 	free_irq(jrp->irq, dev);
+@@ -153,23 +159,24 @@ static irqreturn_t caam_jr_interrupt(int irq, void *st_dev)
+ 	wr_reg32(&jrp->rregs->jrintstatus, irqstate);
+ 
+ 	preempt_disable();
+-	tasklet_schedule(&jrp->irqtask);
++	napi_schedule(per_cpu_ptr(jrp->irqtask, smp_processor_id()));
+ 	preempt_enable();
+ 
+ 	return IRQ_HANDLED;
+ }
+ 
+ /* Deferred service handler, run as interrupt-fired tasklet */
+-static void caam_jr_dequeue(unsigned long devarg)
++static int caam_jr_dequeue(struct napi_struct *napi, int budget)
+ {
+ 	int hw_idx, sw_idx, i, head, tail;
+-	struct device *dev = (struct device *)devarg;
++	struct device *dev = &napi->dev->dev;
+ 	struct caam_drv_private_jr *jrp = dev_get_drvdata(dev);
+ 	void (*usercall)(struct device *dev, u32 *desc, u32 status, void *arg);
+ 	u32 *userdesc, userstatus;
+ 	void *userarg;
++	int cleaned = 0;
+ 
+-	while (rd_reg32(&jrp->rregs->outring_used)) {
++	while (rd_reg32(&jrp->rregs->outring_used) && cleaned < budget) {
+ 
+ 		head = ACCESS_ONCE(jrp->head);
+ 
+@@ -226,10 +233,16 @@ static void caam_jr_dequeue(unsigned long devarg)
+ 
+ 		/* Finally, execute user's callback */
+ 		usercall(dev, userdesc, userstatus, userarg);
++		cleaned++;
+ 	}
+ 
+-	/* reenable / unmask IRQs */
+-	clrbits32(&jrp->rregs->rconfig_lo, JRCFG_IMSK);
++	if (cleaned < budget) {
++		napi_complete(per_cpu_ptr(jrp->irqtask, smp_processor_id()));
++		/* reenable / unmask IRQs */
++		clrbits32(&jrp->rregs->rconfig_lo, JRCFG_IMSK);
++	}
++
++	return cleaned;
+ }
+ 
+ /**
+@@ -376,7 +389,28 @@ static int caam_jr_init(struct device *dev)
+ 
+ 	jrp = dev_get_drvdata(dev);
+ 
+-	tasklet_init(&jrp->irqtask, caam_jr_dequeue, (unsigned long)dev);
++	/* Connect job ring interrupt handler. */
++	jrp->irqtask = alloc_percpu(struct napi_struct);
++	if (!jrp->irqtask) {
++		dev_err(dev, "can't allocate percpu irqtask memory\n");
++		return -ENOMEM;
++	}
++
++	jrp->net_dev = alloc_percpu(struct net_device);
++	if (!jrp->net_dev) {
++		dev_err(dev, "can't allocate percpu net_dev memory\n");
++		free_percpu(jrp->irqtask);
++		return -ENOMEM;
++	}
++
++	for_each_possible_cpu(i) {
++		(per_cpu_ptr(jrp->net_dev, i))->dev = *dev;
++		INIT_LIST_HEAD(&per_cpu_ptr(jrp->net_dev, i)->napi_list);
++		netif_napi_add(per_cpu_ptr(jrp->net_dev, i),
++				per_cpu_ptr(jrp->irqtask, i),
++				caam_jr_dequeue, CAAM_NAPI_WEIGHT);
++		napi_enable(per_cpu_ptr(jrp->irqtask, i));
++	}
+ 
+ 	/* Connect job ring interrupt handler. */
+ 	error = request_irq(jrp->irq, caam_jr_interrupt, IRQF_SHARED,
+-- 
+2.0.2
+

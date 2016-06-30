@@ -1,0 +1,325 @@
+From 8b3b8fcf7743aa5333983e25b8684b5bf7080a36 Mon Sep 17 00:00:00 2001
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Tue, 30 Jun 2015 12:40:55 +0100
+Subject: [PATCH 0847/1077] drm/i915: Reserve space improvements
+
+commit 79bbcc299fca92ba3558c4966e6ad52ee1052d89 upstream.
+
+An earlier patch was added to reserve space in the ring buffer for the
+commands issued during 'add_request()'. The initial version was
+pessimistic in the way it handled buffer wrapping and would cause
+premature wraps and thus waste ring space.
+
+This patch updates the code to better handle the wrap case. It no
+longer enforces that the space being asked for and the reserved space
+are a single contiguous block. Instead, it allows the reserve to be on
+the far end of a wrap operation. It still guarantees that the space is
+available so when the wrap occurs, no wait will happen. Thus the wrap
+cannot fail which is the whole point of the exercise.
+
+Also fixed a merge failure with some comments from the original patch.
+
+v2: Incorporated suggestion by David Gordon to move the wrap code
+inside the prepare function and thus allow a single combined
+wait_for_space() call rather than doing one before the wrap and
+another after. This also makes the prepare code much simpler and
+easier to follow.
+
+v3: Fix for 'effective_size' vs 'size' during ring buffer remainder
+calculations (spotted by Tomas Elf).
+
+For: VIZ-5115
+CC: Daniel Vetter <daniel@ffwll.ch>
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Tomas Elf <tomas.elf@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Pengyu Ma <pengyu.ma@windriver.com>
+---
+ drivers/gpu/drm/i915/intel_lrc.c        | 73 +++++++++++++-------------
+ drivers/gpu/drm/i915/intel_ringbuffer.c | 90 +++++++++++++++++++--------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |  4 +-
+ 3 files changed, 90 insertions(+), 77 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index a3ab240..f818872 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -661,12 +661,12 @@ static int logical_ring_wait_for_space(struct drm_i915_gem_request *req,
+ 	unsigned space;
+ 	int ret;
+ 
+-	/* The whole point of reserving space is to not wait! */
+-	WARN_ON(ringbuf->reserved_in_use);
+-
+ 	if (intel_ring_space(ringbuf) >= bytes)
+ 		return 0;
+ 
++	/* The whole point of reserving space is to not wait! */
++	WARN_ON(ringbuf->reserved_in_use);
++
+ 	list_for_each_entry(target, &ring->request_list, list) {
+ 		/*
+ 		 * The request queue is per-engine, so can contain requests
+@@ -716,22 +716,11 @@ intel_logical_ring_advance_and_submit(struct drm_i915_gem_request *request)
+ 	execlists_context_queue(request);
+ }
+ 
+-static int logical_ring_wrap_buffer(struct drm_i915_gem_request *req)
++static void __wrap_ring_buffer(struct intel_ringbuffer *ringbuf)
+ {
+-	struct intel_ringbuffer *ringbuf = req->ringbuf;
+ 	uint32_t __iomem *virt;
+ 	int rem = ringbuf->size - ringbuf->tail;
+ 
+-	/* Can't wrap if space has already been reserved! */
+-	WARN_ON(ringbuf->reserved_in_use);
+-
+-	if (ringbuf->space < rem) {
+-		int ret = logical_ring_wait_for_space(req, rem);
+-
+-		if (ret)
+-			return ret;
+-	}
+-
+ 	virt = ringbuf->virtual_start + ringbuf->tail;
+ 	rem /= 4;
+ 	while (rem--)
+@@ -739,40 +728,50 @@ static int logical_ring_wrap_buffer(struct drm_i915_gem_request *req)
+ 
+ 	ringbuf->tail = 0;
+ 	intel_ring_update_space(ringbuf);
+-
+-	return 0;
+ }
+ 
+ static int logical_ring_prepare(struct drm_i915_gem_request *req, int bytes)
+ {
+ 	struct intel_ringbuffer *ringbuf = req->ringbuf;
+-	int ret;
+-
+-	/*
+-	 * Add on the reserved size to the request to make sure that after
+-	 * the intended commands have been emitted, there is guaranteed to
+-	 * still be enough free space to send them to the hardware.
+-	 */
+-	if (!ringbuf->reserved_in_use)
+-		bytes += ringbuf->reserved_size;
+-
+-	if (unlikely(ringbuf->tail + bytes > ringbuf->effective_size)) {
+-		ret = logical_ring_wrap_buffer(req);
+-		if (unlikely(ret))
+-			return ret;
++	int remain_usable = ringbuf->effective_size - ringbuf->tail;
++	int remain_actual = ringbuf->size - ringbuf->tail;
++	int ret, total_bytes, wait_bytes = 0;
++	bool need_wrap = false;
+ 
+-		if(ringbuf->reserved_size) {
+-			uint32_t size = ringbuf->reserved_size;
++	if (ringbuf->reserved_in_use)
++		total_bytes = bytes;
++	else
++		total_bytes = bytes + ringbuf->reserved_size;
+ 
+-			intel_ring_reserved_space_cancel(ringbuf);
+-			intel_ring_reserved_space_reserve(ringbuf, size);
++	if (unlikely(bytes > remain_usable)) {
++		/*
++		 * Not enough space for the basic request. So need to flush
++		 * out the remainder and then wait for base + reserved.
++		 */
++		wait_bytes = remain_actual + total_bytes;
++		need_wrap = true;
++	} else {
++		if (unlikely(total_bytes > remain_usable)) {
++			/*
++			 * The base request will fit but the reserved space
++			 * falls off the end. So only need to to wait for the
++			 * reserved size after flushing out the remainder.
++			 */
++			wait_bytes = remain_actual + ringbuf->reserved_size;
++			need_wrap = true;
++		} else if (total_bytes > ringbuf->space) {
++			/* No wrapping required, just waiting. */
++			wait_bytes = total_bytes;
+ 		}
+ 	}
+ 
+-	if (unlikely(ringbuf->space < bytes)) {
+-		ret = logical_ring_wait_for_space(req, bytes);
++	if (wait_bytes) {
++		ret = logical_ring_wait_for_space(req, wait_bytes);
+ 		if (unlikely(ret))
+ 			return ret;
++
++		if (need_wrap)
++			__wrap_ring_buffer(ringbuf);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index f85c9a9..b2e3d55 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2128,12 +2128,12 @@ static int ring_wait_for_space(struct intel_engine_cs *ring, int n)
+ 	unsigned space;
+ 	int ret;
+ 
+-	/* The whole point of reserving space is to not wait! */
+-	WARN_ON(ringbuf->reserved_in_use);
+-
+ 	if (intel_ring_space(ringbuf) >= n)
+ 		return 0;
+ 
++	/* The whole point of reserving space is to not wait! */
++	WARN_ON(ringbuf->reserved_in_use);
++
+ 	list_for_each_entry(request, &ring->request_list, list) {
+ 		space = __intel_ring_space(request->postfix, ringbuf->tail,
+ 					   ringbuf->size);
+@@ -2152,21 +2152,11 @@ static int ring_wait_for_space(struct intel_engine_cs *ring, int n)
+ 	return 0;
+ }
+ 
+-static int intel_wrap_ring_buffer(struct intel_engine_cs *ring)
++static void __wrap_ring_buffer(struct intel_ringbuffer *ringbuf)
+ {
+ 	uint32_t __iomem *virt;
+-	struct intel_ringbuffer *ringbuf = ring->buffer;
+ 	int rem = ringbuf->size - ringbuf->tail;
+ 
+-	/* Can't wrap if space has already been reserved! */
+-	WARN_ON(ringbuf->reserved_in_use);
+-
+-	if (ringbuf->space < rem) {
+-		int ret = ring_wait_for_space(ring, rem);
+-		if (ret)
+-			return ret;
+-	}
+-
+ 	virt = ringbuf->virtual_start + ringbuf->tail;
+ 	rem /= 4;
+ 	while (rem--)
+@@ -2174,8 +2164,6 @@ static int intel_wrap_ring_buffer(struct intel_engine_cs *ring)
+ 
+ 	ringbuf->tail = 0;
+ 	intel_ring_update_space(ringbuf);
+-
+-	return 0;
+ }
+ 
+ int intel_ring_idle(struct intel_engine_cs *ring)
+@@ -2245,9 +2233,21 @@ void intel_ring_reserved_space_use(struct intel_ringbuffer *ringbuf)
+ void intel_ring_reserved_space_end(struct intel_ringbuffer *ringbuf)
+ {
+ 	WARN_ON(!ringbuf->reserved_in_use);
+-	WARN(ringbuf->tail > ringbuf->reserved_tail + ringbuf->reserved_size,
+-	     "request reserved size too small: %d vs %d!\n",
+-	     ringbuf->tail - ringbuf->reserved_tail, ringbuf->reserved_size);
++	if (ringbuf->tail > ringbuf->reserved_tail) {
++		WARN(ringbuf->tail > ringbuf->reserved_tail + ringbuf->reserved_size,
++		     "request reserved size too small: %d vs %d!\n",
++		     ringbuf->tail - ringbuf->reserved_tail, ringbuf->reserved_size);
++	} else {
++		/*
++		 * The ring was wrapped while the reserved space was in use.
++		 * That means that some unknown amount of the ring tail was
++		 * no-op filled and skipped. Thus simply adding the ring size
++		 * to the tail and doing the above space check will not work.
++		 * Rather than attempt to track how much tail was skipped,
++		 * it is much simpler to say that also skipping the sanity
++		 * check every once in a while is not a big issue.
++		 */
++	}
+ 
+ 	ringbuf->reserved_size   = 0;
+ 	ringbuf->reserved_in_use = false;
+@@ -2256,33 +2256,45 @@ void intel_ring_reserved_space_end(struct intel_ringbuffer *ringbuf)
+ static int __intel_ring_prepare(struct intel_engine_cs *ring, int bytes)
+ {
+ 	struct intel_ringbuffer *ringbuf = ring->buffer;
+-	int ret;
+-
+-	/*
+-	 * Add on the reserved size to the request to make sure that after
+-	 * the intended commands have been emitted, there is guaranteed to
+-	 * still be enough free space to send them to the hardware.
+-	 */
+-	if (!ringbuf->reserved_in_use)
+-		bytes += ringbuf->reserved_size;
+-
+-	if (unlikely(ringbuf->tail + bytes > ringbuf->effective_size)) {
+-		ret = intel_wrap_ring_buffer(ring);
+-		if (unlikely(ret))
+-			return ret;
++	int remain_usable = ringbuf->effective_size - ringbuf->tail;
++	int remain_actual = ringbuf->size - ringbuf->tail;
++	int ret, total_bytes, wait_bytes = 0;
++	bool need_wrap = false;
+ 
+-		if(ringbuf->reserved_size) {
+-			uint32_t size = ringbuf->reserved_size;
++	if (ringbuf->reserved_in_use)
++		total_bytes = bytes;
++	else
++		total_bytes = bytes + ringbuf->reserved_size;
+ 
+-			intel_ring_reserved_space_cancel(ringbuf);
+-			intel_ring_reserved_space_reserve(ringbuf, size);
++	if (unlikely(bytes > remain_usable)) {
++		/*
++		 * Not enough space for the basic request. So need to flush
++		 * out the remainder and then wait for base + reserved.
++		 */
++		wait_bytes = remain_actual + total_bytes;
++		need_wrap = true;
++	} else {
++		if (unlikely(total_bytes > remain_usable)) {
++			/*
++			 * The base request will fit but the reserved space
++			 * falls off the end. So only need to to wait for the
++			 * reserved size after flushing out the remainder.
++			 */
++			wait_bytes = remain_actual + ringbuf->reserved_size;
++			need_wrap = true;
++		} else if (total_bytes > ringbuf->space) {
++			/* No wrapping required, just waiting. */
++			wait_bytes = total_bytes;
+ 		}
+ 	}
+ 
+-	if (unlikely(ringbuf->space < bytes)) {
+-		ret = ring_wait_for_space(ring, bytes);
++	if (wait_bytes) {
++		ret = ring_wait_for_space(ring, wait_bytes);
+ 		if (unlikely(ret))
+ 			return ret;
++
++		if (need_wrap)
++			__wrap_ring_buffer(ringbuf);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 541b50c..44784e6 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -480,7 +480,6 @@ static inline u32 intel_ring_get_tail(struct intel_ringbuffer *ringbuf)
+  * will always have sufficient room to do its stuff. The request creation
+  * code calls this automatically.
+  */
+-int intel_ring_reserve_space(struct drm_i915_gem_request *request);
+ void intel_ring_reserved_space_reserve(struct intel_ringbuffer *ringbuf, int size);
+ /* Cancel the reservation, e.g. because the request is being discarded. */
+ void intel_ring_reserved_space_cancel(struct intel_ringbuffer *ringbuf);
+@@ -489,4 +488,7 @@ void intel_ring_reserved_space_use(struct intel_ringbuffer *ringbuf);
+ /* Finish with the reserved space - for use by i915_add_request() only. */
+ void intel_ring_reserved_space_end(struct intel_ringbuffer *ringbuf);
+ 
++/* Legacy ringbuffer specific portion of reservation code: */
++int intel_ring_reserve_space(struct drm_i915_gem_request *request);
++
+ #endif /* _INTEL_RINGBUFFER_H_ */
+-- 
+2.0.2
+

@@ -1,0 +1,562 @@
+From edd5ad4026d18fd3265bb57f442fc12dd0357338 Mon Sep 17 00:00:00 2001
+From: "Lu.Jiang" <lu.jiang@windriver.com>
+Date: Tue, 9 Sep 2014 18:12:13 +0800
+Subject: [PATCH 345/987] Modify USDPAA DMA mapping code to allow non power of
+ 4 mappings
+
+[Original patch taken from QorIQ-SDK-V1.6-SOURCE-20140619-yocto.iso]
+
+This patch modifies the USDPAA code to allow non power of 4 DMA
+maps.  The code will use multiple TLB1 entries if needed.  DMA
+maps are still phyically and virually contiguous.
+
+Signed-off-by: Roy Pledge <Roy.Pledge@freescale.com>
+Change-Id: I42942067059a3c06f0b0d031d266d228295c7c45
+Reviewed-on: http://git.am.freescale.net:8181/3857
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Reviewed-by: Wang Haiying-R54964 <Haiying.Wang@freescale.com>
+Reviewed-by: Rivera Jose-B46482 <Jose.G.Rivera@freescale.com>
+Signed-off-by: Lu.Jiang <lu.jiang@windriver.com>
+---
+ drivers/staging/fsl_qbman/fsl_usdpaa.c | 333 +++++++++++++++++++++++----------
+ 1 file changed, 235 insertions(+), 98 deletions(-)
+
+diff --git a/drivers/staging/fsl_qbman/fsl_usdpaa.c b/drivers/staging/fsl_qbman/fsl_usdpaa.c
+index 26b63e6..b12f990 100644
+--- a/drivers/staging/fsl_qbman/fsl_usdpaa.c
++++ b/drivers/staging/fsl_qbman/fsl_usdpaa.c
+@@ -50,6 +50,7 @@ struct mem_fragment {
+ 	unsigned long pfn_base; /* PFN version of 'base' */
+ 	unsigned long pfn_len; /* PFN version of 'len' */
+ 	unsigned int refs; /* zero if unmapped */
++	u64 root_len; /* Size of the orignal fragment */
+ 	struct list_head list;
+ 	/* if mapped, flags+name captured at creation time */
+ 	u32 flags;
+@@ -64,7 +65,9 @@ struct mem_fragment {
+  * ioctl(USDPAA_IOCTL_DMA_MAP), though the actual mapping then happens via a
+  * mmap(). */
+ struct mem_mapping {
+-	struct mem_fragment *frag;
++	struct mem_fragment *root_frag;
++	u32 frag_count;
++	u64 total_size;
+ 	struct list_head list;
+ };
+ 
+@@ -169,12 +172,28 @@ static const struct alloc_backend {
+ 	}
+ };
+ 
++/* Determines the largest acceptable page size for a given size
++   The sizes are determined by what the TLB1 acceptable page sizes are */
++static u32 largest_page_size(u32 size)
++{
++	int shift = 30; /* Start at 1G size */
++	if (size < 4096)
++		return 0;
++	do {
++		if (size >= (1<<shift))
++			return 1<<shift;
++		shift -= 2;
++	} while (shift >= 12); /* Up to 4k */
++	return 0;
++}
++
+ /* Helper for ioctl_dma_map() when we have a larger fragment than we need. This
+  * splits the fragment into 4 and returns the upper-most. (The caller can loop
+  * until it has a suitable fragment size.) */
+ static struct mem_fragment *split_frag(struct mem_fragment *frag)
+ {
+ 	struct mem_fragment *x[3];
++
+ 	x[0] = kmalloc(sizeof(struct mem_fragment), GFP_KERNEL);
+ 	x[1] = kmalloc(sizeof(struct mem_fragment), GFP_KERNEL);
+ 	x[2] = kmalloc(sizeof(struct mem_fragment), GFP_KERNEL);
+@@ -196,6 +215,7 @@ static struct mem_fragment *split_frag(struct mem_fragment *frag)
+ 	x[2]->pfn_base = x[1]->pfn_base + frag->pfn_len;
+ 	x[0]->pfn_len = x[1]->pfn_len = x[2]->pfn_len = frag->pfn_len;
+ 	x[0]->refs = x[1]->refs = x[2]->refs = 0;
++	x[0]->root_len = x[1]->root_len = x[2]->root_len = frag->root_len;
+ 	list_add(&x[0]->list, &frag->list);
+ 	list_add(&x[1]->list, &x[0]->list);
+ 	list_add(&x[2]->list, &x[1]->list);
+@@ -211,12 +231,16 @@ static struct mem_fragment *merge_frag(struct mem_fragment *frag)
+ 	uint64_t newlen = frag->len << 2;
+ 	uint64_t newbase = frag->base & ~(newlen - 1);
+ 	struct mem_fragment *tmp, *leftmost = frag, *rightmost = frag;
++
++	/* If this fragment is already at root size don't allow merge */
++	if (frag->len == frag->root_len)
++		return NULL;
+ 	/* Scan left until we find the start */
+ 	tmp = list_entry(frag->list.prev, struct mem_fragment, list);
+ 	while ((&tmp->list != &mem_list) && (tmp->base >= newbase)) {
+ 		if (tmp->refs)
+ 			return NULL;
+-		if (tmp->len != tmp->len)
++		if (tmp->len != frag->len)
+ 			return NULL;
+ 		leftmost = tmp;
+ 		tmp = list_entry(tmp->list.prev, struct mem_fragment, list);
+@@ -226,7 +250,7 @@ static struct mem_fragment *merge_frag(struct mem_fragment *frag)
+ 	while ((&tmp->list != &mem_list) && (tmp->base < (newbase + newlen))) {
+ 		if (tmp->refs)
+ 			return NULL;
+-		if (tmp->len != tmp->len)
++		if (tmp->len != frag->len)
+ 			return NULL;
+ 		rightmost = tmp;
+ 		tmp = list_entry(tmp->list.next, struct mem_fragment, list);
+@@ -251,15 +275,6 @@ static struct mem_fragment *merge_frag(struct mem_fragment *frag)
+ 	return frag;
+ }
+ 
+-/* Helper to verify that 'sz' is (4096 * 4^x) for some x. */
+-static int is_good_size(u64 sz)
+-{
+-	int log = ilog2(phys_size);
+-	if ((phys_size & (phys_size - 1)) || (log < 12) || (log & 1))
+-		return 0;
+-	return 1;
+-}
+-
+ /* Hook from arch/powerpc/mm/mem.c */
+ int usdpaa_test_fault(unsigned long pfn, u64 *phys_addr, u64 *size)
+ {
+@@ -458,6 +473,18 @@ static bool check_portal_channel(void *ctx, u32 channel)
+ 	return false;
+ }
+ 
++__maybe_unused static void dump_frags(void)
++{
++	struct mem_fragment *frag;
++	int i = 0;
++	list_for_each_entry(frag, &mem_list, list) {
++		pr_info("FRAG %d: base 0x%llx len 0x%llx root_len 0x%llx\n",
++			i, frag->base, frag->len, frag->root_len);
++		++i;
++	}
++}
++
++
+ static int usdpaa_release(struct inode *inode, struct file *filp)
+ {
+ 	struct ctx *ctx = filp->private_data;
+@@ -557,15 +584,23 @@ static int usdpaa_release(struct inode *inode, struct file *filp)
+ 	/* Release any DMA regions */
+ 	spin_lock(&mem_lock);
+ 	list_for_each_entry_safe(map, tmpmap, &ctx->maps, list) {
+-		if (map->frag->has_locking && (map->frag->owner == map)) {
+-			map->frag->owner = NULL;
+-			wake_up(&map->frag->wq);
++		struct mem_fragment *current_frag = map->root_frag;
++		int i;
++		if (map->root_frag->has_locking &&
++		    (map->root_frag->owner == map)) {
++			map->root_frag->owner = NULL;
++			wake_up(&map->root_frag->wq);
+ 		}
+-		if (!--map->frag->refs) {
+-			struct mem_fragment *frag = map->frag;
+-			do {
+-				frag = merge_frag(frag);
+-			} while (frag);
++		/* Check each fragment and merge if the ref count is 0 */
++		for (i = 0; i < map->frag_count; i++) {
++			if (!--current_frag->refs) {
++				struct mem_fragment *frag = current_frag;
++				do {
++					frag = merge_frag(frag);
++				} while (frag);
++			}
++			current_frag = list_entry(current_frag->list.next,
++						  struct mem_fragment, list);
+ 		}
+ 		list_del(&map->list);
+ 		kfree(map);
+@@ -602,12 +637,19 @@ static int check_mmap_dma(struct ctx *ctx, struct vm_area_struct *vma,
+ 	struct mem_mapping *map;
+ 
+ 	list_for_each_entry(map, &ctx->maps, list) {
+-		if (map->frag->pfn_base == vma->vm_pgoff) {
+-			*match = 1;
+-			if (map->frag->len != (vma->vm_end - vma->vm_start))
+-				return -EINVAL;
+-			*pfn = map->frag->pfn_base;
+-			return 0;
++		int i;
++		struct mem_fragment *frag = map->root_frag;
++
++		for (i = 0; i < map->frag_count; i++) {
++			if (frag->pfn_base == vma->vm_pgoff) {
++				*match = 1;
++				if (frag->len != (vma->vm_end - vma->vm_start))
++					return -EINVAL;
++				*pfn = frag->pfn_base;
++				return 0;
++			}
++			frag = list_entry(frag->list.next, struct mem_fragment,
++					  list);
+ 		}
+ 	}
+ 	*match = 0;
+@@ -688,7 +730,7 @@ static unsigned long usdpaa_get_unmapped_area(struct file *file,
+ {
+ 	struct vm_area_struct *vma;
+ 
+-	if (!is_good_size(len))
++	if (len % PAGE_SIZE)
+ 		return -EINVAL;
+ 
+ 	addr = USDPAA_MEM_ROUNDUP(addr, len);
+@@ -832,15 +874,20 @@ static long ioctl_id_reserve(struct ctx *ctx, void __user *arg)
+ static long ioctl_dma_map(struct file *fp, struct ctx *ctx,
+ 			  struct usdpaa_ioctl_dma_map *i)
+ {
+-	struct mem_fragment *frag;
++	struct mem_fragment *frag, *start_frag, *next_frag;
+ 	struct mem_mapping *map, *tmp;
+-	u64 search_size;
+-	int ret = 0;
+-	if (i->len && !is_good_size(i->len))
++	int ret = 0, k;
++	u32 largest_page, so_far = 0;
++	int frag_count = 0;
++	unsigned long next_addr = PAGE_SIZE;
++
++	if (i->len && i->len % PAGE_SIZE)
+ 		return -EINVAL;
++
+ 	map = kmalloc(sizeof(*map), GFP_KERNEL);
+ 	if (!map)
+ 		return -ENOMEM;
++
+ 	spin_lock(&mem_lock);
+ 	if (i->flags & USDPAA_DMA_FLAG_SHARE) {
+ 		list_for_each_entry(frag, &mem_list, list) {
+@@ -854,19 +901,23 @@ static long ioctl_dma_map(struct file *fp, struct ctx *ctx,
+ 					ret = -EBUSY;
+ 					goto out;
+ 				}
++				/* Check if this has already been mapped
++				   to this process */
+ 				list_for_each_entry(tmp, &ctx->maps, list)
+-					if (tmp->frag == frag) {
++					if (tmp->root_frag == frag) {
+ 						ret = -EBUSY;
+ 						goto out;
+ 					}
+ 				i->has_locking = frag->has_locking;
+ 				i->did_create = 0;
+ 				i->len = frag->len;
++				start_frag = frag;
+ 				goto do_map;
+ 			}
+ 		}
+ 		/* No matching entry */
+ 		if (!(i->flags & USDPAA_DMA_FLAG_CREATE)) {
++			pr_err("ioctl_dma_map() No matching entry\n");
+ 			ret = -ENOMEM;
+ 			goto out;
+ 		}
+@@ -876,52 +927,124 @@ static long ioctl_dma_map(struct file *fp, struct ctx *ctx,
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+-	/* We search for the required size and if that fails, for the next
+-	 * biggest size, etc. */
+-	for (search_size = i->len; search_size <= phys_size;
+-	     search_size <<= 2) {
++	/* Verify there is sufficent space to do the mapping */
++	down_write(&current->mm->mmap_sem);
++	next_addr = usdpaa_get_unmapped_area(fp, next_addr, i->len, 0, 0);
++	up_write(&current->mm->mmap_sem);
++
++	if (next_addr & ~PAGE_MASK) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	/* Find one of more contiguous fragments that satisfy the total length
++	   trying to minimize the number of fragments
++	   compute the largest page size that the allocation could use */
++	largest_page = largest_page_size(i->len);
++	start_frag = NULL;
++	while (largest_page &&
++	       largest_page <= largest_page_size(phys_size) &&
++	       start_frag == NULL) {
++		/* Search the list for a frag of that size */
+ 		list_for_each_entry(frag, &mem_list, list) {
+-			if (!frag->refs && (frag->len == search_size)) {
+-				while (frag->len > i->len) {
+-					frag = split_frag(frag);
+-					if (!frag) {
+-						ret = -ENOMEM;
+-						goto out;
+-					}
++			if (!frag->refs && (frag->len == largest_page)) {
++				/* See if the next x fragments are free
++				   and can accomidate the size */
++				u32 found_size = largest_page;
++				next_frag = list_entry(frag->list.next,
++						       struct mem_fragment,
++						       list);
++				/* If the fragement is too small check
++				   if the neighbours cab support it */
++				while (found_size < i->len) {
++					if (&mem_list == &next_frag->list)
++						break; /* End of list */
++					if (next_frag->refs != 0 ||
++					    next_frag->len == 0)
++						break; /* not enough space */
++					found_size += next_frag->len;
++				}
++				if (found_size >= i->len) {
++					/* Success! there is enough contigous
++					   free space */
++					start_frag = frag;
++					break;
+ 				}
+-				frag->flags = i->flags;
+-				strncpy(frag->name, i->name,
+-					USDPAA_DMA_NAME_MAX);
+-				frag->has_locking = i->has_locking;
+-				init_waitqueue_head(&frag->wq);
+-				frag->owner = NULL;
+-				i->did_create = 1;
+-				goto do_map;
+ 			}
+-		}
++		} /* next frag loop */
++		/* Couldn't statisfy the request with this
++		   largest page size, try a smaller one */
++		largest_page <<= 2;
++	}
++	if (start_frag == NULL) {
++		/* Couldn't find proper amount of space */
++		ret = -ENOMEM;
++		goto out;
+ 	}
+-	ret = -ENOMEM;
+-	goto out;
+-
++	i->did_create = 1;
+ do_map:
+-	map->frag = frag;
+-	frag->refs++;
++	/* We may need to divide the final fragment to accomidate the mapping */
++	next_frag = start_frag;
++	while (so_far != i->len) {
++		BUG_ON(next_frag->len == 0);
++		while ((next_frag->len + so_far) > i->len) {
++			/* Split frag until they match */
++			split_frag(next_frag);
++		}
++		so_far += next_frag->len;
++		++frag_count;
++		next_frag = list_entry(next_frag->list.next,
++				       struct mem_fragment, list);
++	}
++
++	/* we need to reserve start count fragments starting at start frag */
++	next_frag = start_frag;
++	for (k = 0; k < frag_count; k++) {
++		next_frag->refs++;
++		next_frag = list_entry(next_frag->list.next,
++				       struct mem_fragment, list);
++	}
++
++	start_frag->flags = i->flags;
++	strncpy(start_frag->name, i->name, USDPAA_DMA_NAME_MAX);
++	start_frag->has_locking = i->has_locking;
++	init_waitqueue_head(&start_frag->wq);
++	start_frag->owner = NULL;
++
++	/* Setup the map entry */
++	map->root_frag = start_frag;
++	map->total_size = i->len;
++	map->frag_count = frag_count;
+ 	list_add(&map->list, &ctx->maps);
+-	i->phys_addr = frag->base;
+-
++	i->phys_addr = start_frag->base;
+ out:
+ 	spin_unlock(&mem_lock);
+ 	if (!ret) {
+ 		unsigned long longret;
+-		down_write(&current->mm->mmap_sem);
+-		longret = do_mmap_pgoff(fp, PAGE_SIZE, map->frag->len, PROT_READ |
+-			(i->flags & USDPAA_DMA_FLAG_RDONLY ? 0 : PROT_WRITE),
+-			MAP_SHARED, map->frag->pfn_base);
+-		up_write(&current->mm->mmap_sem);
+-		if (longret & ~PAGE_MASK)
+-			ret = (int)longret;
+-		else
+-			i->ptr = (void *)longret;
++		unsigned long next_addr = PAGE_SIZE;
++		next_frag = start_frag;
++		for (k = 0; k < frag_count; k++) {
++			down_write(&current->mm->mmap_sem);
++			longret = do_mmap_pgoff(fp, next_addr, next_frag->len,
++						PROT_READ |
++						(i->flags &
++						 USDPAA_DMA_FLAG_RDONLY ? 0
++						 : PROT_WRITE),
++						MAP_SHARED,
++						next_frag->pfn_base);
++			up_write(&current->mm->mmap_sem);
++			if (longret & ~PAGE_MASK)
++				ret = (int)longret;
++			else {
++				if (k == 0)
++					i->ptr = (void *)longret;
++				else
++					BUG_ON(next_addr != longret);
++				next_addr = longret + next_frag->len;
++			}
++			next_frag = list_entry(next_frag->list.next,
++					       struct mem_fragment, list);
++		}
+ 	} else
+ 		kfree(map);
+ 	return ret;
+@@ -941,12 +1064,12 @@ static long ioctl_dma_unmap(struct ctx *ctx, void __user *arg)
+ 	}
+ 	spin_lock(&mem_lock);
+ 	list_for_each_entry(map, &ctx->maps, list) {
+-		if (map->frag->pfn_base == vma->vm_pgoff) {
++		if (map->root_frag->pfn_base == vma->vm_pgoff) {
+ 			/* Drop the map lock if we hold it */
+-			if (map->frag->has_locking &&
+-					(map->frag->owner == map)) {
+-				map->frag->owner = NULL;
+-				wake_up(&map->frag->wq);
++			if (map->root_frag->has_locking &&
++					(map->root_frag->owner == map)) {
++				map->root_frag->owner = NULL;
++				wake_up(&map->root_frag->wq);
+ 			}
+ 			goto map_match;
+ 		}
+@@ -983,8 +1106,8 @@ static int test_lock(struct mem_mapping *map)
+ {
+ 	int ret = 0;
+ 	spin_lock(&mem_lock);
+-	if (!map->frag->owner) {
+-		map->frag->owner = map;
++	if (!map->root_frag->owner) {
++		map->root_frag->owner = map;
+ 		ret = 1;
+ 	}
+ 	spin_unlock(&mem_lock);
+@@ -1004,7 +1127,7 @@ static long ioctl_dma_lock(struct ctx *ctx, void __user *arg)
+ 	}
+ 	spin_lock(&mem_lock);
+ 	list_for_each_entry(map, &ctx->maps, list) {
+-		if (map->frag->pfn_base == vma->vm_pgoff)
++		if (map->root_frag->pfn_base == vma->vm_pgoff)
+ 			goto map_match;
+ 	}
+ 	map = NULL;
+@@ -1012,9 +1135,9 @@ map_match:
+ 	spin_unlock(&mem_lock);
+ 	up_read(&current->mm->mmap_sem);
+ 
+-	if (!map->frag->has_locking)
++	if (!map->root_frag->has_locking)
+ 		return -ENODEV;
+-	return wait_event_interruptible(map->frag->wq, test_lock(map));
++	return wait_event_interruptible(map->root_frag->wq, test_lock(map));
+ }
+ 
+ static long ioctl_dma_unlock(struct ctx *ctx, void __user *arg)
+@@ -1030,12 +1153,12 @@ static long ioctl_dma_unlock(struct ctx *ctx, void __user *arg)
+ 	else {
+ 		spin_lock(&mem_lock);
+ 		list_for_each_entry(map, &ctx->maps, list) {
+-			if (map->frag->pfn_base == vma->vm_pgoff) {
+-				if (!map->frag->has_locking)
++			if (map->root_frag->pfn_base == vma->vm_pgoff) {
++				if (!map->root_frag->has_locking)
+ 					ret = -ENODEV;
+-				else if (map->frag->owner == map) {
+-					map->frag->owner = NULL;
+-					wake_up(&map->frag->wq);
++				else if (map->root_frag->owner == map) {
++					map->root_frag->owner = NULL;
++					wake_up(&map->root_frag->wq);
+ 					ret = 0;
+ 				} else
+ 					ret = -EBUSY;
+@@ -1390,12 +1513,12 @@ __init void fsl_usdpaa_init_early(void)
+ 		pr_info("No USDPAA memory, no 'usdpaa_mem' bootarg\n");
+ 		return;
+ 	}
+-	if (!is_good_size(phys_size)) {
+-		pr_err("'usdpaa_mem' bootarg must be 4096*4^x\n");
++	if (phys_size % PAGE_SIZE) {
++		pr_err("'usdpaa_mem' bootarg must be a multiple of page size\n");
+ 		phys_size = 0;
+ 		return;
+ 	}
+-	phys_start = memblock_alloc(phys_size, phys_size);
++	phys_start = memblock_alloc(phys_size, largest_page_size(phys_size));
+ 	if (!phys_start) {
+ 		pr_err("Failed to reserve USDPAA region (sz:%llx)\n",
+ 		       phys_size);
+@@ -1413,25 +1536,39 @@ static int __init usdpaa_init(void)
+ {
+ 	struct mem_fragment *frag;
+ 	int ret;
++	u64 tmp_size = phys_size;
++	u64 tmp_start = phys_start;
++	u64 tmp_pfn_size = pfn_size;
++	u64 tmp_pfn_start = pfn_start;
+ 
+ 	pr_info("Freescale USDPAA process driver\n");
+ 	if (!phys_start) {
+ 		pr_warn("fsl-usdpaa: no region found\n");
+ 		return 0;
+ 	}
+-	frag = kmalloc(sizeof(*frag), GFP_KERNEL);
+-	if (!frag) {
+-		pr_err("Failed to setup USDPAA memory accounting\n");
+-		return -ENOMEM;
++
++	while (tmp_size != 0) {
++		u32 frag_size = largest_page_size(tmp_size);
++		frag = kmalloc(sizeof(*frag), GFP_KERNEL);
++		if (!frag) {
++			pr_err("Failed to setup USDPAA memory accounting\n");
++			return -ENOMEM;
++		}
++		frag->base = tmp_start;
++		frag->len = frag->root_len = frag_size;
++		frag->pfn_base = tmp_pfn_start;
++		frag->pfn_len = frag_size / PAGE_SIZE;
++		frag->refs = 0;
++		init_waitqueue_head(&frag->wq);
++		frag->owner = NULL;
++		list_add(&frag->list, &mem_list);
++
++		/* Adjust for this frag */
++		tmp_start += frag_size;
++		tmp_size -= frag_size;
++		tmp_pfn_start += frag_size / PAGE_SIZE;
++		tmp_pfn_size -= frag_size / PAGE_SIZE;
+ 	}
+-	frag->base = phys_start;
+-	frag->len = phys_size;
+-	frag->pfn_base = pfn_start;
+-	frag->pfn_len = pfn_size;
+-	frag->refs = 0;
+-	init_waitqueue_head(&frag->wq);
+-	frag->owner = NULL;
+-	list_add(&frag->list, &mem_list);
+ 	ret = misc_register(&usdpaa_miscdev);
+ 	if (ret)
+ 		pr_err("fsl-usdpaa: failed to register misc device\n");
+-- 
+1.9.1
+

@@ -1,0 +1,252 @@
+From 819050694b08ab43f5fd230317888b1fa4b0bf5a Mon Sep 17 00:00:00 2001
+From: Ioana Radulescu <ruxandra.radulescu@freescale.com>
+Date: Tue, 2 Jul 2013 16:54:34 +0300
+Subject: [PATCH 295/987] dpaa_eth: Recycle the buffers of linear skbs
+
+[Original patch taken from QorIQ-SDK-V1.6-SOURCE-20140619-yocto.iso]
+
+Add recycling support to the "optimized for termination" flavour
+of the driver. For now, only the recycling of buffers pertaining to
+linear skbs is supported.
+
+The rules for recycling are similar to those used in the forwarding
+code; unlike that codebase however, only the page fragment is recycled,
+not the entire skb structure.
+
+Signed-off-by: Ioana Radulescu <ruxandra.radulescu@freescale.com>
+Change-Id: I6d3014e90119436d121f20d93a58a7d3054c13fa
+Reviewed-on: http://git.am.freescale.net:8181/3478
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Reviewed-by: Hamciuc Bogdan-BHAMCIU1 <bogdan.hamciuc@freescale.com>
+Reviewed-by: Bucur Madalin-Cristian-B32716 <madalin.bucur@freescale.com>
+Reviewed-by: Sovaiala Cristian-Constantin-B39531 <Cristian.Sovaiala@freescale.com>
+Reviewed-by: Fleming Andrew-AFLEMING <AFLEMING@freescale.com>
+---
+ drivers/net/ethernet/freescale/dpa/dpaa_eth.h      |  15 +++
+ .../net/ethernet/freescale/dpa/dpaa_eth_non_sg.c   |  15 ---
+ drivers/net/ethernet/freescale/dpa/dpaa_eth_sg.c   | 114 +++++++++++++++++++--
+ 3 files changed, 123 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/dpa/dpaa_eth.h b/drivers/net/ethernet/freescale/dpa/dpaa_eth.h
+index a111086..68c1994 100644
+--- a/drivers/net/ethernet/freescale/dpa/dpaa_eth.h
++++ b/drivers/net/ethernet/freescale/dpa/dpaa_eth.h
+@@ -127,6 +127,18 @@ struct dpa_buffer_layout_s {
+ 	dpa_get_buffer_size(buffer_layout, (dpa_get_max_frm() - ETH_FCS_LEN))
+ #endif
+ 
++/*
++ * Maximum size of a buffer for which recycling is allowed.
++ * We need an upper limit such that forwarded skbs that get reallocated on Tx
++ * aren't allowed to grow unboundedly. On the other hand, we need to make sure
++ * that skbs allocated by us will not fail to be recycled due to their size.
++ *
++ * For a requested size, the kernel allocator provides the next power of two
++ * sized block, which the stack will use as is, regardless of the actual size
++ * it required; since we must acommodate at most 9.6K buffers (L2 maximum
++ * supported frame size), set the recycling upper limit to 16K.
++ */
++#define DPA_RECYCLE_MAX_SIZE	16384
+ 
+ #if defined(CONFIG_FSL_DPAA_FMAN_UNIT_TESTS)
+ /*TODO: temporary for fman pcd testing */
+@@ -207,6 +219,9 @@ void fsl_dpaa_eth_set_hooks(struct dpaa_eth_hooks_s *hooks);
+  */
+ #define FSL_QMAN_MAX_OAL	127
+ 
++/* Maximum offset value for a contig or sg FD (represented on 9 bits) */
++#define DPA_MAX_FD_OFFSET	((1 << 9) - 1)
++
+ /*
+  * Values for the L3R field of the FM Parse Results
+  */
+diff --git a/drivers/net/ethernet/freescale/dpa/dpaa_eth_non_sg.c b/drivers/net/ethernet/freescale/dpa/dpaa_eth_non_sg.c
+index 42a0448..b7bfc3e 100644
+--- a/drivers/net/ethernet/freescale/dpa/dpaa_eth_non_sg.c
++++ b/drivers/net/ethernet/freescale/dpa/dpaa_eth_non_sg.c
+@@ -42,21 +42,6 @@
+ 
+ #ifndef CONFIG_FSL_DPAA_ETH_SG_SUPPORT
+ 
+-/* Maximum size of a buffer for which recycling is allowed.
+- * We need an upper limit such that forwarded skbs that get reallocated on Tx
+- * aren't allowed to grow unboundedly. On the other hand, we need to make sure
+- * that skbs allocated by us will not fail to be recycled due to their size.
+- *
+- * For a requested size, the kernel allocator provides the next power of two
+- * sized block, which the stack will use as is, regardless of the actual size
+- * it required; since we must acommodate at most 9.6K buffers (L2 maximum
+- * supported frame size), set the recycling upper limit to 16K.
+- */
+-#define DPA_RECYCLE_MAX_SIZE	16384
+-
+-/* Maximum offset value for a contig or sg FD (represented on 9bits) */
+-#define DPA_MAX_FD_OFFSET	((1 << 9) - 1)
+-
+ /* Maximum frame size on Tx for which skb copying is preferrable to
+  * creating a S/G frame
+  */
+diff --git a/drivers/net/ethernet/freescale/dpa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/dpa/dpaa_eth_sg.c
+index c1b71d1..1d4f3ca 100644
+--- a/drivers/net/ethernet/freescale/dpa/dpaa_eth_sg.c
++++ b/drivers/net/ethernet/freescale/dpa/dpaa_eth_sg.c
+@@ -276,6 +276,57 @@ struct sk_buff *_dpa_cleanup_tx_fd(const struct dpa_priv_s *priv,
+ 	return skb;
+ }
+ 
++#ifndef CONFIG_FSL_DPAA_TS
++static bool dpa_skb_is_recyclable(struct sk_buff *skb)
++{
++	/* No recycling possible if skb has an userspace buffer */
++	if (skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY)
++		return false;
++
++	/* or if it's cloned or shared */
++	if (skb_shared(skb) || skb_cloned(skb) ||
++	    skb->fclone != SKB_FCLONE_UNAVAILABLE)
++		return false;
++
++	/* or if it's kmalloc'ed  */
++	if (skb->head_frag == 0)
++		return false;
++
++	return true;
++}
++
++static bool dpa_buf_is_recyclable(struct sk_buff *skb,
++				  uint32_t min_size,
++				  uint16_t min_offset,
++				  unsigned char **new_buf_start)
++{
++	unsigned char *new;
++
++	/* In order to recycle a buffer, the following conditions must be met:
++	 * - buffer size no less than the buffer pool size
++	 * - buffer size no higher than an upper limit (to avoid moving too much
++	 *   system memory to the buffer pools)
++	 * - buffer address aligned to cacheline bytes
++	 * - offset of data from start of buffer no lower than a minimum value
++	 * - offset of data from start of buffer no higher than a maximum value
++	 */
++	new = min(skb_end_pointer(skb) - min_size, skb->data - min_offset);
++
++	/* left align to the nearest cacheline */
++	new = (unsigned char *)((unsigned long)new & ~(SMP_CACHE_BYTES - 1));
++
++	if (likely(new >= skb->head &&
++		   new >= (skb->data - DPA_MAX_FD_OFFSET) &&
++		   skb_end_pointer(skb) - new <= DPA_RECYCLE_MAX_SIZE)) {
++		*new_buf_start = new;
++		return true;
++	}
++
++	return false;
++}
++#endif /* CONFIG_FSL_DPAA_TS */
++
++
+ /*
+  * Build a linear skb around the received buffer.
+  * We are guaranteed there is enough room at the end of the data buffer to
+@@ -560,16 +611,48 @@ static int __hot skb_to_contig_fd(struct dpa_priv_s *priv,
+ {
+ 	struct sk_buff **skbh;
+ 	dma_addr_t addr;
+-	struct dpa_bp *dpa_bp;
++	struct dpa_bp *dpa_bp = priv->dpa_bp;
+ 	struct net_device *net_dev = priv->net_dev;
+ 	int err;
++	enum dma_data_direction dma_dir = DMA_TO_DEVICE;
++	int *count_ptr = __this_cpu_ptr(dpa_bp->percpu_count);
++	unsigned char *rec_buf_start;
+ 
+-	/* We are guaranteed that we have at least tx_headroom bytes */
++	/* We are guaranteed to have at least tx_headroom bytes */
+ 	skbh = (struct sk_buff **)(skb->data - priv->tx_headroom);
++	fd->offset = priv->tx_headroom;
+ 
+-	*skbh = skb;
++#ifndef CONFIG_FSL_DPAA_TS
++	/* Check recycling conditions; only if timestamp support is not
++	 * enabled, otherwise we need the fd back on tx confirmation
++	 */
++
++	/* We cannot recycle the buffer if the pool is already full */
++	if (unlikely(*count_ptr >= dpa_bp->target_count))
++		goto no_recycle;
++
++	/* ... or if the skb doesn't meet the recycling criteria */
++	if (unlikely(!dpa_skb_is_recyclable(skb)))
++		goto no_recycle;
++
++	/* ... or if buffer recycling conditions are not met */
++	if (unlikely(!dpa_buf_is_recyclable(skb, dpa_bp->size,
++			priv->tx_headroom, &rec_buf_start)))
++		goto no_recycle;
++
++	/* Buffer is recyclable; use the new start address */
++	skbh = (struct sk_buff **)rec_buf_start;
+ 
+-	dpa_bp = priv->dpa_bp;
++	/* and set fd parameters and DMA mapping direction */
++	fd->cmd |= FM_FD_CMD_FCO;
++	fd->bpid = dpa_bp->bpid;
++	BUG_ON(skb->data - rec_buf_start > DPA_MAX_FD_OFFSET);
++	fd->offset = (uint16_t)(skb->data - rec_buf_start);
++	dma_dir = DMA_BIDIRECTIONAL;
++#endif
++
++no_recycle:
++	*skbh = skb;
+ 
+ 	/*
+ 	 * Enable L3/L4 hardware checksum computation.
+@@ -588,9 +671,8 @@ static int __hot skb_to_contig_fd(struct dpa_priv_s *priv,
+ 	/* Fill in the FD */
+ 	fd->format = qm_fd_contig;
+ 	fd->length20 = skb->len;
+-	fd->offset = priv->tx_headroom; /* This is now guaranteed */
+ 
+-	addr = dma_map_single(dpa_bp->dev, skbh, dpa_bp->size, DMA_TO_DEVICE);
++	addr = dma_map_single(dpa_bp->dev, skbh, dpa_bp->size, dma_dir);
+ 	if (unlikely(dma_mapping_error(dpa_bp->dev, addr))) {
+ 		if (netif_msg_tx_err(priv) && net_ratelimit())
+ 			netdev_err(net_dev, "dma_map_single() failed\n");
+@@ -801,14 +883,34 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+ 	if (unlikely(err < 0))
+ 		goto skb_to_fd_failed;
+ 
++	if (fd.cmd & FM_FD_CMD_FCO) {
++		/* The buffer contained in this skb will be recycled. Update
++		 * the buffer pool percpu count. Also bump up the usage count
++		 * of the page containing the recycled buffer to make sure it
++		 * doesn't get freed.
++		 */
++		(*percpu_priv->dpa_bp_count)++;
++		get_page(virt_to_head_page(skb->head));
++		percpu_priv->tx_returned++;
++	}
++
+ 	if (unlikely(dpa_xmit(priv, percpu_stats, queue_mapping, &fd) < 0))
+ 		goto xmit_failed;
+ 
++	/* If we recycled the buffer, no need to hold on to the skb anymore */
++	if (fd.cmd & FM_FD_CMD_FCO)
++		dev_kfree_skb(skb);
++
+ 	net_dev->trans_start = jiffies;
+ 
+ 	return NETDEV_TX_OK;
+ 
+ xmit_failed:
++	if (fd.cmd & FM_FD_CMD_FCO) {
++		(*percpu_priv->dpa_bp_count)--;
++		put_page(virt_to_head_page(skb->head));
++		percpu_priv->tx_returned--;
++	}
+ 	_dpa_cleanup_tx_fd(priv, &fd);
+ skb_to_fd_failed:
+ enomem:
+-- 
+1.9.1
+
