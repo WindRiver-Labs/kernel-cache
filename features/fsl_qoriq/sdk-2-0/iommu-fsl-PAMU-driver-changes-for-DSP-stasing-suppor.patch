@@ -1,0 +1,645 @@
+From de27db8f6242e573140ffb0fee1178a1fcbb675e Mon Sep 17 00:00:00 2001
+From: Codrin Ciubotariu <codrin.ciubotariu@nxp.com>
+Date: Tue, 12 Jan 2016 16:40:26 +0200
+Subject: [PATCH 0330/1429] iommu/fsl: PAMU driver changes for DSP stasing
+ support.
+
+Modifications to PAMU driver for supporting DSP stashing.
+
+Signed-off-by: Varun Sethi <Varun.Sethi@freescale.com>
+Change-Id: I1462806c85f0f398a332ac321bb7b67a8cabc1bb
+Reviewed-on: http://git.am.freescale.net:8181/9617
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Reviewed-by: Stuart Yoder <stuart.yoder@freescale.com>
+Reviewed-by: Jose Rivera <German.Rivera@freescale.com>
+[Original patch taken from QorIQ-SDK-V2.0-20160527-yocto]
+Signed-off-by: Yanjiang Jin <yanjiang.jin@windriver.com>
+---
+ arch/powerpc/include/asm/fsl_pamu_stash.h |   18 +++
+ drivers/iommu/fsl_pamu.c                  |   89 +++++++++++-
+ drivers/iommu/fsl_pamu.h                  |    8 +-
+ drivers/iommu/fsl_pamu_domain.c           |  228 ++++++++++++++++++++++-------
+ drivers/iommu/fsl_pamu_domain.h           |   14 +-
+ include/linux/iommu.h                     |    1 +
+ 6 files changed, 291 insertions(+), 67 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/fsl_pamu_stash.h b/arch/powerpc/include/asm/fsl_pamu_stash.h
+index 38311c9..7861940 100644
+--- a/arch/powerpc/include/asm/fsl_pamu_stash.h
++++ b/arch/powerpc/include/asm/fsl_pamu_stash.h
+@@ -19,11 +19,23 @@
+ #ifndef __FSL_PAMU_STASH_H
+ #define __FSL_PAMU_STASH_H
+ 
++/* Define operation mapping indexes */
++enum omap_index {
++	OMI_QMAN,
++	OMI_FMAN,
++	OMI_QMAN_PRIV,
++	OMI_CAAM,
++	OMI_PMAN,
++	OMI_DSP,
++	OMI_MAX,
++};
++
+ /* cache stash targets */
+ enum pamu_stash_target {
+ 	PAMU_ATTR_CACHE_L1 = 1,
+ 	PAMU_ATTR_CACHE_L2,
+ 	PAMU_ATTR_CACHE_L3,
++	PAMU_ATTR_CACHE_DSP_L2,
+ };
+ 
+ /*
+@@ -34,6 +46,12 @@ enum pamu_stash_target {
+ struct pamu_stash_attribute {
+ 	u32	cpu;	/* cpu number */
+ 	u32	cache;	/* cache to stash to: L1,L2,L3 */
++	u32	window; /* ~0 indicates all windows */
++};
++
++struct pamu_omi_attribute {
++	u32	omi;	/* index in the operation mapping table */
++	u32	window;	/* ~0 indicates all windows */
+ };
+ 
+ #endif  /* __FSL_PAMU_STASH_H */
+diff --git a/drivers/iommu/fsl_pamu.c b/drivers/iommu/fsl_pamu.c
+index 9c15ca9..80cd45b 100644
+--- a/drivers/iommu/fsl_pamu.c
++++ b/drivers/iommu/fsl_pamu.c
+@@ -25,6 +25,7 @@
+ #include <linux/genalloc.h>
+ 
+ #include <asm/mpc85xx.h>
++#include <asm/fsl_kibo.h>
+ 
+ /* define indexes for each operation mapping scenario */
+ #define OMI_QMAN        0x00
+@@ -288,16 +289,16 @@ void pamu_free_subwins(int liodn)
+ }
+ 
+ /*
+- * Function used for updating stash destination for the coressponding
++ * Function used for updating a specifc PAACE field for the coressponding
+  * LIODN.
+  */
+-int  pamu_update_paace_stash(int liodn, u32 subwin, u32 value)
++int  pamu_update_paace_field(int liodn, u32 subwin, int field, u32 value)
+ {
+ 	struct paace *paace;
+ 
+ 	paace = pamu_get_ppaace(liodn);
+ 	if (!paace) {
+-		pr_debug("Invalid liodn entry\n");
++		pr_err("Invalid liodn entry\n");
+ 		return -ENOENT;
+ 	}
+ 	if (subwin) {
+@@ -305,8 +306,19 @@ int  pamu_update_paace_stash(int liodn, u32 subwin, u32 value)
+ 		if (!paace)
+ 			return -ENOENT;
+ 	}
+-	set_bf(paace->impl_attr, PAACE_IA_CID, value);
+ 
++	switch (field) {
++	case PAACE_STASH_FIELD:
++		set_bf(paace->impl_attr, PAACE_IA_CID, value);
++		break;
++	case PAACE_OMI_FIELD:
++		set_bf(paace->impl_attr, PAACE_IA_OTM, PAACE_OTM_INDEXED);
++		paace->op_encode.index_ot.omi = value;
++		break;
++	default:
++		pr_debug("Invalid field, can't update\n");
++		return -EINVAL;
++	}
+ 	mb();
+ 
+ 	return 0;
+@@ -532,6 +544,63 @@ void get_ome_index(u32 *omi_index, struct device *dev)
+ 		*omi_index = OMI_QMAN_PRIV;
+ }
+ 
++/*
++ * We get the stash id programmed by SDOS from the shared
++ * cluster L2 l2csr1 register.
++ */
++static u32 get_dsp_l2_stash_id(u32 vcpu)
++{
++	const u32 *prop;
++	struct device_node *node;
++	struct ccsr_cluster_l2 *l2cache_regs;
++	u32 stash_id;
++
++	for_each_compatible_node(node, NULL, "fsl,sc3900") {
++		prop = of_get_property(node, "reg", 0);
++		if (!prop) {
++			pr_err("missing reg property in dsp cpu node %s\n",
++			       node->full_name);
++			of_node_put(node);
++			return ~(u32)0;
++		}
++
++		if (*prop != vcpu)
++			continue;
++
++		prop = of_get_property(node, "next-level-cache", 0);
++		if (!prop) {
++			pr_err("missing next level cache property in dsp cpu %s\n",
++			       node->full_name);
++			of_node_put(node);
++			return ~(u32)0;
++		}
++		of_node_put(node);
++
++		node = of_find_node_by_phandle(*prop);
++		if (!node) {
++			pr_err("Invalid node for cache hierarchy %s\n",
++			       node->full_name);
++			return ~(u32)0;
++		}
++
++		l2cache_regs = of_iomap(node, 0);
++		if (!l2cache_regs) {
++			pr_err("failed to map cluster l2 cache registers %s\n",
++			       node->full_name);
++			of_node_put(node);
++			return ~(u32)0;
++		}
++
++		stash_id = in_be32(&l2cache_regs->l2csr1) &
++				 CLUSTER_L2_STASH_MASK;
++		of_node_put(node);
++		iounmap(l2cache_regs);
++
++		return stash_id;
++	}
++	return ~(u32)0;
++}
++
+ /**
+  * get_stash_id - Returns stash destination id corresponding to a
+  *                cache type and vcpu.
+@@ -549,6 +618,11 @@ u32 get_stash_id(u32 stash_dest_hint, u32 vcpu)
+ 	int len, found = 0;
+ 	int i;
+ 
++	/* check for DSP L2 cache */
++	if (stash_dest_hint == PAMU_ATTR_CACHE_DSP_L2) {
++		return get_dsp_l2_stash_id(vcpu);
++	}
++
+ 	/* Fastpath, exit early if L3/CPC cache is target for stashing */
+ 	if (stash_dest_hint == PAMU_ATTR_CACHE_L3) {
+ 		node = of_find_matching_node(NULL, l3_device_ids);
+@@ -693,6 +767,13 @@ static void setup_omt(struct ome *omt)
+ 	ome = &omt[OMI_CAAM];
+ 	ome->moe[IOE_READ_IDX]  = EOE_VALID | EOE_READI;
+ 	ome->moe[IOE_WRITE_IDX] = EOE_VALID | EOE_WRITE;
++
++	/* Configure OMI_DSP */
++	ome = &omt[OMI_DSP];
++	ome->moe[IOE_READ_IDX]  = EOE_VALID | EOE_RWNITC;
++	ome->moe[IOE_EREAD0_IDX] = EOE_VALID | EOE_RWNITC;
++	ome->moe[IOE_WRITE_IDX] = EOE_VALID | EOE_WWSAO;
++	ome->moe[IOE_EWRITE0_IDX] = EOE_VALID | EOE_WWSAO;
+ }
+ 
+ /*
+diff --git a/drivers/iommu/fsl_pamu.h b/drivers/iommu/fsl_pamu.h
+index aab723f..4294284 100644
+--- a/drivers/iommu/fsl_pamu.h
++++ b/drivers/iommu/fsl_pamu.h
+@@ -322,6 +322,12 @@ struct paace {
+ 	u32 reserved[8];			/* not currently implemented */
+ };
+ 
++enum paace_field {
++	PAACE_STASH_FIELD,
++	PAACE_OMI_FIELD,
++	PAACE_FIELD_MAX,
++};
++
+ /* OME : Operation mapping entry
+  * MOE : Mapped Operation Encodings
+  * The operation mapping table is table containing operation mapping entries (OME).
+@@ -404,7 +410,7 @@ int pamu_config_spaace(int liodn, u32 subwin_cnt, u32 subwin_addr,
+ 
+ u32 get_stash_id(u32 stash_dest_hint, u32 vcpu);
+ void get_ome_index(u32 *omi_index, struct device *dev);
+-int  pamu_update_paace_stash(int liodn, u32 subwin, u32 value);
++int  pamu_update_paace_field(int liodn, u32 subwin, int field, u32 value);
+ int pamu_disable_spaace(int liodn, u32 subwin);
+ u32 pamu_get_max_subwin_cnt(void);
+ 
+diff --git a/drivers/iommu/fsl_pamu_domain.c b/drivers/iommu/fsl_pamu_domain.c
+index 1d45293..1040b4c 100644
+--- a/drivers/iommu/fsl_pamu_domain.c
++++ b/drivers/iommu/fsl_pamu_domain.c
+@@ -106,10 +106,10 @@ static int map_subwins(int liodn, struct fsl_dma_domain *dma_domain)
+ 			spin_lock_irqsave(&iommu_lock, flags);
+ 			ret = pamu_config_spaace(liodn, dma_domain->win_cnt, i,
+ 						 sub_win_ptr[i].size,
+-						 ~(u32)0,
++						 sub_win_ptr[i].omi,
+ 						 rpn,
+ 						 dma_domain->snoop_id,
+-						 dma_domain->stash_id,
++						 sub_win_ptr[i].stash_id,
+ 						 (i > 0) ? 1 : 0,
+ 						 sub_win_ptr[i].prot);
+ 			spin_unlock_irqrestore(&iommu_lock, flags);
+@@ -134,9 +134,9 @@ static int map_win(int liodn, struct fsl_dma_domain *dma_domain)
+ 	spin_lock_irqsave(&iommu_lock, flags);
+ 	ret = pamu_config_ppaace(liodn, wnd_addr,
+ 				 wnd->size,
+-				 ~(u32)0,
++				 wnd->omi,
+ 				 wnd->paddr >> PAMU_PAGE_SHIFT,
+-				 dma_domain->snoop_id, dma_domain->stash_id,
++				 dma_domain->snoop_id, wnd->stash_id,
+ 				 0, wnd->prot);
+ 	spin_unlock_irqrestore(&iommu_lock, flags);
+ 	if (ret)
+@@ -165,10 +165,10 @@ static int update_liodn(int liodn, struct fsl_dma_domain *dma_domain, u32 wnd_nr
+ 	if (dma_domain->win_cnt > 1) {
+ 		ret = pamu_config_spaace(liodn, dma_domain->win_cnt, wnd_nr,
+ 					 wnd->size,
+-					 ~(u32)0,
++					 wnd->omi,
+ 					 wnd->paddr >> PAMU_PAGE_SHIFT,
+ 					 dma_domain->snoop_id,
+-					 dma_domain->stash_id,
++					 wnd->stash_id,
+ 					 (wnd_nr > 0) ? 1 : 0,
+ 					 wnd->prot);
+ 		if (ret)
+@@ -181,9 +181,9 @@ static int update_liodn(int liodn, struct fsl_dma_domain *dma_domain, u32 wnd_nr
+ 
+ 		ret = pamu_config_ppaace(liodn, wnd_addr,
+ 					 wnd->size,
+-					 ~(u32)0,
++					 wnd->omi,
+ 					 wnd->paddr >> PAMU_PAGE_SHIFT,
+-					 dma_domain->snoop_id, dma_domain->stash_id,
++					 dma_domain->snoop_id, wnd->stash_id,
+ 					 0, wnd->prot);
+ 		if (ret)
+ 			pr_debug("Window reconfiguration failed for liodn %d\n",
+@@ -195,31 +195,56 @@ static int update_liodn(int liodn, struct fsl_dma_domain *dma_domain, u32 wnd_nr
+ 	return ret;
+ }
+ 
+-static int update_liodn_stash(int liodn, struct fsl_dma_domain *dma_domain,
+-			      u32 val)
++struct pamu_attr_info {
++	u32 window;
++	int field;
++	u32 value;
++};
++
++static int update_liodn_attr(int liodn, struct fsl_dma_domain *dma_domain,
++			     struct pamu_attr_info *attr_info)
+ {
+ 	int ret = 0, i;
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&iommu_lock, flags);
+-	if (!dma_domain->win_arr) {
+-		pr_debug("Windows not configured, stash destination update failed for liodn %d\n",
+-			 liodn);
+-		spin_unlock_irqrestore(&iommu_lock, flags);
+-		return -EINVAL;
+-	}
++	spin_lock(&iommu_lock);
+ 
+-	for (i = 0; i < dma_domain->win_cnt; i++) {
+-		ret = pamu_update_paace_stash(liodn, i, val);
+-		if (ret) {
+-			pr_debug("Failed to update SPAACE %d field for liodn %d\n ",
+-				 i, liodn);
+-			spin_unlock_irqrestore(&iommu_lock, flags);
+-			return ret;
++	if (~attr_info->window == 0) {
++		for (i = 0; i < dma_domain->win_cnt; i++) {
++			ret = pamu_update_paace_field(liodn, i,
++						      attr_info->field,
++						      attr_info->value);
++			if (ret)
++				break;
+ 		}
++	} else {
++		ret = pamu_update_paace_field(liodn, attr_info->window,
++					      attr_info->field,
++					      attr_info->value);
+ 	}
+ 
+-	spin_unlock_irqrestore(&iommu_lock, flags);
++	spin_unlock(&iommu_lock);
++
++	return ret;
++}
++
++/*
++ * Update attribute  for all LIODNs associated with the domain
++ *
++ */
++static int update_domain_attr(struct fsl_dma_domain *dma_domain,
++				 struct pamu_attr_info *attr_info)
++{
++	struct device_domain_info *info;
++	int ret = 0;
++
++	if (!list_empty(&dma_domain->devices)) {
++		list_for_each_entry(info, &dma_domain->devices, link) {
++			ret = update_liodn_attr(info->liodn, dma_domain,
++						attr_info);
++			if (ret)
++				break;
++		}
++	}
+ 
+ 	return ret;
+ }
+@@ -251,7 +276,7 @@ static int pamu_set_liodn(int liodn, struct device *dev,
+ 	if (!ret)
+ 		ret = pamu_config_ppaace(liodn, window_addr, window_size, omi_index,
+ 					 0, dma_domain->snoop_id,
+-					 dma_domain->stash_id, win_cnt, 0);
++					 ~(u32)0, win_cnt, 0);
+ 	spin_unlock_irqrestore(&iommu_lock, flags);
+ 	if (ret) {
+ 		pr_debug("PAACE configuration failed for liodn %d, win_cnt =%d\n",
+@@ -268,7 +293,7 @@ static int pamu_set_liodn(int liodn, struct device *dev,
+ 				ret = pamu_config_spaace(liodn, win_cnt, i,
+ 							 subwin_size, omi_index,
+ 							 0, dma_domain->snoop_id,
+-							 dma_domain->stash_id,
++							 ~(u32)0,
+ 							 0, 0);
+ 			spin_unlock_irqrestore(&iommu_lock, flags);
+ 			if (ret) {
+@@ -310,7 +335,6 @@ static struct fsl_dma_domain *iommu_alloc_dma_domain(void)
+ 	if (!domain)
+ 		return NULL;
+ 
+-	domain->stash_id = ~(u32)0;
+ 	domain->snoop_id = ~(u32)0;
+ 	domain->win_cnt = pamu_get_max_subwin_cnt();
+ 	domain->geom_size = 0;
+@@ -454,21 +478,6 @@ static int pamu_set_domain_geometry(struct fsl_dma_domain *dma_domain,
+ 	return ret;
+ }
+ 
+-/* Update stash destination for all LIODNs associated with the domain */
+-static int update_domain_stash(struct fsl_dma_domain *dma_domain, u32 val)
+-{
+-	struct device_domain_info *info;
+-	int ret = 0;
+-
+-	list_for_each_entry(info, &dma_domain->devices, link) {
+-		ret = update_liodn_stash(info->liodn, dma_domain, val);
+-		if (ret)
+-			break;
+-	}
+-
+-	return ret;
+-}
+-
+ /* Update domain mappings for all LIODNs associated with the domain */
+ static int update_domain_mapping(struct fsl_dma_domain *dma_domain, u32 wnd_nr)
+ {
+@@ -759,27 +768,101 @@ static  int configure_domain_geometry(struct iommu_domain *domain, void *data)
+ 	return 0;
+ }
+ 
++static inline int check_attr_window(u32 wnd, struct fsl_dma_domain *dma_domain)
++{
++	return (~wnd != 0) && (wnd >= dma_domain->win_cnt);
++}
++
++/* Set the domain operation mapping attribute */
++static int configure_domain_op_map(struct fsl_dma_domain *dma_domain,
++				    void *data)
++{
++	struct dma_window *wnd;
++	unsigned long flags;
++	struct pamu_attr_info attr_info;
++	int ret, i;
++	struct pamu_omi_attribute *omi_attr = data;
++
++	spin_lock_irqsave(&dma_domain->domain_lock, flags);
++
++	if (!dma_domain->win_arr) {
++		pr_err("Number of windows not configured\n");
++		spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
++		return -ENODEV;
++	}
++
++	if (omi_attr->omi >= OMI_MAX ||
++		check_attr_window(omi_attr->window, dma_domain)) {
++		pr_err("Invalid operation mapping index\n");
++		spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
++		return -EINVAL;
++	}
++
++	if (~omi_attr->window == 0) {
++		wnd = &dma_domain->win_arr[0];
++		for (i = 0; i < dma_domain->win_cnt; i++)
++			wnd[i].omi = omi_attr->omi;
++	} else {
++		wnd = &dma_domain->win_arr[omi_attr->window];
++		wnd->omi = omi_attr->omi;
++	}
++
++	attr_info.window = omi_attr->window;
++	attr_info.field = PAACE_OMI_FIELD;
++	attr_info.value = omi_attr->omi;
++	ret = update_domain_attr(dma_domain, &attr_info);
++
++	spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
++
++	return ret;
++}
++
+ /* Set the domain stash attribute */
+ static int configure_domain_stash(struct fsl_dma_domain *dma_domain, void *data)
+ {
+ 	struct pamu_stash_attribute *stash_attr = data;
++	struct dma_window *wnd;
+ 	unsigned long flags;
++	u32 stash_id;
+ 	int ret;
++	int i;
++	struct pamu_attr_info attr_info;
+ 
+ 	spin_lock_irqsave(&dma_domain->domain_lock, flags);
+ 
+-	memcpy(&dma_domain->dma_stash, stash_attr,
+-	       sizeof(struct pamu_stash_attribute));
++	if (!dma_domain->win_arr) {
++		pr_err("Number of windows not configured\n");
++		spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
++		return -ENODEV;
++	}
+ 
+-	dma_domain->stash_id = get_stash_id(stash_attr->cache,
+-					    stash_attr->cpu);
+-	if (dma_domain->stash_id == ~(u32)0) {
+-		pr_debug("Invalid stash attributes\n");
++	stash_id = get_stash_id(stash_attr->cache, stash_attr->cpu);
++	if ((~stash_id == 0) ||
++	     check_attr_window(stash_attr->window, dma_domain)) {
++		pr_err("Invalid stash attributes\n");
+ 		spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = update_domain_stash(dma_domain, dma_domain->stash_id);
++	if (~stash_attr->window == 0) {
++		wnd = &dma_domain->win_arr[0];
++		for (i = 0; i < dma_domain->win_cnt; i++) {
++			wnd[i].stash_id = stash_id;
++			memcpy(&wnd[i].stash_attr, stash_attr,
++			       sizeof(wnd[i].stash_attr));
++			wnd[i].stash_attr.window = i;
++		}
++	} else {
++		wnd = &dma_domain->win_arr[stash_attr->window];
++		wnd->stash_id = stash_id;
++		memcpy(&wnd->stash_attr,
++		       stash_attr, sizeof(wnd->stash_attr));
++	}
++
++	attr_info.window = stash_attr->window;
++	attr_info.field = PAACE_STASH_FIELD;
++	attr_info.value = stash_id;
++	ret = update_domain_attr(dma_domain, &attr_info);
+ 
+ 	spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+ 
+@@ -830,6 +913,9 @@ static int fsl_pamu_set_domain_attr(struct iommu_domain *domain,
+ 	case DOMAIN_ATTR_FSL_PAMU_ENABLE:
+ 		ret = configure_domain_dma_state(dma_domain, *(int *)data);
+ 		break;
++	case DOMAIN_ATTR_FSL_PAMU_OP_MAP:
++		ret = configure_domain_op_map(dma_domain, data);
++		break;
+ 	default:
+ 		pr_debug("Unsupported attribute type\n");
+ 		ret = -EINVAL;
+@@ -846,16 +932,37 @@ static int fsl_pamu_get_domain_attr(struct iommu_domain *domain,
+ 	int ret = 0;
+ 
+ 	switch (attr_type) {
+-	case DOMAIN_ATTR_FSL_PAMU_STASH:
+-		memcpy(data, &dma_domain->dma_stash,
+-		       sizeof(struct pamu_stash_attribute));
+-		break;
+ 	case DOMAIN_ATTR_FSL_PAMU_ENABLE:
+ 		*(int *)data = dma_domain->enabled;
+ 		break;
+ 	case DOMAIN_ATTR_FSL_PAMUV1:
+ 		*(int *)data = DOMAIN_ATTR_FSL_PAMUV1;
+ 		break;
++	case DOMAIN_ATTR_FSL_PAMU_STASH: {
++		struct pamu_stash_attribute *stash_attr = data;
++		struct dma_window *wnd;
++
++		if (stash_attr->window >= dma_domain->win_cnt ||
++		    ~stash_attr->window == 0)
++			return -EINVAL;
++
++		wnd = &dma_domain->win_arr[stash_attr->window];
++		memcpy(stash_attr, &wnd->stash_attr,
++		       sizeof(struct pamu_stash_attribute));
++		break;
++	}
++	case DOMAIN_ATTR_FSL_PAMU_OP_MAP: {
++		struct pamu_omi_attribute *omi_attr = data;
++		struct dma_window *wnd;
++
++		if (omi_attr->window >= dma_domain->win_cnt ||
++		    ~omi_attr->window == 0)
++			return -EINVAL;
++
++		wnd = &dma_domain->win_arr[omi_attr->window];
++		omi_attr->omi = wnd->omi;
++		break;
++	}
+ 	default:
+ 		pr_debug("Unsupported attribute type\n");
+ 		ret = -EINVAL;
+@@ -1001,6 +1108,16 @@ static void fsl_pamu_remove_device(struct device *dev)
+ 	iommu_group_remove_device(dev);
+ }
+ 
++static void dma_domain_init_windows(struct fsl_dma_domain *dma_domain)
++{
++	int i;
++
++	for (i = 0; i < dma_domain->win_cnt; i++) {
++		dma_domain->win_arr[i].stash_id = ~(u32)0;
++		dma_domain->win_arr[i].omi = ~(u32)0;
++	}
++}
++
+ static int fsl_pamu_set_windows(struct iommu_domain *domain, u32 w_count)
+ {
+ 	struct fsl_dma_domain *dma_domain = to_fsl_dma_domain(domain);
+@@ -1044,6 +1161,7 @@ static int fsl_pamu_set_windows(struct iommu_domain *domain, u32 w_count)
+ 			return -ENOMEM;
+ 		}
+ 		dma_domain->win_cnt = w_count;
++		dma_domain_init_windows(dma_domain);
+ 	}
+ 	spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+ 
+diff --git a/drivers/iommu/fsl_pamu_domain.h b/drivers/iommu/fsl_pamu_domain.h
+index f2b0f74..1364a78 100644
+--- a/drivers/iommu/fsl_pamu_domain.h
++++ b/drivers/iommu/fsl_pamu_domain.h
+@@ -22,10 +22,13 @@
+ #include "fsl_pamu.h"
+ 
+ struct dma_window {
+-	phys_addr_t paddr;
+-	u64 size;
+-	int valid;
+-	int prot;
++	phys_addr_t                 paddr;
++	u64                         size;
++	int                         valid;
++	int                         prot;
++	struct pamu_stash_attribute stash_attr;
++	u32                         stash_id;
++	u32                         omi;
+ };
+ 
+ struct fsl_dma_domain {
+@@ -67,9 +70,6 @@ struct fsl_dma_domain {
+ 	 */
+ 	int				mapped;
+ 	int				enabled;
+-	/* stash_id obtained from the stash attribute details */
+-	u32				stash_id;
+-	struct pamu_stash_attribute	dma_stash;
+ 	u32				snoop_id;
+ 	struct iommu_domain		iommu_domain;
+ 	spinlock_t			domain_lock;
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index cce2bc9..08541c2 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -109,6 +109,7 @@ enum iommu_attr {
+ 	DOMAIN_ATTR_PAGING,
+ 	DOMAIN_ATTR_WINDOWS,
+ 	DOMAIN_ATTR_FSL_PAMU_STASH,
++	DOMAIN_ATTR_FSL_PAMU_OP_MAP,
+ 	DOMAIN_ATTR_FSL_PAMU_ENABLE,
+ 	DOMAIN_ATTR_FSL_PAMUV1,
+ 	DOMAIN_ATTR_NESTING,	/* two stages of translation */
+-- 
+1.7.5.4
+

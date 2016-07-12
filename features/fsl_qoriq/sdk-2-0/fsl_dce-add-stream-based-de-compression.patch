@@ -1,0 +1,548 @@
+From b019fefcc8ad3387de703b30e2ebd735ee516681 Mon Sep 17 00:00:00 2001
+From: Jeffrey Ladouceur <Jeffrey.Ladouceur@freescale.com>
+Date: Thu, 22 Aug 2013 12:48:45 -0400
+Subject: [PATCH 0984/1429] fsl_dce: add stream based (de)compression
+
+The fsl_dce_stream object enables the user to do stream based (de)compression.
+As opposed to chunk based compression where all the data in a single frame is
+sent to the DCE device, stream based (de)compression permits the user to send
+mulitple frames and receive the corresponding resuls in multiple frames.
+
+Signed-off-by: Jeffrey Ladouceur <Jeffrey.Ladouceur@freescale.com>
+Change-Id: I83065d4681c512d595724b4f92a731de8a032867
+Reviewed-on: http://git.am.freescale.net:8181/4297
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Reviewed-by: Thorpe Geoff-R01361 <Geoff.Thorpe@freescale.com>
+Reviewed-by: Wang Haiying-R54964 <Haiying.Wang@freescale.com>
+Reviewed-by: Rivera Jose-B46482 <German.Rivera@freescale.com>
+[Original patch taken from QorIQ-SDK-V2.0-20160527-yocto]
+Signed-off-by: Yanjiang Jin <yanjiang.jin@windriver.com>
+---
+ drivers/staging/fsl_dce/Makefile         |    2 +-
+ drivers/staging/fsl_dce/fsl_dce_stream.c |  306 ++++++++++++++++++++++++++++++
+ drivers/staging/fsl_dce/fsl_dce_stream.h |  187 ++++++++++++++++++
+ 3 files changed, 494 insertions(+), 1 deletions(-)
+ create mode 100644 drivers/staging/fsl_dce/fsl_dce_stream.c
+ create mode 100644 drivers/staging/fsl_dce/fsl_dce_stream.h
+
+diff --git a/drivers/staging/fsl_dce/Makefile b/drivers/staging/fsl_dce/Makefile
+index dabff50..ec737da 100644
+--- a/drivers/staging/fsl_dce/Makefile
++++ b/drivers/staging/fsl_dce/Makefile
+@@ -6,7 +6,7 @@ obj-$(CONFIG_FSL_DCE) += fsl-dce.o
+ obj-$(CONFIG_FSL_DCE_CONFIG) += fsl-dce-config.o
+ obj-$(CONFIG_FSL_DCE_DEBUGFS) += fsl-dce-debugfs.o
+ 
+-fsl-dce-y := dce_sys.o flib/dce_flow.o fsl_dce_chunk.o
++fsl-dce-y := dce_sys.o flib/dce_flow.o fsl_dce_chunk.o fsl_dce_stream.o
+ fsl-dce-config-y := dce_driver.o
+ fsl-dce-debugfs-y := dce_debugfs.o
+ 
+diff --git a/drivers/staging/fsl_dce/fsl_dce_stream.c b/drivers/staging/fsl_dce/fsl_dce_stream.c
+new file mode 100644
+index 0000000..c49ef2f
+--- /dev/null
++++ b/drivers/staging/fsl_dce/fsl_dce_stream.c
+@@ -0,0 +1,306 @@
++/* Copyright 2013 Freescale Semiconductor, Inc.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *       notice, this list of conditions and the following disclaimer in the
++ *       documentation and/or other materials provided with the distribution.
++ *     * Neither the name of Freescale Semiconductor nor the names of its
++ *       contributors may be used to endorse or promote products derived from
++ *       this software without specific prior written permission.
++ *
++ *
++ * ALTERNATIVELY, this software may be distributed under the terms of the
++ * GNU General Public License ("GPL") as published by the Free Software
++ * Foundation, either version 2 of that License or (at your option) any
++ * later version.
++ *
++ * This software is provided by Freescale Semiconductor "as is" and any
++ * express or implied warranties, including, but not limited to, the implied
++ * warranties of merchantability and fitness for a particular purpose are
++ * disclaimed. In no event shall Freescale Semiconductor be liable for any
++ * direct, indirect, incidental, special, exemplary, or consequential damages
++ * (including, but not limited to, procurement of substitute goods or services;
++ * loss of use, data, or profits; or business interruption) however caused and
++ * on any theory of liability, whether in contract, strict liability, or tort
++ * (including negligence or otherwise) arising in any way out of the use of
++ * this software, even if advised of the possibility of such damage.
++ */
++
++#include <linux/types.h>
++#include <linux/err.h>
++#include <linux/spinlock_types.h>
++#include <linux/cpumask.h>
++#include <linux/rbtree.h>
++#include <linux/export.h>
++#include "fsl_dce_stream.h"
++#include "dce_sys.h"
++
++static void stream_base_cb(struct fsl_dce_flow *flow, const struct qm_fd *fd,
++			void *callback_tag)
++{
++	if (likely(ISEQ_32FTK(fd->cmd, DCE_CMD, PROCESS)))
++		flow->cbs.process_cb(flow, fd, callback_tag);
++	else if (ISEQ_32FTK(fd->cmd, DCE_CMD, CTX_INVALIDATE))
++		flow->cbs.scr_invalidate_cb(flow, fd, callback_tag);
++	else if (ISEQ_32FTK(fd->cmd, DCE_CMD, NOP))
++		flow->cbs.nop_cb(flow, fd, callback_tag);
++}
++
++int fsl_dce_stream_setup(struct fsl_dce_stream *stream,
++	uint32_t flags,
++	enum dce_mode mode,
++	enum dce_compression_format cf,
++	fsl_dce_process_cb process_cb,
++	fsl_dce_nop_cb nop_cb,
++	fsl_dce_scr_invalidate_cb scr_invalidate_cb)
++{
++	return fsl_dce_stream_setup2(stream, flags, mode, cf,
++		DCE_TRUNCATION, NULL, process_cb, nop_cb, scr_invalidate_cb);
++}
++EXPORT_SYMBOL(fsl_dce_stream_setup);
++
++static int allocate_stateful_dma_resources(struct fsl_dce_stream *stream,
++				enum dce_mode mode,
++				enum dce_processing_mode pmode)
++{
++	int ret = -ENOMEM;
++
++	if (mode == DCE_COMPRESSION) {
++		stream->hw_comp_scr = fsl_dce_hw_scr_64b_new();
++		if (!stream->hw_comp_scr)
++			return ret;
++		stream->comp_hist = fsl_dce_hw_compress_history_new();
++		if (!stream->comp_hist)
++			return ret;
++		if (pmode == DCE_RECYCLING) {
++			stream->pending_output_ptr =
++				fsl_dce_hw_pending_output_new();
++			if (!stream->pending_output_ptr)
++				return ret;
++		}
++	} else {
++		stream->hw_decomp_scr = fsl_dce_hw_scr_128b_new();
++		if (!stream->hw_decomp_scr)
++			return ret;
++		stream->decomp_hist = fsl_dce_hw_decompress_history_new();
++		if (!stream->decomp_hist)
++			return ret;
++		if (pmode == DCE_RECYCLING) {
++			stream->pending_output_ptr =
++				fsl_dce_hw_pending_output_new();
++			if (!stream->pending_output_ptr)
++				return ret;
++		}
++		stream->decomp_ctx_ptr = fsl_dce_hw_decomp_ctxt_new();
++		if (!stream->decomp_ctx_ptr)
++			return ret;
++	}
++	return 0;
++}
++
++static void free_stateful_dma_resources(struct fsl_dce_stream *stream,
++				enum dce_mode mode,
++				enum dce_processing_mode pmode)
++{
++	if (mode == DCE_COMPRESSION) {
++		if (stream->hw_comp_scr)
++			fsl_dce_hw_scr_64b_free(stream->hw_comp_scr);
++		stream->comp_hist = fsl_dce_hw_compress_history_new();
++		if (stream->comp_hist)
++			fsl_dce_hw_compress_history_free(stream->comp_hist);
++		if (pmode == DCE_RECYCLING) {
++			stream->pending_output_ptr =
++				fsl_dce_hw_pending_output_new();
++			if (stream->pending_output_ptr)
++				fsl_dce_hw_pending_output_free(
++					stream->pending_output_ptr);
++		}
++	} else {
++		if (stream->hw_decomp_scr)
++			fsl_dce_hw_scr_128b_free(stream->hw_decomp_scr);
++		if (stream->decomp_hist)
++			fsl_dce_hw_decompress_history_free(stream->decomp_hist);
++		if (pmode == DCE_RECYCLING) {
++			stream->pending_output_ptr =
++				fsl_dce_hw_pending_output_new();
++			if (stream->pending_output_ptr)
++				fsl_dce_hw_pending_output_free(
++					stream->pending_output_ptr);
++		}
++		if (stream->decomp_ctx_ptr)
++			fsl_dce_hw_decomp_ctxt_free(stream->decomp_ctx_ptr);
++	}
++}
++
++void fsl_dce_build_scf_uspc(struct fsl_dce_stream *stream, struct scf_64b *scf)
++{
++	set_pending_output_ptr(scf, fsl_dce_map(stream->pending_output_ptr));
++	if (stream->flow.mode == DCE_COMPRESSION)
++		set_history_ptr(scf, fsl_dce_map(stream->hw_comp_scr));
++	else {
++		set_history_ptr(scf, fsl_dce_map(stream->hw_decomp_scr));
++		set_decomp_ctxt_ptr(scf, fsl_dce_map(stream->decomp_ctx_ptr));
++	}
++	set_pmode(scf, stream->pmode);
++}
++EXPORT_SYMBOL(fsl_dce_build_scf_uspc);
++
++void fsl_dce_attach_scf_64b_2_3mbr_sgtable(struct scf_64b *scf,
++	struct qm_sg_entry sg_table[3])
++{
++	qm_sg_entry_set64(&sg_table[2], fsl_dce_map(scf));
++	sg_table[2].length = sizeof(*scf);
++	sg_table[2].final = 1;
++}
++EXPORT_SYMBOL(fsl_dce_attach_scf_64b_2_3mbr_sgtable);
++
++void fsl_dce_attach_scf_128b_2_3mbr_sgtable(struct scf_128b *scf,
++	struct qm_sg_entry sg_table[3])
++{
++	qm_sg_entry_set64(&sg_table[2], fsl_dce_map(scf));
++	sg_table[2].length = sizeof(*scf);
++	sg_table[2].final = 1;
++}
++EXPORT_SYMBOL(fsl_dce_attach_scf_128b_2_3mbr_sgtable);
++
++void fsl_dce_attach_3mbr_sgtable_2_fd(struct qm_sg_entry sg_table[3],
++					struct qm_fd *fd)
++{
++	qm_fd_addr_set64(fd, fsl_dce_map(sg_table));
++	fd->format = qm_fd_compound;
++}
++EXPORT_SYMBOL(fsl_dce_attach_3mbr_sgtable_2_fd);
++
++int fsl_dce_stream_setup2(struct fsl_dce_stream *stream,
++	uint32_t flags,
++	enum dce_mode mode,
++	enum dce_compression_format cf,
++	enum dce_processing_mode pmode,
++	struct dce_bman_cfg *bcfg,
++	fsl_dce_process_cb process_cb,
++	fsl_dce_nop_cb nop_cb,
++	fsl_dce_scr_invalidate_cb scr_invalidate_cb)
++{
++	int ret = 0;
++	struct fsl_dce_flow_init_params flow_params;
++
++	memset(&flow_params, 0, sizeof(flow_params));
++
++	if (!stream)
++		return -EINVAL;
++	memset(stream, 0, sizeof(*stream));
++
++	stream->pmode = pmode;
++
++	ret = allocate_stateful_dma_resources(stream, mode, pmode);
++	if (ret) {
++		free_stateful_dma_resources(stream, mode, pmode);
++		return ret;
++	}
++
++	/* QMan frame queue ids will be allocated */
++	if (bcfg)
++		fsl_dce_flow_setopt_bcfg(&stream->flow, *bcfg);
++	flow_params.mode = mode;
++	flow_params.fifo_depth = 1;
++	flow_params.state_config = DCE_STATEFUL;
++	flow_params.base_cb = stream_base_cb;
++	flow_params.process_cb = process_cb;
++	flow_params.nop_cb = nop_cb;
++	flow_params.scr_invalidate_cb = scr_invalidate_cb;
++	if (mode == DCE_COMPRESSION)
++		flow_params.scr =  fsl_dce_map(stream->hw_comp_scr);
++	else
++		flow_params.scr =  fsl_dce_map(stream->hw_decomp_scr);
++	/* RECYCLE mode only supports sychronous mode */
++	ret = fsl_dce_flow_init(&stream->flow, &flow_params);
++	if (ret) {
++		pr_debug("err ret=%d\n", ret);
++		free_stateful_dma_resources(stream, mode, pmode);
++		return ret;
++	}
++	return 0;
++}
++EXPORT_SYMBOL(fsl_dce_stream_setup2);
++
++int fsl_dce_stream_destroy(struct fsl_dce_stream *stream, uint32_t flags,
++			void *callback_tag)
++{
++	int ret;
++
++	ret = fsl_dce_flow_finish(&stream->flow, flags);
++	if (!ret)
++		free_stateful_dma_resources(stream, stream->flow.mode,
++				stream->pmode);
++	return 0;
++}
++EXPORT_SYMBOL(fsl_dce_stream_destroy);
++
++
++int fsl_dce_stream_init_scr(struct fsl_dce_stream *stream, struct qm_fd *fd,
++	void *callback_tag)
++{
++	SET_BF32_TK(fd->cmd, DCE_PROCESS_USPC, YES);
++	return fsl_dce_process(&stream->flow, 0, fd, callback_tag);
++}
++EXPORT_SYMBOL(fsl_dce_stream_init_scr);
++
++int fsl_dce_stream_process(struct fsl_dce_stream *stream, struct qm_fd *fd,
++	bool initial_frame, int z_flush, void *callback_tag)
++{
++	switch (z_flush) {
++	case DCE_PROCESS_Z_FLUSH_NO_FLUSH:
++	case DCE_PROCESS_Z_FLUSH_PARTIAL_FLUSH:
++	case DCE_PROCESS_Z_FLUSH_SYNC_FLUSH:
++	case DCE_PROCESS_Z_FLUSH_FULL_FLUSH:
++	case DCE_PROCESS_Z_FLUSH_FINISH:
++	case DCE_PROCESS_Z_FLUSH_BLOCK:
++	case DCE_PROCESS_Z_FLUSH_TREES:
++		SET_BF32(fd->cmd, DCE_PROCESS_Z_FLUSH, z_flush);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (initial_frame)
++		SET_BF32_TK(fd->cmd, DCE_PROCESS_INITIAL, SET);
++	return fsl_dce_process(&stream->flow, 0, fd, callback_tag);
++}
++EXPORT_SYMBOL(fsl_dce_stream_process);
++
++int fsl_dce_stream_nop(struct fsl_dce_stream *stream, uint32_t flags,
++	void *callback_tag)
++{
++	return fsl_dce_nop(&stream->flow, flags, callback_tag);
++}
++EXPORT_SYMBOL(fsl_dce_stream_nop);
++
++int fsl_dce_stream_deflate_params(struct fsl_dce_stream *stream,
++	uint32_t bman_output_offset,
++	bool bman_release_input,
++	bool base64,
++	uint32_t ce)
++{
++	fsl_dce_flow_setopt_outputoffset(&stream->flow, bman_output_offset);
++	fsl_dce_flow_setopt_release_input(&stream->flow, bman_release_input);
++	fsl_dce_flow_setopt_base64(&stream->flow, base64);
++	fsl_dce_flow_setopt_compression_effort(&stream->flow, ce);
++	return 0;
++}
++EXPORT_SYMBOL(fsl_dce_stream_deflate_params);
++
++int fsl_dce_stream_inflate_params(struct fsl_dce_stream *stream,
++	uint32_t bman_output_offset,
++	bool bman_release_input,
++	bool base64)
++{
++	fsl_dce_flow_setopt_outputoffset(&stream->flow, bman_output_offset);
++	fsl_dce_flow_setopt_release_input(&stream->flow, bman_release_input);
++	fsl_dce_flow_setopt_base64(&stream->flow, base64);
++	return 0;
++}
++EXPORT_SYMBOL(fsl_dce_stream_inflate_params);
++
+diff --git a/drivers/staging/fsl_dce/fsl_dce_stream.h b/drivers/staging/fsl_dce/fsl_dce_stream.h
+new file mode 100644
+index 0000000..09713d9
+--- /dev/null
++++ b/drivers/staging/fsl_dce/fsl_dce_stream.h
+@@ -0,0 +1,187 @@
++/* Copyright 2013 Freescale Semiconductor, Inc.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *       notice, this list of conditions and the following disclaimer in the
++ *       documentation and/or other materials provided with the distribution.
++ *     * Neither the name of Freescale Semiconductor nor the names of its
++ *       contributors may be used to endorse or promote products derived from
++ *       this software without specific prior written permission.
++ *
++ *
++ * ALTERNATIVELY, this software may be distributed under the terms of the
++ * GNU General Public License ("GPL") as published by the Free Software
++ * Foundation, either version 2 of that License or (at your option) any
++ * later version.
++ *
++ * This software is provided by Freescale Semiconductor "as is" and any
++ * express or implied warranties, including, but not limited to, the implied
++ * warranties of merchantability and fitness for a particular purpose are
++ * disclaimed. In no event shall Freescale Semiconductor be liable for any
++ * direct, indirect, incidental, special, exemplary, or consequential damages
++ * (including, but not limited to, procurement of substitute goods or services;
++ * loss of use, data, or profits; or business interruption) however caused and
++ * on any theory of liability, whether in contract, strict liability, or tort
++ * (including negligence or otherwise) arising in any way out of the use of
++ * this software, even if advised of the possibility of such damage.
++ */
++
++#ifndef FSL_DCE_STREAM_H
++#define FSL_DCE_STREAM_H
++
++#include <linux/fsl_qman.h>
++#include <linux/fsl_bman.h>
++#include "flib/dce_flow.h"
++
++/* (De)Allocate DCE hardware resources */
++struct fsl_dce_hw_scr_64b;
++struct fsl_dce_hw_scr_128b;
++struct fsl_dce_hw_compress_history;
++struct fsl_dce_hw_decompress_history;
++struct fsl_dce_hw_pending_output;
++struct fsl_dce_hw_decomp_ctxt;
++
++struct fsl_dce_hw_scr_64b *fsl_dce_hw_scr_64b_new(void);
++void fsl_dce_hw_scr_64b_free(struct fsl_dce_hw_scr_64b *);
++struct fsl_dce_hw_scr_128b *fsl_dce_hw_scr_128b_new(void);
++void fsl_dce_hw_scr_128b_free(struct fsl_dce_hw_scr_128b *);
++struct fsl_dce_hw_compress_history *fsl_dce_hw_compress_history_new(void);
++void fsl_dce_hw_compress_history_free(struct fsl_dce_hw_compress_history *);
++struct fsl_dce_hw_decompress_history *fsl_dce_hw_decompress_history_new(void);
++void fsl_dce_hw_decompress_history_free
++	(struct fsl_dce_hw_decompress_history *);
++struct fsl_dce_hw_pending_output *fsl_dce_hw_pending_output_new(void);
++void fsl_dce_hw_pending_output_free(struct fsl_dce_hw_pending_output *);
++struct fsl_dce_hw_decomp_ctxt *fsl_dce_hw_decomp_ctxt_new(void);
++void fsl_dce_hw_decomp_ctxt_free(struct fsl_dce_hw_decomp_ctxt *);
++
++/************************/
++/* high-level functions */
++/************************/
++struct fsl_dce_stream;
++
++/* DCE stream is a stateful compressor/decompressor object */
++struct fsl_dce_stream {
++	struct fsl_dce_flow flow;
++
++	enum dce_compression_format cf; /* deflate, zlib or gzip */
++	enum dce_processing_mode pmode; /* recycle, trunc */
++
++	/* optional BMan output settings */
++	bool use_bman_output;
++	uint32_t process_params; /* inflate, deflate parameters */
++
++	/* hw dma scr structure */
++	union {
++		struct fsl_dce_hw_scr_64b *hw_comp_scr;
++		struct fsl_dce_hw_scr_128b *hw_decomp_scr;
++	};
++
++	/*
++	 * history window
++	 *	decompression: 32k size 64B aligned
++	 *	compression: 4k size, 64B aligned
++	 */
++	union {
++		struct fsl_dce_hw_compress_history *comp_hist;
++		struct fsl_dce_hw_decompress_history *decomp_hist;
++	};
++
++	/*
++	 * Pending Ouput Data
++	 * decomp: 8256 bytes, comp: 8202. No hard requirement on alignment,
++	 * but 64 is optimal. Only needed in recycle mode.
++	 */
++	struct fsl_dce_hw_pending_output *pending_output_ptr;
++
++	/*
++	 *  Decompression Context Pointer, used to store the alphabet
++	 *  This is a 256 byte buffer with no alignment requirement
++	 */
++	struct fsl_dce_hw_decomp_ctxt *decomp_ctx_ptr;
++
++	uint32_t flags; /* internal state */
++	spinlock_t lock;
++	wait_queue_head_t queue;
++};
++/**
++ * fsl_dce_stream_setup - setup for dce stream object
++ * @stream:
++ * @mode:
++ * @cf:
++ *
++ * Simple dce stream setup function
++ */
++int fsl_dce_stream_setup(struct fsl_dce_stream *stream,
++	uint32_t flags,
++	enum dce_mode mode,
++	enum dce_compression_format cf,
++	fsl_dce_process_cb process_cb,
++	fsl_dce_nop_cb nop_cb,
++	fsl_dce_scr_invalidate_cb scr_invalidate_cb);
++
++/**
++ * fsl_dce_stream_setup2 - Advanced setup for dce stream object
++ * @stream:
++ * @mode:
++ * @cf:
++ * @pmode:
++ * @bcfg
++ *
++ * Advanced dce stream setup function.
++ * A dce_stream in DCE HW terminology is an object which is able to perform
++ * statful (de)compression in either recycle or truncation processing mode.
++ * In recycle mode, only synchronous processing is permitted and therefore
++ * a fifo_depth of 1 is only permitted.
++ */
++int fsl_dce_stream_setup2(struct fsl_dce_stream *stream,
++	uint32_t flags,
++	enum dce_mode mode,
++	enum dce_compression_format cf,
++	enum dce_processing_mode pmode,
++	struct dce_bman_cfg *bcfg,
++	fsl_dce_process_cb process_cb,
++	fsl_dce_nop_cb nop_cb,
++	fsl_dce_scr_invalidate_cb scr_invalidate_cb);
++
++int fsl_dce_stream_destroy(struct fsl_dce_stream *stream, uint32_t flags,
++			void *callback_tag);
++
++int fsl_dce_stream_deflate_params(struct fsl_dce_stream *stream,
++	uint32_t bman_output_offset,
++	bool bman_release_input,
++	bool base64,
++	uint32_t ce); /* DCE_PROCESS_CE_* value */
++
++int fsl_dce_stream_inflate_params(struct fsl_dce_stream *stream,
++	uint32_t bman_output_offset,
++	bool bman_release_input,
++	bool base64);
++
++/*
++ * This is the mission mode api.
++ */
++int fsl_dce_stream_process(struct fsl_dce_stream *stream,
++	struct qm_fd *fd,
++	bool initial_frame, /* if initial frame, sets I bit */
++	int z_flush, /* one of DCE_PROCESS_Z_* values */
++	void *callback_tag); /* optional callback tag */
++
++int fsl_dce_stream_nop(struct fsl_dce_stream *stream, uint32_t flags,
++	void *callback_tag); /* optional callback tag */
++
++/* helper apis */
++int fsl_dce_stream_init_scr(struct fsl_dce_stream *stream, struct qm_fd *fd,
++	void *callback_tag);
++void fsl_dce_attach_3mbr_sgtable_2_fd(struct qm_sg_entry sg_table[3],
++					struct qm_fd *fd);
++void fsl_dce_attach_scf_128b_2_3mbr_sgtable(struct scf_128b *scf,
++	struct qm_sg_entry sg_table[3]);
++void fsl_dce_attach_scf_64b_2_3mbr_sgtable(struct scf_64b *scf,
++	struct qm_sg_entry sg_table[3]);
++void fsl_dce_build_scf_uspc(struct fsl_dce_stream *stream, struct scf_64b *scf);
++
++#endif /* FSL_DCE_STREAM_H */
+-- 
+1.7.5.4
+
