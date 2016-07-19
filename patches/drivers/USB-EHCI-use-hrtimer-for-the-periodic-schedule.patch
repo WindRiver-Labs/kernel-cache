@@ -1,0 +1,359 @@
+From 514539b34f7a10f5e59e82173ff02a83f3ebc464 Mon Sep 17 00:00:00 2001
+From: Li Zhou <li.zhou@windriver.com>
+Date: Fri, 24 Jun 2016 13:53:08 +0800
+Subject: [PATCH 3/3] USB: EHCI: use hrtimer for the periodic schedule
+
+commit 3ca9aebac2ebb8f56d2d097636b8c568320a9f87 upstream.
+
+This patch (as1573) adds hrtimer support for managing ehci-hcd's
+periodic schedule.  There are two issues to deal with.
+
+First, the schedule's state (on or off) must not be changed until the
+hardware status has caught up with the current command.  This is
+handled by an hrtimer event that polls at 1-ms intervals to see when
+the Periodic Schedule Status (PSS) flag matches the Periodic Schedule
+Enable (PSE) value.
+
+Second, the schedule should not be turned off as soon as it becomes
+empty.  Turning the schedule on and off takes time, so we want to wait
+until the schedule has been empty for a suitable period before turning
+it off.  This is handled by an hrtimer event that gets set to expire
+10 ms after the periodic schedule becomes empty.
+
+The existing code polls (for up to 1125 us and with interrupts
+disabled!) to check the status, and doesn't implement a delay before
+turning off the schedule.  Furthermore, if the polling fails then the
+driver decides that the controller has died.  This has caused problems
+for several people; some controllers can take 10 ms or more to turn
+off their periodic schedules.
+
+This patch fixes these issues.  It also makes the "broken_periodic"
+workaround unnecessary; there is no longer any danger of turning off
+the periodic schedule after it has been on for less than 1 ms.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[lz: adapted the patch to solve context issues]
+Signed-off-by: Li Zhou <li.zhou@windriver.com>
+---
+ drivers/usb/host/ehci-hcd.c   |    2 +-
+ drivers/usb/host/ehci-hub.c   |    2 +-
+ drivers/usb/host/ehci-pci.c   |    4 --
+ drivers/usb/host/ehci-sched.c |   69 ++++++++---------------------------
+ drivers/usb/host/ehci-timer.c |   80 +++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/ehci.h       |    7 +++-
+ 6 files changed, 102 insertions(+), 62 deletions(-)
+
+diff --git a/drivers/usb/host/ehci-hcd.c b/drivers/usb/host/ehci-hcd.c
+index e1cd8ac..57dd10f 100644
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -556,7 +556,7 @@ static void ehci_work (struct ehci_hcd *ehci)
+ 	 */
+ 	if (ehci->rh_state == EHCI_RH_RUNNING &&
+ 			(ehci->async->qh_next.ptr != NULL ||
+-			 ehci->periodic_sched != 0))
++			 ehci->periodic_count != 0))
+ 		timer_action (ehci, TIMER_IO_WATCHDOG);
+ }
+ 
+diff --git a/drivers/usb/host/ehci-hub.c b/drivers/usb/host/ehci-hub.c
+index 6bf029a..7446472 100644
+--- a/drivers/usb/host/ehci-hub.c
++++ b/drivers/usb/host/ehci-hub.c
+@@ -440,7 +440,7 @@ static int ehci_bus_resume (struct usb_hcd *hcd)
+ 	temp = 0;
+ 	if (ehci->async->qh_next.qh)
+ 		temp |= CMD_ASE;
+-	if (ehci->periodic_sched)
++	if (ehci->periodic_count)
+ 		temp |= CMD_PSE;
+ 	if (temp) {
+ 		ehci->command |= temp;
+diff --git a/drivers/usb/host/ehci-pci.c b/drivers/usb/host/ehci-pci.c
+index 3302c27..65641e9 100644
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -131,10 +131,6 @@ static int ehci_pci_setup(struct usb_hcd *hcd)
+ 	case PCI_VENDOR_ID_INTEL:
+ 		ehci->need_io_watchdog = 0;
+ 		ehci->fs_i_thresh = 1;
+-		if (pdev->device == 0x27cc) {
+-			ehci->broken_periodic = 1;
+-			ehci_info(ehci, "using broken periodic workaround\n");
+-		}
+ 		if (pdev->device == 0x0806 || pdev->device == 0x0811
+ 				|| pdev->device == 0x0829) {
+ 			ehci_info(ehci, "disable lpm for langwell/penwell\n");
+diff --git a/drivers/usb/host/ehci-sched.c b/drivers/usb/host/ehci-sched.c
+index 941cb75..97db6c7 100644
+--- a/drivers/usb/host/ehci-sched.c
++++ b/drivers/usb/host/ehci-sched.c
+@@ -481,67 +481,26 @@ static int tt_no_collision (
+ 
+ static int enable_periodic (struct ehci_hcd *ehci)
+ {
+-	int	status;
+-
+-	if (ehci->periodic_sched++)
++	if (ehci->periodic_count++)
+ 		return 0;
+ 
+-	/* did clearing PSE did take effect yet?
+-	 * takes effect only at frame boundaries...
+-	 */
+-	status = handshake_on_error_set_halt(ehci, &ehci->regs->status,
+-					     STS_PSS, 0, 9 * 125);
+-	if (status) {
+-		usb_hc_died(ehci_to_hcd(ehci));
+-		return status;
+-	}
+-
+-	ehci->command |= CMD_PSE;
+-	ehci_writel(ehci, ehci->command, &ehci->regs->command);
+-	/* posted write ... PSS happens later */
++	/* Stop waiting to turn off the periodic schedule */
++	ehci->enabled_hrtimer_events &= ~BIT(EHCI_HRTIMER_DISABLE_PERIODIC);
+ 
+-	/* make sure ehci_work scans these */
+-	ehci->next_uframe = ehci_read_frame_index(ehci)
+-		% (ehci->periodic_size << 3);
+-	if (unlikely(ehci->broken_periodic))
+-		ehci->last_periodic_enable = ktime_get_real();
++	/* Don't start the schedule until PSS is 0 */
++	ehci_poll_PSS(ehci);
+ 	return 0;
+ }
+ 
+ static int disable_periodic (struct ehci_hcd *ehci)
+ {
+-	int	status;
+-
+-	if (--ehci->periodic_sched)
++	if (--ehci->periodic_count)
+ 		return 0;
+ 
+-	if (unlikely(ehci->broken_periodic)) {
+-		/* delay experimentally determined */
+-		ktime_t safe = ktime_add_us(ehci->last_periodic_enable, 1000);
+-		ktime_t now = ktime_get_real();
+-		s64 delay = ktime_us_delta(safe, now);
+-
+-		if (unlikely(delay > 0))
+-			udelay(delay);
+-	}
+-
+-	/* did setting PSE not take effect yet?
+-	 * takes effect only at frame boundaries...
+-	 */
+-	status = handshake_on_error_set_halt(ehci, &ehci->regs->status,
+-					     STS_PSS, STS_PSS, 9 * 125);
+-	if (status) {
+-		usb_hc_died(ehci_to_hcd(ehci));
+-		return status;
+-	}
+-
+-	ehci->command &= ~CMD_PSE;
+-	ehci_writel(ehci, ehci->command, &ehci->regs->command);
+-	/* posted write ... */
+-
+-	free_cached_lists(ehci);
++	ehci->next_uframe = -1;		/* the periodic schedule is empty */
+ 
+-	ehci->next_uframe = -1;
++	/* Don't turn off the schedule until PSS is 1 */
++	ehci_poll_PSS(ehci);
+ 	return 0;
+ }
+ 
+@@ -652,8 +611,7 @@ static int qh_unlink_periodic(struct ehci_hcd *ehci, struct ehci_qh *qh)
+ 	qh->qh_next.ptr = NULL;
+ 	qh_put (qh);
+ 
+-	/* maybe turn off periodic schedule */
+-	return disable_periodic(ehci);
++	return 0;
+ }
+ 
+ static void intr_deschedule (struct ehci_hcd *ehci, struct ehci_qh *qh)
+@@ -708,6 +666,9 @@ static void intr_deschedule (struct ehci_hcd *ehci, struct ehci_qh *qh)
+ 			ehci_err(ehci, "can't reschedule qh %p, err %d\n",
+ 					qh, rc);
+ 	}
++
++	/* maybe turn off periodic schedule */
++	disable_periodic(ehci);
+ }
+ 
+ /*-------------------------------------------------------------------------*/
+@@ -2447,7 +2408,7 @@ restart:
+ 
+ 			/* assume completion callbacks modify the queue */
+ 			if (unlikely (modified)) {
+-				if (likely(ehci->periodic_sched > 0))
++				if (likely(ehci->periodic_count > 0))
+ 					goto restart;
+ 				/* short-circuit this scan */
+ 				now_uframe = clock;
+@@ -2476,7 +2437,7 @@ restart:
+ 			unsigned	now;
+ 
+ 			if (ehci->rh_state != EHCI_RH_RUNNING
+-					|| ehci->periodic_sched == 0)
++					|| ehci->periodic_count == 0)
+ 				break;
+ 			ehci->next_uframe = now_uframe;
+ 			now = ehci_read_frame_index(ehci) & (mod - 1);
+diff --git a/drivers/usb/host/ehci-timer.c b/drivers/usb/host/ehci-timer.c
+index f6279e2..ecd3296 100644
+--- a/drivers/usb/host/ehci-timer.c
++++ b/drivers/usb/host/ehci-timer.c
+@@ -16,6 +16,28 @@
+ 
+ /*-------------------------------------------------------------------------*/
+ 
++/* Set a bit in the USBCMD register */
++static void ehci_set_command_bit(struct ehci_hcd *ehci, u32 bit)
++{
++	ehci->command |= bit;
++	ehci_writel(ehci, ehci->command, &ehci->regs->command);
++
++	/* unblock posted write */
++	ehci_readl(ehci, &ehci->regs->command);
++}
++
++/* Clear a bit in the USBCMD register */
++static void ehci_clear_command_bit(struct ehci_hcd *ehci, u32 bit)
++{
++	ehci->command &= ~bit;
++	ehci_writel(ehci, ehci->command, &ehci->regs->command);
++
++	/* unblock posted write */
++	ehci_readl(ehci, &ehci->regs->command);
++}
++
++/*-------------------------------------------------------------------------*/
++
+ /*
+  * EHCI timer support...  Now using hrtimers.
+  *
+@@ -45,6 +67,8 @@
+  * the event types indexed by enum ehci_hrtimer_event in ehci.h.
+  */
+ static unsigned event_delays_ns[] = {
++	1 * NSEC_PER_MSEC,	/* EHCI_HRTIMER_POLL_PSS */
++	10 * NSEC_PER_MSEC,	/* EHCI_HRTIMER_DISABLE_PERIODIC */
+ };
+ 
+ /* Enable a pending hrtimer event */
+@@ -67,12 +91,68 @@ static void ehci_enable_event(struct ehci_hcd *ehci, unsigned event,
+ }
+ 
+ 
++/* Poll the STS_PSS status bit; see when it agrees with CMD_PSE */
++static void ehci_poll_PSS(struct ehci_hcd *ehci)
++{
++	unsigned	actual, want;
++
++	/* Don't do anything if the controller isn't running (e.g., died) */
++	if (ehci->rh_state != EHCI_RH_RUNNING)
++		return;
++
++	want = (ehci->command & CMD_PSE) ? STS_PSS : 0;
++	actual = ehci_readl(ehci, &ehci->regs->status) & STS_PSS;
++
++	if (want != actual) {
++
++		/* Poll again later, but give up after about 20 ms */
++		if (ehci->PSS_poll_count++ < 20) {
++			ehci_enable_event(ehci, EHCI_HRTIMER_POLL_PSS, true);
++			return;
++		}
++		ehci_warn(ehci, "Waited too long for the periodic schedule status, giving up\n");
++	}
++	ehci->PSS_poll_count = 0;
++
++	/* The status is up-to-date; restart or stop the schedule as needed */
++	if (want == 0) {	/* Stopped */
++		free_cached_lists(ehci);
++		if (ehci->periodic_count > 0) {
++
++			/* make sure ehci_work scans these */
++			ehci->next_uframe = ehci_read_frame_index(ehci)
++					& ((ehci->periodic_size << 3) - 1);
++			ehci_set_command_bit(ehci, CMD_PSE);
++		}
++
++	} else {		/* Running */
++		if (ehci->periodic_count == 0) {
++
++			/* Turn off the schedule after a while */
++			ehci_enable_event(ehci, EHCI_HRTIMER_DISABLE_PERIODIC,
++					true);
++		}
++	}
++}
++
++/* Turn off the periodic schedule after a brief delay */
++static void ehci_disable_PSE(struct ehci_hcd *ehci)
++{
++	ehci_clear_command_bit(ehci, CMD_PSE);
++
++	/* Poll to see when it actually stops */
++	ehci_enable_event(ehci, EHCI_HRTIMER_POLL_PSS, true);
++}
++
++
+ /*
+  * Handler functions for the hrtimer event types.
+  * Keep this array in the same order as the event types indexed by
+  * enum ehci_hrtimer_event in ehci.h.
+  */
+ static void (*event_handlers[])(struct ehci_hcd *) = {
++	ehci_poll_PSS,			/* EHCI_HRTIMER_POLL_PSS */
++	ehci_disable_PSE,		/* EHCI_HRTIMER_DISABLE_PERIODIC */
+ };
+ 
+ static enum hrtimer_restart ehci_hrtimer_func(struct hrtimer *t)
+diff --git a/drivers/usb/host/ehci.h b/drivers/usb/host/ehci.h
+index d2d9c93..98e2340 100644
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -74,6 +74,8 @@ enum ehci_rh_state {
+  * ehci-timer.c) in parallel with this list.
+  */
+ enum ehci_hrtimer_event {
++	EHCI_HRTIMER_POLL_PSS,		/* Poll for periodic schedule off */
++	EHCI_HRTIMER_DISABLE_PERIODIC,	/* Wait to disable periodic sched */
+ 	EHCI_HRTIMER_NUM_EVENTS		/* Must come last */
+ };
+ #define EHCI_HRTIMER_NO_EVENT	99
+@@ -85,6 +87,8 @@ struct ehci_hcd {			/* one per controller */
+ 	ktime_t			hr_timeouts[EHCI_HRTIMER_NUM_EVENTS];
+ 	struct hrtimer		hrtimer;
+ 
++	int			PSS_poll_count;
++
+ 	/* glue to PCI and HCD framework */
+ 	struct ehci_caps __iomem *caps;
+ 	struct ehci_regs __iomem *regs;
+@@ -110,7 +114,7 @@ struct ehci_hcd {			/* one per controller */
+ 
+ 	union ehci_shadow	*pshadow;	/* mirror hw periodic table */
+ 	int			next_uframe;	/* scan periodic, start here */
+-	unsigned		periodic_sched;	/* periodic activity count */
++	unsigned		periodic_count;	/* periodic activity count */
+ 	unsigned		uframe_periodic_max; /* max periodic time per uframe */
+ 
+ 
+@@ -159,7 +163,6 @@ struct ehci_hcd {			/* one per controller */
+ 	unsigned		big_endian_capbase:1;
+ 	unsigned		has_amcc_usb23:1;
+ 	unsigned		need_io_watchdog:1;
+-	unsigned		broken_periodic:1;
+ 	unsigned		amd_pll_fix:1;
+ 	unsigned		fs_i_thresh:1;	/* Intel iso scheduling */
+ 	unsigned		use_dummy_qh:1;	/* AMD Frame List table quirk*/
+-- 
+1.7.5.4
+
