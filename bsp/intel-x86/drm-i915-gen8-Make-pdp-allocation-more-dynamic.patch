@@ -1,0 +1,304 @@
+From c799348dad0e4d1740779b5fb6cefabb5c6dd6c7 Mon Sep 17 00:00:00 2001
+From: Michel Thierry <michel.thierry@intel.com>
+Date: Wed, 29 Jul 2015 17:23:46 +0100
+Subject: [PATCH 002/435] drm/i915/gen8: Make pdp allocation more dynamic
+
+commit '6ac1850220732f47bc6ae767fa41542009674ad7' upstream
+
+This transitional patch doesn't do much for the existing code. However,
+it should make upcoming patches to use the full 48b address space a bit
+easier.
+
+32-bit ppgtt uses just 4 PDPs, while 48-bit ppgtt will have up-to 512;
+this patch prepares the existing functions to query the right number of pdps
+at run-time. This also means that used_pdpes should also be allocated during
+ppgtt_init, as the bitmap size will depend on the ppgtt address range
+selected.
+
+v2: Renamed  pdp_free to be similar to  pd/pt (unmap_and_free_pdp).
+v3: To facilitate testing, 48b mode will be available on Broadwell and
+GEN9+, when i915.enable_ppgtt = 3.
+v4: Rebase after s/page_tables/page_table/, added extra information
+about 4-level page table formats and use IS_ENABLED macro.
+v5: Check CONFIG_X86_64 instead of CONFIG_64BIT.
+v6: Rebase after Mika's ppgtt cleanup / scratch merge patch series, and
+follow
+his nomenclature in pdp functions (there is no alloc_pdp yet).
+v7: Rebase after merged version of Mika's ppgtt cleanup patch series.
+v8: Rebase after final merged version of Mika's ppgtt/scratch patches.
+v9: Introduce PML4 (and 48-bit checks) until next patch (Akash).
+v10: Also use test_bit to detect when pd/pt are already allocated (Akash)
+
+Cc: Akash Goel <akash.goel@intel.com>
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com> (v2+)
+Reviewed-by: Akash Goel <akash.goel@intel.com>
+[danvet: Amend commit message as suggested by Michel.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Hu <yadi.hu@windriver.com>
+---
+ drivers/gpu/drm/i915/i915_gem_gtt.c |   86 ++++++++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/i915_gem_gtt.h |   17 +++++---
+ 2 files changed, 80 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 566466f..6724e71 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -522,6 +522,43 @@ static void gen8_initialize_pd(struct i915_address_space *vm,
+ 	fill_px(vm->dev, pd, scratch_pde);
+ }
+ 
++static int __pdp_init(struct drm_device *dev,
++		      struct i915_page_directory_pointer *pdp)
++{
++	size_t pdpes = I915_PDPES_PER_PDP(dev);
++
++	pdp->used_pdpes = kcalloc(BITS_TO_LONGS(pdpes),
++				  sizeof(unsigned long),
++				  GFP_KERNEL);
++	if (!pdp->used_pdpes)
++		return -ENOMEM;
++
++	pdp->page_directory = kcalloc(pdpes, sizeof(*pdp->page_directory),
++				      GFP_KERNEL);
++	if (!pdp->page_directory) {
++		kfree(pdp->used_pdpes);
++		/* the PDP might be the statically allocated top level. Keep it
++		 * as clean as possible */
++		pdp->used_pdpes = NULL;
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++static void __pdp_fini(struct i915_page_directory_pointer *pdp)
++{
++	kfree(pdp->used_pdpes);
++	kfree(pdp->page_directory);
++	pdp->page_directory = NULL;
++}
++
++static void free_pdp(struct drm_device *dev,
++		     struct i915_page_directory_pointer *pdp)
++{
++	__pdp_fini(pdp);
++}
++
+ /* Broadwell Page Directory Pointer Descriptors */
+ static int gen8_write_pdp(struct drm_i915_gem_request *req,
+ 			  unsigned entry,
+@@ -720,7 +757,8 @@ static void gen8_ppgtt_cleanup(struct i915_address_space *vm)
+ 		container_of(vm, struct i915_hw_ppgtt, base);
+ 	int i;
+ 
+-	for_each_set_bit(i, ppgtt->pdp.used_pdpes, GEN8_LEGACY_PDPES) {
++	for_each_set_bit(i, ppgtt->pdp.used_pdpes,
++			 I915_PDPES_PER_PDP(ppgtt->base.dev)) {
+ 		if (WARN_ON(!ppgtt->pdp.page_directory[i]))
+ 			continue;
+ 
+@@ -729,6 +767,7 @@ static void gen8_ppgtt_cleanup(struct i915_address_space *vm)
+ 		free_pd(ppgtt->base.dev, ppgtt->pdp.page_directory[i]);
+ 	}
+ 
++	free_pdp(ppgtt->base.dev, &ppgtt->pdp);
+ 	gen8_free_scratch(vm);
+ }
+ 
+@@ -763,7 +802,7 @@ static int gen8_ppgtt_alloc_pagetabs(struct i915_hw_ppgtt *ppgtt,
+ 
+ 	gen8_for_each_pde(pt, pd, start, length, temp, pde) {
+ 		/* Don't reallocate page tables */
+-		if (pt) {
++		if (test_bit(pde, pd->used_pdes)) {
+ 			/* Scratch is never allocated this way */
+ 			WARN_ON(pt == ppgtt->base.scratch_pt);
+ 			continue;
+@@ -820,11 +859,12 @@ static int gen8_ppgtt_alloc_page_directories(struct i915_hw_ppgtt *ppgtt,
+ 	struct i915_page_directory *pd;
+ 	uint64_t temp;
+ 	uint32_t pdpe;
++	uint32_t pdpes = I915_PDPES_PER_PDP(dev);
+ 
+-	WARN_ON(!bitmap_empty(new_pds, GEN8_LEGACY_PDPES));
++	WARN_ON(!bitmap_empty(new_pds, pdpes));
+ 
+ 	gen8_for_each_pdpe(pd, pdp, start, length, temp, pdpe) {
+-		if (pd)
++		if (test_bit(pdpe, pdp->used_pdpes))
+ 			continue;
+ 
+ 		pd = alloc_pd(dev);
+@@ -839,18 +879,19 @@ static int gen8_ppgtt_alloc_page_directories(struct i915_hw_ppgtt *ppgtt,
+ 	return 0;
+ 
+ unwind_out:
+-	for_each_set_bit(pdpe, new_pds, GEN8_LEGACY_PDPES)
++	for_each_set_bit(pdpe, new_pds, pdpes)
+ 		free_pd(dev, pdp->page_directory[pdpe]);
+ 
+ 	return -ENOMEM;
+ }
+ 
+ static void
+-free_gen8_temp_bitmaps(unsigned long *new_pds, unsigned long **new_pts)
++free_gen8_temp_bitmaps(unsigned long *new_pds, unsigned long **new_pts,
++		       uint32_t pdpes)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < GEN8_LEGACY_PDPES; i++)
++	for (i = 0; i < pdpes; i++)
+ 		kfree(new_pts[i]);
+ 	kfree(new_pts);
+ 	kfree(new_pds);
+@@ -861,23 +902,24 @@ free_gen8_temp_bitmaps(unsigned long *new_pds, unsigned long **new_pts)
+  */
+ static
+ int __must_check alloc_gen8_temp_bitmaps(unsigned long **new_pds,
+-					 unsigned long ***new_pts)
++					 unsigned long ***new_pts,
++					 uint32_t pdpes)
+ {
+ 	int i;
+ 	unsigned long *pds;
+ 	unsigned long **pts;
+ 
+-	pds = kcalloc(BITS_TO_LONGS(GEN8_LEGACY_PDPES), sizeof(unsigned long), GFP_KERNEL);
++	pds = kcalloc(BITS_TO_LONGS(pdpes), sizeof(unsigned long), GFP_KERNEL);
+ 	if (!pds)
+ 		return -ENOMEM;
+ 
+-	pts = kcalloc(GEN8_LEGACY_PDPES, sizeof(unsigned long *), GFP_KERNEL);
++	pts = kcalloc(pdpes, sizeof(unsigned long *), GFP_KERNEL);
+ 	if (!pts) {
+ 		kfree(pds);
+ 		return -ENOMEM;
+ 	}
+ 
+-	for (i = 0; i < GEN8_LEGACY_PDPES; i++) {
++	for (i = 0; i < pdpes; i++) {
+ 		pts[i] = kcalloc(BITS_TO_LONGS(I915_PDES),
+ 				 sizeof(unsigned long), GFP_KERNEL);
+ 		if (!pts[i])
+@@ -890,7 +932,7 @@ int __must_check alloc_gen8_temp_bitmaps(unsigned long **new_pds,
+ 	return 0;
+ 
+ err_out:
+-	free_gen8_temp_bitmaps(pds, pts);
++	free_gen8_temp_bitmaps(pds, pts, pdpes);
+ 	return -ENOMEM;
+ }
+ 
+@@ -916,6 +958,7 @@ static int gen8_alloc_va_range(struct i915_address_space *vm,
+ 	const uint64_t orig_length = length;
+ 	uint64_t temp;
+ 	uint32_t pdpe;
++	uint32_t pdpes = I915_PDPES_PER_PDP(ppgtt->base.dev);
+ 	int ret;
+ 
+ 	/* Wrap is never okay since we can only represent 48b, and we don't
+@@ -927,7 +970,7 @@ static int gen8_alloc_va_range(struct i915_address_space *vm,
+ 	if (WARN_ON(start + length > ppgtt->base.total))
+ 		return -ENODEV;
+ 
+-	ret = alloc_gen8_temp_bitmaps(&new_page_dirs, &new_page_tables);
++	ret = alloc_gen8_temp_bitmaps(&new_page_dirs, &new_page_tables, pdpes);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -935,7 +978,7 @@ static int gen8_alloc_va_range(struct i915_address_space *vm,
+ 	ret = gen8_ppgtt_alloc_page_directories(ppgtt, &ppgtt->pdp, start, length,
+ 					new_page_dirs);
+ 	if (ret) {
+-		free_gen8_temp_bitmaps(new_page_dirs, new_page_tables);
++		free_gen8_temp_bitmaps(new_page_dirs, new_page_tables, pdpes);
+ 		return ret;
+ 	}
+ 
+@@ -989,7 +1032,7 @@ static int gen8_alloc_va_range(struct i915_address_space *vm,
+ 		__set_bit(pdpe, ppgtt->pdp.used_pdpes);
+ 	}
+ 
+-	free_gen8_temp_bitmaps(new_page_dirs, new_page_tables);
++	free_gen8_temp_bitmaps(new_page_dirs, new_page_tables, pdpes);
+ 	mark_tlbs_dirty(ppgtt);
+ 	return 0;
+ 
+@@ -999,10 +1042,10 @@ err_out:
+ 			free_pt(vm->dev, ppgtt->pdp.page_directory[pdpe]->page_table[temp]);
+ 	}
+ 
+-	for_each_set_bit(pdpe, new_page_dirs, GEN8_LEGACY_PDPES)
++	for_each_set_bit(pdpe, new_page_dirs, pdpes)
+ 		free_pd(vm->dev, ppgtt->pdp.page_directory[pdpe]);
+ 
+-	free_gen8_temp_bitmaps(new_page_dirs, new_page_tables);
++	free_gen8_temp_bitmaps(new_page_dirs, new_page_tables, pdpes);
+ 	mark_tlbs_dirty(ppgtt);
+ 	return ret;
+ }
+@@ -1040,7 +1083,16 @@ static int gen8_ppgtt_init(struct i915_hw_ppgtt *ppgtt)
+ 
+ 	ppgtt->switch_mm = gen8_mm_switch;
+ 
++	ret = __pdp_init(false, &ppgtt->pdp);
++
++	if (ret)
++		goto free_scratch;
++
+ 	return 0;
++
++free_scratch:
++	gen8_free_scratch(&ppgtt->base);
++	return ret;
+ }
+ 
+ static void gen6_dump_ppgtt(struct i915_hw_ppgtt *ppgtt, struct seq_file *m)
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index d5bf953..87e389c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -98,6 +98,9 @@ typedef uint64_t gen8_pde_t;
+ #define GEN8_LEGACY_PDPES		4
+ #define GEN8_PTES			I915_PTES(sizeof(gen8_pte_t))
+ 
++/* FIXME: Next patch will use dev */
++#define I915_PDPES_PER_PDP(dev)		GEN8_LEGACY_PDPES
++
+ #define PPAT_UNCACHED_INDEX		(_PAGE_PWT | _PAGE_PCD)
+ #define PPAT_CACHED_PDE_INDEX		0 /* WB LLC */
+ #define PPAT_CACHED_INDEX		_PAGE_PAT /* WB LLCeLLC */
+@@ -241,9 +244,10 @@ struct i915_page_directory {
+ };
+ 
+ struct i915_page_directory_pointer {
+-	/* struct page *page; */
+-	DECLARE_BITMAP(used_pdpes, GEN8_LEGACY_PDPES);
+-	struct i915_page_directory *page_directory[GEN8_LEGACY_PDPES];
++	struct i915_page_dma base;
++
++	unsigned long *used_pdpes;
++	struct i915_page_directory **page_directory;
+ };
+ 
+ struct i915_address_space {
+@@ -436,9 +440,10 @@ static inline uint32_t gen6_pde_index(uint32_t addr)
+ 	     temp = min(temp, length),					\
+ 	     start += temp, length -= temp)
+ 
+-#define gen8_for_each_pdpe(pd, pdp, start, length, temp, iter)		\
+-	for (iter = gen8_pdpe_index(start);	\
+-	     pd = (pdp)->page_directory[iter], length > 0 && iter < GEN8_LEGACY_PDPES;	\
++#define gen8_for_each_pdpe(pd, pdp, start, length, temp, iter)	\
++	for (iter = gen8_pdpe_index(start); \
++	     pd = (pdp)->page_directory[iter], \
++	     length > 0 && (iter < I915_PDPES_PER_PDP(dev)); \
+ 	     iter++,				\
+ 	     temp = ALIGN(start+1, 1 << GEN8_PDPE_SHIFT) - start,	\
+ 	     temp = min(temp, length),					\
+-- 
+1.7.5.4
+
