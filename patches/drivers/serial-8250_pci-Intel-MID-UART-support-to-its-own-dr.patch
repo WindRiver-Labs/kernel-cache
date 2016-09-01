@@ -1,0 +1,606 @@
+From 446f3367c02b5ba51dde079c61251520f1e45a1e Mon Sep 17 00:00:00 2001
+From: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Date: Tue, 13 Oct 2015 13:29:02 +0300
+Subject: [PATCH 160/168] serial: 8250_pci: Intel MID UART support to its own
+ driver
+
+commit d9eda9bab237259b06690652b145d19e0ce37a77 upstream.
+
+Intel MID UART quirks require already quite a bit of code
+in 8250_pci.c. On new Intel platforms where it is used, the
+integrated DMA engine no longer has its own PCI device, but
+is instead configured from the UART's MMIO. That means we
+will have to add even more code for handling just MID UARTs.
+
+Instead of adding that to 8250_pci.c, splitting the support
+of Intel MID UART into its own driver. Handling of the
+integrated DMA engine becomes much simpler this way. Own
+driver will also remove the need for things like specific
+set_termios hooks for every board using this UART, and
+simplify the handling of it in general.
+
+Signed-off-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Acked-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/tty/serial/8250/8250_mid.c |  258 ++++++++++++++++++++++++++++++++++++
+ drivers/tty/serial/8250/8250_pci.c |  228 +-------------------------------
+ drivers/tty/serial/8250/Kconfig    |    8 +
+ drivers/tty/serial/8250/Makefile   |    1 +
+ 4 files changed, 273 insertions(+), 222 deletions(-)
+ create mode 100644 drivers/tty/serial/8250/8250_mid.c
+
+diff --git a/drivers/tty/serial/8250/8250_mid.c b/drivers/tty/serial/8250/8250_mid.c
+new file mode 100644
+index 0000000..61f604c
+--- /dev/null
++++ b/drivers/tty/serial/8250/8250_mid.c
+@@ -0,0 +1,258 @@
++/*
++ * 8250_mid.c - Driver for UART on Intel Penwell and various other Intel SOCs
++ *
++ * Copyright (C) 2015 Intel Corporation
++ * Author: Heikki Krogerus <heikki.krogerus@linux.intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/rational.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++
++#include <linux/dma/hsu.h>
++
++#include "8250.h"
++
++#define PCI_DEVICE_ID_INTEL_PNW_UART1	0x081b
++#define PCI_DEVICE_ID_INTEL_PNW_UART2	0x081c
++#define PCI_DEVICE_ID_INTEL_PNW_UART3	0x081d
++#define PCI_DEVICE_ID_INTEL_TNG_UART	0x1191
++
++/* Intel MID Specific registers */
++#define INTEL_MID_UART_PS		0x30
++#define INTEL_MID_UART_MUL		0x34
++#define INTEL_MID_UART_DIV		0x38
++
++struct mid8250;
++
++struct mid8250_board {
++	unsigned long freq;
++	unsigned int base_baud;
++	int (*setup)(struct mid8250 *, struct uart_port *p);
++};
++
++struct mid8250 {
++	int line;
++	int dma_index;
++	struct pci_dev *dma_dev;
++	struct uart_8250_dma dma;
++	struct mid8250_board *board;
++};
++
++/*****************************************************************************/
++
++static int pnw_setup(struct mid8250 *mid, struct uart_port *p)
++{
++	struct pci_dev *pdev = to_pci_dev(p->dev);
++
++	switch (pdev->device) {
++	case PCI_DEVICE_ID_INTEL_PNW_UART1:
++		mid->dma_index = 0;
++		break;
++	case PCI_DEVICE_ID_INTEL_PNW_UART2:
++		mid->dma_index = 1;
++		break;
++	case PCI_DEVICE_ID_INTEL_PNW_UART3:
++		mid->dma_index = 2;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	mid->dma_dev = pci_get_slot(pdev->bus,
++				    PCI_DEVFN(PCI_SLOT(pdev->devfn), 3));
++	return 0;
++}
++
++static int tng_setup(struct mid8250 *mid, struct uart_port *p)
++{
++	struct pci_dev *pdev = to_pci_dev(p->dev);
++	int index = PCI_FUNC(pdev->devfn);
++
++	/* Currently no support for HSU port0 */
++	if (index-- == 0)
++		return -ENODEV;
++
++	mid->dma_index = index;
++	mid->dma_dev = pci_get_slot(pdev->bus, PCI_DEVFN(5, 0));
++	return 0;
++}
++
++/*****************************************************************************/
++
++static void mid8250_set_termios(struct uart_port *p,
++				struct ktermios *termios,
++				struct ktermios *old)
++{
++	unsigned int baud = tty_termios_baud_rate(termios);
++	struct mid8250 *mid = p->private_data;
++	unsigned short ps = 16;
++	unsigned long fuart = baud * ps;
++	unsigned long w = BIT(24) - 1;
++	unsigned long mul, div;
++
++	if (mid->board->freq < fuart) {
++		/* Find prescaler value that satisfies Fuart < Fref */
++		if (mid->board->freq > baud)
++			ps = mid->board->freq / baud;	/* baud rate too high */
++		else
++			ps = 1;				/* PLL case */
++		fuart = baud * ps;
++	} else {
++		/* Get Fuart closer to Fref */
++		fuart *= rounddown_pow_of_two(mid->board->freq / fuart);
++	}
++
++	rational_best_approximation(fuart, mid->board->freq, w, w, &mul, &div);
++	p->uartclk = fuart * 16 / ps;		/* core uses ps = 16 always */
++
++	writel(ps, p->membase + INTEL_MID_UART_PS);		/* set PS */
++	writel(mul, p->membase + INTEL_MID_UART_MUL);		/* set MUL */
++	writel(div, p->membase + INTEL_MID_UART_DIV);
++
++	serial8250_do_set_termios(p, termios, old);
++}
++
++static bool mid8250_dma_filter(struct dma_chan *chan, void *param)
++{
++	struct hsu_dma_slave *s = param;
++
++	if (s->dma_dev != chan->device->dev || s->chan_id != chan->chan_id)
++		return false;
++
++	chan->private = s;
++	return true;
++}
++
++static int mid8250_dma_setup(struct mid8250 *mid, struct uart_8250_port *port)
++{
++	struct uart_8250_dma *dma = &mid->dma;
++	struct device *dev = port->port.dev;
++	struct hsu_dma_slave *rx_param;
++	struct hsu_dma_slave *tx_param;
++
++	rx_param = devm_kzalloc(dev, sizeof(*rx_param), GFP_KERNEL);
++	if (!rx_param)
++		return -ENOMEM;
++
++	tx_param = devm_kzalloc(dev, sizeof(*tx_param), GFP_KERNEL);
++	if (!tx_param)
++		return -ENOMEM;
++
++	rx_param->chan_id = mid->dma_index * 2 + 1;
++	tx_param->chan_id = mid->dma_index * 2;
++
++	dma->rxconf.src_maxburst = 64;
++	dma->txconf.dst_maxburst = 64;
++
++	rx_param->dma_dev = &mid->dma_dev->dev;
++	tx_param->dma_dev = &mid->dma_dev->dev;
++
++	dma->fn = mid8250_dma_filter;
++	dma->rx_param = rx_param;
++	dma->tx_param = tx_param;
++
++	port->dma = dma;
++	return 0;
++}
++
++static int mid8250_probe(struct pci_dev *pdev, const struct pci_device_id *id)
++{
++	struct uart_8250_port uart;
++	struct mid8250 *mid;
++	int ret;
++
++	ret = pcim_enable_device(pdev);
++	if (ret)
++		return ret;
++
++	pci_set_master(pdev);
++
++	mid = devm_kzalloc(&pdev->dev, sizeof(*mid), GFP_KERNEL);
++	if (!mid)
++		return -ENOMEM;
++
++	mid->board = (struct mid8250_board *)id->driver_data;
++
++	memset(&uart, 0, sizeof(struct uart_8250_port));
++
++	uart.port.dev = &pdev->dev;
++	uart.port.irq = pdev->irq;
++	uart.port.private_data = mid;
++	uart.port.type = PORT_16750;
++	uart.port.iotype = UPIO_MEM;
++	uart.port.uartclk = mid->board->base_baud * 16;
++	uart.port.flags = UPF_SHARE_IRQ | UPF_FIXED_PORT | UPF_FIXED_TYPE;
++	uart.port.set_termios = mid8250_set_termios;
++
++	uart.port.mapbase = pci_resource_start(pdev, 0);
++	uart.port.membase = pcim_iomap(pdev, 0, 0);
++	if (!uart.port.membase)
++		return -ENOMEM;
++
++	if (mid->board->setup) {
++		ret = mid->board->setup(mid, &uart.port);
++		if (ret)
++			return ret;
++	}
++
++	ret = mid8250_dma_setup(mid, &uart);
++	if (ret)
++		return ret;
++
++	ret = serial8250_register_8250_port(&uart);
++	if (ret < 0)
++		return ret;
++
++	mid->line = ret;
++
++	pci_set_drvdata(pdev, mid);
++	return 0;
++}
++
++static void mid8250_remove(struct pci_dev *pdev)
++{
++	struct mid8250 *mid = pci_get_drvdata(pdev);
++
++	serial8250_unregister_port(mid->line);
++}
++
++static const struct mid8250_board pnw_board = {
++	.freq = 50000000,
++	.base_baud = 115200,
++	.setup = pnw_setup,
++};
++
++static const struct mid8250_board tng_board = {
++	.freq = 38400000,
++	.base_baud = 1843200,
++	.setup = tng_setup,
++};
++
++#define MID_DEVICE(id, board) { PCI_VDEVICE(INTEL, id), (kernel_ulong_t)&board }
++
++static const struct pci_device_id pci_ids[] = {
++	MID_DEVICE(PCI_DEVICE_ID_INTEL_PNW_UART1, pnw_board),
++	MID_DEVICE(PCI_DEVICE_ID_INTEL_PNW_UART2, pnw_board),
++	MID_DEVICE(PCI_DEVICE_ID_INTEL_PNW_UART3, pnw_board),
++	MID_DEVICE(PCI_DEVICE_ID_INTEL_TNG_UART, tng_board),
++	{ },
++};
++MODULE_DEVICE_TABLE(pci, pci_ids);
++
++static struct pci_driver mid8250_pci_driver = {
++	.name           = "8250_mid",
++	.id_table       = pci_ids,
++	.probe          = mid8250_probe,
++	.remove         = mid8250_remove,
++};
++
++module_pci_driver(mid8250_pci_driver);
++
++MODULE_AUTHOR("Intel Corporation");
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("Intel MID UART driver");
+diff --git a/drivers/tty/serial/8250/8250_pci.c b/drivers/tty/serial/8250/8250_pci.c
+index b82b2a0..c7dea11 100644
+--- a/drivers/tty/serial/8250/8250_pci.c
++++ b/drivers/tty/serial/8250/8250_pci.c
+@@ -28,7 +28,6 @@
+ 
+ #include <linux/dmaengine.h>
+ #include <linux/platform_data/dma-dw.h>
+-#include <linux/platform_data/dma-hsu.h>
+ 
+ #include "8250.h"
+ 
+@@ -1509,167 +1508,6 @@ byt_serial_setup(struct serial_private *priv,
+ 	return ret;
+ }
+ 
+-#define INTEL_MID_UART_PS		0x30
+-#define INTEL_MID_UART_MUL		0x34
+-#define INTEL_MID_UART_DIV		0x38
+-
+-static void intel_mid_set_termios(struct uart_port *p,
+-				  struct ktermios *termios,
+-				  struct ktermios *old,
+-				  unsigned long fref)
+-{
+-	unsigned int baud = tty_termios_baud_rate(termios);
+-	unsigned short ps = 16;
+-	unsigned long fuart = baud * ps;
+-	unsigned long w = BIT(24) - 1;
+-	unsigned long mul, div;
+-
+-	if (fref < fuart) {
+-		/* Find prescaler value that satisfies Fuart < Fref */
+-		if (fref > baud)
+-			ps = fref / baud;	/* baud rate too high */
+-		else
+-			ps = 1;			/* PLL case */
+-		fuart = baud * ps;
+-	} else {
+-		/* Get Fuart closer to Fref */
+-		fuart *= rounddown_pow_of_two(fref / fuart);
+-	}
+-
+-	rational_best_approximation(fuart, fref, w, w, &mul, &div);
+-	p->uartclk = fuart * 16 / ps;		/* core uses ps = 16 always */
+-
+-	writel(ps, p->membase + INTEL_MID_UART_PS);		/* set PS */
+-	writel(mul, p->membase + INTEL_MID_UART_MUL);		/* set MUL */
+-	writel(div, p->membase + INTEL_MID_UART_DIV);
+-
+-	serial8250_do_set_termios(p, termios, old);
+-}
+-
+-static void intel_mid_set_termios_38_4M(struct uart_port *p,
+-					struct ktermios *termios,
+-					struct ktermios *old)
+-{
+-	intel_mid_set_termios(p, termios, old, 38400000);
+-}
+-
+-static void intel_mid_set_termios_50M(struct uart_port *p,
+-				      struct ktermios *termios,
+-				      struct ktermios *old)
+-{
+-	/*
+-	 * The uart clk is 50Mhz, and the baud rate come from:
+-	 *      baud = 50M * MUL / (DIV * PS * DLAB)
+-	 */
+-	intel_mid_set_termios(p, termios, old, 50000000);
+-}
+-
+-static bool intel_mid_dma_filter(struct dma_chan *chan, void *param)
+-{
+-	struct hsu_dma_slave *s = param;
+-
+-	if (s->dma_dev != chan->device->dev || s->chan_id != chan->chan_id)
+-		return false;
+-
+-	chan->private = s;
+-	return true;
+-}
+-
+-static int intel_mid_serial_setup(struct serial_private *priv,
+-				  const struct pciserial_board *board,
+-				  struct uart_8250_port *port, int idx,
+-				  int index, struct pci_dev *dma_dev)
+-{
+-	struct device *dev = port->port.dev;
+-	struct uart_8250_dma *dma;
+-	struct hsu_dma_slave *tx_param, *rx_param;
+-
+-	dma = devm_kzalloc(dev, sizeof(*dma), GFP_KERNEL);
+-	if (!dma)
+-		return -ENOMEM;
+-
+-	tx_param = devm_kzalloc(dev, sizeof(*tx_param), GFP_KERNEL);
+-	if (!tx_param)
+-		return -ENOMEM;
+-
+-	rx_param = devm_kzalloc(dev, sizeof(*rx_param), GFP_KERNEL);
+-	if (!rx_param)
+-		return -ENOMEM;
+-
+-	rx_param->chan_id = index * 2 + 1;
+-	tx_param->chan_id = index * 2;
+-
+-	dma->rxconf.src_maxburst = 64;
+-	dma->txconf.dst_maxburst = 64;
+-
+-	rx_param->dma_dev = &dma_dev->dev;
+-	tx_param->dma_dev = &dma_dev->dev;
+-
+-	dma->fn = intel_mid_dma_filter;
+-	dma->rx_param = rx_param;
+-	dma->tx_param = tx_param;
+-
+-	port->port.type = PORT_16750;
+-	port->port.flags |= UPF_FIXED_PORT | UPF_FIXED_TYPE;
+-	port->dma = dma;
+-
+-	return pci_default_setup(priv, board, port, idx);
+-}
+-
+-#define PCI_DEVICE_ID_INTEL_PNW_UART1	0x081b
+-#define PCI_DEVICE_ID_INTEL_PNW_UART2	0x081c
+-#define PCI_DEVICE_ID_INTEL_PNW_UART3	0x081d
+-
+-static int pnw_serial_setup(struct serial_private *priv,
+-			    const struct pciserial_board *board,
+-			    struct uart_8250_port *port, int idx)
+-{
+-	struct pci_dev *pdev = priv->dev;
+-	struct pci_dev *dma_dev;
+-	int index;
+-
+-	switch (pdev->device) {
+-	case PCI_DEVICE_ID_INTEL_PNW_UART1:
+-		index = 0;
+-		break;
+-	case PCI_DEVICE_ID_INTEL_PNW_UART2:
+-		index = 1;
+-		break;
+-	case PCI_DEVICE_ID_INTEL_PNW_UART3:
+-		index = 2;
+-		break;
+-	default:
+-		return -EINVAL;
+-	}
+-
+-	dma_dev = pci_get_slot(pdev->bus, PCI_DEVFN(PCI_SLOT(pdev->devfn), 3));
+-
+-	port->port.set_termios = intel_mid_set_termios_50M;
+-
+-	return intel_mid_serial_setup(priv, board, port, idx, index, dma_dev);
+-}
+-
+-#define PCI_DEVICE_ID_INTEL_TNG_UART	0x1191
+-
+-static int tng_serial_setup(struct serial_private *priv,
+-			    const struct pciserial_board *board,
+-			    struct uart_8250_port *port, int idx)
+-{
+-	struct pci_dev *pdev = priv->dev;
+-	struct pci_dev *dma_dev;
+-	int index = PCI_FUNC(pdev->devfn);
+-
+-	/* Currently no support for HSU port0 */
+-	if (index-- == 0)
+-		return -ENODEV;
+-
+-	dma_dev = pci_get_slot(pdev->bus, PCI_DEVFN(5, 0));
+-
+-	port->port.set_termios = intel_mid_set_termios_38_4M;
+-
+-	return intel_mid_serial_setup(priv, board, port, idx, index, dma_dev);
+-}
+-
+ static int
+ pci_omegapci_setup(struct serial_private *priv,
+ 		      const struct pciserial_board *board,
+@@ -2120,34 +1958,6 @@ static struct pci_serial_quirk pci_serial_quirks[] __refdata = {
+ 	},
+ 	{
+ 		.vendor		= PCI_VENDOR_ID_INTEL,
+-		.device		= PCI_DEVICE_ID_INTEL_PNW_UART1,
+-		.subvendor	= PCI_ANY_ID,
+-		.subdevice	= PCI_ANY_ID,
+-		.setup		= pnw_serial_setup,
+-	},
+-	{
+-		.vendor		= PCI_VENDOR_ID_INTEL,
+-		.device		= PCI_DEVICE_ID_INTEL_PNW_UART2,
+-		.subvendor	= PCI_ANY_ID,
+-		.subdevice	= PCI_ANY_ID,
+-		.setup		= pnw_serial_setup,
+-	},
+-	{
+-		.vendor		= PCI_VENDOR_ID_INTEL,
+-		.device		= PCI_DEVICE_ID_INTEL_PNW_UART3,
+-		.subvendor	= PCI_ANY_ID,
+-		.subdevice	= PCI_ANY_ID,
+-		.setup		= pnw_serial_setup,
+-	},
+-	{
+-		.vendor		= PCI_VENDOR_ID_INTEL,
+-		.device		= PCI_DEVICE_ID_INTEL_TNG_UART,
+-		.subvendor	= PCI_ANY_ID,
+-		.subdevice	= PCI_ANY_ID,
+-		.setup		= tng_serial_setup,
+-	},
+-	{
+-		.vendor		= PCI_VENDOR_ID_INTEL,
+ 		.device		= PCI_DEVICE_ID_INTEL_BSW_UART1,
+ 		.subvendor	= PCI_ANY_ID,
+ 		.subdevice	= PCI_ANY_ID,
+@@ -3049,8 +2859,6 @@ enum pci_board_num_t {
+ 	pbn_ADDIDATA_PCIe_8_3906250,
+ 	pbn_ce4100_1_115200,
+ 	pbn_byt,
+-	pbn_pnw,
+-	pbn_tng,
+ 	pbn_qrk,
+ 	pbn_omegapci,
+ 	pbn_NETMOS9900_2s_115200,
+@@ -3838,16 +3646,6 @@ static struct pciserial_board pci_boards[] = {
+ 		.uart_offset	= 0x80,
+ 		.reg_shift      = 2,
+ 	},
+-	[pbn_pnw] = {
+-		.flags		= FL_BASE0,
+-		.num_ports	= 1,
+-		.base_baud	= 115200,
+-	},
+-	[pbn_tng] = {
+-		.flags		= FL_BASE0,
+-		.num_ports	= 1,
+-		.base_baud	= 1843200,
+-	},
+ 	[pbn_qrk] = {
+ 		.flags		= FL_BASE0,
+ 		.num_ports	= 1,
+@@ -3943,6 +3741,12 @@ static const struct pci_device_id blacklist[] = {
+ 	{ PCI_DEVICE(0x4348, 0x5053), }, /* WCH CH353 1S1P */
+ 	{ PCI_DEVICE(0x1c00, 0x3250), }, /* WCH CH382 2S1P */
+ 	{ PCI_DEVICE(0x1c00, 0x3470), }, /* WCH CH384 4S */
++
++	/* Intel platforms with MID UART */
++	{ PCI_VDEVICE(INTEL, 0x081b), },
++	{ PCI_VDEVICE(INTEL, 0x081c), },
++	{ PCI_VDEVICE(INTEL, 0x081d), },
++	{ PCI_VDEVICE(INTEL, 0x1191), },
+ };
+ 
+ /*
+@@ -5650,26 +5454,6 @@ static struct pci_device_id serial_pci_tbl[] = {
+ 		pbn_byt },
+ 
+ 	/*
+-	 * Intel Penwell
+-	 */
+-	{	PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_PNW_UART1,
+-		PCI_ANY_ID, PCI_ANY_ID, 0, 0,
+-		pbn_pnw},
+-	{	PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_PNW_UART2,
+-		PCI_ANY_ID, PCI_ANY_ID, 0, 0,
+-		pbn_pnw},
+-	{	PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_PNW_UART3,
+-		PCI_ANY_ID, PCI_ANY_ID, 0, 0,
+-		pbn_pnw},
+-
+-	/*
+-	 * Intel Tangier
+-	 */
+-	{	PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_TNG_UART,
+-		PCI_ANY_ID, PCI_ANY_ID, 0, 0,
+-		pbn_tng},
+-
+-	/*
+ 	 * Intel Quark x1000
+ 	 */
+ 	{	PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_QRK_UART,
+diff --git a/drivers/tty/serial/8250/Kconfig b/drivers/tty/serial/8250/Kconfig
+index c350703..18b90eb 100644
+--- a/drivers/tty/serial/8250/Kconfig
++++ b/drivers/tty/serial/8250/Kconfig
+@@ -342,3 +342,11 @@ config SERIAL_8250_MT6577
+ 	help
+ 	  If you have a Mediatek based board and want to use the
+ 	  serial port, say Y to this option. If unsure, say N.
++
++config SERIAL_8250_MID
++	tristate "Support for serial ports on Intel MID platforms"
++	depends on SERIAL_8250 && PCI
++	help
++	  Selecting this option will enable handling of the extra features
++	  present on the UART found on Intel Medfield SOC and various other
++	  Intel platforms.
+diff --git a/drivers/tty/serial/8250/Makefile b/drivers/tty/serial/8250/Makefile
+index 31e7cdc..646ef25 100644
+--- a/drivers/tty/serial/8250/Makefile
++++ b/drivers/tty/serial/8250/Makefile
+@@ -23,3 +23,4 @@ obj-$(CONFIG_SERIAL_8250_EM)		+= 8250_em.o
+ obj-$(CONFIG_SERIAL_8250_OMAP)		+= 8250_omap.o
+ obj-$(CONFIG_SERIAL_8250_FINTEK)	+= 8250_fintek.o
+ obj-$(CONFIG_SERIAL_8250_MT6577)	+= 8250_mtk.o
++obj-$(CONFIG_SERIAL_8250_MID)		+= 8250_mid.o
+-- 
+1.7.5.4
+
