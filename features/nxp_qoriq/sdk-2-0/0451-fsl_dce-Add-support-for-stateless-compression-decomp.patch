@@ -1,0 +1,1508 @@
+From 7dec3c4fc43d327f4a53e179eb093ad2de0a86d3 Mon Sep 17 00:00:00 2001
+From: Jeffrey Ladouceur <Jeffrey.Ladouceur@freescale.com>
+Date: Tue, 27 Aug 2013 12:05:08 -0400
+Subject: [PATCH 451/752] fsl_dce: Add support for stateless
+ compression/decompression
+
+The fsl_dce device does compression and decompression of
+various formats (deflate, zlib, gzip).
+The flib directory contains the base layer object required
+to access the dce device. The fsl_dce_flow object contains the
+minimum set of interfaces required to send and receive frames
+to/from the dce via QMan.
+
+The fsl_dce_chunk object is an extension of the fsl_dce_flow object.
+This object is used to compress or decompress single frames (chunks)
+at a time.
+
+Signed-off-by: Jeffrey Ladouceur <Jeffrey.Ladouceur@freescale.com>
+Change-Id: Ia1f671b4610fb70d50353385a3d87dde0584741a
+Reviewed-on: http://git.am.freescale.net:8181/4295
+Tested-by: Review Code-CDREVIEW <CDREVIEW@freescale.com>
+Reviewed-by: Thorpe Geoff-R01361 <Geoff.Thorpe@freescale.com>
+Reviewed-by: Rivera Jose-B46482 <German.Rivera@freescale.com>
+[Original patch taken from QorIQ-SDK-V2.0-20160527-yocto]
+Signed-off-by: Yanjiang Jin <yanjiang.jin@windriver.com>
+---
+ drivers/staging/fsl_dce/Makefile               |   2 +-
+ drivers/staging/fsl_dce/flib/dce_flow.c        | 513 +++++++++++++++++++++++++
+ drivers/staging/fsl_dce/flib/dce_flow.h        | 447 +++++++++++++++++++++
+ drivers/staging/fsl_dce/flib/dce_gzip_helper.h | 104 +++++
+ drivers/staging/fsl_dce/flib/dce_helper.h      | 111 ++++++
+ drivers/staging/fsl_dce/fsl_dce_chunk.c        | 154 ++++++++
+ drivers/staging/fsl_dce/fsl_dce_chunk.h        |  86 +++++
+ 7 files changed, 1416 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/staging/fsl_dce/flib/dce_flow.c
+ create mode 100644 drivers/staging/fsl_dce/flib/dce_flow.h
+ create mode 100644 drivers/staging/fsl_dce/flib/dce_gzip_helper.h
+ create mode 100644 drivers/staging/fsl_dce/flib/dce_helper.h
+ create mode 100644 drivers/staging/fsl_dce/fsl_dce_chunk.c
+ create mode 100644 drivers/staging/fsl_dce/fsl_dce_chunk.h
+
+diff --git a/drivers/staging/fsl_dce/Makefile b/drivers/staging/fsl_dce/Makefile
+index f75b576..dabff50 100644
+--- a/drivers/staging/fsl_dce/Makefile
++++ b/drivers/staging/fsl_dce/Makefile
+@@ -6,7 +6,7 @@ obj-$(CONFIG_FSL_DCE) += fsl-dce.o
+ obj-$(CONFIG_FSL_DCE_CONFIG) += fsl-dce-config.o
+ obj-$(CONFIG_FSL_DCE_DEBUGFS) += fsl-dce-debugfs.o
+ 
+-fsl-dce-y := dce_sys.o
++fsl-dce-y := dce_sys.o flib/dce_flow.o fsl_dce_chunk.o
+ fsl-dce-config-y := dce_driver.o
+ fsl-dce-debugfs-y := dce_debugfs.o
+ 
+diff --git a/drivers/staging/fsl_dce/flib/dce_flow.c b/drivers/staging/fsl_dce/flib/dce_flow.c
+new file mode 100644
+index 0000000..38336b4
+--- /dev/null
++++ b/drivers/staging/fsl_dce/flib/dce_flow.c
+@@ -0,0 +1,513 @@
++/* Copyright 2013 Freescale Semiconductor, Inc. */
++
++#include "../dce_sys.h"
++#include "dce_flow.h"
++#include "dce_helper.h"
++
++#define LOW_PRIORITY_WQ	7
++#define DEXP_MAX	22
++#define DEXP_OFFSET	6
++#define DMANT_MAX	16
++
++#define MAX_FIFO_SIZE	256
++
++/* Internal-only flow flags, mustn't conflict with exported ones */
++#define DCE_FLOW_FLAG_DEAD		0x80000000
++#define DCE_FLOW_FLAG_FINISHING		0x40000000
++#define DCE_FLOW_FLAG_FINISHED		0x20000000
++#define DCE_FLOW_FLAG_INITIALIZING	0x10000000
++#define DCE_FLOW_FLAG_PRIVATE		0xf8000000 /* mask of them all */
++
++/* Internal-only cmd flags, musn't conflict with exported ones */
++#define DCE_FLOW_OP_PRIVATE		0x80000000 /* mask of them all */
++
++static enum qman_cb_dqrr_result cb_dqrr(struct qman_portal *, struct qman_fq *,
++				const struct qm_dqrr_entry *);
++static void cb_ern(struct qman_portal *, struct qman_fq *,
++				const struct qm_mr_entry *);
++static void cb_fqs(struct qman_portal *, struct qman_fq *,
++				const struct qm_mr_entry *);
++static const struct qman_fq_cb dce_fq_base_rx = {
++	.fqs = cb_fqs,
++	.ern = cb_ern
++};
++static const struct qman_fq_cb dce_fq_base_tx = {
++	.dqrr = cb_dqrr,
++	.fqs = cb_fqs
++};
++
++/* this is hitting the rx FQ with a large blunt instrument, ie. park()
++ * does a retire, query, oos, and (re)init. It's possible to force-eligible the
++ * rx FQ instead, then use a DCA_PK within the cb_dqrr() callback to park it.
++ * Implement this optimisation later if it's an issue (and incur the additional
++ * complexity in the state-machine). */
++static int park(struct qman_fq *fq, struct qm_mcc_initfq *initfq)
++{
++	int ret;
++	uint32_t flags;
++
++	ret = qman_retire_fq(fq, &flags);
++	if (ret)
++		return ret;
++	BUG_ON(flags & QMAN_FQ_STATE_BLOCKOOS);
++	/* We can't revert from now on */
++	ret = qman_query_fq(fq, &initfq->fqd);
++	BUG_ON(ret);
++	ret = qman_oos_fq(fq);
++	BUG_ON(ret);
++	/* can't set QM_INITFQ_WE_OAC and QM_INITFQ_WE_TDTHRESH
++	 * at the same time */
++	initfq->we_mask = QM_INITFQ_WE_MASK & ~QM_INITFQ_WE_TDTHRESH;
++	ret = qman_init_fq(fq, 0, initfq);
++	BUG_ON(ret);
++	initfq->we_mask = QM_INITFQ_WE_TDTHRESH;
++	ret = qman_init_fq(fq, 0, initfq);
++	BUG_ON(ret);
++	return 0;
++}
++
++static int configure_tx(struct fsl_dce_flow *flow, bool use_specified_txfq_dest,
++			uint16_t dest_qm_channel)
++{
++	struct qm_mcc_initfq initfq;
++	uint32_t qinit_flags = QMAN_INITFQ_FLAG_SCHED;
++	int ret;
++
++	initfq.we_mask = QM_INITFQ_WE_DESTWQ | QM_INITFQ_WE_FQCTRL;
++	initfq.fqd.dest.wq = LOW_PRIORITY_WQ;
++	initfq.fqd.fq_ctrl = 0; /* disable stashing */
++	if (use_specified_txfq_dest) {
++		/* TODO: this path not supported at the moment */
++		BUG();
++		initfq.fqd.dest.channel = dest_qm_channel;
++		/* Set hold-active *IFF* it's a pool channel */
++		if (dest_qm_channel >= qm_channel_pool1)
++			initfq.fqd.fq_ctrl |= QM_FQCTRL_HOLDACTIVE;
++	} else {
++		qinit_flags |= QMAN_INITFQ_FLAG_LOCAL;
++	}
++	ret = qman_init_fq(&flow->fq_tx, qinit_flags, &initfq);
++	return ret;
++}
++
++static int configure_rx(struct fsl_dce_flow *flow, struct dce_bman_cfg *bcfg,
++			dma_addr_t scr)
++{
++	int ret;
++	struct qm_mcc_initfq initfq;
++	struct dce_context_a *dce_ctx_a =
++		(struct dce_context_a *)&initfq.fqd.context_a;
++	struct dce_context_b *dce_ctx_b =
++		(struct dce_context_b *)&initfq.fqd.context_b;
++
++	pr_debug("dce_flow configure_rx: flow %p, bcfg %p, scr 0x%llx\n",
++		flow, bcfg, scr);
++
++	memset(&initfq, 0, sizeof(initfq));
++
++	initfq.we_mask = QM_INITFQ_WE_DESTWQ | QM_INITFQ_WE_CONTEXTA |
++				QM_INITFQ_WE_CONTEXTB;
++	/* compression channel uses sub-portal 0, decompression sub-portal 1 */
++	initfq.fqd.dest.channel = (flow->mode == DCE_COMPRESSION) ?
++		qm_channel_dce : qm_channel_dce + 1;
++	initfq.fqd.dest.wq = LOW_PRIORITY_WQ;
++
++	/*
++	 * bit shift scr since it is required to be 64B aligned and the
++	 * hardware assumes lower 6 bits to be zero
++	 */
++	BUG_ON(scr & 0x3F);
++	dce_context_a_set_scrp(dce_ctx_a, scr);
++	SET_BF64(dce_ctx_a->d64, DCE_CONTEXT_A_TSIZE,
++		((bcfg) ? bcfg->tsize : 0));
++	/* adjust DEXP according to spec */
++	if (bcfg && bcfg->dbpid)  {
++		if (bcfg->dexp == DEXP_MAX)
++			SET_BF64(dce_ctx_a->d64, DCE_CONTEXT_A_DEXP, 0);
++		else
++			SET_BF64(dce_ctx_a->d64, DCE_CONTEXT_A_DEXP,
++				(bcfg->dexp - DEXP_OFFSET));
++		/* adjust DMANT according to spec */
++		if (bcfg->dmant == DMANT_MAX)
++			SET_BF64(dce_ctx_a->d64, DCE_CONTEXT_A_DMANT, 0);
++		else
++			SET_BF64(dce_ctx_a->d64, DCE_CONTEXT_A_DMANT,
++				bcfg->dmant);
++	}
++	SET_BF64(dce_ctx_a->d64, DCE_CONTEXT_A_TBPID,
++		((bcfg) ? bcfg->tbpid : 0));
++	/* Setup context_b field */
++	SET_BF32(dce_ctx_b->d32, DCE_CONTEXT_B_DBPID,
++		((bcfg) ? bcfg->dbpid : 0));
++	SET_BF32(dce_ctx_b->d32, DCE_CONTEXT_B_FQID,
++		qman_fq_fqid(&flow->fq_tx));
++
++	ret = qman_init_fq(&flow->fq_rx, QMAN_INITFQ_FLAG_SCHED, &initfq);
++	return ret;
++}
++
++void fsl_dce_flow_setopt_fqtx_id(struct fsl_dce_flow *flow, uint32_t id)
++{
++	flow->fqtx_id = id;
++}
++
++void fsl_dce_flow_setopt_fqrx_id(struct fsl_dce_flow *flow, uint32_t id)
++{
++	flow->fqrx_id = id;
++}
++
++void fsl_dce_flow_setopt_bcfg(struct fsl_dce_flow *flow,
++				struct dce_bman_cfg bcfg)
++{
++	flow->bcfg = bcfg;
++}
++
++int fsl_dce_flow_setopt_txfqdest(struct fsl_dce_flow *flow, uint32_t dest)
++{
++	if (dest == 0xffffffff) {
++		flow->use_specified_txfq_dest = false;
++	} else {
++		flow->use_specified_txfq_dest = true;
++		flow->txfq_dest = (uint32_t)dest;
++	}
++
++	return 0;
++}
++
++int fsl_dce_flow_setopt_outputoffset(struct fsl_dce_flow *flow, uint32_t val)
++{
++	switch (val) {
++	case DCE_PROCESS_OO_NONE_LONG:
++	case DCE_PROCESS_OO_32B:
++	case DCE_PROCESS_OO_64B:
++	case DCE_PROCESS_OO_128B:
++	case DCE_PROCESS_OO_256B:
++	case DCE_PROCESS_OO_512B:
++	case DCE_PROCESS_OO_1024B:
++	case DCE_PROCESS_OO_NON_SHORT:
++		SET_BF32(flow->proc_flags, DCE_PROCESS_OO, val);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++int fsl_dce_flow_setopt_compression_effort(struct fsl_dce_flow *flow,
++					uint32_t val)
++{
++	switch (val) {
++	case DCE_PROCESS_CE_NONE:
++	case DCE_PROCESS_CE_STATIC_HUFF_STRMATCH:
++	case DCE_PROCESS_CE_HUFF_ONLY:
++	case DCE_PROCESS_CE_BEST_POSSIBLE:
++		SET_BF32(flow->proc_flags, DCE_PROCESS_CE, val);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++int fsl_dce_flow_setopt_release_input(struct fsl_dce_flow *flow, bool val)
++{
++	if (val)
++		SET_BF32_TK(flow->proc_flags, DCE_PROCESS_RB, YES);
++	else
++		SET_BF32_TK(flow->proc_flags, DCE_PROCESS_RB, NO);
++	return 0;
++}
++
++int fsl_dce_flow_setopt_base64(struct fsl_dce_flow *flow, bool val)
++{
++	if (val)
++		SET_BF32_TK(flow->proc_flags, DCE_PROCESS_B64, YES);
++	else
++		SET_BF32_TK(flow->proc_flags, DCE_PROCESS_B64, NO);
++	return 0;
++}
++
++int fsl_dce_flow_init(struct fsl_dce_flow *flow,
++		struct fsl_dce_flow_init_params *params)
++{
++	int ret = -EINVAL, ret_tmp;
++
++	if (!params) {
++		pr_debug("dce_flow: params is null\n");
++		goto failed_params;
++	}
++
++	if (!params->fifo_depth) {
++		pr_err("dce_flow: invalid fifo depth of zero\n");
++		goto failed_params;
++	}
++	if (params->fifo_depth > MAX_FIFO_SIZE) {
++		pr_err("dce_flow: fifo depth too large %d > %d\n",
++			params->fifo_depth, MAX_FIFO_SIZE);
++		goto failed_params;
++	}
++
++	flow->proc_flags = 0;
++	SET_BF32_TK(flow->proc_flags, DCE_PROCESS_OO, NONE_LONG);
++	SET_BF32_TK(flow->proc_flags, DCE_PROCESS_Z_FLUSH, NO_FLUSH);
++	SET_BF32_TK(flow->proc_flags, DCE_PROCESS_CF, DEFLATE);
++	SET_BF32_TK(flow->proc_flags, DCE_PROCESS_CE, BEST_POSSIBLE);
++	SET_BF32_TK(flow->proc_flags, DCE_PROCESS_SCUS, NORMAL_MODE);
++
++
++	/* set callback functions */
++	flow->cbs.process_cb = params->process_cb;
++	flow->cbs.nop_cb = params->nop_cb;
++	flow->cbs.scr_invalidate_cb = params->scr_invalidate_cb;
++	flow->cbs.base_cb = params->base_cb;
++	/* set compression/decompression mode */
++	flow->mode = params->mode;
++
++	/*
++	 * QMan driver invokes these callback function when a frame is dequeued
++	 * on the tx frame queue
++	 */
++	flow->fq_tx.cb = dce_fq_base_tx;
++	flow->fq_rx.cb = dce_fq_base_rx;
++
++	/*
++	 * allow a fifo depth of 1. Need to bump to 2 for kfifo since
++	 * it only allows power of 2, starting with 2. Otherwise it
++	 * will round down.
++	 */
++	flow->wanted_fifo_depth = params->fifo_depth;
++	if (params->fifo_depth == 1)
++		ret = kfifo_alloc(&flow->fifo, 2, GFP_KERNEL);
++	else
++		ret = kfifo_alloc(&flow->fifo, flow->wanted_fifo_depth,
++				GFP_KERNEL);
++	if (ret) {
++		pr_err("dce_flow: error allocating kfifo 0x%x\n", ret);
++		goto failed_params;
++	}
++	flow->actual_fifo_depth = kfifo_size(&flow->fifo);
++
++	pr_debug("Requested fifo %d, actual %d\n",
++		flow->wanted_fifo_depth, flow->actual_fifo_depth);
++
++	/* Create the Rx frame queue. Use QMan multi-core locking always */
++	ret = qman_create_fq(flow->fqrx_id, QMAN_FQ_FLAG_TO_DCPORTAL |
++			((flow->fqrx_id) ?  0 : QMAN_FQ_FLAG_DYNAMIC_FQID) |
++			QMAN_FQ_FLAG_LOCKED, &flow->fq_rx);
++	if (ret) {
++		pr_err("dce_flow: failed to create RX frame queue 0x%x\n", ret);
++		goto failed_create_rx_fq;
++	}
++	ret = qman_create_fq(flow->fqtx_id, QMAN_FQ_FLAG_NO_ENQUEUE |
++			((flow->fqtx_id) ?  0 : QMAN_FQ_FLAG_DYNAMIC_FQID) |
++			QMAN_FQ_FLAG_LOCKED , &flow->fq_tx);
++	if (ret) {
++		pr_err("dce_flow: failed to create TX frame queue 0x%x\n", ret);
++		goto failed_create_tx_fq;
++	}
++
++	/* Setup RX FQ */
++	ret = configure_rx(flow, &flow->bcfg, params->scr);
++	if (ret) {
++		pr_err("dce_flow: failed to configure RX frame queue 0x%x\n",
++			ret);
++		goto failed_configure_rx_fq;
++	}
++
++	/* Setup TX FQ */
++	ret = configure_tx(flow, flow->use_specified_txfq_dest,
++			flow->txfq_dest);
++	if (ret) {
++		pr_err("dce_flow: failed to configure TX frame queue 0x%x\n",
++			ret);
++		goto failed_configure_tx_fq;
++	}
++	return 0;
++failed_configure_tx_fq:
++	ret_tmp = qman_oos_fq(&flow->fq_rx);
++	BUG_ON(ret_tmp);
++failed_configure_rx_fq:
++	qman_destroy_fq(&flow->fq_tx, 0);
++failed_create_tx_fq:
++	qman_destroy_fq(&flow->fq_rx, 0);
++failed_create_rx_fq:
++	kfifo_free(&flow->fifo);
++failed_params:
++	return ret;
++}
++
++int fsl_dce_flow_fifo_len(struct fsl_dce_flow *flow)
++{
++	return kfifo_len(&flow->fifo);
++}
++
++int fsl_dce_flow_finish(struct fsl_dce_flow *flow, uint32_t flags)
++{
++	int ret = 0;
++	struct qm_mcc_initfq initfq;
++
++	/* This pipeline must be empty */
++	if (kfifo_len(&flow->fifo))
++		return -EBUSY;
++
++	/* Park fq_rx */
++	ret = park(&flow->fq_rx, &initfq);
++	/**
++	 * All the conditions for park() to succeed should be met. If
++	 * this fails, there's a bug (s/w or h/w).
++	 */
++	if (ret)
++		pr_err("fsl_dce: park() should never fail! (%d)\n", ret);
++	/* Rx/Tx are empty so retirement should be immediate */
++	ret = qman_retire_fq(&flow->fq_rx, &flags);
++	BUG_ON(ret);
++	BUG_ON(flags & QMAN_FQ_STATE_BLOCKOOS);
++	ret = qman_retire_fq(&flow->fq_tx, &flags);
++	BUG_ON(ret);
++	BUG_ON(flags & QMAN_FQ_STATE_BLOCKOOS);
++	/* OOS and destroy */
++	ret = qman_oos_fq(&flow->fq_rx);
++	BUG_ON(ret);
++	ret = qman_oos_fq(&flow->fq_tx);
++	BUG_ON(ret);
++	qman_destroy_fq(&flow->fq_rx, 0);
++	qman_destroy_fq(&flow->fq_tx, 0);
++	kfifo_free(&flow->fifo);
++	return 0;
++}
++
++/**
++ * Used for 'work' APIs, convert DCE->QMAN wait flags. The DCE and
++ * QMAN "wait" flags have been aligned so that the below conversion should
++ * compile with good straight-line speed.
++ */
++static inline uint32_t ctrl2eq(uint32_t flags)
++{
++#ifdef CONFIG_FSL_DPA_CAN_WAIT
++	return flags & (QMAN_ENQUEUE_FLAG_WAIT | QMAN_ENQUEUE_FLAG_WAIT_INT);
++#else
++	return flags;
++#endif
++}
++
++/*
++ * Have qman enqueue call this function just before setting the verb so
++ * that we write to our fifo just before having qman process the request.
++ * This way we don't have to remove (rollback) this transaction
++ */
++struct qman_precommit_arg {
++	struct fsl_dce_flow *flow;
++	struct fsl_dce_cmd_token *token;
++};
++
++static int _pre_commit_cb(void *arg)
++{
++	struct qman_precommit_arg *fifo_arg = (struct qman_precommit_arg *)arg;
++	if (unlikely(kfifo_put(&fifo_arg->flow->fifo, fifo_arg->token) == 0))
++		return -ENOMEM;
++	return 0;
++}
++
++static inline int submit_job(struct fsl_dce_flow *flow, uint32_t flags,
++			struct qm_fd *fd, struct fsl_dce_cmd_token *token)
++{
++	int ret = 0;
++	struct qman_precommit_arg cb_arg;
++
++	cb_arg.flow = flow;
++	cb_arg.token = token;
++
++	if (unlikely(kfifo_len(&flow->fifo) == flow->wanted_fifo_depth))
++		return -ENOMEM;
++
++	ret = qman_enqueue_precommit(&flow->fq_rx, fd, ctrl2eq(flags),
++		_pre_commit_cb, &cb_arg);
++
++	return ret;
++}
++
++int fsl_dce_nop(struct fsl_dce_flow *flow, uint32_t flags, void *callback_tag)
++{
++	struct qm_fd fd;
++	struct fsl_dce_cmd_token token;
++
++	token.callback_tag = callback_tag;
++	/* enqueue the NOP command to DCE */
++	memset(&fd, 0, sizeof(fd));
++	fsl_dce_cmd_set_nop(&fd.cmd);
++	return submit_job(flow, flags, &fd, &token);
++}
++
++int fsl_dce_process(struct fsl_dce_flow *flow, uint32_t flags, struct qm_fd *fd,
++		void *callback_tag)
++{
++	struct fsl_dce_cmd_token token;
++
++	token.callback_tag = callback_tag;
++	/* set process options flags */
++	fd->cmd |= flow->proc_flags;
++	/* This is the primary interface to compress/decompress frames */
++	fsl_dce_cmd_set_process(&fd->cmd);
++	return submit_job(flow, flags, fd, &token);
++}
++
++int fsl_dce_src_invalidate(struct fsl_dce_flow *flow, uint32_t flags,
++			void *callback_tag)
++{
++	struct qm_fd fd;
++	struct fsl_dce_cmd_token token;
++
++	memset(&fd, 0, sizeof(fd));
++
++	token.callback_tag = callback_tag;
++	/* enqueue the DCE_CMD_CTX_INVALIDATE command to DCE */
++	memset(&fd, 0, sizeof(fd));
++	fsl_dce_cmd_set_ctx_invalidate(&fd.cmd);
++	return submit_job(flow, flags, &fd, &token);
++}
++
++static inline void cb_helper(__always_unused struct qman_portal *portal,
++			struct fsl_dce_flow *flow, const struct qm_fd *fd,
++			enum dce_status status)
++{
++	struct fsl_dce_cmd_token token;
++
++	if (unlikely(kfifo_get(&flow->fifo, &token) == 0)) {
++		pr_err("dce_flow: fifo empty\n");
++		return;
++	}
++	flow->cbs.base_cb(flow, fd, token.callback_tag);
++}
++
++/* TODO: this scheme does not allow DCE receivers to use held-active at all. Eg.
++ * there's no configuration of held-active for 'fq', and if there was, there's
++ * (a) nothing in the cb_dqrr() to support "park" or "defer" logic, and (b)
++ * nothing in cb_fqs() to support a delayed FQPN (DCAP_PK) notification. */
++static enum qman_cb_dqrr_result cb_dqrr(struct qman_portal *portal,
++			struct qman_fq *fq, const struct qm_dqrr_entry *dq)
++{
++	enum dce_status status = dq->fd.status & DCE_PROCESS_STATUS_MASK;
++	struct fsl_dce_flow *flow = (struct fsl_dce_flow *)fq;
++
++	/* Put flow into DEAD state is a erious error is received ? */
++	cb_helper(portal, flow, &dq->fd, status);
++	return qman_cb_dqrr_consume;
++}
++
++static void cb_ern(__always_unused struct qman_portal *portal,
++		struct qman_fq *fq, const struct qm_mr_entry *mr)
++{
++	pr_err("ERN un-expected\n");
++	BUG();
++}
++
++static void cb_fqs(__always_unused struct qman_portal *portal,
++			__always_unused struct qman_fq *fq,
++			const struct qm_mr_entry *mr)
++{
++	uint8_t verb = mr->verb & QM_MR_VERB_TYPE_MASK;
++
++	if (verb == QM_MR_VERB_FQRNI)
++		return;
++	/* nothing else is supposed to occur */
++	BUG();
++}
++
+diff --git a/drivers/staging/fsl_dce/flib/dce_flow.h b/drivers/staging/fsl_dce/flib/dce_flow.h
+new file mode 100644
+index 0000000..cf16092
+--- /dev/null
++++ b/drivers/staging/fsl_dce/flib/dce_flow.h
+@@ -0,0 +1,447 @@
++/* Copyright 2013 Freescale Semiconductor, Inc. */
++
++#ifndef DCE_FLOW_H
++#define DCE_FLOW_H
++
++#include "dce_defs.h"
++#include <linux/fsl_qman.h>
++#include <linux/kfifo.h>
++
++/**
++ * enum dce_mode - selector for compression or decompression
++ * @DCE_COMPRESSION:	mode is compression
++ * @DCE_DECOMPRESSIONE:	mode is decompression
++ */
++enum dce_mode {
++	DCE_COMPRESSION,
++	DCE_DECOMPRESSION
++};
++
++/**
++ * enum dce_state_config - Flow configuration
++ *
++ * @STATEFUL:	Flow is configured as stateful
++ * @STATELESS:	Flow is configured as stateless
++ *
++ * A stateful Flow is a series of non-interleaved (i.e. Frames from different
++ * Streams do not interleave within a Flow) Streams to be processed, where a
++ * Stream consists of a series of Frames from the same Flow that together
++ * comprise a complete entity to be compressed/decompressed (e.g. GZIP member,
++ * ZLIB stream, or DEFLATE block). DCE maintains a set of Stream Context values,
++ * or state, for each Stream across the individual Frames that comprise it.
++ * Thus, an in-order series, or Stream, of Frames, making up a complete entity
++ * can be processed over time by DCE without having to be reassembled first.
++ * Further, if processing of an individual Frame within the Stream is
++ * interrupted due to insufficient output buffer space, DCE provides a
++ * mechanism to resume processing of the Stream at a later time with additional
++ * output buffer supplied.
++ *
++ * A stateless Flow is a series of single Frame Streams that are to be
++ * processed, but DCE does not maintain any Stream Context between individual
++ * Frames. From DCE’s point of view, each dequeued Frame on a stateless
++ * Flow is an atomic work unit. If processing of a Frame is interrupted for any
++ * reason, DCE returns it with an exception code but does not maintain or update
++ * any Stream Context that would allow resumption of processing.
++ */
++enum dce_state_config {
++	DCE_STATEFUL,
++	DCE_STATELESS,
++};
++
++/**
++ * enum dce_processing_mode - mode of behavior when processing statful Flows.
++ *
++ * @DCE_RECYCLING:	Interrupted streams can be resumed at a later time.
++ * @DCE_TRUNCATION:	Interrupted streams cannot be resumed at a later time.
++ *
++ * When processing of an individual Frame within a Stream is interrupted, due to
++ * insufficient output buffer space, on a @DCE_RECYCLING Flow, DCE keeps
++ * context to allow later resumption of processing of the Flow.  All
++ * subsequently received Frames are returned to software unmodified. This mode
++ * thus enables resumption of processing of the interrupted Stream at a later
++ * time, even if additional pipelined Frames from the same Flow arrive at DCE
++ * after the exception occurs. To resume processing, software resends (recycles)
++ * the interrupted Frame, and all subsequently drained Frames, to DCE with an
++ * indication that processing of the stream is to be resumed.
++ */
++enum dce_processing_mode {
++	DCE_RECYCLING,
++	DCE_TRUNCATION
++};
++
++/**
++ * enum dce_tsize_coding - Specifies the size of the BMan buffers used to create
++ *		scatter/gather tables.
++ *
++ * @DCE_TSIZE_64B:	4 table entries
++ * @DCE_TSIZE_128B:	8 table entries
++ * @DCE_TSIZE_256B:	16 table entries
++ * @DCE_TSIZE_512B:	32 table entries
++ * @DCE_TSIZE_1024B:	64 table entries
++ * @DCE_TSIZE_2048B:	128 table entries
++ * @DCE_TSIZE_4096B:	256 table entries
++ * @DCE_TSIZE_8192B:	512 table entries
++ *
++ * This value is used in the @dce_bman_cfg structure which is used to configure
++ * the usage of BMan when using BMan output buffers.
++ */
++enum dce_tsize_coding {
++	DCE_TSIZE_64B = 0,
++	DCE_TSIZE_128B,
++	DCE_TSIZE_256B,
++	DCE_TSIZE_512B,
++	DCE_TSIZE_1024B,
++	DCE_TSIZE_2048B,
++	DCE_TSIZE_4096B,
++	DCE_TSIZE_8192B
++};
++
++/**
++ * enum dce_compression_format - Specifies the compression format
++ *
++ * @DCE_CF_DEFLATE:	deflate encoding format
++ * @DCE_CF_ZLIB:	zlib encoding format
++ * @DCE_CF_GZIP:	gzip encoding format
++ *
++ * Each PROCESS hardware command received by the DCE hw has a compression format
++ * field.
++ */
++enum dce_compression_format {
++	DCE_CF_DEFLATE,
++	DCE_CF_ZLIB,
++	DCE_CF_GZIP
++};
++
++/**
++ * struct dce_bman_cfg - configuration for BMan usage
++ *
++ * @tsize: size of buffers for scatter/gather tables
++ * @tbpid: buffer pool id for s/g tables
++ * @dmant: data buffer size, mantissa value
++ * @dexp: data buffer size, exponent value
++ * @dbpid: buffer pool is for data buffer
++ *
++ * The DCE treats BMan buffers which hold data vs scatter gather tables
++ * differently. These can be managed from independent buffer pools.
++ */
++struct dce_bman_cfg {
++	/* scatter gather entries size */
++	enum dce_tsize_coding tsize;
++	uint32_t tbpid;
++	/* data buffer configuration */
++	uint32_t dmant; /* range 1..16, gets translated internally */
++	uint32_t dexp; /* range 7..22, gets translated internally */
++	uint32_t dbpid;
++};
++
++/* predeclaration of structure */
++struct fsl_dce_flow;
++
++/* cmd results invoke a user-provided callback of this type */
++typedef void (*fsl_dce_base_cb)(struct fsl_dce_flow *, const struct qm_fd *,
++			void *callback_tag);
++typedef void (*fsl_dce_process_cb)(struct fsl_dce_flow *, const struct qm_fd *,
++			void *callback_tag);
++typedef void (*fsl_dce_nop_cb)(struct fsl_dce_flow *, const struct qm_fd *,
++			void *callback_tag);
++typedef void (*fsl_dce_scr_invalidate_cb)(struct fsl_dce_flow *,
++			const struct qm_fd *, void *callback_tag);
++
++/**
++ * struct fsl_dce_flow_cbs - various command callback functions
++ *
++ * @process_cb: callback to process command
++ * @nop_cb: callback to nop command
++ * @scr_invalidate_cb: callback to stream context record invalidate command
++ */
++struct fsl_dce_flow_cbs {
++	fsl_dce_base_cb base_cb;
++	fsl_dce_process_cb process_cb;
++	fsl_dce_nop_cb nop_cb;
++	fsl_dce_scr_invalidate_cb scr_invalidate_cb;
++};
++
++/**
++ * struct fsl_dce_cmd_token - internal structure used by flow
++ *
++ * @callback_tag: user supplied void pointer.
++ */
++struct fsl_dce_cmd_token {
++	void *callback_tag;
++	uint32_t flags;
++};
++
++/**
++ * struct fsl_dce_flow - pair of QMan frame queues which represents a dce flow
++ *
++ * @fq_tx: dce egress frame queue and associated state change and dequeue
++ *	callback functions. This memory must be dma-able.
++ * @fq_rx: dce ingress frame queue and associated state change and ern QMan
++ *	callback functions. This memory does NOT have to be dma-able.
++ * @cbs: callback functions
++ * @mode: mode of operation, compression or decompression
++ * @bcfg: BMan configuration
++ * @actual_fifo_depth: internal fifo length
++ * @wanted_fifo_depth: requested size of internal fifo
++ * @fifo: A fifo of commands sent to DCE hw
++ * @fqtx_id: id of tx fq
++ * @fqrx_id: if of rx fq
++ * @use_specified_txfq_dest: use the specified @txfq_dest attribute
++ * @txfq_dest: the tx fq destination attribute
++ * @flags: internal state info
++ * @proc_flags: flags used during PROCESS commands
++ */
++struct fsl_dce_flow {
++	struct qman_fq fq_tx;
++	struct qman_fq fq_rx;
++	struct fsl_dce_flow_cbs cbs;
++	enum dce_mode mode;
++	struct dce_bman_cfg bcfg;
++	uint16_t actual_fifo_depth;
++	uint16_t wanted_fifo_depth;
++	DECLARE_KFIFO_PTR(fifo, struct fsl_dce_cmd_token);
++	uint32_t fqtx_id;
++	uint32_t fqrx_id;
++	bool use_specified_txfq_dest;
++	uint32_t txfq_dest;
++	uint32_t flags;
++	uint32_t proc_flags;
++};
++
++void fsl_dce_flow_setopt_fqtx_id(struct fsl_dce_flow *flow, uint32_t id);
++void fsl_dce_flow_setopt_fqrx_id(struct fsl_dce_flow *flow, uint32_t id);
++void fsl_dce_flow_setopt_bcfg(struct fsl_dce_flow *flow,
++				struct dce_bman_cfg bcfg);
++int fsl_dce_flow_setopt_txfqdest(struct fsl_dce_flow *flow, uint32_t dest);
++int fsl_dce_flow_setopt_outputoffset(struct fsl_dce_flow *flow,
++				uint32_t val); /* DCE_PROCESS_OO_*** value */
++int fsl_dce_flow_setopt_compression_effort(struct fsl_dce_flow *flow,
++				uint32_t val); /* DCE_PROCESS_CE_*** value */
++int fsl_dce_flow_setopt_release_input(struct fsl_dce_flow *flow, bool val);
++int fsl_dce_flow_setopt_base64(struct fsl_dce_flow *flow, bool val);
++
++/**
++ * struct fsl_dce_flow_init_params - parameters to initialize a dce flow
++ *
++ * @mode: compression or decompression
++ * @cbs: function callbacks
++ * @state_config: stateless or statefull
++ * @p_mode: truncation mode or recycle mode
++ * @fifo_depth: wanted depth in internal fifo
++ * @base_cb: Base callback function. QMan will invoke this function callback
++ *	on every dequeue from the DCE tx fq.
++ * @process_cb: callback function to invoke on completion of process request.
++ * @nop_cb: callback function to invoke on completion of nop request.
++ * @scr_invalidate_cb: callback function to invoke on completion of a stream
++ *	context record invalidate request.
++ * @scr: if statefull configuration, dma memory for Stream Context Record
++ *	This memory must be 64B aligned. If compression mode must be 64B in
++ *	size. If decompression, must be 128B in size.
++ */
++struct fsl_dce_flow_init_params {
++	enum dce_mode mode;
++	enum dce_state_config state_config;
++	enum dce_processing_mode p_mode;
++	uint16_t fifo_depth;
++	fsl_dce_base_cb base_cb;
++	fsl_dce_process_cb process_cb;
++	fsl_dce_nop_cb nop_cb;
++	fsl_dce_scr_invalidate_cb scr_invalidate_cb;
++	dma_addr_t scr;
++};
++
++/**
++ * fsl_dce_flow_init - Initialize the dce flow
++ *
++ * @flow: the dce flow object to initialize
++ * @params: flow parameters to set.
++ *
++ * Details of what this api does:
++ *	creates the RX Frame Queue. attributes include:
++ *		rx_fqid (either supplied or allocated)
++ *		consumer is a DCPORTAL (ie. DCE)
++ *
++ *	creates the TX Frame Queue. attribute include:
++ *		tx_fqid (either supplied or allocated)
++ *		No Enqueues are permitted.
++ *
++ *	Initialise RX Frame Queue:
++ *		Schedule the frame queue
++ *		set context_a field (stream context record pointer) and output
++ *			buffer pool attributes
++ *		set context_b field (more buffer pool attributes and Tx Frame
++ *			Queue Id.
++ *		set @flow->fq_rx.dest.channel. Different channel if
++ *			compression is being used, vs decompression.
++ *
++ *	Initialise TX Frame Queue:
++ *		Schedules the frame queue
++ *		sets the stashing parameters
++ *		sets @flow->fq_tx.dest.channel. This is either the local
++ *			portal on which this api is being invoked on, or
++ *			a channel_pool. If channel pool, the fq is placed in
++ *			hold active state.
++ */
++int fsl_dce_flow_init(struct fsl_dce_flow *flow,
++		struct fsl_dce_flow_init_params *params);
++
++
++/**
++ * fsl_dce_flow_fifo_len - Number of elements in the fifo
++ *
++ * @flow: the dce flow object to query
++ *
++ * Returns the number of elements in the internal fifo.
++ */
++int fsl_dce_flow_fifo_len(struct fsl_dce_flow *flow);
++
++
++/**
++ * fsl_dce_flow_finish - Finalize the dce flow
++ *
++ * @flow: the dce flow object to finalize
++ * @flags:
++ *
++ * The QMan frame queues will be put out-of-service and destroyed.
++ */
++int fsl_dce_flow_finish(struct fsl_dce_flow *flow, uint32_t flags);
++
++/* Flags for operations */
++#ifdef CONFIG_FSL_DPA_CAN_WAIT
++#define DCE_ENQUEUE_FLAG_WAIT		QMAN_ENQUEUE_FLAG_WAIT
++#define DCE_ENQUEUE_FLAG_WAIT_INT	QMAN_ENQUEUE_FLAG_WAIT_INT
++#endif
++
++/**
++ * fsl_dce_process - send a DCE PROCESS request
++ *
++ * @flow:an initialized dce flow object
++ * @flags:
++ * @fd: dpaa frame descriptor to enqueue
++ * @callback_tag: optional, returned to the user in associated callback function
++ *
++ * The PROCESS Command invokes DCE’s mission mode operation. It indicates to
++ * DCE that the provided Frame structure (simple or compound) is to be
++ * processed according to the mode of its Frame Queue channel and the Frame’s
++ * associated Stream Context Record, and/or a Stream Configuration Frame. The
++ * PROCESS Command is analogous to an invocation of the zlib inflate() or
++ * deflate() function call.
++ *
++ * On a stateful Flow, the DCE will process the provided input Frame,
++ * potentially write some produced output data into the output Frame (less any
++ * residue data held back), and update the Stream Context Record in
++ * anticipation of processing a subsequent PROCESS command on the same Stream.
++ *
++ * On a stateless Flow, the DCE will attempt to fully process the input Frame
++ * and write all produced output data into the output Frame. If the DCE cannot
++ * complete processing of the input Frame it is simply returned with an error
++ * indication code. No continuation of processing, as is done in a typical zlib
++ * function call, is possible using DCE-maintained context.
++ *
++ * Simple Frames may optionally have their component buffers released to BMan
++ * as the Frame is processed.  The simple output Frame that is returned to
++ * Software is constructed of buffers that are acquired from BMan.
++ *
++ * Compound Frames also may optionally have their component buffers released to
++ * BMan. Compound output Frames may be pre-built or constructed of buffers that
++ * are acquired from BMan.
++ *
++ * It is valid for DCE to receive a PROCESS Command Frame that has a null or
++ * zero-length input buffer or zero-length output buffer. DCE will attempt to
++ * process the Frame and update Stream Context Record if necessary.
++ *
++ * For creating GZIP or ZLIB compressed members, the PROCESS Command relies on
++ * the following values in the Stream Configuration Frame, or the Stream Context
++ * Record, fields being valid when the initial Frame of a series (i.e. a Stream)
++ * of Frames is dequeued from QMan:
++ *	- ID1, ID2: Required for compression of GZIP members. Values will be
++ *		placed into the created header.
++ *	- CM: Required for compression of GZIP or ZLIB members. Value will be
++ *		places into the created header. This 8-bit field contains the
++ *		8-bit CM field for GZIP compression and the 8-bit CMF field for
++ *		ZLIB compression.
++ *	- FLG: Required for compression of GZIP or ZLIB members. Value will be
++ *		placed into the created header, with unsupported options
++ *		overridden to 0 (i.e. FDICT) and computed values overridden by
++ *		DCE (i.e. FCHECK).
++ *	- MTIME: Only required for creation of GZIP members. Value will be
++ *		placed into the created GZIP header.
++ *	- XFL: Only required for creation of GZIP members. Value will be placed
++ *		into the created GZIP header.
++ *	- OS: Only required for creation of GZIP members. Value will be placed
++ *		into the created GZIP header.
++ *	- XLEN: Only required for creation of GZIP members. If FLG.FEXTRA is set
++ *		XLEN bytes of data will be read from EXTRA_PTR and inserted into
++ *		the GZIP header.
++ *	- NLEN: Only required for creation of GZIP members. If FLG.FNAME is set,
++ *		NLEN bytes of data will be read from (EXTRA_PTR + XLEN) and
++ *		inserted into the GZIP header. Note that it does not matter
++ *		whether or not FLG.FEXTRA is set.
++ *	- CLEN: Only required for creation of GZIP members. If FLG.FCOMMENT is
++ *		set, CLEN bytes of data will be read from (EXTRA_PTR + XLEN +
++ *		NLEN) and inserted into the GZIP header. Note that it does not
++ *		matter whether or not FLG.FEXTRA or FLG.FNAME is set.
++ *	- EXTRA_PTR: Only required for creation of GZIP members. Only required
++ *		if one or more of XLEN, NLEN, or CLEN is non-zero.
++ *
++ * All other Stream Context Record fields will be initialized by DCE prior to
++ * processing the first input Frame (denoted by a set I bit). Any stale values
++ * present are ignored and updated afterwards. Note that in order for the
++ * created compressed stream to be RFC compliant, care must be taken to ensure
++ * that the provisioned header values are consistent with DCE’s output. For
++ * example, DCE is only capable of producing GZIP streams with CM=8 and CINFO=4,
++ * so these values must be provisioned in order to create properly formed GZIP
++ * members.
++ *
++ * On decompression Flows, DCE validates the received header information found
++ * in the first N1 bytes of the Stream for consistency with the CF field
++ * setting. Any inconsistencies in the header or unsupported/reserved values
++ * present in the STATUS/CMD fields will result in an Invalid STATUS/CMD error
++ * or the appropriate GZIP, ZLIB, or DEFLATE header error.  The PROCESS Command
++ * supports the same set of flush parameters as zlib inflate() and deflate()
++ * calls do.
++ */
++int fsl_dce_process(struct fsl_dce_flow *flow, uint32_t flags,
++		struct qm_fd *fd, void *callback_tag);
++
++/**
++ * fsl_dce_nop - send a DCE NOP request
++ *
++ * @flow: an initialized dce flow object
++ * @flags: bit-mask of  DCE_FLOW_OP_*** options
++ * @callback_tag: optional, returned to the user in associated callback function
++ *
++ * Sends a NOP command to the DCE. The flow must be initialized. Returns
++ * zero on success. If no flags are specified the api will return after the
++ * command has been enqueued.
++ * The NOP Command provides Software with a non-invasive ordering mechanism to
++ * ensure that all preceding input Frames from the associated Stream have been
++ * fully processed, without needing to send a compress or decompress command
++ * through the DCE.
++ */
++int fsl_dce_nop(struct fsl_dce_flow *flow, uint32_t flags, void *callback_tag);
++
++/**
++ * fsl_dce_scr_invalidate - send a DCE Context Invalidate request
++ *
++ * @flow: an initiazed dce flow object
++ * @flags: bit-mask of  DCE_FLOW_OP_*** options
++ * @callback_tag: optional, returned to the user in associated callback function
++ *
++ * Sends a Context Invalidate command to the DCE. Returns zero on success. If no
++ * flags are specified the api will return after the command has been enqueued.
++ * The Context Invalidate Command provides Software with a means to invalidate a
++ * cached copy of a Stream Context Record in the DCE hardware. The invalidate
++ * command guarantees that the system memory locations used by, or referenced
++ * by, the context can be returned to Software.  As its name implies, the
++ * Context Invalidate command does not cause an updated copy of the Stream
++ * Context Record to be written to system memory, so it will cause a loss of
++ * information if used in the middle of Stream that is being processed.  This
++ * command is only useful when processed on a stateful Flow. If it is received
++ * on a stateless Frame Queue it has no effect.
++ */
++int fsl_dce_scr_invalidate(struct fsl_dce_flow *flow, uint32_t flags,
++			void *callback_tag);
++
++#endif /* DCE_FLOW_H */
++
+diff --git a/drivers/staging/fsl_dce/flib/dce_gzip_helper.h b/drivers/staging/fsl_dce/flib/dce_gzip_helper.h
+new file mode 100644
+index 0000000..6f5dbb8
+--- /dev/null
++++ b/drivers/staging/fsl_dce/flib/dce_gzip_helper.h
+@@ -0,0 +1,104 @@
++/*
++ * Copyright 2013 Freescale Semiconductor, Inc.
++ */
++
++#ifndef FL_DCE_GZIP_HELPER_H
++#define FL_DCE_GZIP_HELPER_H
++
++#include "dce_defs.h"
++
++/* GZIP constants */
++#define GZIP_ID1	0x1f
++#define GZIP_ID2	0x8b
++#define GZIP_ID1_ID2	0x1f8b
++#define GZIP_CM_DEFLATE	8
++
++/* GZIP FLaGs settings */
++#define GZIP_FLG_FTEXT		0x01
++#define GZIP_FLG_FHCRC		0x02
++#define GZIP_FLG_FEXTRA		0x04
++#define GZIP_FLG_FNAME		0x08
++#define GZIP_FLG_FCOMMENT	0x10
++
++/* GZIP XFL */
++#define GZIP_XFL_MAX_COMPRESSION	2
++#define GZIP_XFL_FASTEST_ALGO		4
++
++/* GZIP OS */
++#define GZIP_OS_FAT		0
++#define GZIP_OS_AMIGA		1
++#define GZIP_OS_VMS		2
++#define GZIP_OS_UNIX		3
++#define GZIP_OS_VM_CMS		4
++#define GZIP_OS_ATARI		5
++#define GZIP_OS_HPFS		6
++#define GZIP_OS_MACINTOSH	7
++#define GZIP_OS_Z_SYSTEM	8
++#define GZIP_OS_CP_M		9
++#define GZIP_OS_TOPS_20		10
++#define GZIP_OS_NTFS		11
++#define GZIP_OS_QDOS		12
++#define GZIP_OS_ACORN		13
++#define GZIP_OS_UNKNOWN		255
++
++/**
++ * set_extra_ptr_content - set the content of the extra_ptr
++ *
++ * @extra_ptr: location where extra_data, comment and filename are located.
++ * @extra_ptr_size: number of byte that extra_ptr points to
++ * @extra_data: gzip extra data container
++ * @extra_data_size: size in bytes to use in extra_data
++ * @filename: NULL terminated filename or can be NULL
++ * @comment: NULL terminated comment or can be NULL
++ *
++ * @extra_data_size + strlen(@filename)+1 + strlen(@comment)+1 <= extra_ptr_size
++ * return 0 on success
++ * NOTE: Don't think I can define this api like this because of dma_add_t.
++ * The intent is to copy in contiguous memory first the extra data followed
++ * by the file name and then the comment at the extra_ptr location.
++ * But I think this has to be cpu address, not dma address.
++ */
++static inline int set_extra_ptr_content(void *extra_ptr, size_t extra_ptr_size,
++	void *extra_data, size_t extra_data_size, char *filename, char *comment)
++{
++	size_t filename_size = 0, comment_size = 0;
++
++	if (filename)
++		filename_size = strlen(filename) + 1;
++	if (comment)
++		comment_size = strlen(comment) + 1;
++
++	if (extra_ptr_size < extra_data_size + filename_size + comment_size)
++		return -EINVAL;
++	memcpy(extra_ptr, extra_data, extra_data_size);
++	memcpy(extra_ptr + extra_data_size, filename, filename_size);
++	memcpy(extra_ptr + extra_data_size + filename_size, comment,
++		comment_size);
++	return 0;
++}
++
++/**
++ * init_gzip_header - initialize the gzip header in the stream configuration
++ *			stream
++ *
++ * @scf: A stream configuration frame which is 64 byte aligned and at least
++ *	64 bytes in size. The following fields are set:
++ *		ID1 = 31
++ *		ID2 = 139
++ *		CM = 8
++ *		FLG, MTIME, XFL, XLEN, NLEN, CLEN = 0
++ *		OS = GZIP_OS_UNIX
++ *		EXTRA_PTR is left unmodified.
++ */
++static inline void init_gzip_header(struct scf_64b *scf)
++{
++	set_id1id2(scf, GZIP_ID1_ID2);
++	set_cm(scf, GZIP_CM_DEFLATE);
++	set_flg(scf, 0);
++	set_mtime(scf, 0);
++	set_xfl(scf, GZIP_XFL_MAX_COMPRESSION);
++	set_os(scf, GZIP_OS_UNIX);
++}
++
++#endif /* FL_DCE_GZIP_HELPER_H */
++
+diff --git a/drivers/staging/fsl_dce/flib/dce_helper.h b/drivers/staging/fsl_dce/flib/dce_helper.h
+new file mode 100644
+index 0000000..d6fe3d0
+--- /dev/null
++++ b/drivers/staging/fsl_dce/flib/dce_helper.h
+@@ -0,0 +1,111 @@
++/*
++ * Copyright 2013 Freescale Semiconductor, Inc.
++ */
++
++#ifndef FL_DCE_HELPER_H
++#define FL_DCE_HELPER_H
++
++#include "dce_defs.h"
++
++/**
++ * get_dce_status - returns lowest 8 bits
++ * @fd_status:  frame descriptor 32bit field
++ */
++static inline enum dce_status fsl_dce_get_status(uint32_t fd_status)
++{
++	return (enum dce_status)
++		GET_BF32(fd_status, DCE_PROCESS_STATUS);
++};
++
++/* stateful dma memory minimum size and alignment requirements */
++
++/* compression or decompression */
++#define PENDING_OUTPUT_MIN_SIZE		8192
++#define PENDING_OUTPUT_ALIGN		64 /* not required, but optimal */
++
++/* compression only */
++#define SCR_COMPRESSION_MIN_SIZE	64
++#define SCR_COMPRESSION_ALIGN		64
++#define HISTORY_COMPRESSION_MIN_SIZE	4096
++#define HISTORY_COMPRESSION_ALIGN	64
++
++/* decompression only */
++#define SCR_DECOMPRESSION_MIN_SIZE	128
++#define SCR_DECOMPRESSION_ALIGN		64
++#define HISTORY_DECOMPRESSION_MIN_SIZE	32768
++#define HISTORY_DECOMPRESSION_ALIGN	64
++#define DECOMPRESSION_CTX_MIN_SIZE	256
++#define DECOMPRESSION_CTX_ALIGN		64 /* not required, but optimal */
++
++/* Various Stream Context Frame Helpers */
++
++/**
++ * fsl_dce_statefull_decompression_dma - dma memory required for statefull
++ *					decompression
++ *
++ * @scf: the stream context frame object to set the corresponding dma memory
++ *	pointers. This need to be subsequently sent using a process command
++ *	while setting the USPC.
++ * @pending_output: must be minumum of PENDING_OUTPUT_MIN_SIZE, and optimal
++ *	if alignment is PENDING_OUTPUT_ALIGN
++ * @history: minimum size is HISTORY_DECOMPRESSION_MIN_SIZE with alignment of
++ *	HISTORY_DECOMPRESSION_ALIGN
++ * @decomp_ctxt: must be minimum size of DECOMPRESSION_CTX_MIN_SIZE, with
++ *	optimal alignment of DECOMPRESSION_CTX_ALIGN
++ */
++static inline void fsl_dce_statefull_decompression_dma(struct scf_64b *scf,
++	dma_addr_t pending_output, dma_addr_t history, dma_addr_t decomp_ctxt)
++{
++	set_pending_output_ptr(scf, pending_output);
++	set_history_ptr(scf, history);
++	set_decomp_ctxt_ptr(scf, decomp_ctxt);
++}
++
++/**
++ * fsl_dce_statefull_compression_dma - dma memory required for statefull
++ *					compression
++ *
++ * @scf: the stream context frame object to set the corresponding dma memory
++ *	pointers. This will subsequently be sent using a process command while
++ *	setting the USPC.
++ * @pending_output: must be minumum of PENDING_OUTPUT_MIN_SIZE, and optimal
++ *	if alignment is PENDING_OUTPUT_ALIGN
++ * history: minimum size is HISTORY_COMPRESSION_MIN_SIZE with alignment of
++ *	HISTORY_COMPRESSION_ALIGN
++ */
++static inline void fsl_dce_statefull_compression_dma(struct scf_64b *scf,
++	dma_addr_t pending_output, dma_addr_t history)
++{
++	set_pending_output_ptr(scf, pending_output);
++	set_history_ptr(scf, history);
++}
++
++/* DCE input command helpers */
++static inline void fsl_dce_cmd_set_process(uint32_t *cmd)
++{
++	SET_BF32_TK(*cmd, DCE_CMD, PROCESS);
++}
++
++static inline void fsl_dce_cmd_set_ctx_invalidate(uint32_t *cmd)
++{
++	SET_BF32_TK(*cmd, DCE_CMD, CTX_INVALIDATE);
++}
++
++static inline void fsl_dce_cmd_set_nop(uint32_t *cmd)
++{
++	SET_BF32_TK(*cmd, DCE_CMD, NOP);
++}
++
++/* DCE process command helpers */
++static inline void fsl_dce_cmd_set_compression_effort_none(uint32_t *cmd)
++{
++	SET_BF32_TK(*cmd, DCE_PROCESS_CE, NONE);
++}
++static inline void fsl_dce_cmd_set_compression_effort_statichuff(uint32_t *cmd)
++
++{
++	SET_BF32_TK(*cmd, DCE_PROCESS_CE, STATIC_HUFF_STRMATCH);
++}
++
++#endif /* FL_DCE_HELPER_H */
++
+diff --git a/drivers/staging/fsl_dce/fsl_dce_chunk.c b/drivers/staging/fsl_dce/fsl_dce_chunk.c
+new file mode 100644
+index 0000000..18895b4
+--- /dev/null
++++ b/drivers/staging/fsl_dce/fsl_dce_chunk.c
+@@ -0,0 +1,154 @@
++/* Copyright 2013 Freescale Semiconductor, Inc.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *       notice, this list of conditions and the following disclaimer in the
++ *       documentation and/or other materials provided with the distribution.
++ *     * Neither the name of Freescale Semiconductor nor the names of its
++ *       contributors may be used to endorse or promote products derived from
++ *       this software without specific prior written permission.
++ *
++ *
++ * ALTERNATIVELY, this software may be distributed under the terms of the
++ * GNU General Public License ("GPL") as published by the Free Software
++ * Foundation, either version 2 of that License or (at your option) any
++ * later version.
++ *
++ * This software is provided by Freescale Semiconductor "as is" and any
++ * express or implied warranties, including, but not limited to, the implied
++ * warranties of merchantability and fitness for a particular purpose are
++ * disclaimed. In no event shall Freescale Semiconductor be liable for any
++ * direct, indirect, incidental, special, exemplary, or consequential damages
++ * (including, but not limited to, procurement of substitute goods or services;
++ * loss of use, data, or profits; or business interruption) however caused and
++ * on any theory of liability, whether in contract, strict liability, or tort
++ * (including negligence or otherwise) arising in any way out of the use of
++ * this software, even if advised of the possibility of such damage.
++ */
++
++#include <linux/types.h>
++#include <linux/err.h>
++#include <linux/spinlock_types.h>
++#include <linux/cpumask.h>
++#include <linux/rbtree.h>
++#include <linux/export.h>
++#include "fsl_dce_chunk.h"
++
++#define DCE_FIFO_DEPTH	256
++
++static void chunk_base_cb(struct fsl_dce_flow *flow, const struct qm_fd *fd,
++			void *callback_tag)
++{
++	if (likely(ISEQ_32FTK(fd->cmd, DCE_CMD, PROCESS)))
++		flow->cbs.process_cb(flow, fd, callback_tag);
++	else if (ISEQ_32FTK(fd->cmd, DCE_CMD, CTX_INVALIDATE))
++		flow->cbs.scr_invalidate_cb(flow, fd, callback_tag);
++	else if (ISEQ_32FTK(fd->cmd, DCE_CMD, NOP))
++		flow->cbs.nop_cb(flow, fd, callback_tag);
++}
++
++int fsl_dce_chunk_setup2(struct fsl_dce_chunk *chunk,
++	uint32_t flags,
++	enum dce_mode mode,
++	enum dce_compression_format cf,
++	struct dce_bman_cfg *bcfg,
++	fsl_dce_process_cb process_cb,
++	fsl_dce_nop_cb nop_cb)
++{
++	int ret = 0;
++	struct fsl_dce_flow_init_params flow_params;
++
++	if (!chunk)
++		return -EINVAL;
++
++	memset(&flow_params, 0, sizeof(flow_params));
++	memset(chunk, 0, sizeof(*chunk));
++
++	chunk->cf = cf;
++
++	/* QMan frame queue ids will be allocated */
++	if (bcfg)
++		fsl_dce_flow_setopt_bcfg(&chunk->flow, *bcfg);
++	flow_params.mode = mode;
++	flow_params.fifo_depth = DCE_FIFO_DEPTH;
++	flow_params.state_config = DCE_STATELESS;
++	flow_params.base_cb = chunk_base_cb;
++	flow_params.process_cb = process_cb;
++	flow_params.nop_cb = nop_cb;
++	ret = fsl_dce_flow_init(&chunk->flow, &flow_params);
++	if (ret) {
++		pr_debug("dce_chunk: err ret = %d\n", ret);
++		return ret;
++	}
++	return 0;
++}
++EXPORT_SYMBOL(fsl_dce_chunk_setup2);
++
++int fsl_dce_chunk_fifo_len(struct fsl_dce_chunk *chunk)
++{
++	return fsl_dce_flow_fifo_len(&chunk->flow);
++}
++EXPORT_SYMBOL(fsl_dce_chunk_fifo_len);
++
++
++int fsl_dce_chunk_destroy(struct fsl_dce_chunk *chunk, uint32_t flags,
++			void *callback_tag)
++{
++	return fsl_dce_flow_finish(&chunk->flow, flags);
++}
++EXPORT_SYMBOL(fsl_dce_chunk_destroy);
++
++
++int fsl_dce_chunk_process(struct fsl_dce_chunk *chunk, uint32_t flags,
++			struct qm_fd *fd, void *callback_tag)
++{
++	if (chunk->cf == DCE_CF_ZLIB)
++		SET_BF32_TK(fd->cmd, DCE_PROCESS_CF, ZLIB);
++	else if (chunk->cf == DCE_CF_GZIP)
++		SET_BF32_TK(fd->cmd, DCE_PROCESS_CF, GZIP);
++
++	/* Bug 15470 */
++	SET_BF32_TK(fd->cmd, DCE_PROCESS_Z_FLUSH, FINISH);
++
++	/* Bug 14479, see 14477, must set UHC for gzip/zlib */
++	SET_BF32_TK(fd->cmd, DCE_PROCESS_UHC, YES);
++	return fsl_dce_process(&chunk->flow, flags, fd, callback_tag);
++}
++EXPORT_SYMBOL(fsl_dce_chunk_process);
++
++int fsl_dce_chunk_nop(struct fsl_dce_chunk *chunk, uint32_t flags,
++	void *callback_tag)
++{
++	return fsl_dce_nop(&chunk->flow, flags, callback_tag);
++}
++EXPORT_SYMBOL(fsl_dce_chunk_nop);
++
++int fsl_dce_chunk_deflate_params(struct fsl_dce_chunk *chunk,
++	uint32_t bman_output_offset,
++	bool bman_release_input,
++	bool base64,
++	uint32_t ce)
++{
++	fsl_dce_flow_setopt_outputoffset(&chunk->flow, bman_output_offset);
++	fsl_dce_flow_setopt_release_input(&chunk->flow, bman_release_input);
++	fsl_dce_flow_setopt_base64(&chunk->flow, base64);
++	fsl_dce_flow_setopt_compression_effort(&chunk->flow, ce);
++	return 0;
++}
++EXPORT_SYMBOL(fsl_dce_chunk_deflate_params);
++
++int fsl_dce_chunk_inflate_params(struct fsl_dce_chunk *chunk,
++	uint32_t bman_output_offset,
++	bool bman_release_input,
++	bool base64)
++{
++	fsl_dce_flow_setopt_outputoffset(&chunk->flow, bman_output_offset);
++	fsl_dce_flow_setopt_release_input(&chunk->flow, bman_release_input);
++	fsl_dce_flow_setopt_base64(&chunk->flow, base64);
++	return 0;
++}
++EXPORT_SYMBOL(fsl_dce_chunk_inflate_params);
++
+diff --git a/drivers/staging/fsl_dce/fsl_dce_chunk.h b/drivers/staging/fsl_dce/fsl_dce_chunk.h
+new file mode 100644
+index 0000000..156c568
+--- /dev/null
++++ b/drivers/staging/fsl_dce/fsl_dce_chunk.h
+@@ -0,0 +1,86 @@
++/* Copyright 2013 Freescale Semiconductor, Inc.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *       notice, this list of conditions and the following disclaimer in the
++ *       documentation and/or other materials provided with the distribution.
++ *     * Neither the name of Freescale Semiconductor nor the names of its
++ *       contributors may be used to endorse or promote products derived from
++ *       this software without specific prior written permission.
++ *
++ *
++ * ALTERNATIVELY, this software may be distributed under the terms of the
++ * GNU General Public License ("GPL") as published by the Free Software
++ * Foundation, either version 2 of that License or (at your option) any
++ * later version.
++ *
++ * This software is provided by Freescale Semiconductor "as is" and any
++ * express or implied warranties, including, but not limited to, the implied
++ * warranties of merchantability and fitness for a particular purpose are
++ * disclaimed. In no event shall Freescale Semiconductor be liable for any
++ * direct, indirect, incidental, special, exemplary, or consequential damages
++ * (including, but not limited to, procurement of substitute goods or services;
++ * loss of use, data, or profits; or business interruption) however caused and
++ * on any theory of liability, whether in contract, strict liability, or tort
++ * (including negligence or otherwise) arising in any way out of the use of
++ * this software, even if advised of the possibility of such damage.
++ */
++
++#ifndef FSL_DCE_CHUNK_H
++#define FSL_DCE_CHUNK_H
++
++#include <linux/fsl_qman.h>
++#include <linux/fsl_bman.h>
++#include "flib/dce_flow.h"
++
++/*
++ *  DCE chunk is a stateless compressor/decompressor object. Each Frame which
++ *  is compressed/decompressed is one complete work item and doesn't depend
++ *  on previous Frames. As an example a Frame should be considered as one
++ *  complete file.
++ */
++struct fsl_dce_chunk {
++	struct fsl_dce_flow flow;
++
++	enum dce_compression_format cf; /* deflate, zlib or gzip */
++	/* optional BMan output settings */
++	bool use_bman_output;
++	uint32_t flags; /* internal state */
++	spinlock_t lock;
++	wait_queue_head_t queue;
++};
++
++int fsl_dce_chunk_setup2(struct fsl_dce_chunk *chunk,
++	uint32_t flags,
++	enum dce_mode mode,
++	enum dce_compression_format cf,
++	struct dce_bman_cfg *bcfg,
++	fsl_dce_process_cb process_cb,
++	fsl_dce_nop_cb nop_cb);
++
++int fsl_dce_chunk_fifo_len(struct fsl_dce_chunk *chunk);
++
++int fsl_dce_chunk_destroy(struct fsl_dce_chunk *chunk, uint32_t flags,
++			void *callback_tag);
++
++int fsl_dce_chunk_deflate_params(struct fsl_dce_chunk *chunk,
++	uint32_t bman_output_offset,
++	bool bman_release_input,
++	bool base64,
++	uint32_t ce); /* DCE_PROCESS_CE_* value */
++
++int fsl_dce_chunk_inflate_params(struct fsl_dce_chunk *chunk,
++	uint32_t bman_output_offset,
++	bool bman_release_input,
++	bool base64);
++
++int fsl_dce_chunk_process(struct fsl_dce_chunk *chunk, uint32_t flags,
++	struct qm_fd *fd, void *callback_tag); /* optional callback tag */
++
++int fsl_dce_chunk_nop(struct fsl_dce_chunk *chunk, uint32_t flags,
++	void *callback_tag); /* optional callback tag */
++
++#endif /* FSL_DCE_CHUNK_H */
+-- 
+2.9.3
+
