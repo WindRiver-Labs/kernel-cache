@@ -1,0 +1,192 @@
+From 313a3ccfed6f150012ebafe9ee3caab082554b50 Mon Sep 17 00:00:00 2001
+From: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Date: Tue, 1 Dec 2015 17:56:12 +0200
+Subject: [PATCH 0795/2508] drm/i915: Inspect subunit states on hangcheck
+
+commit 61642ff03523995918c452ef41adf0795d54d909 upstream
+
+If head seems stuck and engine in question is rcs,
+inspect subunit state transitions from undone to done,
+before deciding that this really is a hang instead of limited
+progress. Only account the transitions of subunits from
+undone to done once, to prevent unstable subunit states
+to keep us falsely active.
+
+As this adds one extra steps to hangcheck heuristics,
+before hang is declared, it adds 1500ms to to detect hang
+for render ring to a total of 7500ms. We could sample
+the subunit states on first head stuck condition but
+decide not to do so only in order to mimic old behaviour. This
+way the check order of promotion from seqno > atchd > instdone
+is consistently done.
+
+v2: Deal with unstable done states (Arun)
+    Clear instdone progress on head and seqno movement (Chris)
+    Report raw and accumulated instdone's in in debugfs (Chris)
+    Return HANGCHECK_ACTIVE on undone->done
+
+References: https://bugs.freedesktop.org/show_bug.cgi?id=93029
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Dave Gordon <david.s.gordon@intel.com>
+Cc: Daniel Vetter <daniel@ffwll.ch>
+Cc: Arun Siluvery <arun.siluvery@linux.intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1448985372-19535-1-git-send-email-mika.kuoppala@intel.com
+---
+ drivers/gpu/drm/i915/i915_debugfs.c     |   20 +++++++++-
+ drivers/gpu/drm/i915/i915_irq.c         |   62 ++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    1 +
+ 3 files changed, 77 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index ef9b329..3570e71 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -1336,7 +1336,8 @@ static int i915_hangcheck_info(struct seq_file *m, void *unused)
+ 	struct intel_engine_cs *ring;
+ 	u64 acthd[I915_NUM_RINGS];
+ 	u32 seqno[I915_NUM_RINGS];
+-	int i;
++	u32 instdone[I915_NUM_INSTDONE_REG];
++	int i, j;
+ 
+ 	if (!i915.enable_hangcheck) {
+ 		seq_printf(m, "Hangcheck disabled\n");
+@@ -1350,6 +1351,8 @@ static int i915_hangcheck_info(struct seq_file *m, void *unused)
+ 		acthd[i] = intel_ring_get_active_head(ring);
+ 	}
+ 
++	i915_get_extra_instdone(dev, instdone);
++
+ 	intel_runtime_pm_put(dev_priv);
+ 
+ 	if (delayed_work_pending(&dev_priv->gpu_error.hangcheck_work)) {
+@@ -1370,6 +1373,21 @@ static int i915_hangcheck_info(struct seq_file *m, void *unused)
+ 			   (long long)ring->hangcheck.max_acthd);
+ 		seq_printf(m, "\tscore = %d\n", ring->hangcheck.score);
+ 		seq_printf(m, "\taction = %d\n", ring->hangcheck.action);
++
++		if (ring->id == RCS) {
++			seq_puts(m, "\tinstdone read =");
++
++			for (j = 0; j < I915_NUM_INSTDONE_REG; j++)
++				seq_printf(m, " 0x%08x", instdone[j]);
++
++			seq_puts(m, "\n\tinstdone accu =");
++
++			for (j = 0; j < I915_NUM_INSTDONE_REG; j++)
++				seq_printf(m, " 0x%08x",
++					   ring->hangcheck.instdone[j]);
++
++			seq_puts(m, "\n");
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 89a8e2f..de5a09a 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2948,14 +2948,44 @@ static void semaphore_clear_deadlocks(struct drm_i915_private *dev_priv)
+ 		ring->hangcheck.deadlock = 0;
+ }
+ 
+-static enum intel_ring_hangcheck_action
+-ring_stuck(struct intel_engine_cs *ring, u64 acthd)
++static bool subunits_stuck(struct intel_engine_cs *ring)
+ {
+-	struct drm_device *dev = ring->dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	u32 tmp;
++	u32 instdone[I915_NUM_INSTDONE_REG];
++	bool stuck;
++	int i;
++
++	if (ring->id != RCS)
++		return true;
++
++	i915_get_extra_instdone(ring->dev, instdone);
+ 
++	/* There might be unstable subunit states even when
++	 * actual head is not moving. Filter out the unstable ones by
++	 * accumulating the undone -> done transitions and only
++	 * consider those as progress.
++	 */
++	stuck = true;
++	for (i = 0; i < I915_NUM_INSTDONE_REG; i++) {
++		const u32 tmp = instdone[i] | ring->hangcheck.instdone[i];
++
++		if (tmp != ring->hangcheck.instdone[i])
++			stuck = false;
++
++		ring->hangcheck.instdone[i] |= tmp;
++	}
++
++	return stuck;
++}
++
++static enum intel_ring_hangcheck_action
++head_stuck(struct intel_engine_cs *ring, u64 acthd)
++{
+ 	if (acthd != ring->hangcheck.acthd) {
++
++		/* Clear subunit states on head movement */
++		memset(ring->hangcheck.instdone, 0,
++		       sizeof(ring->hangcheck.instdone));
++
+ 		if (acthd > ring->hangcheck.max_acthd) {
+ 			ring->hangcheck.max_acthd = acthd;
+ 			return HANGCHECK_ACTIVE;
+@@ -2964,6 +2994,24 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
+ 		return HANGCHECK_ACTIVE_LOOP;
+ 	}
+ 
++	if (!subunits_stuck(ring))
++		return HANGCHECK_ACTIVE;
++
++	return HANGCHECK_HUNG;
++}
++
++static enum intel_ring_hangcheck_action
++ring_stuck(struct intel_engine_cs *ring, u64 acthd)
++{
++	struct drm_device *dev = ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	enum intel_ring_hangcheck_action ha;
++	u32 tmp;
++
++	ha = head_stuck(ring, acthd);
++	if (ha != HANGCHECK_HUNG)
++		return ha;
++
+ 	if (IS_GEN2(dev))
+ 		return HANGCHECK_HUNG;
+ 
+@@ -3105,7 +3153,11 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
+ 			if (ring->hangcheck.score > 0)
+ 				ring->hangcheck.score--;
+ 
++			/* Clear head and subunit states on seqno movement */
+ 			ring->hangcheck.acthd = ring->hangcheck.max_acthd = 0;
++
++			memset(ring->hangcheck.instdone, 0,
++			       sizeof(ring->hangcheck.instdone));
+ 		}
+ 
+ 		ring->hangcheck.seqno = seqno;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index fd6aff3..c9d1670 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -93,6 +93,7 @@ struct intel_ring_hangcheck {
+ 	int score;
+ 	enum intel_ring_hangcheck_action action;
+ 	int deadlock;
++	u32 instdone[I915_NUM_INSTDONE_REG];
+ };
+ 
+ struct intel_ringbuffer {
+-- 
+1.7.5.4
+

@@ -1,0 +1,263 @@
+From ae7046427ba6d644bfd92ea2b72ec93d965a3824 Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Mon, 4 May 2015 09:43:53 +0300
+Subject: [PATCH 2321/2508] mei: revamp client connection
+
+commit 0c53357ca4b3a03aafc211de663e84dba7c628e2 upstream
+
+Simplify connect state machine by changing the logic around
+Connection request in progress - only check if we have a callback in
+relevant queue.
+Extract common code into mei_cl_send_connect() function
+
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/misc/mei/bus.c       |    6 +++
+ drivers/misc/mei/client.c    |   97 ++++++++++++++++++++++++++++++++---------
+ drivers/misc/mei/client.h    |    3 +-
+ drivers/misc/mei/interrupt.c |   43 ------------------
+ 4 files changed, 83 insertions(+), 66 deletions(-)
+
+diff --git a/drivers/misc/mei/bus.c b/drivers/misc/mei/bus.c
+index 873c1b6..00b0cb2 100644
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@ -436,6 +436,12 @@ int mei_cl_enable_device(struct mei_cl_device *device)
+ 
+ 	mutex_lock(&dev->device_lock);
+ 
++	if (mei_cl_is_connected(cl)) {
++		mutex_unlock(&dev->device_lock);
++		dev_warn(dev->dev, "Already connected");
++		return -EBUSY;
++	}
++
+ 	err = mei_cl_connect(cl, NULL);
+ 	if (err < 0) {
+ 		mutex_unlock(&dev->device_lock);
+diff --git a/drivers/misc/mei/client.c b/drivers/misc/mei/client.c
+index d2fcc08..6a84579 100644
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -881,28 +881,83 @@ out:
+  *
+  * Return: true if other client is connected, false - otherwise.
+  */
+-bool mei_cl_is_other_connecting(struct mei_cl *cl)
++static bool mei_cl_is_other_connecting(struct mei_cl *cl)
+ {
+ 	struct mei_device *dev;
+-	struct mei_cl *ocl; /* the other client */
+-
+-	if (WARN_ON(!cl || !cl->dev))
+-		return false;
++	struct mei_cl_cb *cb;
+ 
+ 	dev = cl->dev;
+ 
+-	list_for_each_entry(ocl, &dev->file_list, link) {
+-		if (ocl->state == MEI_FILE_CONNECTING &&
+-		    ocl != cl &&
+-		    cl->me_client_id == ocl->me_client_id)
++	list_for_each_entry(cb, &dev->ctrl_rd_list.list, list) {
++		if (cb->fop_type == MEI_FOP_CONNECT &&
++		    cl->me_client_id == cb->cl->me_client_id)
+ 			return true;
+-
+ 	}
+ 
+ 	return false;
+ }
+ 
+ /**
++ * mei_cl_send_connect - send connect request
++ *
++ * @cl: host client
++ * @cb: callback block
++ *
++ * Return: 0, OK; otherwise, error.
++ */
++static int mei_cl_send_connect(struct mei_cl *cl, struct mei_cl_cb *cb)
++{
++	struct mei_device *dev;
++	int ret;
++
++	dev = cl->dev;
++
++	ret = mei_hbm_cl_connect_req(dev, cl);
++	cl->status = ret;
++	if (ret) {
++		cl->state = MEI_FILE_DISCONNECT_REPLY;
++		return ret;
++	}
++
++	list_move_tail(&cb->list, &dev->ctrl_rd_list.list);
++	cl->timer_count = MEI_CONNECT_TIMEOUT;
++	return 0;
++}
++
++/**
++ * mei_cl_irq_connect - send connect request in irq_thread context
++ *
++ * @cl: host client
++ * @cb: callback block
++ * @cmpl_list: complete list
++ *
++ * Return: 0, OK; otherwise, error.
++ */
++int mei_cl_irq_connect(struct mei_cl *cl, struct mei_cl_cb *cb,
++			      struct mei_cl_cb *cmpl_list)
++{
++	struct mei_device *dev = cl->dev;
++	u32 msg_slots;
++	int slots;
++	int rets;
++
++	msg_slots = mei_data2slots(sizeof(struct hbm_client_connect_request));
++	slots = mei_hbuf_empty_slots(dev);
++
++	if (mei_cl_is_other_connecting(cl))
++		return 0;
++
++	if (slots < msg_slots)
++		return -EMSGSIZE;
++
++	rets = mei_cl_send_connect(cl, cb);
++	if (rets)
++		list_move_tail(&cb->list, &cmpl_list->list);
++
++	return rets;
++}
++
++/**
+  * mei_cl_connect - connect host client to the me one
+  *
+  * @cl: host client
+@@ -935,18 +990,14 @@ int mei_cl_connect(struct mei_cl *cl, struct file *file)
+ 	if (rets)
+ 		goto out;
+ 
++	cl->state = MEI_FILE_CONNECTING;
++	list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
++
+ 	/* run hbuf acquire last so we don't have to undo */
+ 	if (!mei_cl_is_other_connecting(cl) && mei_hbuf_acquire(dev)) {
+-		cl->state = MEI_FILE_CONNECTING;
+-		if (mei_hbm_cl_connect_req(dev, cl)) {
+-			rets = -ENODEV;
++		rets = mei_cl_send_connect(cl, cb);
++		if (rets)
+ 			goto out;
+-		}
+-		cl->timer_count = MEI_CONNECT_TIMEOUT;
+-		list_add_tail(&cb->list, &dev->ctrl_rd_list.list);
+-	} else {
+-		cl->state = MEI_FILE_INITIALIZING;
+-		list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
+ 	}
+ 
+ 	mutex_unlock(&dev->device_lock);
+@@ -957,20 +1008,22 @@ int mei_cl_connect(struct mei_cl *cl, struct file *file)
+ 	mutex_lock(&dev->device_lock);
+ 
+ 	if (!mei_cl_is_connected(cl)) {
+-		/* something went really wrong */
++		/* timeout or something went really wrong */
+ 		if (!cl->status)
+ 			cl->status = -EFAULT;
+-		mei_cl_set_disconnected(cl);
+ 	}
+ 
+ 	rets = cl->status;
+-
+ out:
+ 	cl_dbg(dev, cl, "rpm: autosuspend\n");
+ 	pm_runtime_mark_last_busy(dev->dev);
+ 	pm_runtime_put_autosuspend(dev->dev);
+ 
+ 	mei_io_cb_free(cb);
++
++	if (!mei_cl_is_connected(cl))
++		mei_cl_set_disconnected(cl);
++
+ 	return rets;
+ }
+ 
+diff --git a/drivers/misc/mei/client.h b/drivers/misc/mei/client.h
+index 57ce177..181aed9 100644
+--- a/drivers/misc/mei/client.h
++++ b/drivers/misc/mei/client.h
+@@ -103,12 +103,13 @@ static inline bool mei_cl_is_connected(struct mei_cl *cl)
+ 	return  cl->state == MEI_FILE_CONNECTED;
+ }
+ 
+-bool mei_cl_is_other_connecting(struct mei_cl *cl);
+ int mei_cl_disconnect(struct mei_cl *cl);
+ void mei_cl_set_disconnected(struct mei_cl *cl);
+ int mei_cl_irq_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb,
+ 			  struct mei_cl_cb *cmpl_list);
+ int mei_cl_connect(struct mei_cl *cl, struct file *file);
++int mei_cl_irq_connect(struct mei_cl *cl, struct mei_cl_cb *cb,
++			      struct mei_cl_cb *cmpl_list);
+ int mei_cl_read_start(struct mei_cl *cl, size_t length, struct file *fp);
+ int mei_cl_irq_read_msg(struct mei_cl *cl, struct mei_msg_hdr *hdr,
+ 			struct mei_cl_cb *cmpl_list);
+diff --git a/drivers/misc/mei/interrupt.c b/drivers/misc/mei/interrupt.c
+index 6fd7ca9..3b74e3b 100644
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -223,49 +223,6 @@ static int mei_cl_irq_read(struct mei_cl *cl, struct mei_cl_cb *cb,
+ 	return 0;
+ }
+ 
+-
+-/**
+- * mei_cl_irq_connect - send connect request in irq_thread context
+- *
+- * @cl: client
+- * @cb: callback block.
+- * @cmpl_list: complete list.
+- *
+- * Return: 0, OK; otherwise, error.
+- */
+-static int mei_cl_irq_connect(struct mei_cl *cl, struct mei_cl_cb *cb,
+-			      struct mei_cl_cb *cmpl_list)
+-{
+-	struct mei_device *dev = cl->dev;
+-	u32 msg_slots;
+-	int slots;
+-	int ret;
+-
+-	msg_slots = mei_data2slots(sizeof(struct hbm_client_connect_request));
+-	slots = mei_hbuf_empty_slots(dev);
+-
+-	if (mei_cl_is_other_connecting(cl))
+-		return 0;
+-
+-	if (slots < msg_slots)
+-		return -EMSGSIZE;
+-
+-	cl->state = MEI_FILE_CONNECTING;
+-
+-	ret = mei_hbm_cl_connect_req(dev, cl);
+-	if (ret) {
+-		cl->status = ret;
+-		cb->buf_idx = 0;
+-		list_del_init(&cb->list);
+-		return ret;
+-	}
+-
+-	list_move_tail(&cb->list, &dev->ctrl_rd_list.list);
+-	cl->timer_count = MEI_CONNECT_TIMEOUT;
+-	return 0;
+-}
+-
+-
+ /**
+  * mei_irq_read_handler - bottom half read routine after ISR to
+  * handle the read processing.
+-- 
+1.7.5.4
+

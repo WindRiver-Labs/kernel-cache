@@ -1,0 +1,189 @@
+From 997b7cf2e3a106d0ad576b1b52f591f1cef28008 Mon Sep 17 00:00:00 2001
+From: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Date: Wed, 16 Dec 2015 09:26:48 +0200
+Subject: [PATCH 0799/2508] drm/i915: Do one shot unclaimed mmio detection
+ less frequently
+
+commit 7571494004d88249bcee2a20fa74cb50753676fe upstream
+
+We have done unclaimed register access check in normal
+(mmio_debug=0) mode once per write. This adds probability
+of finding the exact sequence where we did the bad access, but
+also adds burden to each write.
+
+As we have mmio_debug available for more fine grained analysis,
+give up accuracy of detecting correct spot at the first occurrence
+by doing the one shot detection and arming of mmio_debug in hangcheck
+and in modeset. This removes the write path performance burden.
+
+v2: Remove gratuitous DRM_DEBUG and return value, comments (Chris)
+
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Paulo Zanoni <przanoni@gmail.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1450250808-14864-1-git-send-email-mika.kuoppala@intel.com
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    3 ++
+ drivers/gpu/drm/i915/i915_irq.c      |   11 +++++----
+ drivers/gpu/drm/i915/intel_display.c |   13 ++++++++++++
+ drivers/gpu/drm/i915/intel_uncore.c  |   37 ++++++++++++++++-----------------
+ 4 files changed, 40 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index d3c9d37..0ba2bc7 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -714,6 +714,8 @@ struct intel_uncore {
+ 		i915_reg_t reg_post;
+ 		u32 val_reset;
+ 	} fw_domain[FW_DOMAIN_ID_COUNT];
++
++	int unclaimed_mmio_check;
+ };
+ 
+ /* Iterate over initialised fw domains */
+@@ -2712,6 +2714,7 @@ extern void intel_uncore_early_sanitize(struct drm_device *dev,
+ 					bool restore_forcewake);
+ extern void intel_uncore_init(struct drm_device *dev);
+ extern bool intel_uncore_unclaimed_mmio(struct drm_i915_private *dev_priv);
++extern void intel_uncore_arm_unclaimed_mmio_detection(struct drm_i915_private *dev_priv);
+ extern void intel_uncore_fini(struct drm_device *dev);
+ extern void intel_uncore_forcewake_reset(struct drm_device *dev, bool restore);
+ const char *intel_uncore_forcewake_domain_to_str(const enum forcewake_domain_id id);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 1f69e0b..5fe32aa 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2187,11 +2187,6 @@ static irqreturn_t ironlake_irq_handler(int irq, void *arg)
+ 	/* IRQs are synced during runtime_suspend, we don't require a wakeref */
+ 	disable_rpm_wakeref_asserts(dev_priv);
+ 
+-	/* We get interrupts on unclaimed registers, so check for this before we
+-	 * do any I915_{READ,WRITE}. */
+-	if (intel_uncore_unclaimed_mmio(dev_priv))
+-		DRM_ERROR("Unclaimed register before interrupt\n");
+-
+ 	/* disable master interrupt before clearing iir  */
+ 	de_ier = I915_READ(DEIER);
+ 	I915_WRITE(DEIER, de_ier & ~DE_MASTER_IRQ_CONTROL);
+@@ -3080,6 +3075,12 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
+ 	 */
+ 	DISABLE_RPM_WAKEREF_ASSERTS(dev_priv);
+ 
++	/* As enabling the GPU requires fairly extensive mmio access,
++	 * periodically arm the mmio checker to see if we are triggering
++	 * any invalid access.
++	 */
++	intel_uncore_arm_unclaimed_mmio_detection(dev_priv);
++
+ 	for_each_ring(ring, dev_priv, i) {
+ 		u64 acthd;
+ 		u32 seqno;
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 038e207..b9fb16c 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -13650,6 +13650,19 @@ static int intel_atomic_commit(struct drm_device *dev,
+ 
+ 	drm_atomic_state_free(state);
+ 
++	/* As one of the primary mmio accessors, KMS has a high likelihood
++	 * of triggering bugs in unclaimed access. After we finish
++	 * modesetting, see if an error has been flagged, and if so
++	 * enable debugging for the next modeset - and hope we catch
++	 * the culprit.
++	 *
++	 * XXX note that we assume display power is on at this point.
++	 * This might hold true now but we need to add pm helper to check
++	 * unclaimed only when the hardware is on, as atomic commits
++	 * can happen also when the device is completely off.
++	 */
++	intel_uncore_arm_unclaimed_mmio_detection(dev_priv);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_uncore.c b/drivers/gpu/drm/i915/intel_uncore.c
+index 7ab5916..c7af339 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -619,22 +619,6 @@ hsw_unclaimed_reg_debug(struct drm_i915_private *dev_priv,
+ 	}
+ }
+ 
+-static void
+-hsw_unclaimed_reg_detect(struct drm_i915_private *dev_priv)
+-{
+-	static bool mmio_debug_once = true;
+-
+-	if (i915.mmio_debug || !mmio_debug_once)
+-		return;
+-
+-	if (check_for_unclaimed_mmio(dev_priv)) {
+-		DRM_DEBUG("Unclaimed register detected, "
+-			  "enabling oneshot unclaimed register reporting. "
+-			  "Please use i915.mmio_debug=N for more information.\n");
+-		i915.mmio_debug = mmio_debug_once--;
+-	}
+-}
+-
+ #define GEN2_READ_HEADER(x) \
+ 	u##x val = 0; \
+ 	assert_rpm_wakelock_held(dev_priv);
+@@ -914,7 +898,6 @@ hsw_write##x(struct drm_i915_private *dev_priv, i915_reg_t reg, u##x val, bool t
+ 		gen6_gt_check_fifodbg(dev_priv); \
+ 	} \
+ 	hsw_unclaimed_reg_debug(dev_priv, reg, false, false); \
+-	hsw_unclaimed_reg_detect(dev_priv); \
+ 	GEN6_WRITE_FOOTER; \
+ }
+ 
+@@ -949,7 +932,6 @@ gen8_write##x(struct drm_i915_private *dev_priv, i915_reg_t reg, u##x val, bool
+ 		__force_wake_get(dev_priv, FORCEWAKE_RENDER); \
+ 	__raw_i915_write##x(dev_priv, reg, val); \
+ 	hsw_unclaimed_reg_debug(dev_priv, reg, false, false); \
+-	hsw_unclaimed_reg_detect(dev_priv); \
+ 	GEN6_WRITE_FOOTER; \
+ }
+ 
+@@ -1019,7 +1001,6 @@ gen9_write##x(struct drm_i915_private *dev_priv, i915_reg_t reg, u##x val, \
+ 		__force_wake_get(dev_priv, fw_engine); \
+ 	__raw_i915_write##x(dev_priv, reg, val); \
+ 	hsw_unclaimed_reg_debug(dev_priv, reg, false, false); \
+-	hsw_unclaimed_reg_detect(dev_priv); \
+ 	GEN6_WRITE_FOOTER; \
+ }
+ 
+@@ -1239,6 +1220,8 @@ void intel_uncore_init(struct drm_device *dev)
+ 	intel_uncore_fw_domains_init(dev);
+ 	__intel_uncore_early_sanitize(dev, false);
+ 
++	dev_priv->uncore.unclaimed_mmio_check = 1;
++
+ 	switch (INTEL_INFO(dev)->gen) {
+ 	default:
+ 	case 9:
+@@ -1600,3 +1583,19 @@ bool intel_uncore_unclaimed_mmio(struct drm_i915_private *dev_priv)
+ {
+ 	return check_for_unclaimed_mmio(dev_priv);
+ }
++
++void
++intel_uncore_arm_unclaimed_mmio_detection(struct drm_i915_private *dev_priv)
++{
++	if (unlikely(i915.mmio_debug ||
++		     dev_priv->uncore.unclaimed_mmio_check <= 0))
++		return;
++
++	if (unlikely(intel_uncore_unclaimed_mmio(dev_priv))) {
++		DRM_DEBUG("Unclaimed register detected, "
++			  "enabling oneshot unclaimed register reporting. "
++			  "Please use i915.mmio_debug=N for more information.\n");
++		i915.mmio_debug++;
++		dev_priv->uncore.unclaimed_mmio_check--;
++	}
++}
+-- 
+1.7.5.4
+

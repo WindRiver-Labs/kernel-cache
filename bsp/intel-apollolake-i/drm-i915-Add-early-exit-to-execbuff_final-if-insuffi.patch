@@ -1,0 +1,258 @@
+From 710104e3ff934e6449397c86ecfde74055051d0e Mon Sep 17 00:00:00 2001
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Fri, 8 Apr 2016 13:44:32 -0700
+Subject: [PATCH 1329/2508] drm/i915: Add early exit to execbuff_final() if
+ insufficient ring space
+
+commit 77511982f650df87ca1e818cad642f128e2c7d6b from
+https://github.com/01org/linux-apollolake-i
+
+One of the major purposes of the GPU scheduler is to avoid stalling
+the CPU when the GPU is busy and unable to accept more work. This
+change adds support to the ring submission code to allow a ring space
+check to be performed before attempting to submit a batch buffer to
+the hardware. If insufficient space is available then the scheduler
+can go away and come back later, letting the CPU get on with other
+work, rather than stalling and waiting for the hardware to catch up.
+
+v3: Updated to use locally cached request pointer.
+
+v4: Line wrapped some comments differently to keep the style checker
+happy. Downgraded a BUG_ON to a WARN_ON as the latter is preferred.
+
+Removed some obsolete, commented out code.
+
+For: VIZ-1587
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   41 +++++++++++++++------
+ drivers/gpu/drm/i915/intel_lrc.c           |   54 +++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |   26 +++++++++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |    1 +
+ 4 files changed, 107 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 3e09427..abbbce5 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1138,25 +1138,19 @@ i915_reset_gen7_sol_offsets(struct drm_device *dev,
+ {
+ 	struct intel_engine_cs *engine = req->engine;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	int ret, i;
++	int i;
+ 
+ 	if (!IS_GEN7(dev) || engine != &dev_priv->engine[RCS]) {
+ 		DRM_DEBUG("sol reset is gen7/rcs only\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = intel_ring_begin(req, 4 * 3);
+-	if (ret)
+-		return ret;
+-
+ 	for (i = 0; i < 4; i++) {
+ 		intel_ring_emit(engine, MI_LOAD_REGISTER_IMM(1));
+ 		intel_ring_emit_reg(engine, GEN7_SO_WRITE_OFFSET(i));
+ 		intel_ring_emit(engine, 0);
+ 	}
+ 
+-	intel_ring_advance(engine);
+-
+ 	return 0;
+ }
+ 
+@@ -1284,6 +1278,7 @@ int i915_gem_ringbuffer_submission_final(struct i915_execbuffer_params *params)
+ 	struct intel_engine_cs  *engine = params->engine;
+ 	u64 exec_start, exec_len;
+ 	int ret;
++	uint32_t min_space;
+ 
+ 	/* The mutex must be acquired before calling this function */
+ 	WARN_ON(!mutex_is_locked(&params->dev->struct_mutex));
+@@ -1307,6 +1302,34 @@ int i915_gem_ringbuffer_submission_final(struct i915_execbuffer_params *params)
+ 		goto error;
+ 
+ 	/*
++	 * It would be a bad idea to run out of space while writing commands
++	 * to the ring. One of the major aims of the scheduler is to not
++	 * stall at any point for any reason. However, doing an early exit
++	 * half way through submission could result in a partial sequence
++	 * being written which would leave the engine in an unknown state.
++	 * Therefore, check in advance that there will be enough space for
++	 * the entire submission whether emitted by the code below OR by any
++	 * other functions that may be executed before the end of final().
++	 *
++	 * NB: This test deliberately overestimates, because that's easier
++	 * than tracing every potential path that could be taken!
++	 *
++	 * Current measurements suggest that we may need to emit up to 186
++	 * dwords, so this is rounded up to 256 here. Then double that to get
++	 * the free space requirement, because the block is not allowed to
++	 * span the transition from the end to the beginning of the ring.
++	 */
++#define I915_BATCH_EXEC_MAX_LEN         256	/* max dwords emitted here */
++	min_space = I915_BATCH_EXEC_MAX_LEN * 2 * sizeof(uint32_t);
++	ret = intel_ring_test_space(req->ringbuf, min_space);
++	if (ret)
++		goto error;
++
++	ret = intel_ring_begin(req, I915_BATCH_EXEC_MAX_LEN);
++	if (ret)
++		goto error;
++
++	/*
+ 	 * Unconditionally invalidate gpu caches and ensure that we do flush
+ 	 * any residual writes from the previous batch.
+ 	 */
+@@ -1324,10 +1347,6 @@ int i915_gem_ringbuffer_submission_final(struct i915_execbuffer_params *params)
+ 
+ 	if (engine == &dev_priv->engine[RCS] &&
+ 	    params->instp_mode != dev_priv->relative_constants_mode) {
+-		ret = intel_ring_begin(req, 4);
+-		if (ret)
+-			goto error;
+-
+ 		intel_ring_emit(engine, MI_NOOP);
+ 		intel_ring_emit(engine, MI_LOAD_REGISTER_IMM(1));
+ 		intel_ring_emit_reg(engine, INSTPM);
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 9118aae..dff42b9 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -335,6 +335,27 @@ uint64_t intel_lr_context_descriptor(struct intel_context *ctx,
+ 	return ctx->engine[engine->id].lrc_desc;
+ }
+ 
++/*
++ * Test to see if the ring has sufficient space to submit a given piece
++ * of work without causing a stall
++ */
++static int logical_ring_test_space(struct intel_ringbuffer *ringbuf,
++				   int min_space)
++{
++	if (ringbuf->space < min_space) {
++		/* Need to update the actual ring space. Otherwise, the system
++		 * hangs forever testing a software copy of the space value that
++		 * never changes!
++		 */
++		intel_ring_update_space(ringbuf);
++
++		if (ringbuf->space < min_space)
++			return -EAGAIN;
++	}
++
++	return 0;
++}
++
+ /**
+  * intel_execlists_ctx_id() - get the Execlists Context ID
+  * @ctx: Context to get the ID for
+@@ -1013,6 +1034,7 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 	struct intel_engine_cs *engine = params->engine;
+ 	u64 exec_start;
+ 	int ret;
++	uint32_t min_space;
+ 
+ 	/* The mutex must be acquired before calling this function */
+ 	WARN_ON(!mutex_is_locked(&params->dev->struct_mutex));
+@@ -1036,6 +1058,34 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 		goto err;
+ 
+ 	/*
++	 * It would be a bad idea to run out of space while writing commands
++	 * to the ring. One of the major aims of the scheduler is to not
++	 * stall at any point for any reason. However, doing an early exit
++	 * half way through submission could result in a partial sequence
++	 * being written which would leave the engine in an unknown state.
++	 * Therefore, check in advance that there will be enough space for
++	 * the entire submission whether emitted by the code below OR by any
++	 * other functions that may be executed before the end of final().
++	 *
++	 * NB: This test deliberately overestimates, because that's easier
++	 * than tracing every potential path that could be taken!
++	 *
++	 * Current measurements suggest that we may need to emit up to 186
++	 * dwords, so this is rounded up to 256 here. Then double that to get
++	 * the free space requirement, because the block is not allowed to
++	 * span the transition from the end to the beginning of the ring.
++	 */
++#define I915_BATCH_EXEC_MAX_LEN         256	/* max dwords emitted here */
++	min_space = I915_BATCH_EXEC_MAX_LEN * 2 * sizeof(uint32_t);
++	ret = logical_ring_test_space(ringbuf, min_space);
++	if (ret)
++		goto err;
++
++	ret = intel_logical_ring_begin(req, I915_BATCH_EXEC_MAX_LEN);
++	if (ret)
++		goto err;
++
++	/*
+ 	 * Unconditionally invalidate gpu caches and ensure that we do flush
+ 	 * any residual writes from the previous batch.
+ 	 */
+@@ -1045,10 +1095,6 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 
+ 	if (engine == &dev_priv->engine[RCS] &&
+ 	    params->instp_mode != dev_priv->relative_constants_mode) {
+-		ret = intel_logical_ring_begin(req, 4);
+-		if (ret)
+-			return ret;
+-
+ 		intel_logical_ring_emit(ringbuf, MI_NOOP);
+ 		intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
+ 		intel_logical_ring_emit_reg(ringbuf, INSTPM);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 1ed582e..45b2c44 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2592,6 +2592,32 @@ int intel_ring_cacheline_align(struct drm_i915_gem_request *req)
+ 	return 0;
+ }
+ 
++/*
++ * Test to see if the ring has sufficient space to submit a given piece
++ * of work without causing a stall
++ */
++int intel_ring_test_space(struct intel_ringbuffer *ringbuf, int min_space)
++{
++	struct drm_i915_private *dev_priv = ringbuf->engine->dev->dev_private;
++
++	/* There is a separate LRC version of this code. */
++	WARN_ON(i915.enable_execlists);
++
++	if (ringbuf->space < min_space) {
++		/* Need to update the actual ring space. Otherwise, the system
++		 * hangs forever testing a software copy of the space value that
++		 * never changes!
++		 */
++		ringbuf->head  = I915_READ_HEAD(ringbuf->engine);
++		ringbuf->space = intel_ring_space(ringbuf);
++
++		if (ringbuf->space < min_space)
++			return -EAGAIN;
++	}
++
++	return 0;
++}
++
+ void intel_ring_init_seqno(struct intel_engine_cs *engine, u32 seqno)
+ {
+ 	struct drm_device *dev = engine->dev;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index a0c6962..b4bfd5c 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -448,6 +448,7 @@ void intel_cleanup_engine(struct intel_engine_cs *engine);
+ 
+ int intel_ring_alloc_request_extras(struct drm_i915_gem_request *request);
+ 
++int intel_ring_test_space(struct intel_ringbuffer *ringbuf, int min_space);
+ int __must_check intel_ring_begin(struct drm_i915_gem_request *req, int n);
+ int __must_check intel_ring_cacheline_align(struct drm_i915_gem_request *req);
+ static inline void intel_ring_emit(struct intel_engine_cs *engine,
+-- 
+1.7.5.4
+

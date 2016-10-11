@@ -1,0 +1,236 @@
+From 0c975c5e1b855466a03ddfa29029060d042bb459 Mon Sep 17 00:00:00 2001
+From: Dave Gordon <david.s.gordon@intel.com>
+Date: Fri, 8 Apr 2016 13:53:25 -0700
+Subject: [PATCH 1371/2508] drm/i915/preempt: Implement mid-batch preemption
+ support
+
+commit 1312797147acb509267a8eb739c56f0fa1118a79 from
+https://github.com/01org/linux-apollolake-i
+
+Batch buffers which have been pre-emption mid-way through execution
+must be handled separately. Rather than simply re-submitting the batch
+as a brand new piece of work, the driver only needs to requeue the
+context. The hardware will take care of picking up where it left off.
+
+v2: New patch in series.
+
+For: VIZ-2021
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c   |    1 +
+ drivers/gpu/drm/i915/i915_scheduler.c |   56 +++++++++++++++++++++++++++++---
+ drivers/gpu/drm/i915/i915_scheduler.h |    3 ++
+ drivers/gpu/drm/i915/intel_lrc.c      |   51 ++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_lrc.h      |    1 +
+ 5 files changed, 106 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 4b00e82..d6823c0 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -3727,6 +3727,7 @@ static int i915_scheduler_info(struct seq_file *m, void *unused)
+ 	PRINT_VAR("  Queued",               "u", stats[e].queued);
+ 	PRINT_VAR("  Submitted",            "u", stats[e].submitted);
+ 	PRINT_VAR("  Preempted",            "u", stats[e].preempted);
++	PRINT_VAR("  Midbatch preempted",   "u", stats[e].mid_preempted);
+ 	PRINT_VAR("  Completed",            "u", stats[e].completed);
+ 	PRINT_VAR("  Expired",              "u", stats[e].expired);
+ 	seq_putc(m, '\n');
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 000f2a5..21ce76b 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -618,7 +618,9 @@ static int i915_scheduler_submit(struct intel_engine_cs *engine)
+ 		 * watchdog/reset code has not nuked the node while we
+ 		 * weren't looking:
+ 		 */
+-		if (ret && (node->status != I915_SQS_DEAD)) {
++		if (ret == 0) {
++			req->scheduler_flags &= ~I915_REQ_SF_RESTART;
++		} else if (node->status != I915_SQS_DEAD) {
+ 			bool requeue = true;
+ 
+ 			/*
+@@ -1199,6 +1201,7 @@ i915_scheduler_preemption_postprocess(struct intel_engine_cs *engine)
+ 	struct i915_scheduler *scheduler = dev_priv->scheduler;
+ 	struct i915_scheduler_queue_entry *pnode = NULL;
+ 	struct drm_i915_gem_request *preq = NULL;
++	struct drm_i915_gem_request *midp = NULL;
+ 	struct i915_scheduler_stats *stats;
+ 	unsigned long flags;
+ 	int preempted = 0, preemptive = 0;
+@@ -1267,8 +1270,12 @@ i915_scheduler_preemption_postprocess(struct intel_engine_cs *engine)
+ 				node->status = I915_SQS_PREEMPTED;
+ 				trace_i915_scheduler_unfly(engine, node);
+ 				trace_i915_scheduler_node_state_change(engine, node);
+-				/* Empty the preempted ringbuffer */
+-				intel_lr_context_resync(req->ctx, engine, false);
++
++				/* Identify a mid-batch preemption */
++				if (req->seqno == engine->last_batch_start) {
++					WARN(midp, "Multiple mid-batch-preempted requests?\n");
++					midp = req;
++				}
+ 			}
+ 
+ 			i915_gem_request_dequeue(req);
+@@ -1283,12 +1290,49 @@ i915_scheduler_preemption_postprocess(struct intel_engine_cs *engine)
+ 	if (stats->max_preempted < preempted)
+ 		stats->max_preempted = preempted;
+ 
++	/* Now fix up the contexts of all preempt{ive,ed} requests */
+ 	{
+-		/* XXX: Sky should be empty now */
++		struct intel_context *mid_ctx = NULL;
+ 		struct i915_scheduler_queue_entry *node;
++		u32 started = engine->last_batch_start;
++
++		/*
++		 * Iff preemption was mid-batch, we should have found a
++		 * mid-batch-preempted request
++		 */
++		if (started && started != engine->last_irq_seqno)
++			WARN(!midp, "Mid-batch preempted, but request not found\n");
++		else
++			WARN(midp, "Found unexpected mid-batch preemption?\n");
++
++		if (midp) {
++			/* Rewrite this context rather than emptying it */
++			intel_lr_context_resync_req(midp);
++			midp->scheduler_flags |= I915_REQ_SF_RESTART;
++			mid_ctx = midp->ctx;
++			stats->mid_preempted += 1;
++			WARN_ON(preq == midp);
++		}
+ 
+-		for_each_scheduler_node(node, engine->id)
+-			WARN_ON(I915_SQS_IS_FLYING(node));
++		for_each_scheduler_node(node, engine->id) {
++			/* XXX: Sky should be empty now */
++			if (WARN_ON(I915_SQS_IS_FLYING(node)))
++				continue;
++
++			/* Clean up preempted contexts */
++			if (node->status != I915_SQS_PREEMPTED)
++				continue;
++
++			if (node->params.ctx != mid_ctx) {
++				/* Empty the preempted ringbuffer */
++				intel_lr_context_resync(node->params.ctx, engine,
++							false);
++				/* Request is now queued, not preempted */
++				node->status = I915_SQS_QUEUED;
++				trace_i915_scheduler_node_state_change(engine,
++								       node);
++			}
++		}
+ 	}
+ 
+ 	/* Anything else to do here ... ? */
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index eabf10e..6af3b8a 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -33,6 +33,8 @@ enum {
+ 	I915_REQ_SF_WAS_PREEMPT      = (1 << 1),
+ 	/* Request is preemptive */
+ 	I915_REQ_SF_PREEMPT          = (1 << 2),
++	/* Request has been preempted midbatch, need to restart */
++	I915_REQ_SF_RESTART          = (1 << 3),
+ };
+ 
+ enum i915_scheduler_queue_status {
+@@ -111,6 +113,7 @@ struct i915_scheduler_stats {
+ 	uint32_t queued;
+ 	uint32_t submitted;
+ 	uint32_t preempted;
++	uint32_t mid_preempted;
+ 	uint32_t completed;
+ 	uint32_t expired;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 33fd2b7..c7f9dbc 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1096,6 +1096,18 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 	if (ret)
+ 		goto err;
+ 
++	/*
++	 * For the case of restarting a mid-batch preempted request,
++	 * the ringbuffer already contains all necessary instructions,
++	 * so we can just go straight to submitting it
++	 */
++	if ((req->scheduler_flags & I915_REQ_SF_RESTART)) {
++		DRM_DEBUG_DRIVER("restart: req head/tail 0x%x/%x ringbuf 0x%x/%x\n",
++			req->head, req->tail, ringbuf->head, ringbuf->tail);
++		i915_gem_execbuffer_retire_commands(params);
++		return 0;
++	}
++
+ 	/* record where we start filling the ring */
+ 	req->head = intel_ring_get_tail(ringbuf);
+ 
+@@ -2902,6 +2914,45 @@ error_deref_obj:
+ }
+ 
+ /*
++ * Update the ringbuffer associated with the specified request
++ * so that only the section relating to that request is valid.
++ * Then propagate the change to the associated context image.
++ */
++void intel_lr_context_resync_req(struct drm_i915_gem_request *req)
++{
++	enum intel_engine_id engine_id = req->engine->id;
++	struct drm_i915_gem_object *ctx_obj;
++	struct intel_ringbuffer *ringbuf;
++	struct page *page;
++	uint32_t *reg_state;
++
++	ctx_obj = req->ctx->engine[engine_id].state;
++	ringbuf = req->ringbuf;
++
++	if (WARN_ON(!ringbuf || !ctx_obj))
++		return;
++	if (WARN_ON(i915_gem_object_get_pages(ctx_obj)))
++		return;
++
++	page = i915_gem_object_get_page(ctx_obj, LRC_STATE_PN);
++	reg_state = kmap_atomic(page);
++
++	DRM_DEBUG_DRIVER("Updating ringbuf head/tail, previously 0x%x/%x ...\n",
++		ringbuf->head, ringbuf->tail);
++
++	ringbuf->tail = req->tail;
++	ringbuf->last_retired_head = req->head;
++	intel_ring_update_space(ringbuf);
++
++	DRM_DEBUG_DRIVER("Updated ringbuf, now 0x%x/%x space %d\n",
++		ringbuf->head, ringbuf->tail, ringbuf->space);
++
++	reg_state[CTX_RING_TAIL+1] = ringbuf->tail;
++
++	kunmap_atomic(reg_state);
++}
++
++/*
+  * Empty the ringbuffer associated with the specified request
+  * by updating the ringbuffer 'head' to the value of 'tail', or,
+  * if 'rezero' is true, setting both 'head' and 'tail' to zero.
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index f354919..51cc86b 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -103,6 +103,7 @@ int intel_lr_context_deferred_alloc(struct intel_context *ctx,
+ 				    struct intel_engine_cs *engine);
+ void intel_lr_context_unpin(struct intel_context *ctx,
+ 			    struct intel_engine_cs *engine);
++void intel_lr_context_resync_req(struct drm_i915_gem_request *req);
+ void intel_lr_context_resync(struct intel_context *ctx,
+ 			     struct intel_engine_cs *ring,
+ 			     bool rezero);
+-- 
+1.7.5.4
+

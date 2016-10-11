@@ -1,0 +1,324 @@
+From ee3468b4a7f523720504153c0b08fc4278d94ae2 Mon Sep 17 00:00:00 2001
+From: Dave Gordon <david.s.gordon@intel.com>
+Date: Fri, 8 Apr 2016 13:53:05 -0700
+Subject: [PATCH 1351/2508] drm/i915/guc: implement submission via
+ REQUEST_PREEMPTION action
+
+commit fa9aea0ab32b2bcc839aec47c9c021884a2d0a5a from
+https://github.com/01org/linux-apollolake-i
+
+If a batch is submitted via the preemptive (KMD_HIGH-priority) client
+then instead of ringing the doorbell we dispatch it using the GuC
+"REQUEST_PREEMPTION" action. Also, we specify "clear work queue" and
+"clear submit queue" in that request, so the scheduler can reconsider
+what is to be done next after preemption.
+
+Note that the preemption request requires a reference to the GuC per-
+context shared data, which in early versions of the GuC firmware was at
+the end of the context object but nowadays is at the start.
+
+For: VIZ-2021
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+---
+ drivers/gpu/drm/i915/i915_guc_submission.c |   64 ++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_guc_fwif.h      |    7 ++
+ drivers/gpu/drm/i915/intel_lrc.c           |   91 +++++++++++++++++++++-------
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |    6 ++-
+ 4 files changed, 140 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_guc_submission.c b/drivers/gpu/drm/i915/i915_guc_submission.c
+index 3a538e9..c39e469 100644
+--- a/drivers/gpu/drm/i915/i915_guc_submission.c
++++ b/drivers/gpu/drm/i915/i915_guc_submission.c
+@@ -93,7 +93,8 @@ static int host2guc_action(struct intel_guc *guc, u32 *data, u32 len)
+ 	for (i = 0; i < len; i++)
+ 		I915_WRITE(SOFT_SCRATCH(i), data[i]);
+ 
+-	POSTING_READ(SOFT_SCRATCH(i - 1));
++	I915_WRITE(SOFT_SCRATCH(15), 0);
++	POSTING_READ(SOFT_SCRATCH(0));
+ 
+ 	I915_WRITE(HOST2GUC_INTERRUPT, HOST2GUC_TRIGGER);
+ 
+@@ -124,6 +125,55 @@ static int host2guc_action(struct intel_guc *guc, u32 *data, u32 len)
+ }
+ 
+ /*
++ * Tell the GuC to submit a request pre-emptively
++ */
++static int
++host2guc_preempt(struct i915_guc_client *client,
++		 struct intel_context *ctx,
++		 struct intel_engine_cs *ring)
++{
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++	struct intel_guc *guc = &dev_priv->guc;
++	uint32_t engine_id = ring->guc_id;
++	struct drm_i915_gem_object *ctx_obj = ctx->engine[engine_id].state;
++	struct intel_ringbuffer *ringbuf = ctx->engine[engine_id].ringbuf;
++	struct guc_process_desc *desc;
++	void *base;
++	u32 data[7];
++	int ret;
++
++	if (WARN_ON(!ctx_obj || !ringbuf))
++		return -EINVAL;
++
++	WARN_ON(!i915_gem_obj_is_pinned(ctx_obj));
++	WARN_ON(!i915_gem_obj_is_pinned(ringbuf->obj));
++
++	WARN_ON(guc->preempt_client != client);
++
++	base = kmap_atomic(i915_gem_object_get_page(client->client_obj, 0));
++	desc = base + client->proc_desc_offset;
++
++	/* Update the tail so it is visible to GuC */
++	desc->tail = client->wq_tail;
++	kunmap_atomic(base);
++
++	data[0] = HOST2GUC_ACTION_REQUEST_PREEMPTION;
++	data[1] = guc->preempt_client->ctx_index;		/* preemptive client			*/
++	data[2] = /* PREEMPT_ENGINE_OPTIONS */
++		  HOST2GUC_PREEMPT_OPTION_IMMEDIATE |		/* submit before return			*/
++		  HOST2GUC_PREEMPT_OPTION_DROP_WORK_Q |		/* drop wq for client data[5]		*/
++		  HOST2GUC_PREEMPT_OPTION_DROP_SUBMIT_Q;	/* drop submitted (engine, priority)	*/
++	data[3] = engine_id;					/* target engine			*/
++	data[4] = guc->execbuf_client->priority;		/* victim priority			*/
++	data[5] = guc->execbuf_client->ctx_index;		/* victim ctx/wq			*/
++	data[6] = i915_gem_obj_ggtt_offset(ctx_obj) + LRC_GUCSHR_PN*PAGE_SIZE;
++
++	ret = host2guc_action(guc, data, 7);
++	WARN_ON(ret);
++	return ret;
++}
++
++/*
+  * Tell the GuC to allocate or deallocate a specific doorbell
+  */
+ 
+@@ -565,16 +615,21 @@ static int guc_add_workqueue_item(struct i915_guc_client *gc,
+ int i915_guc_submit(struct i915_guc_client *client,
+ 		    struct drm_i915_gem_request *rq)
+ {
+-	struct intel_guc *guc = client->guc;
++	bool preemptive = client->priority <= GUC_CTX_PRIORITY_HIGH;
+ 	unsigned int engine_id = rq->engine->guc_id;
++	struct intel_guc *guc = client->guc;
+ 	int q_ret, b_ret;
+ 
+ 	if (WARN_ON(engine_id >= I915_NUM_ENGINES))
+ 		return -ENXIO;
+ 
+ 	q_ret = guc_add_workqueue_item(client, rq);
+-	if (q_ret == 0)
+-		b_ret = guc_ring_doorbell(client);
++	if (q_ret == 0) {
++		if (preemptive)
++			b_ret = host2guc_preempt(client, rq->ctx, rq->engine);
++		else
++			b_ret = guc_ring_doorbell(client);
++	}
+ 
+ 	client->submissions[engine_id] += 1;
+ 	if (q_ret) {
+@@ -585,6 +640,7 @@ int i915_guc_submit(struct i915_guc_client *client,
+ 		client->retcode = q_ret = b_ret;
+ 	} else {
+ 		client->retcode = 0;
++		rq->elsp_submitted += 1;
+ 	}
+ 	guc->submissions[engine_id] += 1;
+ 	guc->last_seqno[engine_id] = rq->seqno;
+diff --git a/drivers/gpu/drm/i915/intel_guc_fwif.h b/drivers/gpu/drm/i915/intel_guc_fwif.h
+index 2de57ff..7032bae 100644
+--- a/drivers/gpu/drm/i915/intel_guc_fwif.h
++++ b/drivers/gpu/drm/i915/intel_guc_fwif.h
+@@ -420,6 +420,7 @@ struct guc_ads {
+ /* This Action will be programmed in C180 - SOFT_SCRATCH_O_REG */
+ enum host2guc_action {
+ 	HOST2GUC_ACTION_DEFAULT = 0x0,
++	HOST2GUC_ACTION_REQUEST_PREEMPTION = 0x2,
+ 	HOST2GUC_ACTION_SAMPLE_FORCEWAKE = 0x6,
+ 	HOST2GUC_ACTION_ALLOCATE_DOORBELL = 0x10,
+ 	HOST2GUC_ACTION_DEALLOCATE_DOORBELL = 0x20,
+@@ -429,6 +430,12 @@ enum host2guc_action {
+ 	HOST2GUC_ACTION_LIMIT
+ };
+ 
++enum action_preempt_options {
++	HOST2GUC_PREEMPT_OPTION_IMMEDIATE = 0x1,
++	HOST2GUC_PREEMPT_OPTION_DROP_WORK_Q = 0x4,
++	HOST2GUC_PREEMPT_OPTION_DROP_SUBMIT_Q = 0x8,
++};
++
+ /*
+  * The GuC sends its response to a command by overwriting the
+  * command in SS0. The response is distinguishable from a command
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index a49e16e..905c811 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -801,6 +801,9 @@ intel_logical_ring_advance_and_submit(struct drm_i915_gem_request *request)
+ 	struct intel_ringbuffer *ringbuf = request->ringbuf;
+ 	struct drm_i915_private *dev_priv = request->i915;
+ 	struct intel_engine_cs *engine = request->engine;
++	struct i915_guc_client *client = dev_priv->guc.execbuf_client;
++	static const bool fake = false;	/* true => only pretend to preempt */
++	bool preemptive = false;	/* for now */
+ 
+ 	intel_logical_ring_advance(ringbuf);
+ 	request->tail = ringbuf->tail;
+@@ -829,8 +832,11 @@ intel_logical_ring_advance_and_submit(struct drm_i915_gem_request *request)
+ 		}
+ 	}
+ 
+-	if (dev_priv->guc.execbuf_client)
+-		i915_guc_submit(dev_priv->guc.execbuf_client, request);
++	if (preemptive && dev_priv->guc.preempt_client && !fake)
++		client = dev_priv->guc.preempt_client;
++
++	if (client)
++		i915_guc_submit(client, request);
+ 	else
+ 		execlists_context_queue(request);
+ 
+@@ -2054,57 +2060,96 @@ static void bxt_a_set_seqno(struct intel_engine_cs *engine, u32 seqno)
+  */
+ #define WA_TAIL_DWORDS 2
+ 
+-static inline u32 hws_seqno_address(struct intel_engine_cs *engine)
+-{
+-	return engine->status_page.gfx_addr + I915_GEM_HWS_INDEX_ADDR;
+-}
+-
+ static int gen8_emit_request(struct drm_i915_gem_request *request)
+ {
+ 	struct intel_ringbuffer *ringbuf = request->ringbuf;
++	u32 cmd;
++	u64 addr;
+ 	int ret;
+ 
+-	ret = intel_logical_ring_begin(request, 6 + WA_TAIL_DWORDS);
++	/*
++	 * Reserve space for the instructions below, plus some NOOPs
++	 * at the end of each request to be used as a workaround for
++	 * not being allowed to do lite restore with HEAD==TAIL
++	 * (WaIdleLiteRestore).
++	 */
++	ret = intel_logical_ring_begin(request, 4 + 2 + WA_TAIL_DWORDS);
+ 	if (ret)
+ 		return ret;
+ 
++	cmd = MI_FLUSH_DW;
++	cmd += 1;			/* Gen8+ uses long addresses	*/
++	cmd |= MI_FLUSH_DW_OP_STOREDW;	/* Store DWord as post-op	*/
++	cmd |= MI_FLUSH_DW_STORE_INDEX;	/* Address is relative to HWSP	*/
++
++	// Must be QWord aligned even for DWord write
++	BUILD_BUG_ON((I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT) & (1 << 2));
++
++#if	1
+ 	/* w/a: bit 5 needs to be zero for MI_FLUSH_DW address. */
+-	BUILD_BUG_ON(I915_GEM_HWS_INDEX_ADDR & (1 << 5));
++	// This is true for a QWord write, but not a DWord
++	BUILD_BUG_ON((I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT) & (1 << 5));
++#endif
+ 
+-	intel_logical_ring_emit(ringbuf,
+-				(MI_FLUSH_DW + 1) | MI_FLUSH_DW_OP_STOREDW);
+-	intel_logical_ring_emit(ringbuf,
+-				hws_seqno_address(request->engine) |
+-				MI_FLUSH_DW_USE_GTT);
+-	intel_logical_ring_emit(ringbuf, 0);
++	addr = I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT;
++	addr |= MI_FLUSH_DW_USE_GTT;
++//	addr += ring->status_page.gfx_addr;
++
++	intel_logical_ring_emit(ringbuf, cmd);
++	intel_logical_ring_emit(ringbuf, lower_32_bits(addr));
++	intel_logical_ring_emit(ringbuf, upper_32_bits(addr));
+ 	intel_logical_ring_emit(ringbuf, i915_gem_request_get_seqno(request));
++
+ 	intel_logical_ring_emit(ringbuf, MI_USER_INTERRUPT);
+ 	intel_logical_ring_emit(ringbuf, MI_NOOP);
++
+ 	return intel_logical_ring_advance_and_submit(request);
+ }
+ 
+ static int gen8_emit_request_render(struct drm_i915_gem_request *request)
+ {
+ 	struct intel_ringbuffer *ringbuf = request->ringbuf;
++	u32 cmd, opts;
++	u64 addr;
+ 	int ret;
+ 
+-	ret = intel_logical_ring_begin(request, 6 + WA_TAIL_DWORDS);
++	/*
++	 * Reserve space for the instructions below, plus some NOOPs
++	 * at the end of each request to be used as a workaround for
++	 * not being allowed to do lite restore with HEAD==TAIL
++	 * (WaIdleLiteRestore).
++	 */
++	ret = intel_logical_ring_begin(request, 6 + 2 + WA_TAIL_DWORDS);
+ 	if (ret)
+ 		return ret;
+ 
++	cmd = GFX_OP_PIPE_CONTROL(6);
++
++	opts = PIPE_CONTROL_GLOBAL_GTT_IVB;	/* Address via GGTT	*/
++	opts |= PIPE_CONTROL_STORE_DATA_INDEX;	/* Index into HWSP	*/
++	opts |= PIPE_CONTROL_CS_STALL;		/* Stall CS until done	*/
++	opts |= PIPE_CONTROL_QW_WRITE;		/* Write QWord		*/
++
++	// Must be QWord aligned
++	BUILD_BUG_ON((I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT) & (1 << 2));
++
++	addr = I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT;
++//	addr += ring->status_page.gfx_addr;
++
+ 	/* w/a for post sync ops following a GPGPU operation we
+ 	 * need a prior CS_STALL, which is emitted by the flush
+ 	 * following the batch.
+ 	 */
+-	intel_logical_ring_emit(ringbuf, GFX_OP_PIPE_CONTROL(5));
+-	intel_logical_ring_emit(ringbuf,
+-				(PIPE_CONTROL_GLOBAL_GTT_IVB |
+-				 PIPE_CONTROL_CS_STALL |
+-				 PIPE_CONTROL_QW_WRITE));
+-	intel_logical_ring_emit(ringbuf, hws_seqno_address(request->engine));
+-	intel_logical_ring_emit(ringbuf, 0);
++	intel_logical_ring_emit(ringbuf, cmd);
++	intel_logical_ring_emit(ringbuf, opts);
++	intel_logical_ring_emit(ringbuf, lower_32_bits(addr));
++	intel_logical_ring_emit(ringbuf, upper_32_bits(addr));
+ 	intel_logical_ring_emit(ringbuf, i915_gem_request_get_seqno(request));
++	intel_logical_ring_emit(ringbuf, 0);	/* Clear 'in progress'	*/
++
+ 	intel_logical_ring_emit(ringbuf, MI_USER_INTERRUPT);
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++
+ 	return intel_logical_ring_advance_and_submit(request);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 3de4d2b..52cfd90 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -457,7 +457,11 @@ intel_write_status_page(struct intel_engine_cs *engine,
+  * chosen carefully to meet those requirements. The list below shows the
+  * currently-known alignment requirements:
+  *
+- *	I915_GEM_SCRATCH_INDEX	    must be EVEN
++ *	I915_GEM_SCRATCH_INDEX	    must be EVEN (QWord aligned)
++ *	I915_GEM_HWS_INDEX	    must be EVEN (QWord aligned), but also bit 3
++ *				    must be ZERO, so that the resulting address
++ *				    has a 0 in bit 5 (see BSpec for limitation
++ *				    on MI_FLUSH_DW instruction).
+  */
+ 
+ /*
+-- 
+1.7.5.4
+

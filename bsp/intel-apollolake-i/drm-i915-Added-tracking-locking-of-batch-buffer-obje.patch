@@ -1,0 +1,145 @@
+From e4bbf08f802b138b339f49116a04f8c732f221d9 Mon Sep 17 00:00:00 2001
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Fri, 8 Apr 2016 13:44:19 -0700
+Subject: [PATCH 1316/2508] drm/i915: Added tracking/locking of batch buffer
+ objects
+
+commit 78897fba2382d33400e9b61005a930f0f139ff52 from
+https://github.com/01org/linux-apollolake-i
+
+The scheduler needs to track interdependencies between batch buffers.
+These are calculated by analysing the object lists of the buffers and
+looking for commonality. The scheduler also needs to keep those
+buffers locked long after the initial IOCTL call has returned to user
+land.
+
+v3: Updated to support read-read optimisation.
+
+v5: Updated due to changes to earlier patches in series for splitting
+bypass mode into a separate function and consoliding the clean up code.
+
+For: VIZ-1587
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Reviewed-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   45 ++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_scheduler.c      |   15 +++++++++
+ 2 files changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 2795631..d93f157 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1467,7 +1467,7 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	struct i915_execbuffer_params *params = &qe.params;
+ 	const u32 ctx_id = i915_execbuffer2_get_context_id(*args);
+ 	u32 dispatch_flags;
+-	int ret;
++	int ret, i;
+ 	bool need_relocs;
+ 
+ 	if (!i915_gem_check_execbuffer(args))
+@@ -1540,6 +1540,12 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 		goto pre_mutex_err;
+ 	}
+ 
++	qe.objs = kzalloc(sizeof(*qe.objs) * args->buffer_count, GFP_KERNEL);
++	if (!qe.objs) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
+ 	/* Look up object handles */
+ 	ret = eb_lookup_vmas(eb, exec, args, vm, file);
+ 	if (ret)
+@@ -1664,9 +1670,32 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	params->args_DR1                = args->DR1;
+ 	params->args_DR4                = args->DR4;
+ 	params->batch_obj               = batch_obj;
+-	params->ctx                     = ctx;
+ 	params->request                 = req;
+ 
++	/*
++	 * Save away the list of objects used by this batch buffer for the
++	 * purpose of tracking inter-buffer dependencies.
++	 */
++	for (i = 0; i < args->buffer_count; i++) {
++		struct drm_i915_gem_object *obj;
++
++		/*
++		 * NB: 'drm_gem_object_lookup()' increments the object's
++		 * reference count and so must be matched by a
++		 * 'drm_gem_object_unreference' call.
++		 */
++		obj = to_intel_bo(drm_gem_object_lookup(dev, file,
++							  exec[i].handle));
++		qe.objs[i].obj       = obj;
++		qe.objs[i].read_only = obj->base.pending_write_domain == 0;
++
++	}
++	qe.num_objs = i;
++
++	/* Lock and save the context object as well. */
++	i915_gem_context_reference(ctx);
++	params->ctx = ctx;
++
+ 	ret = dev_priv->gt.execbuf_submit(params, args, &eb->vmas);
+ 	if (ret)
+ 		goto err_batch_unpin;
+@@ -1698,6 +1727,18 @@ err:
+ 	i915_gem_context_unreference(ctx);
+ 	eb_destroy(eb);
+ 
++	/* Need to release the objects: */
++	if (qe.objs) {
++		for (i = 0; i < qe.num_objs; i++)
++			drm_gem_object_unreference(&qe.objs[i].obj->base);
++
++		kfree(qe.objs);
++	}
++
++	/* Context too */
++	if (params->ctx)
++		i915_gem_context_unreference(params->ctx);
++
+ 	/*
+ 	 * If the request was created but not successfully submitted then it
+ 	 * must be freed again. If it was submitted then it is being tracked
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index e0b2ab1..0d3c0eb 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -734,6 +734,8 @@ void i915_scheduler_wakeup(struct drm_device *dev)
+  */
+ void i915_scheduler_clean_node(struct i915_scheduler_queue_entry *node)
+ {
++	int i;
++
+ 	if (!I915_SQS_IS_COMPLETE(node)) {
+ 		WARN(!node->params.request->cancelled,
+ 		     "Cleaning active node: %d!\n", node->status);
+@@ -751,6 +753,19 @@ void i915_scheduler_clean_node(struct i915_scheduler_queue_entry *node)
+ 		node->params.batch_obj = NULL;
+ 	}
+ 
++	/* Release the locked buffers: */
++	for (i = 0; i < node->num_objs; i++)
++		drm_gem_object_unreference(&node->objs[i].obj->base);
++	kfree(node->objs);
++	node->objs = NULL;
++	node->num_objs = 0;
++
++	/* Context too: */
++	if (node->params.ctx) {
++		i915_gem_context_unreference(node->params.ctx);
++		node->params.ctx = NULL;
++	}
++
+ 	/* And anything else owned by the node: */
+ 	if (node->params.cliprects) {
+ 		kfree(node->params.cliprects);
+-- 
+1.7.5.4
+

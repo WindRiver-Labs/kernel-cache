@@ -1,0 +1,656 @@
+From e7d43898589e50a9bdda22dd0c61edad01e5ae5f Mon Sep 17 00:00:00 2001
+From: Matt Roper <matthew.d.roper@intel.com>
+Date: Tue, 23 Feb 2016 17:20:13 -0800
+Subject: [PATCH 1034/2508] drm/i915: Add two-stage ILK-style watermark
+ programming (v11)
+
+commit ed4a6a7ca853253f9b86f3005d76345482a71283 upstream
+
+In addition to calculating final watermarks, let's also pre-calculate a
+set of intermediate watermark values at atomic check time.  These
+intermediate watermarks are a combination of the watermarks for the old
+state and the new state; they should satisfy the requirements of both
+states which means they can be programmed immediately when we commit the
+atomic state (without waiting for a vblank).  Once the vblank does
+happen, we can then re-program watermarks to the more optimal final
+value.
+
+v2: Significant rebasing/rewriting.
+
+v3:
+ - Move 'need_postvbl_update' flag to CRTC state (Daniel)
+ - Don't forget to check intermediate watermark values for validity
+   (Maarten)
+ - Don't due async watermark optimization; just do it at the end of the
+   atomic transaction, after waiting for vblanks.  We do want it to be
+   async eventually, but adding that now will cause more trouble for
+   Maarten's in-progress work.  (Maarten)
+ - Don't allocate space in crtc_state for intermediate watermarks on
+   platforms that don't need it (gen9+).
+ - Move WaCxSRDisabledForSpriteScaling:ivb into intel_begin_crtc_commit
+   now that ilk_update_wm is gone.
+
+v4:
+ - Add a wm_mutex to cover updates to intel_crtc->active and the
+   need_postvbl_update flag.  Since we don't have async yet it isn't
+   terribly important yet, but might as well add it now.
+ - Change interface to program watermarks.  Platforms will now expose
+   .initial_watermarks() and .optimize_watermarks() functions to do
+   watermark programming.  These should lock wm_mutex, copy the
+   appropriate state values into intel_crtc->active, and then call
+   the internal program watermarks function.
+
+v5:
+ - Skip intermediate watermark calculation/check during initial hardware
+   readout since we don't trust the existing HW values (and don't have
+   valid values of our own yet).
+ - Don't try to call .optimize_watermarks() on platforms that don't have
+   atomic watermarks yet.  (Maarten)
+
+v6:
+ - Rebase
+
+v7:
+ - Further rebase
+
+v8:
+ - A few minor indentation and line length fixes
+
+v9:
+ - Yet another rebase since Maarten's patches reworked a bunch of the
+   code (wm_pre, wm_post, etc.) that this was previously based on.
+
+v10:
+ - Move wm_mutex to dev_priv to protect against racing commits against
+   disjoint CRTC sets. (Maarten)
+ - Drop unnecessary clearing of cstate->wm.need_postvbl_update (Maarten)
+
+v11:
+ - Now that we've moved to atomic watermark updates, make sure we call
+   the proper function to program watermarks in
+   {ironlake,haswell}_crtc_enable(); the failure to do so on the
+   previous patch iteration led to us not actually programming the
+   watermarks before turning on the CRTC, which was the cause of the
+   underruns that the CI system was seeing.
+ - Fix inverted logic for determining when to optimize watermarks.  We
+   were needlessly optimizing when the intermediate/optimal values were
+   the same (harmless), but not actually optimizing when they differed
+   (also harmless, but wasteful from a power/bandwidth perspective).
+
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1456276813-5689-1-git-send-email-matthew.d.roper@intel.com
+---
+ drivers/gpu/drm/i915/i915_dma.c      |    1 +
+ drivers/gpu/drm/i915/i915_drv.h      |   13 +++-
+ drivers/gpu/drm/i915/intel_atomic.c  |    1 +
+ drivers/gpu/drm/i915/intel_display.c |   97 +++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_drv.h     |   28 ++++++-
+ drivers/gpu/drm/i915/intel_pm.c      |  162 +++++++++++++++++++++++----------
+ 6 files changed, 244 insertions(+), 58 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 826bbd8..f847dbf 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1007,6 +1007,7 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 	mutex_init(&dev_priv->sb_lock);
+ 	mutex_init(&dev_priv->modeset_restore_lock);
+ 	mutex_init(&dev_priv->av_mutex);
++	mutex_init(&dev_priv->wm.wm_mutex);
+ 
+ 	ret = i915_workqueues_init(dev_priv);
+ 	if (ret < 0)
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 6e63248..20bda74 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -631,7 +631,11 @@ struct drm_i915_display_funcs {
+ 			  struct dpll *best_clock);
+ 	int (*compute_pipe_wm)(struct intel_crtc *crtc,
+ 			       struct drm_atomic_state *state);
+-	void (*program_watermarks)(struct intel_crtc_state *cstate);
++	int (*compute_intermediate_wm)(struct drm_device *dev,
++				       struct intel_crtc *intel_crtc,
++				       struct intel_crtc_state *newstate);
++	void (*initial_watermarks)(struct intel_crtc_state *cstate);
++	void (*optimize_watermarks)(struct intel_crtc_state *cstate);
+ 	void (*update_wm)(struct drm_crtc *crtc);
+ 	int (*modeset_calc_cdclk)(struct drm_atomic_state *state);
+ 	void (*modeset_commit_cdclk)(struct drm_atomic_state *state);
+@@ -1980,6 +1984,13 @@ struct drm_i915_private {
+ 		};
+ 
+ 		uint8_t max_level;
++
++		/*
++		 * Should be held around atomic WM register writing; also
++		 * protects * intel_crtc->wm.active and
++		 * cstate->wm.need_postvbl_update.
++		 */
++		struct mutex wm_mutex;
+ 	} wm;
+ 
+ 	struct i915_runtime_pm pm;
+diff --git a/drivers/gpu/drm/i915/intel_atomic.c b/drivers/gpu/drm/i915/intel_atomic.c
+index 8e579a8..6a661e7 100644
+--- a/drivers/gpu/drm/i915/intel_atomic.c
++++ b/drivers/gpu/drm/i915/intel_atomic.c
+@@ -98,6 +98,7 @@ intel_crtc_duplicate_state(struct drm_crtc *crtc)
+ 	crtc_state->disable_cxsr = false;
+ 	crtc_state->wm_changed = false;
+ 	crtc_state->fb_changed = false;
++	crtc_state->wm.need_postvbl_update = false;
+ 
+ 	return &crtc_state->base;
+ }
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 2dfbd26..c9a4f23 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -4841,7 +4841,42 @@ static void intel_pre_plane_update(struct intel_crtc_state *old_crtc_state)
+ 			intel_set_memory_cxsr(dev_priv, false);
+ 	}
+ 
+-	if (!needs_modeset(&pipe_config->base) && pipe_config->wm_changed)
++	/*
++	 * IVB workaround: must disable low power watermarks for at least
++	 * one frame before enabling scaling.  LP watermarks can be re-enabled
++	 * when scaling is disabled.
++	 *
++	 * WaCxSRDisabledForSpriteScaling:ivb
++	 */
++	if (pipe_config->disable_lp_wm) {
++		ilk_disable_lp_wm(dev);
++		intel_wait_for_vblank(dev, crtc->pipe);
++	}
++
++	/*
++	 * If we're doing a modeset, we're done.  No need to do any pre-vblank
++	 * watermark programming here.
++	 */
++	if (needs_modeset(&pipe_config->base))
++		return;
++
++	/*
++	 * For platforms that support atomic watermarks, program the
++	 * 'intermediate' watermarks immediately.  On pre-gen9 platforms, these
++	 * will be the intermediate values that are safe for both pre- and
++	 * post- vblank; when vblank happens, the 'active' values will be set
++	 * to the final 'target' values and we'll do this again to get the
++	 * optimal watermarks.  For gen9+ platforms, the values we program here
++	 * will be the final target values which will get automatically latched
++	 * at vblank time; no further programming will be necessary.
++	 *
++	 * If a platform hasn't been transitioned to atomic watermarks yet,
++	 * we'll continue to update watermarks the old way, if flags tell
++	 * us to.
++	 */
++	if (dev_priv->display.initial_watermarks != NULL)
++		dev_priv->display.initial_watermarks(pipe_config);
++	else if (pipe_config->wm_changed)
+ 		intel_update_watermarks(&crtc->base);
+ }
+ 
+@@ -4920,7 +4955,7 @@ static void ironlake_crtc_enable(struct drm_crtc *crtc)
+ 	 */
+ 	intel_crtc_load_lut(crtc);
+ 
+-	intel_update_watermarks(crtc);
++	dev_priv->display.initial_watermarks(intel_crtc->config);
+ 	intel_enable_pipe(intel_crtc);
+ 
+ 	if (intel_crtc->config->has_pch_encoder)
+@@ -5019,7 +5054,7 @@ static void haswell_crtc_enable(struct drm_crtc *crtc)
+ 	if (!intel_crtc->config->has_dsi_encoder)
+ 		intel_ddi_enable_transcoder_func(crtc);
+ 
+-	intel_update_watermarks(crtc);
++	dev_priv->display.initial_watermarks(pipe_config);
+ 	intel_enable_pipe(intel_crtc);
+ 
+ 	if (intel_crtc->config->has_pch_encoder)
+@@ -11811,6 +11846,7 @@ int intel_plane_atomic_calc_changes(struct drm_crtc_state *crtc_state,
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+ 	struct drm_plane *plane = plane_state->plane;
+ 	struct drm_device *dev = crtc->dev;
++	struct drm_i915_private *dev_priv = to_i915(dev);
+ 	struct intel_plane_state *old_plane_state =
+ 		to_intel_plane_state(plane->state);
+ 	int idx = intel_crtc->base.base.id, ret;
+@@ -11869,6 +11905,11 @@ int intel_plane_atomic_calc_changes(struct drm_crtc_state *crtc_state,
+ 		pipe_config->wm_changed = true;
+ 	}
+ 
++	/* Pre-gen9 platforms need two-step watermark updates */
++	if (pipe_config->wm_changed && INTEL_INFO(dev)->gen < 9 &&
++	    dev_priv->display.optimize_watermarks)
++		to_intel_crtc_state(crtc_state)->wm.need_postvbl_update = true;
++
+ 	if (visible || was_visible)
+ 		intel_crtc->atomic.fb_bits |=
+ 			to_intel_plane(plane)->frontbuffer_bit;
+@@ -11980,8 +12021,29 @@ static int intel_crtc_atomic_check(struct drm_crtc *crtc,
+ 	ret = 0;
+ 	if (dev_priv->display.compute_pipe_wm) {
+ 		ret = dev_priv->display.compute_pipe_wm(intel_crtc, state);
+-		if (ret)
++		if (ret) {
++			DRM_DEBUG_KMS("Target pipe watermarks are invalid\n");
++			return ret;
++		}
++	}
++
++	if (dev_priv->display.compute_intermediate_wm &&
++	    !to_intel_atomic_state(state)->skip_intermediate_wm) {
++		if (WARN_ON(!dev_priv->display.compute_pipe_wm))
++			return 0;
++
++		/*
++		 * Calculate 'intermediate' watermarks that satisfy both the
++		 * old state and the new state.  We can program these
++		 * immediately.
++		 */
++		ret = dev_priv->display.compute_intermediate_wm(crtc->dev,
++								intel_crtc,
++								pipe_config);
++		if (ret) {
++			DRM_DEBUG_KMS("No valid intermediate pipe watermarks are possible\n");
+ 			return ret;
++		}
+ 	}
+ 
+ 	if (INTEL_INFO(dev)->gen >= 9) {
+@@ -13516,6 +13578,7 @@ static int intel_atomic_commit(struct drm_device *dev,
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_crtc_state *crtc_state;
+ 	struct drm_crtc *crtc;
++	struct intel_crtc_state *intel_cstate;
+ 	int ret = 0, i;
+ 	bool hw_check = intel_state->modeset;
+ 	unsigned long put_domains[I915_MAX_PIPES] = {};
+@@ -13631,6 +13694,20 @@ static int intel_atomic_commit(struct drm_device *dev,
+ 	if (intel_state->modeset)
+ 		intel_display_power_put(dev_priv, POWER_DOMAIN_MODESET);
+ 
++	/*
++	 * Now that the vblank has passed, we can go ahead and program the
++	 * optimal watermarks on platforms that need two-step watermark
++	 * programming.
++	 *
++	 * TODO: Move this (and other cleanup) to an async worker eventually.
++	 */
++	for_each_crtc_in_state(state, crtc, crtc_state, i) {
++		intel_cstate = to_intel_crtc_state(crtc->state);
++
++		if (dev_priv->display.optimize_watermarks)
++			dev_priv->display.optimize_watermarks(intel_cstate);
++	}
++
+ 	mutex_lock(&dev->struct_mutex);
+ 	drm_atomic_helper_cleanup_planes(dev, state);
+ 	mutex_unlock(&dev->struct_mutex);
+@@ -15301,7 +15378,7 @@ static void sanitize_watermarks(struct drm_device *dev)
+ 	int i;
+ 
+ 	/* Only supported on platforms that use atomic watermark design */
+-	if (!dev_priv->display.program_watermarks)
++	if (!dev_priv->display.optimize_watermarks)
+ 		return;
+ 
+ 	/*
+@@ -15322,6 +15399,13 @@ retry:
+ 	if (WARN_ON(IS_ERR(state)))
+ 		goto fail;
+ 
++	/*
++	 * Hardware readout is the only time we don't want to calculate
++	 * intermediate watermarks (since we don't trust the current
++	 * watermarks).
++	 */
++	to_intel_atomic_state(state)->skip_intermediate_wm = true;
++
+ 	ret = intel_atomic_check(dev, state);
+ 	if (ret) {
+ 		/*
+@@ -15344,7 +15428,8 @@ retry:
+ 	for_each_crtc_in_state(state, crtc, cstate, i) {
+ 		struct intel_crtc_state *cs = to_intel_crtc_state(cstate);
+ 
+-		dev_priv->display.program_watermarks(cs);
++		cs->wm.need_postvbl_update = true;
++		dev_priv->display.optimize_watermarks(cs);
+ 	}
+ 
+ 	drm_atomic_state_free(state);
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 6302867..64b8321 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -260,6 +260,12 @@ struct intel_atomic_state {
+ 
+ 	struct intel_shared_dpll_config shared_dpll[I915_NUM_PLLS];
+ 	struct intel_wm_config wm_config;
++
++	/*
++	 * Current watermarks can't be trusted during hardware readout, so
++	 * don't bother calculating intermediate watermarks.
++	 */
++	bool skip_intermediate_wm;
+ };
+ 
+ struct intel_plane_state {
+@@ -510,13 +516,29 @@ struct intel_crtc_state {
+ 
+ 	struct {
+ 		/*
+-		 * optimal watermarks, programmed post-vblank when this state
+-		 * is committed
++		 * Optimal watermarks, programmed post-vblank when this state
++		 * is committed.
+ 		 */
+ 		union {
+ 			struct intel_pipe_wm ilk;
+ 			struct skl_pipe_wm skl;
+ 		} optimal;
++
++		/*
++		 * Intermediate watermarks; these can be programmed immediately
++		 * since they satisfy both the current configuration we're
++		 * switching away from and the new configuration we're switching
++		 * to.
++		 */
++		struct intel_pipe_wm intermediate;
++
++		/*
++		 * Platforms with two-step watermark programming will need to
++		 * update watermark programming post-vblank to switch from the
++		 * safe intermediate watermarks to the optimal final
++		 * watermarks.
++		 */
++		bool need_postvbl_update;
+ 	} wm;
+ };
+ 
+@@ -600,6 +622,7 @@ struct intel_crtc {
+ 			struct intel_pipe_wm ilk;
+ 			struct skl_pipe_wm skl;
+ 		} active;
++
+ 		/* allow CxSR on this pipe */
+ 		bool cxsr_allowed;
+ 	} wm;
+@@ -1567,6 +1590,7 @@ void skl_wm_get_hw_state(struct drm_device *dev);
+ void skl_ddb_get_hw_state(struct drm_i915_private *dev_priv,
+ 			  struct skl_ddb_allocation *ddb /* out */);
+ uint32_t ilk_pipe_pixel_rate(const struct intel_crtc_state *pipe_config);
++bool ilk_disable_lp_wm(struct drm_device *dev);
+ int sanitize_rc6_option(const struct drm_device *dev, int enable_rc6);
+ 
+ /* intel_sdvo.c */
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 69d0169..17a5818 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -2278,6 +2278,29 @@ static void skl_setup_wm_latency(struct drm_device *dev)
+ 	intel_print_wm_latency(dev, "Gen9 Plane", dev_priv->wm.skl_latency);
+ }
+ 
++static bool ilk_validate_pipe_wm(struct drm_device *dev,
++				 struct intel_pipe_wm *pipe_wm)
++{
++	/* LP0 watermark maximums depend on this pipe alone */
++	const struct intel_wm_config config = {
++		.num_pipes_active = 1,
++		.sprites_enabled = pipe_wm->sprites_enabled,
++		.sprites_scaled = pipe_wm->sprites_scaled,
++	};
++	struct ilk_wm_maximums max;
++
++	/* LP0 watermarks always use 1/2 DDB partitioning */
++	ilk_compute_wm_maximums(dev, 0, &config, INTEL_DDB_PART_1_2, &max);
++
++	/* At least LP0 must be valid */
++	if (!ilk_validate_wm_level(0, &max, &pipe_wm->wm[0])) {
++		DRM_DEBUG_KMS("LP0 watermark invalid\n");
++		return false;
++	}
++
++	return true;
++}
++
+ /* Compute new watermarks for the pipe */
+ static int ilk_compute_pipe_wm(struct intel_crtc *intel_crtc,
+ 			       struct drm_atomic_state *state)
+@@ -2292,10 +2315,6 @@ static int ilk_compute_pipe_wm(struct intel_crtc *intel_crtc,
+ 	struct intel_plane_state *sprstate = NULL;
+ 	struct intel_plane_state *curstate = NULL;
+ 	int level, max_level = ilk_wm_max_level(dev);
+-	/* LP0 watermark maximums depend on this pipe alone */
+-	struct intel_wm_config config = {
+-		.num_pipes_active = 1,
+-	};
+ 	struct ilk_wm_maximums max;
+ 
+ 	cstate = intel_atomic_get_crtc_state(state, intel_crtc);
+@@ -2319,21 +2338,18 @@ static int ilk_compute_pipe_wm(struct intel_crtc *intel_crtc,
+ 			curstate = to_intel_plane_state(ps);
+ 	}
+ 
+-	config.sprites_enabled = sprstate->visible;
+-	config.sprites_scaled = sprstate->visible &&
++	pipe_wm->pipe_enabled = cstate->base.active;
++	pipe_wm->sprites_enabled = sprstate->visible;
++	pipe_wm->sprites_scaled = sprstate->visible &&
+ 		(drm_rect_width(&sprstate->dst) != drm_rect_width(&sprstate->src) >> 16 ||
+ 		drm_rect_height(&sprstate->dst) != drm_rect_height(&sprstate->src) >> 16);
+ 
+-	pipe_wm->pipe_enabled = cstate->base.active;
+-	pipe_wm->sprites_enabled = config.sprites_enabled;
+-	pipe_wm->sprites_scaled = config.sprites_scaled;
+-
+ 	/* ILK/SNB: LP2+ watermarks only w/o sprites */
+ 	if (INTEL_INFO(dev)->gen <= 6 && sprstate->visible)
+ 		max_level = 1;
+ 
+ 	/* ILK/SNB/IVB: LP1+ watermarks only w/o scaling */
+-	if (config.sprites_scaled)
++	if (pipe_wm->sprites_scaled)
+ 		max_level = 0;
+ 
+ 	ilk_compute_wm_level(dev_priv, intel_crtc, 0, cstate,
+@@ -2342,12 +2358,8 @@ static int ilk_compute_pipe_wm(struct intel_crtc *intel_crtc,
+ 	if (IS_HASWELL(dev) || IS_BROADWELL(dev))
+ 		pipe_wm->linetime = hsw_compute_linetime_wm(dev, cstate);
+ 
+-	/* LP0 watermarks always use 1/2 DDB partitioning */
+-	ilk_compute_wm_maximums(dev, 0, &config, INTEL_DDB_PART_1_2, &max);
+-
+-	/* At least LP0 must be valid */
+-	if (!ilk_validate_wm_level(0, &max, &pipe_wm->wm[0]))
+-		return -EINVAL;
++	if (!ilk_validate_pipe_wm(dev, pipe_wm))
++		return false;
+ 
+ 	ilk_compute_wm_reg_maximums(dev, 1, &max);
+ 
+@@ -2372,6 +2384,59 @@ static int ilk_compute_pipe_wm(struct intel_crtc *intel_crtc,
+ }
+ 
+ /*
++ * Build a set of 'intermediate' watermark values that satisfy both the old
++ * state and the new state.  These can be programmed to the hardware
++ * immediately.
++ */
++static int ilk_compute_intermediate_wm(struct drm_device *dev,
++				       struct intel_crtc *intel_crtc,
++				       struct intel_crtc_state *newstate)
++{
++	struct intel_pipe_wm *a = &newstate->wm.intermediate;
++	struct intel_pipe_wm *b = &intel_crtc->wm.active.ilk;
++	int level, max_level = ilk_wm_max_level(dev);
++
++	/*
++	 * Start with the final, target watermarks, then combine with the
++	 * currently active watermarks to get values that are safe both before
++	 * and after the vblank.
++	 */
++	*a = newstate->wm.optimal.ilk;
++	a->pipe_enabled |= b->pipe_enabled;
++	a->sprites_enabled |= b->sprites_enabled;
++	a->sprites_scaled |= b->sprites_scaled;
++
++	for (level = 0; level <= max_level; level++) {
++		struct intel_wm_level *a_wm = &a->wm[level];
++		const struct intel_wm_level *b_wm = &b->wm[level];
++
++		a_wm->enable &= b_wm->enable;
++		a_wm->pri_val = max(a_wm->pri_val, b_wm->pri_val);
++		a_wm->spr_val = max(a_wm->spr_val, b_wm->spr_val);
++		a_wm->cur_val = max(a_wm->cur_val, b_wm->cur_val);
++		a_wm->fbc_val = max(a_wm->fbc_val, b_wm->fbc_val);
++	}
++
++	/*
++	 * We need to make sure that these merged watermark values are
++	 * actually a valid configuration themselves.  If they're not,
++	 * there's no safe way to transition from the old state to
++	 * the new state, so we need to fail the atomic transaction.
++	 */
++	if (!ilk_validate_pipe_wm(dev, a))
++		return -EINVAL;
++
++	/*
++	 * If our intermediate WM are identical to the final WM, then we can
++	 * omit the post-vblank programming; only update if it's different.
++	 */
++	if (memcmp(a, &newstate->wm.optimal.ilk, sizeof(*a)) == 0)
++		newstate->wm.need_postvbl_update = false;
++
++	return 0;
++}
++
++/*
+  * Merge the watermarks from all active pipes for a specific level.
+  */
+ static void ilk_merge_wm_level(struct drm_device *dev,
+@@ -2383,9 +2448,7 @@ static void ilk_merge_wm_level(struct drm_device *dev,
+ 	ret_wm->enable = true;
+ 
+ 	for_each_intel_crtc(dev, intel_crtc) {
+-		const struct intel_crtc_state *cstate =
+-			to_intel_crtc_state(intel_crtc->base.state);
+-		const struct intel_pipe_wm *active = &cstate->wm.optimal.ilk;
++		const struct intel_pipe_wm *active = &intel_crtc->wm.active.ilk;
+ 		const struct intel_wm_level *wm = &active->wm[level];
+ 
+ 		if (!active->pipe_enabled)
+@@ -2533,15 +2596,14 @@ static void ilk_compute_wm_results(struct drm_device *dev,
+ 
+ 	/* LP0 register values */
+ 	for_each_intel_crtc(dev, intel_crtc) {
+-		const struct intel_crtc_state *cstate =
+-			to_intel_crtc_state(intel_crtc->base.state);
+ 		enum pipe pipe = intel_crtc->pipe;
+-		const struct intel_wm_level *r = &cstate->wm.optimal.ilk.wm[0];
++		const struct intel_wm_level *r =
++			&intel_crtc->wm.active.ilk.wm[0];
+ 
+ 		if (WARN_ON(!r->enable))
+ 			continue;
+ 
+-		results->wm_linetime[pipe] = cstate->wm.optimal.ilk.linetime;
++		results->wm_linetime[pipe] = intel_crtc->wm.active.ilk.linetime;
+ 
+ 		results->wm_pipe[pipe] =
+ 			(r->pri_val << WM0_PIPE_PLANE_SHIFT) |
+@@ -2748,7 +2810,7 @@ static void ilk_write_wm_values(struct drm_i915_private *dev_priv,
+ 	dev_priv->wm.hw = *results;
+ }
+ 
+-static bool ilk_disable_lp_wm(struct drm_device *dev)
++bool ilk_disable_lp_wm(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+@@ -3643,11 +3705,9 @@ static void ilk_compute_wm_config(struct drm_device *dev,
+ 	}
+ }
+ 
+-static void ilk_program_watermarks(struct intel_crtc_state *cstate)
++static void ilk_program_watermarks(struct drm_i915_private *dev_priv)
+ {
+-	struct drm_crtc *crtc = cstate->base.crtc;
+-	struct drm_device *dev = crtc->dev;
+-	struct drm_i915_private *dev_priv = to_i915(dev);
++	struct drm_device *dev = dev_priv->dev;
+ 	struct intel_pipe_wm lp_wm_1_2 = {}, lp_wm_5_6 = {}, *best_lp_wm;
+ 	struct ilk_wm_maximums max;
+ 	struct intel_wm_config config = {};
+@@ -3678,28 +3738,28 @@ static void ilk_program_watermarks(struct intel_crtc_state *cstate)
+ 	ilk_write_wm_values(dev_priv, &results);
+ }
+ 
+-static void ilk_update_wm(struct drm_crtc *crtc)
++static void ilk_initial_watermarks(struct intel_crtc_state *cstate)
+ {
+-	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+-	struct intel_crtc_state *cstate = to_intel_crtc_state(crtc->state);
+-
+-	WARN_ON(cstate->base.active != intel_crtc->active);
++	struct drm_i915_private *dev_priv = to_i915(cstate->base.crtc->dev);
++	struct intel_crtc *intel_crtc = to_intel_crtc(cstate->base.crtc);
+ 
+-	/*
+-	 * IVB workaround: must disable low power watermarks for at least
+-	 * one frame before enabling scaling.  LP watermarks can be re-enabled
+-	 * when scaling is disabled.
+-	 *
+-	 * WaCxSRDisabledForSpriteScaling:ivb
+-	 */
+-	if (cstate->disable_lp_wm) {
+-		ilk_disable_lp_wm(crtc->dev);
+-		intel_wait_for_vblank(crtc->dev, intel_crtc->pipe);
+-	}
++	mutex_lock(&dev_priv->wm.wm_mutex);
++	intel_crtc->wm.active.ilk = cstate->wm.intermediate;
++	ilk_program_watermarks(dev_priv);
++	mutex_unlock(&dev_priv->wm.wm_mutex);
++}
+ 
+-	intel_crtc->wm.active.ilk = cstate->wm.optimal.ilk;
++static void ilk_optimize_watermarks(struct intel_crtc_state *cstate)
++{
++	struct drm_i915_private *dev_priv = to_i915(cstate->base.crtc->dev);
++	struct intel_crtc *intel_crtc = to_intel_crtc(cstate->base.crtc);
+ 
+-	ilk_program_watermarks(cstate);
++	mutex_lock(&dev_priv->wm.wm_mutex);
++	if (cstate->wm.need_postvbl_update) {
++		intel_crtc->wm.active.ilk = cstate->wm.optimal.ilk;
++		ilk_program_watermarks(dev_priv);
++	}
++	mutex_unlock(&dev_priv->wm.wm_mutex);
+ }
+ 
+ static void skl_pipe_wm_active_state(uint32_t val,
+@@ -7077,9 +7137,13 @@ void intel_init_pm(struct drm_device *dev)
+ 		     dev_priv->wm.spr_latency[1] && dev_priv->wm.cur_latency[1]) ||
+ 		    (!IS_GEN5(dev) && dev_priv->wm.pri_latency[0] &&
+ 		     dev_priv->wm.spr_latency[0] && dev_priv->wm.cur_latency[0])) {
+-			dev_priv->display.update_wm = ilk_update_wm;
+ 			dev_priv->display.compute_pipe_wm = ilk_compute_pipe_wm;
+-			dev_priv->display.program_watermarks = ilk_program_watermarks;
++			dev_priv->display.compute_intermediate_wm =
++				ilk_compute_intermediate_wm;
++			dev_priv->display.initial_watermarks =
++				ilk_initial_watermarks;
++			dev_priv->display.optimize_watermarks =
++				ilk_optimize_watermarks;
+ 		} else {
+ 			DRM_DEBUG_KMS("Failed to read display plane latency. "
+ 				      "Disable CxSR\n");
+-- 
+1.7.5.4
+

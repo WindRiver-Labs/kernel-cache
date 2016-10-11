@@ -1,0 +1,306 @@
+From 6d27b399b190d2cdcffd044365767c475a628078 Mon Sep 17 00:00:00 2001
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Fri, 8 Apr 2016 13:44:23 -0700
+Subject: [PATCH 1320/2508] drm/i915: Added scheduler flush calls to ring
+ throttle and idle functions
+
+commit ebf0795522bb2c9503c27b8b7e82e62455ad093e from
+https://github.com/01org/linux-apollolake-i
+
+When requesting that all GPU work is completed, it is now necessary to
+get the scheduler involved in order to flush out work that queued and
+not yet submitted.
+
+v2: Updated to add support for flushing the scheduler queue by time
+stamp rather than just doing a blanket flush.
+
+v3: Moved submit_max_priority() to this patch from an earlier patch
+is it is no longer required in the other.
+
+v4: Corrected the format of a comment to keep the style checker happy.
+Downgraded a BUG_ON to a WARN_ON as the latter is preferred.
+
+v5: Shuffled functions around to remove forward prototypes, removed
+similarly offensive white space and added documentation. Re-worked the
+mutex locking around the submit function. [Joonas Lahtinen]
+
+Used lighter weight spinlocks.
+
+For: VIZ-1587
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c       |   22 ++++
+ drivers/gpu/drm/i915/i915_scheduler.c |  178 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_scheduler.h |    3 +
+ 3 files changed, 203 insertions(+), 0 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index d13cb07..20cc019 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3799,6 +3799,10 @@ int i915_gpu_idle(struct drm_device *dev)
+ 
+ 	/* Flush everything onto the inactive list. */
+ 	for_each_engine(engine, dev_priv) {
++		ret = i915_scheduler_flush(engine, true);
++		if (ret < 0)
++			return ret;
++
+ 		if (!i915.enable_execlists) {
+ 			struct drm_i915_gem_request *req;
+ 
+@@ -4513,6 +4517,7 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+ 	struct drm_i915_gem_request *request, *target = NULL;
+ 	unsigned reset_counter;
+ 	int ret;
++	struct intel_engine_cs *engine;
+ 
+ 	ret = i915_gem_wait_for_error(&dev_priv->gpu_error);
+ 	if (ret)
+@@ -4522,6 +4527,23 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+ 	if (ret)
+ 		return ret;
+ 
++	for_each_engine(engine, dev_priv) {
++		/*
++		 * Flush out scheduler entries that are getting 'stale'. Note
++		 * that the following recent_enough test will only check
++		 * against the time at which the request was submitted to the
++		 * hardware (i.e. when it left the scheduler) not the time it
++		 * was submitted to the driver.
++		 *
++		 * Also, there is not much point worring about busy return
++		 * codes from the scheduler flush call. Even if more work
++		 * cannot be submitted right now for whatever reason, we
++		 * still want to throttle against stale work that has already
++		 * been submitted.
++		 */
++		i915_scheduler_flush_stamp(engine, recent_enough, false);
++	}
++
+ 	spin_lock(&file_priv->mm.lock);
+ 	list_for_each_entry(request, &file_priv->mm.request_list, client_list) {
+ 		if (time_after_eq(request->emitted_jiffies, recent_enough))
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 77f3d35..06b5fa4 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -310,6 +310,10 @@ static int i915_scheduler_pop_from_queue_locked(struct intel_engine_cs *engine,
+  * attempting to acquire a mutex while holding a spin lock is a Bad Idea.
+  * And releasing the one before acquiring the other leads to other code
+  * being run and interfering.
++ *
++ * Hence any caller that does not already have the mutex lock for other
++ * reasons should call i915_scheduler_submit_unlocked() instead in order to
++ * obtain the lock first.
+  */
+ static int i915_scheduler_submit(struct intel_engine_cs *engine)
+ {
+@@ -433,6 +437,22 @@ error:
+ 	return ret;
+ }
+ 
++static int i915_scheduler_submit_unlocked(struct intel_engine_cs *engine)
++{
++	struct drm_device *dev = engine->dev;
++	int ret;
++
++	ret = i915_mutex_lock_interruptible(dev);
++	if (ret)
++		return ret;
++
++	ret = i915_scheduler_submit(engine);
++
++	mutex_unlock(&dev->struct_mutex);
++
++	return ret;
++}
++
+ static void i915_generate_dependencies(struct i915_scheduler *scheduler,
+ 				       struct i915_scheduler_queue_entry *node,
+ 				       uint32_t engine)
+@@ -929,6 +949,164 @@ void i915_scheduler_work_handler(struct work_struct *work)
+ 		i915_scheduler_process_work(engine);
+ }
+ 
++static int i915_scheduler_submit_max_priority(struct intel_engine_cs *engine,
++					      bool is_locked)
++{
++	struct i915_scheduler_queue_entry *node;
++	struct drm_i915_private *dev_priv = engine->dev->dev_private;
++	struct i915_scheduler *scheduler = dev_priv->scheduler;
++	int ret, count = 0;
++	bool found;
++
++	do {
++		found = false;
++		spin_lock_irq(&scheduler->lock);
++		for_each_scheduler_node(node, engine->id) {
++			if (!I915_SQS_IS_QUEUED(node))
++				continue;
++
++			if (node->priority < scheduler->priority_level_max)
++				continue;
++
++			found = true;
++			break;
++		}
++		spin_unlock_irq(&scheduler->lock);
++
++		if (!found)
++			break;
++
++		if (is_locked)
++			ret = i915_scheduler_submit(engine);
++		else
++			ret = i915_scheduler_submit_unlocked(engine);
++		if (ret < 0)
++			return ret;
++
++		count += ret;
++	} while (found);
++
++	return count;
++}
++
++/**
++ * i915_scheduler_flush_stamp - force requests of a given age through the
++ * scheduler.
++ * @engine: Engine to be flushed
++ * @target: Jiffy based time stamp to flush up to
++ * @is_locked: Is the driver mutex lock held?
++ * DRM has a throttle by age of request facility. This requires waiting for
++ * outstanding work over a given age. This function helps that by forcing
++ * queued batch buffers over said age through the system.
++ * Returns zero on success or -EAGAIN if the scheduler is busy (e.g. waiting
++ * for a pre-emption event to complete) but the mutex lock is held which
++ * would prevent the scheduler's asynchronous processing from completing.
++ */
++int i915_scheduler_flush_stamp(struct intel_engine_cs *engine,
++			       unsigned long target,
++			       bool is_locked)
++{
++	struct i915_scheduler_queue_entry *node;
++	struct drm_i915_private *dev_priv;
++	struct i915_scheduler *scheduler;
++	int flush_count = 0;
++
++	if (!engine)
++		return -EINVAL;
++
++	dev_priv  = engine->dev->dev_private;
++	scheduler = dev_priv->scheduler;
++
++	if (!scheduler)
++		return 0;
++
++	if (is_locked && (scheduler->flags[engine->id] & I915_SF_SUBMITTING)) {
++		/*
++		 * Scheduler is busy already submitting another batch,
++		 * come back later rather than going recursive...
++		 */
++		return -EAGAIN;
++	}
++
++	spin_lock_irq(&scheduler->lock);
++	i915_scheduler_priority_bump_clear(scheduler);
++	for_each_scheduler_node(node, engine->id) {
++		if (!I915_SQS_IS_QUEUED(node))
++			continue;
++
++		if (node->stamp > target)
++			continue;
++
++		flush_count = i915_scheduler_priority_bump(scheduler,
++					node, scheduler->priority_level_max);
++	}
++	spin_unlock_irq(&scheduler->lock);
++
++	if (flush_count) {
++		DRM_DEBUG_DRIVER("<%s> Bumped %d entries\n", engine->name, flush_count);
++		flush_count = i915_scheduler_submit_max_priority(engine, is_locked);
++	}
++
++	return flush_count;
++}
++
++/**
++ * i915_scheduler_flush - force all requests through the scheduler.
++ * @engine: Engine to be flushed
++ * @is_locked: Is the driver mutex lock held?
++ * For various reasons it is sometimes necessary to the scheduler out, e.g.
++ * due to engine reset.
++ * Returns zero on success or -EAGAIN if the scheduler is busy (e.g. waiting
++ * for a pre-emption event to complete) but the mutex lock is held which
++ * would prevent the scheduler's asynchronous processing from completing.
++ */
++int i915_scheduler_flush(struct intel_engine_cs *engine, bool is_locked)
++{
++	struct i915_scheduler_queue_entry *node;
++	struct drm_i915_private *dev_priv;
++	struct i915_scheduler *scheduler;
++	bool found;
++	int ret;
++	uint32_t count = 0;
++
++	if (!engine)
++		return -EINVAL;
++
++	dev_priv  = engine->dev->dev_private;
++	scheduler = dev_priv->scheduler;
++
++	if (!scheduler)
++		return 0;
++
++	WARN_ON(is_locked && (scheduler->flags[engine->id] & I915_SF_SUBMITTING));
++
++	do {
++		found = false;
++		spin_lock_irq(&scheduler->lock);
++		for_each_scheduler_node(node, engine->id) {
++			if (!I915_SQS_IS_QUEUED(node))
++				continue;
++
++			found = true;
++			break;
++		}
++		spin_unlock_irq(&scheduler->lock);
++
++		if (found) {
++			if (is_locked)
++				ret = i915_scheduler_submit(engine);
++			else
++				ret = i915_scheduler_submit_unlocked(engine);
++			if (ret < 0)
++				return ret;
++
++			count += ret;
++		}
++	} while (found);
++
++	return count;
++}
++
+ /**
+  * i915_scheduler_is_mutex_required - query if it is safe to hold the mutex
+  * lock while waiting for the given request.
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index 1a0123b..4abfdce 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -102,6 +102,9 @@ int i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe);
+ bool i915_scheduler_notify_request(struct drm_i915_gem_request *req);
+ void i915_scheduler_wakeup(struct drm_device *dev);
+ void i915_scheduler_work_handler(struct work_struct *work);
++int i915_scheduler_flush(struct intel_engine_cs *engine, bool is_locked);
++int i915_scheduler_flush_stamp(struct intel_engine_cs *engine,
++			       unsigned long stamp, bool is_locked);
+ bool i915_scheduler_is_mutex_required(struct drm_i915_gem_request *req);
+ 
+ #endif  /* _I915_SCHEDULER_H_ */
+-- 
+1.7.5.4
+

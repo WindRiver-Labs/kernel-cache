@@ -1,0 +1,587 @@
+From 1ce9eafd101aeed33eea99a9f82a9d44d991c58f Mon Sep 17 00:00:00 2001
+From: Dave Gordon <david.s.gordon@intel.com>
+Date: Fri, 8 Apr 2016 13:53:26 -0700
+Subject: [PATCH 1372/2508] drm/i915/preempt: update (LRC) ringbuffer-filling
+ code to create preemptive requests
+
+commit b98e9c75a0e05273e8958facf2412a2c9cac3d81 from
+https://github.com/01org/linux-apollolake-i
+
+This patch refactors the rinbuffer-level code (in execlists/GuC mode
+only) and enhances it so that it can emit the proper sequence of opcode
+for preemption requests.
+
+A preemption request is similar to an batch submission, but doesn't
+actually invoke a batchbuffer, the purpose being simply to get the
+engine to stop what it's doing so that the scheduler can then send it a
+new workload instead.
+
+Preemption requests use different locations in the hardware status page
+to hold the 'active' and 'done' seqnos from regular batches, so that
+information pertaining to a preempted batch is not overwritten. Also,
+whereas a regular batch clears its 'active' flag when it finishes (so
+that TDR knows it's no longer to blame), preemption requests leave this
+set and the driver clears it once the completion of the preemption
+request has been noticed. Only one preemption (per ring) can be in
+progress at one time, so this handshake ensures correct sequencing of
+the request between the GPU and CPU.
+
+Actually-preemptive requests are still disabled via a module parameter
+at this stage, but all the components should now be ready for us to turn
+it on :)
+
+v2: Updated to use locally cached request pointer and to fix the
+location of the dispatch trace point.
+
+For: VIZ-2021
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+---
+ drivers/gpu/drm/i915/intel_lrc.c        |  386 +++++++++++++++++++++++--------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |   33 ++-
+ 2 files changed, 312 insertions(+), 107 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index c7f9dbc..7851e1e 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -803,7 +803,7 @@ intel_logical_ring_advance_and_submit(struct drm_i915_gem_request *request)
+ 	struct intel_engine_cs *engine = request->engine;
+ 	struct i915_guc_client *client = dev_priv->guc.execbuf_client;
+ 	static const bool fake = false;	/* true => only pretend to preempt */
+-	bool preemptive = false;	/* for now */
++	bool preemptive;
+ 
+ 	intel_logical_ring_advance(ringbuf);
+ 	request->tail = ringbuf->tail;
+@@ -832,6 +832,7 @@ intel_logical_ring_advance_and_submit(struct drm_i915_gem_request *request)
+ 		}
+ 	}
+ 
++	preemptive = (request->scheduler_flags & I915_REQ_SF_PREEMPT) != 0;
+ 	if (preemptive && dev_priv->guc.preempt_client && !fake)
+ 		client = dev_priv->guc.preempt_client;
+ 
+@@ -1028,6 +1029,184 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
+ }
+ 
+ /*
++ * This function stores the specified constant value in the (index)th DWORD
++ * of the hardware status page (execlist mode only). See separate code for
++ * legacy mode.
++ */
++static void
++emit_store_dw_index(struct drm_i915_gem_request *req, uint32_t value,
++		    uint32_t index)
++{
++	struct intel_ringbuffer *ringbuf = req->ringbuf;
++	uint64_t hwpa = req->engine->status_page.gfx_addr;
++
++	hwpa += index << MI_STORE_DWORD_INDEX_SHIFT;
++
++	intel_logical_ring_emit(ringbuf, MI_STORE_DWORD_IMM_GEN4 |
++					 MI_GLOBAL_GTT);
++	intel_logical_ring_emit(ringbuf, lower_32_bits(hwpa));
++	intel_logical_ring_emit(ringbuf, upper_32_bits(hwpa)); /* GEN8+ */
++	intel_logical_ring_emit(ringbuf, value);
++
++	req->engine->gpu_caches_dirty = true;
++}
++
++#if	0
++/*
++ * This function stores the specified register value in the (index)th DWORD
++ * of the hardware status page (execlist mode only). See separate code for
++ * legacy mode.
++ */
++static void
++emit_store_reg_index(struct drm_i915_gem_request *req, i915_reg_t reg,
++		     uint32_t index)
++{
++	struct intel_ringbuffer *ringbuf = req->ringbuf;
++	uint64_t hwpa = req->engine->status_page.gfx_addr;
++
++	hwpa += index << MI_STORE_DWORD_INDEX_SHIFT;
++
++	intel_logical_ring_emit(ringbuf, (MI_STORE_REG_MEM+1) | MI_GLOBAL_GTT);
++	intel_logical_ring_emit_reg(ringbuf, reg);
++	intel_logical_ring_emit(ringbuf, lower_32_bits(hwpa));
++	intel_logical_ring_emit(ringbuf, upper_32_bits(hwpa)); /* GEN8+ */
++
++	req->engine->gpu_caches_dirty = true;
++}
++#endif	/* 0 */
++
++/*
++ * This function stores the two specified values in the (index)th DWORD
++ * and the following DWORD of the hardware status page (execlist mode only).
++ * See separate code for legacy mode.
++ */
++static int
++gen8_emit_flush_qw_store_index(struct drm_i915_gem_request *request,
++			       uint32_t flags, uint32_t index,
++			       uint32_t data1, uint32_t data2)
++{
++	struct intel_ringbuffer *ringbuf = request->ringbuf;
++	uint32_t cmd;
++	int ret;
++
++	cmd = MI_FLUSH_DW;
++	cmd += 2;			/* 64-bit address and data	*/
++	cmd |= MI_FLUSH_DW_OP_STOREDW;	/* Store {D,Q}Word as post-op	*/
++	cmd |= MI_FLUSH_DW_STORE_INDEX;	/* Address is relative to HWSP	*/
++	cmd |= flags;			/* Extra (invalidate) bits	*/
++
++	/* The address must be QWord aligned (index must be EVEN) */
++	index <<= MI_STORE_DWORD_INDEX_SHIFT;
++	if (WARN_ON_ONCE(index & 7))
++		return -EINVAL;
++	/* w/a: bit 5 needs to be zero for MI_FLUSH_DW QWord address. */
++	if (WARN_ON_ONCE(index & (1 << 5)))
++		return -EINVAL;
++	index |= MI_FLUSH_DW_USE_GTT;
++
++	ret = intel_logical_ring_begin(request, 6);
++	if (ret)
++		return ret;
++
++	intel_logical_ring_emit(ringbuf, cmd);
++	intel_logical_ring_emit(ringbuf, index);
++	intel_logical_ring_emit(ringbuf, 0);	/* upper_32_bits(index)	*/
++	intel_logical_ring_emit(ringbuf, data1);
++	intel_logical_ring_emit(ringbuf, data2);
++
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++
++	intel_logical_ring_advance(ringbuf);
++	return 0;
++}
++
++/*
++ * This function stores the two specified values in the (index)th DWORD
++ * and the following DWORD of the hardware status page (execlist mode only).
++ * See separate code for legacy mode.
++ */
++static int
++gen8_emit_pipe_control_qw_store_index(struct drm_i915_gem_request *request,
++				      uint32_t flags, uint32_t index,
++				      uint32_t data1, uint32_t data2)
++{
++	struct intel_ringbuffer *ringbuf = request->ringbuf;
++	uint32_t cmd, opts;
++	int ret;
++
++	cmd = GFX_OP_PIPE_CONTROL(6);
++
++	opts = PIPE_CONTROL_GLOBAL_GTT_IVB;	/* Address via GGTT	*/
++	opts |= PIPE_CONTROL_STORE_DATA_INDEX;	/* Index into HWSP	*/
++	opts |= PIPE_CONTROL_CS_STALL;		/* Stall CS until done	*/
++	opts |= PIPE_CONTROL_QW_WRITE;		/* Write QWord		*/
++	opts |= flags;				/* Extra flag bits	*/
++
++	/* The address must be QWord aligned (index must be EVEN) */
++	index <<= MI_STORE_DWORD_INDEX_SHIFT;
++	if (WARN_ON_ONCE(index & 7))
++		return -EINVAL;
++	/* w/a: bit 5 needs to be zero for MI_FLUSH_DW QWord address. */
++	if (WARN_ON_ONCE(index & (1 << 5)))
++		return -EINVAL;
++
++	ret = intel_logical_ring_begin(request, 6);
++	if (ret)
++		return ret;
++
++	intel_logical_ring_emit(ringbuf, cmd);
++	intel_logical_ring_emit(ringbuf, opts);
++	intel_logical_ring_emit(ringbuf, index);
++	intel_logical_ring_emit(ringbuf, 0);	/* upper_32_bits(index)	*/
++	intel_logical_ring_emit(ringbuf, data1);
++	intel_logical_ring_emit(ringbuf, data2);
++
++	intel_logical_ring_advance(ringbuf);
++	return 0;
++}
++
++/*
++ * Emit the commands to execute when preparing to start a batch
++ *
++ * The GPU will log the seqno of the batch before it starts
++ * running any of the commands to actually execute that batch
++ */
++static void
++emit_preamble(struct drm_i915_gem_request *req)
++{
++	struct intel_ringbuffer *ringbuf = req->ringbuf;
++	uint32_t seqno = i915_gem_request_get_seqno(req);
++
++	WARN_ON(!seqno);
++
++	if (req->scheduler_flags & I915_REQ_SF_PREEMPT)
++		emit_store_dw_index(req, seqno, I915_PREEMPTIVE_ACTIVE_SEQNO);
++	else
++		emit_store_dw_index(req, seqno, I915_BATCH_ACTIVE_SEQNO);
++
++	intel_logical_ring_emit(ringbuf, MI_REPORT_HEAD);
++	intel_logical_ring_emit(ringbuf, MI_NOOP);
++
++	req->engine->gpu_caches_dirty = true;
++}
++
++static void
++emit_relconsts_mode(struct i915_execbuffer_params *params)
++{
++	if (params->instp_mode != params->ctx->relative_constants_mode) {
++		struct intel_ringbuffer *ringbuf = params->request->ringbuf;
++		uint32_t val = params->instp_mask << 16 | params->instp_mode;
++
++		intel_logical_ring_emit(ringbuf, MI_NOOP);
++		intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
++		intel_logical_ring_emit_reg(ringbuf, INSTPM);
++		intel_logical_ring_emit(ringbuf, val);
++
++		params->ctx->relative_constants_mode = params->instp_mode;
++	}
++}
++
++/*
+  * This is the main function for sending a batch to the engine.
+  * It is called from the scheduler, with the struct_mutex already held.
+  */
+@@ -1112,6 +1291,11 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 	req->head = intel_ring_get_tail(ringbuf);
+ 
+ 	/*
++	 * Log the seqno of the batch we're starting
++	 */
++	emit_preamble(req);
++
++	/*
+ 	 * Unconditionally invalidate gpu caches and ensure that we do flush
+ 	 * any residual writes from the previous batch.
+ 	 */
+@@ -1119,25 +1303,20 @@ int intel_execlists_submission_final(struct i915_execbuffer_params *params)
+ 	if (ret)
+ 		goto err;
+ 
+-	if (engine == &dev_priv->engine[RCS] &&
+-	    params->instp_mode != params->ctx->relative_constants_mode) {
+-		intel_logical_ring_emit(ringbuf, MI_NOOP);
+-		intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
+-		intel_logical_ring_emit_reg(ringbuf, INSTPM);
+-		intel_logical_ring_emit(ringbuf, params->instp_mask << 16 | params->instp_mode);
+-		intel_logical_ring_advance(ringbuf);
++	if (!(req->scheduler_flags & I915_REQ_SF_PREEMPT)) {
++		if (engine == &dev_priv->engine[RCS])
++			emit_relconsts_mode(params);
+ 
+-		params->ctx->relative_constants_mode = params->instp_mode;
+-	}
++		exec_start = params->batch_obj_vm_offset +
++			     params->args_batch_start_offset;
+ 
+-	exec_start = params->batch_obj_vm_offset +
+-		     params->args_batch_start_offset;
+-
+-	ret = engine->emit_bb_start(req, exec_start, params->dispatch_flags);
+-	if (ret)
+-		goto err;
++		ret = engine->emit_bb_start(req, exec_start,
++					    params->dispatch_flags);
++		if (ret)
++			goto err;
+ 
+-	trace_i915_gem_ring_dispatch(req, params->dispatch_flags);
++		trace_i915_gem_ring_dispatch(req, params->dispatch_flags);
++	}
+ 
+ 	i915_gem_execbuffer_retire_commands(params);
+ 
+@@ -1930,41 +2109,30 @@ static int gen8_emit_flush(struct drm_i915_gem_request *request,
+ 			   u32 invalidate_domains,
+ 			   u32 unused)
+ {
+-	struct intel_ringbuffer *ringbuf = request->ringbuf;
+-	struct intel_engine_cs *engine = ringbuf->engine;
+-	struct drm_device *dev = engine->dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	uint32_t cmd;
+-	int ret;
++	uint32_t flags = 0;
+ 
+-	ret = intel_logical_ring_begin(request, 4);
+-	if (ret)
+-		return ret;
+-
+-	cmd = MI_FLUSH_DW + 1;
+-
+-	/* We always require a command barrier so that subsequent
+-	 * commands, such as breadcrumb interrupts, are strictly ordered
+-	 * wrt the contents of the write cache being flushed to memory
+-	 * (and thus being coherent from the CPU).
++	/*
++	 * We always require a command barrier so that subsequent commands,
++	 * such as breadcrumb interrupts, are strictly ordered w.r.t the
++	 * contents of the write cache being flushed to memory (and thus
++	 * being coherent from the CPU).
+ 	 */
+-	cmd |= MI_FLUSH_DW_STORE_INDEX | MI_FLUSH_DW_OP_STOREDW;
+ 
+ 	if (invalidate_domains & I915_GEM_GPU_DOMAINS) {
+-		cmd |= MI_INVALIDATE_TLB;
+-		if (engine == &dev_priv->engine[VCS])
+-			cmd |= MI_INVALIDATE_BSD;
++		struct drm_i915_private *dev_priv = request->i915;
++
++		if (request->engine == &dev_priv->engine[VCS])
++			flags |= MI_INVALIDATE_BSD;
++		flags |= MI_INVALIDATE_TLB;
+ 	}
+ 
+-	intel_logical_ring_emit(ringbuf, cmd);
+-	intel_logical_ring_emit(ringbuf,
+-				I915_GEM_HWS_SCRATCH_ADDR |
+-				MI_FLUSH_DW_USE_GTT);
+-	intel_logical_ring_emit(ringbuf, 0); /* upper addr */
+-	intel_logical_ring_emit(ringbuf, 0); /* value */
+-	intel_logical_ring_advance(ringbuf);
++	/* Index must be QWord aligned */
++	BUILD_BUG_ON(I915_GEM_HWS_SCRATCH_INDEX & 1);
++	/* w/a: bit 5 needs to be zero for MI_FLUSH_DW QWord address. */
++	BUILD_BUG_ON(I915_GEM_HWS_SCRATCH_INDEX & (1 << (5 - MI_STORE_DWORD_INDEX_SHIFT)));
+ 
+-	return 0;
++	return gen8_emit_flush_qw_store_index(request, flags,
++			I915_GEM_HWS_SCRATCH_INDEX, 0, 0);
+ }
+ 
+ static int gen8_emit_flush_render(struct drm_i915_gem_request *request,
+@@ -2075,93 +2243,115 @@ static void bxt_a_set_seqno(struct intel_engine_cs *engine, u32 seqno)
+  */
+ #define WA_TAIL_DWORDS 2
+ 
++/*
++ * Emit the commands that flag the end of execution of a batch.
++ *
++ * The GPU will:
++ * 1) log the seqno of the request we're just completing.
++ * 2) in the case of a preemptive batch, leave the in-progress sequence
++ *    number set to the same value; otherwise, clear it. We use MI_FLUSH_DW
++ *    to ensure the seqno write completes before the interrupt happens.
++ * 3) Issue a USER INTERRUPT to notify the driver that the sequence number
++ *    has been updated.
++ */
++
+ static int gen8_emit_request(struct drm_i915_gem_request *request)
+ {
+ 	struct intel_ringbuffer *ringbuf = request->ringbuf;
+-	u32 cmd;
+-	u64 addr;
++	uint32_t seqno = i915_gem_request_get_seqno(request);
++	uint32_t index = I915_GEM_HWS_INDEX;
++	uint32_t data2 = 0;
+ 	int ret;
+ 
++	/* Index must be QWord aligned */
++	BUILD_BUG_ON(I915_BATCH_DONE_SEQNO & 1);
++	BUILD_BUG_ON(I915_PREEMPTIVE_DONE_SEQNO & 1);
++
++	/* w/a: bit 5 needs to be zero for MI_FLUSH_DW QWord address. */
++	BUILD_BUG_ON(I915_BATCH_DONE_SEQNO & (1 << (5 - MI_STORE_DWORD_INDEX_SHIFT)));
++	BUILD_BUG_ON(I915_PREEMPTIVE_DONE_SEQNO & (1 << (5 - MI_STORE_DWORD_INDEX_SHIFT)));
++
++	WARN_ON(!seqno);
++
++	if (request->scheduler_flags & I915_REQ_SF_PREEMPT) {
++		index = I915_PREEMPTIVE_DONE_SEQNO;
++		data2 = seqno;
++	}
++
++	ret = gen8_emit_flush_qw_store_index(request, 0, index, seqno, data2);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * Reserve space for the instructions below, plus some NOOPs
+ 	 * at the end of each request to be used as a workaround for
+ 	 * not being allowed to do lite restore with HEAD==TAIL
+ 	 * (WaIdleLiteRestore).
+ 	 */
+-	ret = intel_logical_ring_begin(request, 4 + 2 + WA_TAIL_DWORDS);
++	ret = intel_logical_ring_begin(request, 2 + WA_TAIL_DWORDS);
+ 	if (ret)
+ 		return ret;
+ 
+-	cmd = MI_FLUSH_DW;
+-	cmd += 1;			/* Gen8+ uses long addresses	*/
+-	cmd |= MI_FLUSH_DW_OP_STOREDW;	/* Store DWord as post-op	*/
+-	cmd |= MI_FLUSH_DW_STORE_INDEX;	/* Address is relative to HWSP	*/
+-
+-	// Must be QWord aligned even for DWord write
+-	BUILD_BUG_ON((I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT) & (1 << 2));
+-
+-#if	1
+-	/* w/a: bit 5 needs to be zero for MI_FLUSH_DW address. */
+-	// This is true for a QWord write, but not a DWord
+-	BUILD_BUG_ON((I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT) & (1 << 5));
+-#endif
+-
+-	addr = I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT;
+-	addr |= MI_FLUSH_DW_USE_GTT;
+-//	addr += ring->status_page.gfx_addr;
+-
+-	intel_logical_ring_emit(ringbuf, cmd);
+-	intel_logical_ring_emit(ringbuf, lower_32_bits(addr));
+-	intel_logical_ring_emit(ringbuf, upper_32_bits(addr));
+-	intel_logical_ring_emit(ringbuf, i915_gem_request_get_seqno(request));
+-
+ 	intel_logical_ring_emit(ringbuf, MI_USER_INTERRUPT);
+ 	intel_logical_ring_emit(ringbuf, MI_NOOP);
+ 
+ 	return intel_logical_ring_advance_and_submit(request);
+ }
+ 
++/*
++ * Emit the commands that flag the end of execution of a batch.
++ *
++ * The GPU will:
++ * 1) log the seqno of the request we're just completing.
++ * 2) in the case of a preemptive batch, leave the in-progress sequence
++ *    number set to the same value; otherwise, clear it. We use PIPE_CONTROL
++ *    to ensure the seqno write completes before the interrupt happens.
++ * 3) Issue a USER INTERRUPT to notify the driver that the sequence number
++ *    has been updated.
++ */
+ static int gen8_emit_request_render(struct drm_i915_gem_request *request)
+ {
+ 	struct intel_ringbuffer *ringbuf = request->ringbuf;
+-	u32 cmd, opts;
+-	u64 addr;
++	uint32_t seqno = i915_gem_request_get_seqno(request);
++	uint32_t index = I915_GEM_HWS_INDEX;
++	uint32_t data2 = 0;
+ 	int ret;
+ 
++	/* Index must be QWord aligned */
++	BUILD_BUG_ON(I915_BATCH_DONE_SEQNO & 1);
++	BUILD_BUG_ON(I915_PREEMPTIVE_DONE_SEQNO & 1);
++
++	/* w/a: bit 5 needs to be zero for MI_FLUSH_DW QWord address. */
++	BUILD_BUG_ON(I915_BATCH_DONE_SEQNO & (1 << (5 - MI_STORE_DWORD_INDEX_SHIFT)));
++	BUILD_BUG_ON(I915_PREEMPTIVE_DONE_SEQNO & (1 << (5 - MI_STORE_DWORD_INDEX_SHIFT)));
++
++	WARN_ON(!seqno);
++
++	if (request->scheduler_flags & I915_REQ_SF_PREEMPT) {
++		index = I915_PREEMPTIVE_DONE_SEQNO;
++		data2 = seqno;
++	}
++
++	/*
++	 * w/a for post sync ops following a GPGPU operation we
++	 * need a prior CS_STALL, which is emitted by the flush
++	 * following the batch.
++	 */
++
++	ret = gen8_emit_pipe_control_qw_store_index(request, 0, index, seqno, data2);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * Reserve space for the instructions below, plus some NOOPs
+ 	 * at the end of each request to be used as a workaround for
+ 	 * not being allowed to do lite restore with HEAD==TAIL
+ 	 * (WaIdleLiteRestore).
+ 	 */
+-	ret = intel_logical_ring_begin(request, 6 + 2 + WA_TAIL_DWORDS);
++	ret = intel_logical_ring_begin(request, 2 + WA_TAIL_DWORDS);
+ 	if (ret)
+ 		return ret;
+ 
+-	cmd = GFX_OP_PIPE_CONTROL(6);
+-
+-	opts = PIPE_CONTROL_GLOBAL_GTT_IVB;	/* Address via GGTT	*/
+-	opts |= PIPE_CONTROL_STORE_DATA_INDEX;	/* Index into HWSP	*/
+-	opts |= PIPE_CONTROL_CS_STALL;		/* Stall CS until done	*/
+-	opts |= PIPE_CONTROL_QW_WRITE;		/* Write QWord		*/
+-
+-	// Must be QWord aligned
+-	BUILD_BUG_ON((I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT) & (1 << 2));
+-
+-	addr = I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT;
+-//	addr += ring->status_page.gfx_addr;
+-
+-	/* w/a for post sync ops following a GPGPU operation we
+-	 * need a prior CS_STALL, which is emitted by the flush
+-	 * following the batch.
+-	 */
+-	intel_logical_ring_emit(ringbuf, cmd);
+-	intel_logical_ring_emit(ringbuf, opts);
+-	intel_logical_ring_emit(ringbuf, lower_32_bits(addr));
+-	intel_logical_ring_emit(ringbuf, upper_32_bits(addr));
+-	intel_logical_ring_emit(ringbuf, i915_gem_request_get_seqno(request));
+-	intel_logical_ring_emit(ringbuf, 0);	/* Clear 'in progress'	*/
+-
+ 	intel_logical_ring_emit(ringbuf, MI_USER_INTERRUPT);
+ 	intel_logical_ring_emit(ringbuf, MI_NOOP);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index fd82a28..7adabfc 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -458,28 +458,43 @@ intel_write_status_page(struct intel_engine_cs *engine,
+  * chosen carefully to meet those requirements. The list below shows the
+  * currently-known alignment requirements:
+  *
+- *	I915_GEM_SCRATCH_INDEX	    must be EVEN (QWord aligned)
+- *	I915_GEM_HWS_INDEX	    must be EVEN (QWord aligned), but also bit 3
+- *				    must be ZERO, so that the resulting address
+- *				    has a 0 in bit 5 (see BSpec for limitation
+- *				    on MI_FLUSH_DW instruction).
++ *	I915_GEM_HWS_INDEX
++ *	I915_GEM_SCRATCH_INDEX
++ *		must be EVEN (QWord aligned) but ALSO bit 3 must be ZERO,
++ *		so that the resulting address has a 0 in bit 5 (due to H/W
++ *		limitation on MI_FLUSH_DW instruction with QWord data).
++ *
++ *	I915_BATCH_DONE_SEQNO
++ *	I915_PREEMPTIVE_DONE_SEQNO
++ *		must be EVEN (QWord aligned) but ALSO bit 3 must be ZERO,
++ *		so that the resulting address has a 0 in bit 5 (due to H/W
++ *		limitation on MI_FLUSH_DW instruction with QWord data).
++ *
++ *	I915_BATCH_ACTIVE_SEQNO
++ *	I915_PREEMPTIVE_ACTIVE_SEQNO
++ *		must each be at the odd address one above the corresponding
++ *		I915_*_DONE_SEQNO value, as they are addressed both as DWords
++ *		in their own right and as half of a QWord containing both the
++ *		DONE and ACTIVE values together.
+  */
+ 
+ /*
+  * Tracking; these are updated by the GPU at the beginning and/or end of every
+- * batch. One pair for regular buffers, the other for preemptive ones.
++ * batch. One pair is for regular buffers, the other for preemptive ones.
+  */
+ #define I915_BATCH_DONE_SEQNO		0x30  /* Completed batch seqno        */
+ #define I915_BATCH_ACTIVE_SEQNO		0x31  /* In progress batch seqno      */
+ #define I915_PREEMPTIVE_DONE_SEQNO	0x32  /* Completed preemptive batch   */
+ #define I915_PREEMPTIVE_ACTIVE_SEQNO	0x33  /* In progress preemptive batch */
++#define I915_GEM_HWS_SCRATCH_INDEX	0x34  /* QWord, uses 0x35 as well     */
++#define I915_GEM_HWS_SCRATCH_ADDR	(I915_GEM_HWS_SCRATCH_INDEX << MI_STORE_DWORD_INDEX_SHIFT)
++
++/* Beware of addresses 0xX8-0xXF due to MI_FLUSH_DW with QWord bug */
+ 
+ #define I915_GEM_HWS_INDEX		I915_BATCH_DONE_SEQNO	/* alias */
+-#define I915_GEM_HWS_INDEX_ADDR         (I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT)
++//#define I915_GEM_HWS_INDEX_ADDR       (I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT)
+ //#define I915_GEM_ACTIVE_SEQNO_INDEX	I915_BATCH_ACTIVE_SEQNO	/* alias */
+ 
+-#define I915_GEM_HWS_SCRATCH_INDEX	0x40  /* QWord */
+-#define I915_GEM_HWS_SCRATCH_ADDR	(I915_GEM_HWS_SCRATCH_INDEX << MI_STORE_DWORD_INDEX_SHIFT)
+ 
+ struct intel_ringbuffer *
+ intel_engine_create_ringbuffer(struct intel_engine_cs *engine, int size);
+-- 
+1.7.5.4
+

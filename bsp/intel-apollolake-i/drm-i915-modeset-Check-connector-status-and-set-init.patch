@@ -1,0 +1,323 @@
+From 1b0e8af3929a64e59dc2288d333316c784b254a2 Mon Sep 17 00:00:00 2001
+From: Bob Paauwe <bob.j.paauwe@intel.com>
+Date: Fri, 22 Apr 2016 16:43:19 -0700
+Subject: [PATCH 1422/2508] drm/i915/modeset: Check connector status and set
+ initial mode (v3)
+
+commit ffcd9938c47a60972d7ad197af24f68a3df7b38b from
+https://github.com/01org/linux-apollolake-i
+
+on the attached connectors.  Look up and use the preferred mode for the
+connected connectors.
+
+v2: use drm_for_each_crtc instead of for_each_crtc (Matt)
+    use drm_crtc_mask() instead of bit shifting (Matt)
+    fix get_modeline() to check for found mode (Matt)
+    return PTR_ERR instead of IS_ERR (Matt)
+    remove block that checks for null mode in update_crtc_state (Matt)
+    fix up deadlock handling (Matt)
+v3: check for other errors from update_atomic_state (Matt)
+    remove redundent check for ret != 0 in failure case (Matt)
+
+Signed-off-by: Bob Paauwe <bob.j.paauwe@intel.com>
+Reviewed-by: James Xiong <james.xiong@intel.com>
+Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+[mattrope: One minor comment typo fix (s/included/include/)]
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+---
+ drivers/gpu/drm/i915/intel_initial_modeset.c |  254 ++++++++++++++++++++++++--
+ 1 files changed, 239 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_initial_modeset.c b/drivers/gpu/drm/i915/intel_initial_modeset.c
+index a90e61a..0ab84d4 100644
+--- a/drivers/gpu/drm/i915/intel_initial_modeset.c
++++ b/drivers/gpu/drm/i915/intel_initial_modeset.c
+@@ -41,6 +41,194 @@
+ #include "intel_drv.h"
+ #include "i915_drv.h"
+ 
++static bool use_connector(struct drm_connector *connector)
++{
++	if (connector->force == DRM_FORCE_OFF)
++		return false;
++
++	connector->status = connector->funcs->detect(connector, true);
++	return (connector->status == connector_status_connected);
++}
++
++static void attach_crtc(struct drm_device *dev, struct drm_encoder *encoder)
++{
++	struct drm_crtc *possible_crtc;
++
++	drm_for_each_crtc(possible_crtc, dev) {
++		if (!(encoder->possible_crtcs & drm_crtc_mask(possible_crtc)))
++			continue;
++		if (possible_crtc->state->enable)
++			continue;
++		encoder->crtc = possible_crtc;
++		break;
++	}
++}
++
++static struct drm_encoder *get_encoder(struct drm_device *dev,
++				       struct drm_connector *connector)
++{
++	const struct drm_connector_helper_funcs *connector_funcs;
++	struct drm_encoder *encoder;
++
++	connector_funcs = connector->helper_private;
++	encoder = connector_funcs->best_encoder(connector);
++	if (!encoder) {
++		DRM_DEBUG_KMS("connector %s has no encoder\n",
++			      connector->name);
++		return NULL;
++	}
++
++	if (!encoder->crtc) {
++		attach_crtc(dev, encoder);
++		if (!encoder->crtc)
++			return NULL;
++	}
++
++	return encoder;
++}
++
++static struct drm_display_mode *get_modeline(struct drm_i915_private *dev_priv,
++					     struct drm_connector *connector,
++					     int width, int height)
++{
++	struct drm_display_mode *mode = NULL;
++	bool found = false;
++
++	/*
++	 * fill_modes() takes a bit of time but is necessary.
++	 * It is reading the EDID (or loading the EDID firmware blob
++	 * and building the connector mode list. The time can be
++	 * minimized by using a small EDID blob built into the kernel.
++	 */
++
++	connector->funcs->fill_modes(connector, width, height);
++
++	if (!mode) {
++		list_for_each_entry(mode, &connector->modes, head) {
++			if (mode->hdisplay > width ||
++			    mode->vdisplay > height)
++				continue;
++			if (mode->type & DRM_MODE_TYPE_PREFERRED) {
++				found = true;
++				break;
++			}
++		}
++	}
++	if (!found) {
++		DRM_ERROR("Failed to find a valid mode.\n");
++		mode = NULL;
++	}
++
++	return mode;
++}
++
++static int update_crtc_state(struct drm_atomic_state *state,
++			     struct drm_display_mode *mode,
++			     struct drm_crtc *crtc)
++{
++	struct drm_crtc_state *crtc_state;
++	int ret;
++
++	crtc_state = drm_atomic_get_crtc_state(state, crtc);
++	if (IS_ERR(crtc_state))
++		return PTR_ERR(crtc_state);
++
++	ret = drm_atomic_set_mode_for_crtc(crtc_state, mode);
++	if (ret) {
++		crtc_state->active = false;
++		return ret;
++	}
++
++	crtc_state->active = true;
++	return 0;
++}
++
++static int update_connector_state(struct drm_atomic_state *state,
++				  struct drm_connector *connector,
++				  struct drm_crtc *crtc)
++{
++	struct drm_connector_state *conn_state;
++	int ret;
++
++	conn_state = drm_atomic_get_connector_state(state, connector);
++	if (IS_ERR(conn_state)) {
++		DRM_DEBUG_KMS("failed to get connector %s state\n",
++			      connector->name);
++		return PTR_ERR(conn_state);
++	}
++
++	ret = drm_atomic_set_crtc_for_connector(conn_state, crtc);
++	if (ret) {
++		DRM_DEBUG_KMS("failed to set crtc for connector\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++static int update_primary_plane_state(struct drm_atomic_state *state,
++				      struct drm_crtc *crtc,
++				      struct drm_display_mode *mode,
++				      struct drm_framebuffer *fb)
++{
++	int hdisplay, vdisplay;
++	struct drm_plane_state *primary_state;
++	int ret;
++
++	primary_state = drm_atomic_get_plane_state(state, crtc->primary);
++	ret = drm_atomic_set_crtc_for_plane(primary_state, crtc);
++	if (ret)
++		return ret;
++	drm_crtc_get_hv_timing(mode, &hdisplay, &vdisplay);
++	drm_atomic_set_fb_for_plane(primary_state, fb);
++	primary_state->crtc_x = 0;
++	primary_state->crtc_y = 0;
++	primary_state->crtc_w = hdisplay;
++	primary_state->crtc_h = vdisplay;
++	primary_state->src_x = 0 << 16;
++	primary_state->src_y = 0 << 16;
++	primary_state->src_w = hdisplay << 16;
++	primary_state->src_h = vdisplay << 16;
++
++	return 0;
++}
++
++static int update_atomic_state(struct drm_device *dev,
++			       struct drm_atomic_state *state,
++			       struct drm_connector *connector,
++			       struct drm_encoder *encoder)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_display_mode *mode;
++	struct drm_framebuffer *fb = NULL;
++	struct drm_crtc *crtc = encoder->crtc;
++	int ret;
++
++	mode = get_modeline(dev_priv, connector,
++			    dev->mode_config.max_width,
++			    dev->mode_config.max_height);
++	if (!mode)
++		return -EINVAL;
++
++	ret = update_crtc_state(state, mode, crtc);
++	if (ret)
++		return ret;
++
++	/* attach connector to atomic state */
++	ret = update_connector_state(state, connector, crtc);
++	if (ret)
++		return ret;
++
++	/* Set up primary plane if a framebuffer is allocated */
++	if (fb) {
++		ret = update_primary_plane_state(state, crtc, mode, fb);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ 
+ static int disable_planes(struct drm_device *dev,
+ 			  struct drm_atomic_state *state)
+@@ -82,6 +270,7 @@ static void modeset_config_fn(struct work_struct *work)
+ 	struct drm_i915_private *dev_priv =
+ 		container_of(work, typeof(*dev_priv), initial_modeset_work);
+ 	struct drm_device *dev = dev_priv->dev;
++	struct drm_connector *connector;
+ 	struct drm_atomic_state *state;
+ 	struct drm_modeset_acquire_ctx ctx;
+ 	struct drm_plane *plane;
+@@ -95,32 +284,67 @@ static void modeset_config_fn(struct work_struct *work)
+ 	state->acquire_ctx = &ctx;
+ 	drm_modeset_lock_all_ctx(dev, &ctx);
+ 
++retry:
++	ret = disable_planes(dev, state);
++	if (ret == -EDEADLK)
++		goto backoff;
++
++	if (ret)
++		goto fail;
++
++	/*
++	 * For each connector that we want to set up, update the atomic
++	 * state to include the connector and crtc mode.
++	 */
++	mutex_lock(&dev->mode_config.mutex);
++	drm_for_each_connector(connector, dev) {
++		struct drm_encoder *encoder;
++
++		if (use_connector(connector)) {
++			if (!(encoder = get_encoder(dev, connector)))
++				continue;
++
++			ret = update_atomic_state(dev, state,
++					    connector, encoder);
++			if (ret == -EDEADLK) {
++				mutex_unlock(&dev->mode_config.mutex);
++				goto backoff;
++			}
++			if (ret)
++				goto fail;
++		}
++	}
++
+ 	ret = drm_modeset_lock(&dev->mode_config.connection_mutex,
+ 			       state->acquire_ctx);
++	if (ret == -EDEADLK)
++		goto backoff;
+ 	if (ret)
++		goto fail;
++
++	ret = drm_atomic_commit(state);
++	mutex_unlock(&dev->mode_config.mutex);
++	if (!ret)
+ 		goto out;
++	if (ret != -EDEADLK)
++		goto fail;
+ 
+-retry:
+-	ret = disable_planes(dev, state);
+-	if (ret == 0)
+-		ret = drm_atomic_commit(state);
+-
+-	if (ret == -EDEADLK) {
+-		DRM_DEBUG_KMS("modeset commit deadlock, retry...\n");
+-		drm_modeset_backoff(&ctx);
+-		drm_atomic_state_clear(state);
+-		goto retry;
+-	}
++backoff:
++	DRM_DEBUG_KMS("modeset commit deadlock, retry...\n");
++	drm_modeset_backoff(&ctx);
++	drm_atomic_state_clear(state);
++	goto retry;
++
++fail:
++	drm_atomic_state_free(state);
+ 
+ out:
+-	if (ret)
+-		drm_atomic_state_free(state);
+-	else
++	if (!ret) {
+ 		drm_for_each_plane(plane, dev) {
+ 			if (plane->old_fb)
+ 				drm_framebuffer_unreference(plane->old_fb);
+ 		}
+-
++	}
+ 	drm_modeset_drop_locks(&ctx);
+ 	drm_modeset_acquire_fini(&ctx);
+ }
+-- 
+1.7.5.4
+

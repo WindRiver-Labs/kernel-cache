@@ -1,0 +1,272 @@
+From 783651226d74a1b1a57aa1f0db278d8819830f75 Mon Sep 17 00:00:00 2001
+From: Dave Gordon <david.s.gordon@intel.com>
+Date: Fri, 8 Apr 2016 13:53:21 -0700
+Subject: [PATCH 1367/2508] drm/i915/preempt: scheduler logic for landing
+ preemptive requests
+
+commit 9f18882ac90b81650d1a0a98c433927c5642f39e from
+https://github.com/01org/linux-apollolake-i
+
+This patch adds the GEM & scheduler logic for detection and first-stage
+processing of completed preemption requests. Similar to regular batches,
+they deposit their sequence number in the hardware status page when
+starting and again when finished, but using different locations so that
+information pertaining to a preempted batch is not overwritten. Also,
+the in-progress flag is not by the GPU cleared at the end of the batch;
+instead driver software is responsible for clearing this once the
+request completion has been noticed.
+
+Actually-preemptive requests are still disabled via a module parameter
+at this early stage, as the rest of the logic to deal with the
+consequences of preemption isn't in place yet.
+
+v2: Re-worked to simplify 'pre-emption in progress' logic.
+
+For: VIZ-2021
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c         |   62 +++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_scheduler.c   |   74 +++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/i915_scheduler.h   |    3 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    1 +
+ 4 files changed, 119 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index d448c7f..aad8b9a 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2569,6 +2569,14 @@ i915_gem_init_seqno(struct drm_device *dev, u32 seqno)
+ 		engine->last_irq_seqno = 0;
+ 	}
+ 
++	/* Also reset sw batch tracking state */
++	for_each_engine(engine, dev_priv) {
++		intel_write_status_page(engine, I915_BATCH_DONE_SEQNO, 0);
++		intel_write_status_page(engine, I915_BATCH_ACTIVE_SEQNO, 0);
++		intel_write_status_page(engine, I915_PREEMPTIVE_DONE_SEQNO, 0);
++		intel_write_status_page(engine, I915_PREEMPTIVE_ACTIVE_SEQNO, 0);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -2921,7 +2929,10 @@ void i915_gem_request_notify(struct intel_engine_cs *engine, bool fence_locked)
+ 	 */
+ 	seqno = engine->get_seqno(engine, false);
+ 	trace_i915_gem_request_notify(engine, seqno);
+-	if (seqno == engine->last_irq_seqno)
++
++	/* Is there anything new to process? */
++	if ((seqno == engine->last_irq_seqno) &&
++	    !i915_scheduler_is_engine_preempting(engine))
+ 		return;
+ 
+ 	if (!fence_locked)
+@@ -2950,7 +2961,7 @@ void i915_gem_request_notify(struct intel_engine_cs *engine, bool fence_locked)
+ 		 * and call scheduler_clean() while the scheduler
+ 		 * thinks it is still active.
+ 		 */
+-		if (i915_scheduler_notify_request(req))
++		if (i915_scheduler_notify_request(req, false))
+ 			wake_sched = true;
+ 
+ 		if (!req->cancelled) {
+@@ -2967,6 +2978,53 @@ void i915_gem_request_notify(struct intel_engine_cs *engine, bool fence_locked)
+ 		list_add_tail(&req->unsignal_link, &engine->fence_unsignal_list);
+ 	}
+ 
++	if (i915_scheduler_is_engine_preempting(engine)) {
++		u32 preempt_start, preempt_done;
++
++		preempt_start = intel_read_status_page(engine,
++						I915_PREEMPTIVE_ACTIVE_SEQNO);
++		preempt_done = intel_read_status_page(engine,
++						I915_PREEMPTIVE_DONE_SEQNO);
++
++		/*
++		 * A preemption request leaves both ACTIVE and DONE set to the
++		 * same seqno.  If we find ACTIVE set but DONE is different,
++		 * the preemption has started but not yet completed, so leave
++		 * it until next time. After successfully processing a
++		 * preemption request, we clear ACTIVE below to ensure we
++		 * don't see it again.
++		 */
++		if (preempt_start && preempt_done == preempt_start) {
++			bool sched_ack = false;
++
++			list_for_each_entry_safe(req, req_next, &engine->fence_signal_list, signal_link) {
++				if (req->seqno == preempt_done) {
++					/*
++					 * De-list and notify the scheduler,
++					 * but don't signal yet
++					 */
++					list_del_init(&req->signal_link);
++					sched_ack = i915_scheduler_notify_request(req, true);
++					break;
++				}
++			}
++
++			WARN_ON(!sched_ack);
++			wake_sched = true;
++
++			/*
++			 * Capture BATCH ACTIVE to determine whether a batch
++			 * was in progress when preempted
++			 */
++			engine->last_batch_start = intel_read_status_page(engine,
++							I915_BATCH_ACTIVE_SEQNO);
++
++			/* Acknowledge/clear preemption-active flag */
++			intel_write_status_page(req->engine,
++					     I915_PREEMPTIVE_ACTIVE_SEQNO, 0);
++		}
++	}
++
+ 	if (!fence_locked)
+ 		spin_unlock_irqrestore(&engine->fence_lock, flags);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.c b/drivers/gpu/drm/i915/i915_scheduler.c
+index 15ac69b..49ca327 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.c
++++ b/drivers/gpu/drm/i915/i915_scheduler.c
+@@ -966,41 +966,73 @@ int i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe)
+  * then i915_scheduler_wakeup() is called so the scheduler can do further
+  * processing (submit more work) at the end.
+  */
+-bool i915_scheduler_notify_request(struct drm_i915_gem_request *req)
++bool i915_scheduler_notify_request(struct drm_i915_gem_request *req,
++				   bool preempt)
+ {
+-	struct drm_i915_private *dev_priv = to_i915(req->engine->dev);
++	struct drm_i915_private *dev_priv = req->i915;
+ 	struct i915_scheduler *scheduler = dev_priv->scheduler;
+ 	struct i915_scheduler_queue_entry *node = req->scheduler_qe;
++	uint32_t engine_id = req->engine->id;
+ 	unsigned long flags;
++	bool result;
+ 
+ 	trace_i915_scheduler_landing(req);
+ 
+-	if (!node)
+-		return false;
+-
+ 	spin_lock_irqsave(&scheduler->lock, flags);
+ 
+-	WARN_ON(!I915_SQS_IS_FLYING(node));
+-
+-	/* Node was in flight so mark it as complete. */
+-	if (req->cancelled) {
++	if (!node) {
++		/* Untracked request, presumably engine init */
++		WARN_ON(preempt);
++		WARN_ON(!(req->scheduler_flags & I915_REQ_SF_UNTRACKED));
++		scheduler->stats[engine_id].non_batch_done++;
++		result = false;
++	} else if (WARN(!I915_SQS_IS_FLYING(node), "Node not flying: %d:%d -> %s! [preempt = %d]\n",
++			req->uniq, req->seqno,
++			i915_scheduler_queue_status_str(node->status),
++			preempt)) {
++		/* This shouldn't happen */
++		result = false;
++	} else if (req->cancelled) {
+ 		/* If a preemption was in progress, it won't complete now. */
++		/* Need to clear I915_PREEMPTIVE_ACTIVE_SEQNO??? */
+ 		if (node->status == I915_SQS_OVERTAKING)
+-			scheduler->flags[req->engine->id] &=
++			scheduler->flags[engine_id] &=
+ 				    ~(I915_SF_PREEMPTING | I915_SF_PREEMPTED);
+ 
+ 		node->status = I915_SQS_DEAD;
+-		scheduler->stats[req->engine->id].kill_flying++;
+-	} else {
++		scheduler->stats[engine_id].kill_flying++;
++		result = true;
++	} else if (node->status == I915_SQS_FLYING) {
++		WARN(preempt, "Got flying node with preemption!\n");
++
++		/* Node was in flight so mark it as complete. */
+ 		node->status = I915_SQS_COMPLETE;
+-		scheduler->stats[req->engine->id].completed++;
++		scheduler->stats[engine_id].completed++;
++		result = true;
++	} else if (node->status == I915_SQS_OVERTAKING) {
++		WARN(!preempt, "Got overtaking node without preemption!\n");
++
++		/* Preempting request has completed & becomes preempted */
++		node->status = I915_SQS_PREEMPTED;
++		trace_i915_scheduler_unfly(node->params.engine, node);
++
++		/* Scheduler is now in post-preemption state */
++		scheduler->flags[engine_id] |= I915_SF_PREEMPTED;
++		scheduler->stats[engine_id].preempts_completed++;
++		result = true;
++	} else {
++		WARN(true, "Unknown node state: %s [%s]!\n",
++		     i915_scheduler_queue_status_str(node->status),
++		     preempt ? "preempting" : "regular");
++		result = false;
+ 	}
+ 
+-	trace_i915_scheduler_node_state_change(req->engine, node);
++	if (result)
++		trace_i915_scheduler_node_state_change(req->engine, node);
+ 
+ 	spin_unlock_irqrestore(&scheduler->lock, flags);
+ 
+-	return true;
++	return result;
+ }
+ 
+ static int i915_scheduler_remove_dependent(struct i915_scheduler *scheduler,
+@@ -1433,11 +1465,17 @@ static int i915_scheduler_dump_locked(struct intel_engine_cs *engine,
+ 	}
+ 
+ 	if (scheduler->flags[engine->id] & I915_SF_DUMP_SEQNO) {
+-		uint32_t seqno;
++		uint32_t seqno, b_active, b_done, p_active, p_done;
+ 
+-		seqno = engine->get_seqno(engine, true);
++		seqno    = engine->get_seqno(engine, true);
++		p_done   = intel_read_status_page(engine, I915_PREEMPTIVE_DONE_SEQNO);
++		p_active = intel_read_status_page(engine, I915_PREEMPTIVE_ACTIVE_SEQNO);
++		b_done   = intel_read_status_page(engine, I915_BATCH_DONE_SEQNO);
++		b_active = intel_read_status_page(engine, I915_BATCH_ACTIVE_SEQNO);
+ 
+-		DRM_DEBUG_DRIVER("<%s> Seqno = %d\n", engine->name, seqno);
++		DRM_DEBUG_DRIVER("<%s> Seqno = %08x, BD = %08x, BA = %08x, PD = %08x, PA = %08x\n",
++				 engine->name, seqno, b_done, b_active,
++				 p_done, p_active);
+ 	}
+ 
+ 	if (scheduler->flags[engine->id] & I915_SF_DUMP_DETAILS) {
+diff --git a/drivers/gpu/drm/i915/i915_scheduler.h b/drivers/gpu/drm/i915/i915_scheduler.h
+index ceef0bd..5d9549c 100644
+--- a/drivers/gpu/drm/i915/i915_scheduler.h
++++ b/drivers/gpu/drm/i915/i915_scheduler.h
+@@ -183,7 +183,8 @@ void i915_scheduler_closefile(struct drm_device *dev, struct drm_file *file);
+ void i915_scheduler_reset_cleanup(struct intel_engine_cs *engine);
+ void i915_scheduler_clean_node(struct i915_scheduler_queue_entry *node);
+ int i915_scheduler_queue_execbuffer(struct i915_scheduler_queue_entry *qe);
+-bool i915_scheduler_notify_request(struct drm_i915_gem_request *req);
++bool i915_scheduler_notify_request(struct drm_i915_gem_request *req,
++				   bool preempt);
+ void i915_scheduler_wakeup(struct drm_device *dev);
+ bool i915_scheduler_is_engine_flying(struct intel_engine_cs *engine);
+ bool i915_scheduler_is_engine_preempting(struct intel_engine_cs *engine);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 52cfd90..fd82a28 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -377,6 +377,7 @@ struct  intel_engine_cs {
+ 	struct list_head fence_signal_list;
+ 	struct list_head fence_unsignal_list;
+ 	uint32_t last_irq_seqno;
++	uint32_t last_batch_start;
+ };
+ 
+ static inline bool
+-- 
+1.7.5.4
+

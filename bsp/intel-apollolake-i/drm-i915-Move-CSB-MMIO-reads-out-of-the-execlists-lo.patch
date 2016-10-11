@@ -1,0 +1,188 @@
+From 86e0ae51b515a4c57d44df34ffdf4ea106b99eb7 Mon Sep 17 00:00:00 2001
+From: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date: Thu, 17 Mar 2016 12:59:46 +0000
+Subject: [PATCH 1171/2508] drm/i915: Move CSB MMIO reads out of the execlists
+ lock
+
+commit 26720ab97feac7153a7b5c3c79cf5d53a8531126 upstream
+
+By reading the CSB (slow MMIO accesses) into a temporary local
+buffer we can decrease the duration of holding the execlist
+lock.
+
+Main advantage is that during heavy batch buffer submission we
+reduce the execlist lock contention, which should decrease the
+latency and CPU usage between the submitting userspace process
+and interrupt handling.
+
+Downside is that we need to grab and relase the forcewake twice,
+but as the below numbers will show this is completely hidden
+by the primary gains.
+
+Testing with "gem_latency -n 100" (submit batch buffers with a
+hundred nops each) shows more than doubling of the throughput
+and more than halving of the dispatch latency, overall latency
+and CPU time spend in the submitting process.
+
+Submitting empty batches ("gem_latency -n 0") does not seem
+significantly affected by this change with throughput and CPU
+time improving by half a percent, and overall latency worsening
+by the same amount.
+
+Above tests were done in a hundred runs on a big core Broadwell.
+
+v2:
+  * Overflow protection to local CSB buffer.
+  * Use closer dev_priv in execlists_submit_requests. (Chris Wilson)
+
+v3: Rebase.
+
+v4: Added commend about irq needed to be disabled in
+    execlists_submit_request. (Chris Wilson)
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Chris Wilsno <chris@chris-wilson.co.uk>
+Link: http://patchwork.freedesktop.org/patch/msgid/1458219586-20452-1-git-send-email-tvrtko.ursulin@linux.intel.com
+---
+ drivers/gpu/drm/i915/intel_lrc.c |   79 +++++++++++++++++++-------------------
+ 1 files changed, 40 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index df98112..e75bfcb 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -416,15 +416,25 @@ static void execlists_update_context(struct drm_i915_gem_request *rq)
+ static void execlists_submit_requests(struct drm_i915_gem_request *rq0,
+ 				      struct drm_i915_gem_request *rq1)
+ {
++	struct drm_i915_private *dev_priv = rq0->i915;
++
++	/* BUG_ON(!irqs_disabled());  */
++
+ 	execlists_update_context(rq0);
+ 
+ 	if (rq1)
+ 		execlists_update_context(rq1);
+ 
++	spin_lock(&dev_priv->uncore.lock);
++	intel_uncore_forcewake_get__locked(dev_priv, FORCEWAKE_ALL);
++
+ 	execlists_elsp_write(rq0, rq1);
++
++	intel_uncore_forcewake_put__locked(dev_priv, FORCEWAKE_ALL);
++	spin_unlock(&dev_priv->uncore.lock);
+ }
+ 
+-static void execlists_context_unqueue__locked(struct intel_engine_cs *engine)
++static void execlists_context_unqueue(struct intel_engine_cs *engine)
+ {
+ 	struct drm_i915_gem_request *req0 = NULL, *req1 = NULL;
+ 	struct drm_i915_gem_request *cursor, *tmp;
+@@ -478,19 +488,6 @@ static void execlists_context_unqueue__locked(struct intel_engine_cs *engine)
+ 	execlists_submit_requests(req0, req1);
+ }
+ 
+-static void execlists_context_unqueue(struct intel_engine_cs *engine)
+-{
+-	struct drm_i915_private *dev_priv = engine->dev->dev_private;
+-
+-	spin_lock(&dev_priv->uncore.lock);
+-	intel_uncore_forcewake_get__locked(dev_priv, FORCEWAKE_ALL);
+-
+-	execlists_context_unqueue__locked(engine);
+-
+-	intel_uncore_forcewake_put__locked(dev_priv, FORCEWAKE_ALL);
+-	spin_unlock(&dev_priv->uncore.lock);
+-}
+-
+ static unsigned int
+ execlists_check_remove_request(struct intel_engine_cs *engine, u32 request_id)
+ {
+@@ -551,12 +548,10 @@ void intel_lrc_irq_handler(struct intel_engine_cs *engine)
+ 	struct drm_i915_private *dev_priv = engine->dev->dev_private;
+ 	u32 status_pointer;
+ 	unsigned int read_pointer, write_pointer;
+-	u32 status = 0;
+-	u32 status_id;
++	u32 csb[GEN8_CSB_ENTRIES][2];
++	unsigned int csb_read = 0, i;
+ 	unsigned int submit_contexts = 0;
+ 
+-	spin_lock(&engine->execlist_lock);
+-
+ 	spin_lock(&dev_priv->uncore.lock);
+ 	intel_uncore_forcewake_get__locked(dev_priv, FORCEWAKE_ALL);
+ 
+@@ -568,41 +563,47 @@ void intel_lrc_irq_handler(struct intel_engine_cs *engine)
+ 		write_pointer += GEN8_CSB_ENTRIES;
+ 
+ 	while (read_pointer < write_pointer) {
+-		status = get_context_status(engine, ++read_pointer,
+-				            &status_id);
++		if (WARN_ON_ONCE(csb_read == GEN8_CSB_ENTRIES))
++			break;
++		csb[csb_read][0] = get_context_status(engine, ++read_pointer,
++						      &csb[csb_read][1]);
++		csb_read++;
++	}
+ 
+-		if (unlikely(status & GEN8_CTX_STATUS_PREEMPTED)) {
+-			if (status & GEN8_CTX_STATUS_LITE_RESTORE) {
+-				if (execlists_check_remove_request(engine, status_id))
++	engine->next_context_status_buffer = write_pointer % GEN8_CSB_ENTRIES;
++
++	/* Update the read pointer to the old write pointer. Manual ringbuffer
++	 * management ftw </sarcasm> */
++	I915_WRITE_FW(RING_CONTEXT_STATUS_PTR(engine),
++		      _MASKED_FIELD(GEN8_CSB_READ_PTR_MASK,
++				    engine->next_context_status_buffer << 8));
++
++	intel_uncore_forcewake_put__locked(dev_priv, FORCEWAKE_ALL);
++	spin_unlock(&dev_priv->uncore.lock);
++
++	spin_lock(&engine->execlist_lock);
++
++	for (i = 0; i < csb_read; i++) {
++		if (unlikely(csb[i][0] & GEN8_CTX_STATUS_PREEMPTED)) {
++			if (csb[i][0] & GEN8_CTX_STATUS_LITE_RESTORE) {
++				if (execlists_check_remove_request(engine, csb[i][1]))
+ 					WARN(1, "Lite Restored request removed from queue\n");
+ 			} else
+ 				WARN(1, "Preemption without Lite Restore\n");
+ 		}
+ 
+-		if (status & (GEN8_CTX_STATUS_ACTIVE_IDLE |
++		if (csb[i][0] & (GEN8_CTX_STATUS_ACTIVE_IDLE |
+ 		    GEN8_CTX_STATUS_ELEMENT_SWITCH))
+ 			submit_contexts +=
+-				execlists_check_remove_request(engine,
+-						               status_id);
++				execlists_check_remove_request(engine, csb[i][1]);
+ 	}
+ 
+ 	if (submit_contexts) {
+ 		if (!engine->disable_lite_restore_wa ||
+-		    (status & GEN8_CTX_STATUS_ACTIVE_IDLE))
+-			execlists_context_unqueue__locked(engine);
++		    (csb[i][0] & GEN8_CTX_STATUS_ACTIVE_IDLE))
++			execlists_context_unqueue(engine);
+ 	}
+ 
+-	engine->next_context_status_buffer = write_pointer % GEN8_CSB_ENTRIES;
+-
+-	/* Update the read pointer to the old write pointer. Manual ringbuffer
+-	 * management ftw </sarcasm> */
+-	I915_WRITE_FW(RING_CONTEXT_STATUS_PTR(engine),
+-		      _MASKED_FIELD(GEN8_CSB_READ_PTR_MASK,
+-				    engine->next_context_status_buffer << 8));
+-
+-	intel_uncore_forcewake_put__locked(dev_priv, FORCEWAKE_ALL);
+-	spin_unlock(&dev_priv->uncore.lock);
+-
+ 	spin_unlock(&engine->execlist_lock);
+ 
+ 	if (unlikely(submit_contexts > 2))
+-- 
+1.7.5.4
+
