@@ -1,0 +1,233 @@
+From bc92e897bd0f149aec1f88728f3597abfec3c103 Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Tue, 19 Jan 2016 09:51:55 -0500
+Subject: [PATCH 836/933] Fix: check reference counts for overflow
+
+Linux kernel CVE-2016-0728 is a use-after-free based on overflow of the
+reference counting mechanism.
+
+Implement a kref wrapper in lttng that validates overflows, and use it
+instead of kref_get(). Also check explicitly for overflows on file
+fcount counters.
+
+This should not be an issue in practice in lttng-modules because the ABI
+is only exposed to root, but let's err on the safe side.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+---
+ .../lttng/lib/ringbuffer/ring_buffer_frontend.c    |  6 ++-
+ drivers/staging/lttng/lttng-abi.c                  | 22 +++++++++--
+ drivers/staging/lttng/lttng-events.c               |  7 +++-
+ drivers/staging/lttng/probes/lttng-kretprobes.c    |  4 +-
+ drivers/staging/lttng/wrapper/kref.h               | 46 ++++++++++++++++++++++
+ 5 files changed, 77 insertions(+), 8 deletions(-)
+ create mode 100644 drivers/staging/lttng/wrapper/kref.h
+
+diff --git a/drivers/staging/lttng/lib/ringbuffer/ring_buffer_frontend.c b/drivers/staging/lttng/lib/ringbuffer/ring_buffer_frontend.c
+index c4b797c..dbe52c1 100644
+--- a/drivers/staging/lttng/lib/ringbuffer/ring_buffer_frontend.c
++++ b/drivers/staging/lttng/lib/ringbuffer/ring_buffer_frontend.c
+@@ -61,6 +61,7 @@
+ #include "../../wrapper/ringbuffer/iterator.h"
+ #include "../../wrapper/ringbuffer/nohz.h"
+ #include "../../wrapper/atomic.h"
++#include "../../wrapper/kref.h"
+ #include "../../wrapper/percpu-defs.h"
+ 
+ /*
+@@ -793,7 +794,10 @@ int lib_ring_buffer_open_read(struct lib_ring_buffer *buf)
+ 
+ 	if (!atomic_long_add_unless(&buf->active_readers, 1, 1))
+ 		return -EBUSY;
+-	kref_get(&chan->ref);
++	if (!lttng_kref_get(&chan->ref)) {
++		atomic_long_dec(&buf->active_readers);
++		return -EOVERFLOW;
++	}
+ 	lttng_smp_mb__after_atomic();
+ 	return 0;
+ }
+diff --git a/drivers/staging/lttng/lttng-abi.c b/drivers/staging/lttng/lttng-abi.c
+index b3de092..54988b7 100644
+--- a/drivers/staging/lttng/lttng-abi.c
++++ b/drivers/staging/lttng/lttng-abi.c
+@@ -50,6 +50,7 @@
+ #include "wrapper/ringbuffer/frontend.h"
+ #include "wrapper/poll.h"
+ #include "wrapper/file.h"
++#include "wrapper/kref.h"
+ #include "lttng-abi.h"
+ #include "lttng-abi-old.h"
+ #include "lttng-events.h"
+@@ -427,6 +428,10 @@ int lttng_abi_create_channel(struct file *session_file,
+ 		transport_name = "<unknown>";
+ 		break;
+ 	}
++	if (atomic_long_add_unless(&session_file->f_count,
++		1, INT_MAX) == INT_MAX) {
++		goto refcount_error;
++	}
+ 	/*
+ 	 * We tolerate no failure path after channel creation. It will stay
+ 	 * invariant for the rest of the session.
+@@ -444,11 +449,12 @@ int lttng_abi_create_channel(struct file *session_file,
+ 	chan->file = chan_file;
+ 	chan_file->private_data = chan;
+ 	fd_install(chan_fd, chan_file);
+-	atomic_long_inc(&session_file->f_count);
+ 
+ 	return chan_fd;
+ 
+ chan_error:
++	atomic_long_dec(&session_file->f_count);
++refcount_error:
+ 	fput(chan_file);
+ file_error:
+ 	put_unused_fd(chan_fd);
+@@ -951,17 +957,20 @@ int lttng_abi_open_metadata_stream(struct file *channel_file)
+ 		goto notransport;
+ 	}
+ 
++	if (!lttng_kref_get(&session->metadata_cache->refcount))
++		goto kref_error;
+ 	ret = lttng_abi_create_stream_fd(channel_file, stream_priv,
+ 			&lttng_metadata_ring_buffer_file_operations);
+ 	if (ret < 0)
+ 		goto fd_error;
+ 
+-	kref_get(&session->metadata_cache->refcount);
+ 	list_add(&metadata_stream->list,
+ 		&session->metadata_cache->metadata_stream);
+ 	return ret;
+ 
+ fd_error:
++	kref_put(&session->metadata_cache->refcount, metadata_cache_destroy);
++kref_error:
+ 	module_put(metadata_stream->transport->owner);
+ notransport:
+ 	kfree(metadata_stream);
+@@ -1005,6 +1014,11 @@ int lttng_abi_create_event(struct file *channel_file,
+ 		ret = PTR_ERR(event_file);
+ 		goto file_error;
+ 	}
++	/* The event holds a reference on the channel */
++	if (atomic_long_add_unless(&channel_file->f_count,
++		1, INT_MAX) == INT_MAX) {
++		goto refcount_error;
++	}
+ 	if (event_param->instrumentation == LTTNG_KERNEL_TRACEPOINT
+ 			|| event_param->instrumentation == LTTNG_KERNEL_SYSCALL) {
+ 		struct lttng_enabler *enabler;
+@@ -1036,11 +1050,11 @@ int lttng_abi_create_event(struct file *channel_file,
+ 	}
+ 	event_file->private_data = priv;
+ 	fd_install(event_fd, event_file);
+-	/* The event holds a reference on the channel */
+-	atomic_long_inc(&channel_file->f_count);
+ 	return event_fd;
+ 
+ event_error:
++	atomic_long_dec(&channel_file->f_count);
++refcount_error:
+ 	fput(event_file);
+ file_error:
+ 	put_unused_fd(event_fd);
+diff --git a/drivers/staging/lttng/lttng-events.c b/drivers/staging/lttng/lttng-events.c
+index 1f34fbb..f0f5d0f 100644
+--- a/drivers/staging/lttng/lttng-events.c
++++ b/drivers/staging/lttng/lttng-events.c
+@@ -1085,17 +1085,22 @@ int lttng_session_list_tracker_pids(struct lttng_session *session)
+ 		ret = PTR_ERR(tracker_pids_list_file);
+ 		goto file_error;
+ 	}
++	if (atomic_long_add_unless(&session->file->f_count,
++		1, INT_MAX) == INT_MAX) {
++		goto refcount_error;
++	}
+ 	ret = lttng_tracker_pids_list_fops.open(NULL, tracker_pids_list_file);
+ 	if (ret < 0)
+ 		goto open_error;
+ 	m = tracker_pids_list_file->private_data;
+ 	m->private = session;
+ 	fd_install(file_fd, tracker_pids_list_file);
+-	atomic_long_inc(&session->file->f_count);
+ 
+ 	return file_fd;
+ 
+ open_error:
++	atomic_long_dec(&session->file->f_count);
++refcount_error:
+ 	fput(tracker_pids_list_file);
+ file_error:
+ 	put_unused_fd(file_fd);
+diff --git a/drivers/staging/lttng/probes/lttng-kretprobes.c b/drivers/staging/lttng/probes/lttng-kretprobes.c
+index 73f2656..f4911f9 100644
+--- a/drivers/staging/lttng/probes/lttng-kretprobes.c
++++ b/drivers/staging/lttng/probes/lttng-kretprobes.c
+@@ -224,9 +224,9 @@ int lttng_kretprobes_register(const char *name,
+ 	 * unregistered. Same for memory allocation.
+ 	 */
+ 	kref_init(&lttng_krp->kref_alloc);
+-	kref_get(&lttng_krp->kref_alloc);	/* inc refcount to 2 */
++	kref_get(&lttng_krp->kref_alloc);	/* inc refcount to 2, no overflow. */
+ 	kref_init(&lttng_krp->kref_register);
+-	kref_get(&lttng_krp->kref_register);	/* inc refcount to 2 */
++	kref_get(&lttng_krp->kref_register);	/* inc refcount to 2, no overflow. */
+ 
+ 	/*
+ 	 * Ensure the memory we just allocated don't trigger page faults.
+diff --git a/drivers/staging/lttng/wrapper/kref.h b/drivers/staging/lttng/wrapper/kref.h
+new file mode 100644
+index 0000000..eedefbf
+--- /dev/null
++++ b/drivers/staging/lttng/wrapper/kref.h
+@@ -0,0 +1,46 @@
++#ifndef _LTTNG_WRAPPER_KREF_H
++#define _LTTNG_WRAPPER_KREF_H
++
++/*
++ * wrapper/kref.h
++ *
++ * wrapper around linux/kref.h.
++ *
++ * Copyright (C) 2016 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; only version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * This wrapper code is derived from Linux 3.19.2 include/linux/list.h
++ * and include/linux/rculist.h, hence the GPLv2 license applied to this
++ * file.
++ */
++
++#include <linux/kref.h>
++#include <linux/rculist.h>
++
++/*
++ * lttng_kref_get: get reference count, checking for overflow.
++ *
++ * Return 1 if reference is taken, 0 otherwise (overflow).
++ */
++static inline int lttng_kref_get(struct kref *kref)
++{
++	if (atomic_add_unless(&kref->refcount, 1, INT_MAX) != INT_MAX) {
++		return 1;
++	} else {
++		return 0;
++	}
++}
++
++#endif /* _LTTNG_WRAPPER_KREF_H */
+-- 
+2.0.2
+

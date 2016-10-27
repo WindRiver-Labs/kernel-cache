@@ -1,0 +1,1340 @@
+From 3c5b5c0ed3be6182c2a5f85c9867870096c18491 Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Sat, 14 May 2011 09:53:04 -0400
+Subject: [PATCH 075/933] Metadata generation (partial)
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+---
+ .../lttng/lib/ringbuffer/ring_buffer_frontend.c    |   1 +
+ drivers/staging/lttng/ltt-debugfs-abi.h            |   3 +
+ drivers/staging/lttng/ltt-events.c                 | 248 ++++++++++++++++++++-
+ drivers/staging/lttng/ltt-events.h                 |  75 +++++--
+ drivers/staging/lttng/ltt-probes.c                 |   5 +-
+ drivers/staging/lttng/ltt-ring-buffer-client.h     |  10 +
+ .../lttng/ltt-ring-buffer-metadata-client.h        |  14 +-
+ drivers/staging/lttng/ltt-tracer.h                 |  20 ++
+ drivers/staging/lttng/probes/lttng-events-reset.h  |   3 +
+ drivers/staging/lttng/probes/lttng-events.h        | 189 ++++------------
+ drivers/staging/lttng/probes/lttng-type-list.h     |  54 -----
+ drivers/staging/lttng/probes/lttng-types.c         | 173 +-------------
+ drivers/staging/lttng/probes/lttng-types.h         |  58 +----
+ 13 files changed, 402 insertions(+), 451 deletions(-)
+
+diff --git a/drivers/staging/lttng/lib/ringbuffer/ring_buffer_frontend.c b/drivers/staging/lttng/lib/ringbuffer/ring_buffer_frontend.c
+index 9a90997..5e633f4 100644
+--- a/drivers/staging/lttng/lib/ringbuffer/ring_buffer_frontend.c
++++ b/drivers/staging/lttng/lib/ringbuffer/ring_buffer_frontend.c
+@@ -1632,6 +1632,7 @@ int lib_ring_buffer_reserve_slow(struct lib_ring_buffer_ctx *ctx)
+ 	const struct lib_ring_buffer_config *config = chan->backend.config;
+ 	struct lib_ring_buffer *buf;
+ 	struct switch_offsets offsets;
++	int ret;
+ 
+ 	if (config->alloc == RING_BUFFER_ALLOC_PER_CPU)
+ 		buf = per_cpu_ptr(chan->backend.buf, ctx->cpu);
+diff --git a/drivers/staging/lttng/ltt-debugfs-abi.h b/drivers/staging/lttng/ltt-debugfs-abi.h
+index 3a2af56..2d02b44 100644
+--- a/drivers/staging/lttng/ltt-debugfs-abi.h
++++ b/drivers/staging/lttng/ltt-debugfs-abi.h
+@@ -32,6 +32,9 @@ struct lttng_event {
+ 	char name[];
+ };
+ 
++/* TODO: LTTNG_KERNEL_SESSION..... */
++/* TODO: ioctl LTTNG_KERNEL_TRACER_VERSION */
++
+ #define LTTNG_SESSION		_IO(0xF6, 0x40)
+ #define LTTNG_SESSION_START	_IO(0xF6, 0x41)
+ #define LTTNG_SESSION_STOP	_IO(0xF6, 0x42)
+diff --git a/drivers/staging/lttng/ltt-events.c b/drivers/staging/lttng/ltt-events.c
+index a5ca1ab..29ea9ba 100644
+--- a/drivers/staging/lttng/ltt-events.c
++++ b/drivers/staging/lttng/ltt-events.c
+@@ -11,15 +11,26 @@
+ #include <linux/mutex.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
++#include <linux/jiffies.h>
+ #include "wrapper/vmalloc.h"	/* for wrapper_vmalloc_sync_all() */
+ #include "ltt-events.h"
++#include "ltt-tracer.h"
+ 
+ static LIST_HEAD(sessions);
+ static LIST_HEAD(ltt_transport_list);
+ static DEFINE_MUTEX(sessions_mutex);
+ static struct kmem_cache *event_cache;
+ 
+-static void synchronize_trace(void)
++static
++int _ltt_event_metadata_statedump(struct ltt_session *session,
++				  struct ltt_channel *chan,
++				  struct ltt_event *event);
++static
++int _ltt_session_metadata_statedump(struct ltt_session *session);
++
++
++static
++void synchronize_trace(void)
+ {
+ 	synchronize_sched();
+ #ifdef CONFIG_PREEMPT_RT
+@@ -67,14 +78,34 @@ void ltt_session_destroy(struct ltt_session *session)
+ int ltt_session_start(struct ltt_session *session)
+ {
+ 	int ret = 0;
++	struct ltt_channel *chan;
+ 
+ 	mutex_lock(&sessions_mutex);
+ 	if (session->active) {
+ 		ret = -EBUSY;
+ 		goto end;
+ 	}
++
++	/*
++	 * Snapshot the number of events per channel to know the type of header
++	 * we need to use.
++	 */
++	list_for_each_entry(chan, &session->chan, list) {
++		if (chan->header_type)
++			continue;		/* don't change it if session stop/restart */
++		if (chan->free_event_id < 31)
++			chan->header_type = 1;	/* compact */
++		else
++			chan->header_type = 2;	/* large */
++	}
++
+ 	ACCESS_ONCE(session->active) = 1;
+ 	synchronize_trace();	/* Wait for in-flight events to complete */
++	ret = _ltt_session_metadata_statedump(session);
++	if (ret) {
++		ACCESS_ONCE(session->active) = 0;
++		synchronize_trace();	/* Wait for in-flight events to complete */
++	}
+ end:
+ 	mutex_unlock(&sessions_mutex);
+ 	return ret;
+@@ -138,6 +169,7 @@ struct ltt_channel *ltt_channel_create(struct ltt_session *session,
+ 			read_timer_interval);
+ 	if (!chan->chan)
+ 		goto create_error;
++	chan->id = session->free_chan_id++;
+ 	chan->ops = &transport->ops;
+ 	list_add(&chan->list, &session->chan);
+ 	mutex_unlock(&sessions_mutex);
+@@ -203,10 +235,16 @@ struct ltt_event *ltt_event_create(struct ltt_channel *chan, char *name,
+ 	default:
+ 		WARN_ON_ONCE(1);
+ 	}
++	ret = _ltt_event_metadata_statedump(chan->session, chan, event);
++	if (ret)
++		goto statedump_error;
+ 	list_add(&event->list, &chan->session->events);
+ 	mutex_unlock(&sessions_mutex);
+ 	return event;
+ 
++statedump_error:
++	WARN_ON_ONCE(tracepoint_probe_unregister(name, event_desc->probe_callback,
++						 event));
+ register_error:
+ 	kmem_cache_free(event_cache, event);
+ cache_error:
+@@ -247,6 +285,213 @@ void _ltt_event_destroy(struct ltt_event *event)
+ 	kmem_cache_free(event_cache, event);
+ }
+ 
++int lttng_metadata_printf(struct ltt_session *session,
++			  const char *fmt, ...)
++{
++	struct lib_ring_buffer_ctx ctx;
++	struct ltt_channel *chan = session->metadata;
++	char *str;
++	int ret = 0, waitret;
++	size_t len;
++	va_list ap;
++
++	WARN_ON_ONCE(!ACCESS_ONCE(session->active));
++
++	va_start(ap, fmt);
++	str = kvasprintf(GFP_KERNEL, fmt, ap);
++	va_end(ap);
++	if (!str)
++		return -ENOMEM;
++
++	len = strlen(str) + 1;
++	lib_ring_buffer_ctx_init(&ctx, chan->chan, NULL, len, sizeof(char), -1);
++	/*
++	 * We don't care about metadata buffer's records lost count, because we
++	 * always retry here. Report error if we need to bail out after timeout
++	 * or being interrupted.
++	 */
++	waitret = wait_event_interruptible_timeout(*chan->ops->get_reader_wait_queue(chan),
++		({
++			ret = chan->ops->event_reserve(&ctx);
++			ret != -ENOBUFS || !ret;
++		}),
++		msecs_to_jiffies(LTTNG_METADATA_TIMEOUT_MSEC));
++	if (waitret || ret) {
++		printk(KERN_WARNING "LTTng: Failure to write metadata to buffers (%s)\n",
++			waitret == -ERESTARTSYS ? "interrupted" :
++				(ret == -ENOBUFS ? "timeout" : "I/O error"));
++		if (waitret == -ERESTARTSYS)
++			ret = waitret;
++		goto end;
++	}
++	chan->ops->event_write(&ctx, str, len);
++	chan->ops->event_commit(&ctx);
++end:
++	kfree(str);
++	return ret;
++}
++
++static
++int _ltt_fields_metadata_statedump(struct ltt_session *session,
++				   struct ltt_event *event)
++{
++	const struct lttng_event_desc *desc = event->desc;
++	int ret = 0;
++	int i;
++
++	for (i = 0; i < desc->nr_fields; i++) {
++		const struct lttng_event_field *field = &desc->fields[i];
++
++		switch (field->type.atype) {
++		case atype_integer:
++			ret = lttng_metadata_printf(session,
++				"		integer { size = %u; align = %u; signed = %u;%s } %s;\n",
++				field->type.u.basic.integer.size,
++				field->type.u.basic.integer.alignment,
++				field->type.u.basic.integer.signedness,
++#ifdef __BIG_ENDIAN
++				field->type.u.basic.integer.reverse_byte_order ? " byte_order = le;" : "",
++#else
++				field->type.u.basic.integer.reverse_byte_order ? " byte_order = be;" : "",
++#endif
++				field->name);
++			break;
++		case atype_enum:
++			ret = lttng_metadata_printf(session,
++				"		%s %s;\n",
++				field->type.u.basic.enumeration.name,
++				field->name);
++			break;
++		case atype_array:
++			break;
++		case atype_sequence:
++			break;
++
++		case atype_string:
++			ret = lttng_metadata_printf(session,
++				"		string%s %s;\n",
++				field->type.u.basic.string.encoding == lttng_encode_ASCII ?
++					" { encoding = ASCII; }" : "",
++				field->name);
++			break;
++		default:
++			WARN_ON_ONCE(1);
++			return -EINVAL;
++		}
++	}
++	return ret;
++}
++
++static
++int _ltt_event_metadata_statedump(struct ltt_session *session,
++				  struct ltt_channel *chan,
++				  struct ltt_event *event)
++{
++	int ret = 0;
++
++	if (event->metadata_dumped || !ACCESS_ONCE(session->active))
++		return 0;
++	if (chan == session->metadata)
++		return 0;
++
++	ret = lttng_metadata_printf(session,
++		"event {\n"
++		"	name = %s;\n"
++		"	id = %u;\n"
++		"	stream_id = %u;\n"
++		"	event.fields := struct {\n",
++		event->desc->name,
++		event->id,
++		event->chan->id);
++	if (ret)
++		goto end;
++
++	ret = _ltt_fields_metadata_statedump(session, event);
++	if (ret)
++		goto end;
++
++	/*
++	 * LTTng space reservation can only reserve multiples of the
++	 * byte size.
++	 */
++	ret = lttng_metadata_printf(session,
++		"	} aligned(%u);\n"
++		"};\n", ltt_get_header_alignment());
++	if (ret)
++		goto end;
++
++
++
++
++	event->metadata_dumped = 1;
++end:
++	return ret;
++
++}
++
++static
++int _ltt_channel_metadata_statedump(struct ltt_session *session,
++				    struct ltt_channel *chan)
++{
++	int ret = 0;
++
++	if (chan->metadata_dumped || !ACCESS_ONCE(session->active))
++		return 0;
++	if (chan == session->metadata)
++		return 0;
++
++	WARN_ON_ONCE(!chan->header_type);
++	ret = lttng_metadata_printf(session,
++		"stream {\n"
++		"	id = %u;\n"
++		"	event.header := %s;\n",
++		"};\n",
++		chan->id,
++		chan->header_type == 1 ? "struct event_header_compact" :
++			"struct event_header_large");
++	if (ret)
++		goto end;
++
++	chan->metadata_dumped = 1;
++end:
++	return ret;
++}
++
++/*
++ * Output metadata into this session's metadata buffers.
++ */
++static
++int _ltt_session_metadata_statedump(struct ltt_session *session)
++{
++	struct ltt_channel *chan;
++	struct ltt_event *event;
++	int ret = 0;
++
++	if (!ACCESS_ONCE(session->active))
++		return 0;
++	if (session->metadata_dumped)
++		goto skip_session;
++
++
++
++
++skip_session:
++	list_for_each_entry(chan, &session->chan, list) {
++		ret = _ltt_channel_metadata_statedump(session, chan);
++		if (ret)
++			goto end;
++	}
++
++	list_for_each_entry(event, &session->events, list) {
++		ret = _ltt_event_metadata_statedump(session, chan, event);
++		if (ret)
++			goto end;
++	}
++	session->metadata_dumped = 1;
++end:
++	return ret;
++}
++
+ /**
+  * ltt_transport_register - LTT transport registration
+  * @transport: transport structure
+@@ -286,7 +531,6 @@ void ltt_transport_unregister(struct ltt_transport *transport)
+ }
+ EXPORT_SYMBOL_GPL(ltt_transport_unregister);
+ 
+-
+ static int __init ltt_events_init(void)
+ {
+ 	int ret;
+diff --git a/drivers/staging/lttng/ltt-events.h b/drivers/staging/lttng/ltt-events.h
+index 344b6fd..cc8e809 100644
+--- a/drivers/staging/lttng/ltt-events.h
++++ b/drivers/staging/lttng/ltt-events.h
+@@ -40,38 +40,63 @@ struct lttng_enum_entry {
+ 	const char *string;
+ };
+ 
+-struct lttng_enum {
+-	const struct lttng_enum_entry *entries;
+-	unsigned int len;
++#define __type_integer(_type, _byte_order)			\
++	{							\
++	    .atype = atype_integer,				\
++	    .u.basic.integer =					\
++		{						\
++		  .size = sizeof(_type),			\
++		  .alignment = __alignof__(_type),		\
++		  .signedness = is_signed_type(_type),		\
++		  .reverse_byte_order = _byte_order != __BYTE_ORDER,	\
++		},						\
++	}							\
++
++struct lttng_integer_type {
++	unsigned int size;		/* in bits */
++	unsigned short alignment;	/* in bits */
++	unsigned int signedness:1;
++	unsigned int reverse_byte_order:1;
++};
++
++union _lttng_basic_type {
++	struct lttng_integer_type integer;
++	struct {
++		const char *name;
++	} enumeration;
++	struct {
++		enum lttng_string_encodings encoding;
++	} string;
++};
++
++struct lttng_basic_type {
++	enum abstract_types atype;
++	union {
++		union _lttng_basic_type basic;
++	} u;
+ };
+ 
+ struct lttng_type {
+ 	enum abstract_types atype;
+-	const char *name;
+ 	union {
++		union _lttng_basic_type basic;
+ 		struct {
+-			unsigned int size;		/* in bits */
+-			unsigned short alignment;	/* in bits */
+-			unsigned int signedness:1;
+-			unsigned int reverse_byte_order:1;
+-		} integer;
+-		struct {
+-			const char *parent_type;
+-			const struct lttng_enum def;
+-		} enumeration;
+-		struct {
+-			const char *elem_type;
++			struct lttng_basic_type elem_type;
+ 			unsigned int length;		/* num. elems. */
+ 		} array;
+ 		struct {
+-			const char *elem_type;
+-			const char *length_type;
++			struct lttng_basic_type length_type;
++			struct lttng_basic_type elem_type;
+ 		} sequence;
+-		struct {
+-			enum lttng_string_encodings encoding;
+-		} string;
+ 	} u;
+-} __attribute__((packed));
++};
++
++struct lttng_enum {
++	const char *name;
++	struct lttng_type container_type;
++	const struct lttng_enum_entry *entries;
++	unsigned int len;
++};
+ 
+ /* Event field description */
+ 
+@@ -104,6 +129,7 @@ struct ltt_event {
+ 	void *filter;
+ 	enum instrum_type itype;
+ 	struct list_head list;		/* Event list */
++	int metadata_dumped:1;
+ };
+ 
+ struct ltt_channel_ops {
+@@ -120,9 +146,11 @@ struct ltt_channel_ops {
+ 	void (*event_commit)(struct lib_ring_buffer_ctx *ctx);
+ 	void (*event_write)(struct lib_ring_buffer_ctx *ctx, const void *src,
+ 			    size_t len);
++	wait_queue_head_t *(*get_reader_wait_queue)(struct ltt_channel *chan);
+ };
+ 
+ struct ltt_channel {
++	unsigned int id;
+ 	struct channel *chan;		/* Channel buffers */
+ 	/* Event ID management */
+ 	struct ltt_session *session;
+@@ -131,14 +159,19 @@ struct ltt_channel {
+ 	struct list_head list;		/* Channel list */
+ 	wait_queue_head_t notify_wait;	/* Channel addition notif. waitqueue */
+ 	struct ltt_channel_ops *ops;
++	int metadata_dumped:1;
++	int header_type:2;		/* 0: unset, 1: compact, 2: large */
+ };
+ 
+ struct ltt_session {
+ 	int active;			/* Is trace session active ? */
+ 	struct file *file;		/* File associated to session */
++	struct ltt_channel *metadata;	/* Metadata channel */
+ 	struct list_head chan;		/* Channel list head */
+ 	struct list_head events;	/* Event list head */
+ 	struct list_head list;		/* Session list */
++	unsigned int free_chan_id;	/* Next chan ID to allocate */
++	int metadata_dumped:1;
+ };
+ 
+ struct ltt_transport {
+diff --git a/drivers/staging/lttng/ltt-probes.c b/drivers/staging/lttng/ltt-probes.c
+index dbdb50d..ad7f7c2b 100644
+--- a/drivers/staging/lttng/ltt-probes.c
++++ b/drivers/staging/lttng/ltt-probes.c
+@@ -73,12 +73,11 @@ const struct lttng_event_desc *ltt_event_get(const char *name)
+ 
+ 	mutex_lock(&probe_mutex);
+ 	event = find_event(name);
++	mutex_unlock(&probe_mutex);
+ 	if (!event)
+-		goto end;
++		return NULL;
+ 	ret = try_module_get(__module_text_address((unsigned long) event));
+ 	WARN_ON_ONCE(!ret);
+-end:
+-	mutex_unlock(&probe_mutex);
+ 	return event;
+ }
+ EXPORT_SYMBOL_GPL(ltt_event_get);
+diff --git a/drivers/staging/lttng/ltt-ring-buffer-client.h b/drivers/staging/lttng/ltt-ring-buffer-client.h
+index 55d972a..9056dd7 100644
+--- a/drivers/staging/lttng/ltt-ring-buffer-client.h
++++ b/drivers/staging/lttng/ltt-ring-buffer-client.h
+@@ -332,6 +332,7 @@ void ltt_buffer_read_close(struct lib_ring_buffer *buf)
+ 	
+ }
+ 
++static
+ int ltt_event_reserve(struct lib_ring_buffer_ctx *ctx)
+ {
+ 	int ret, cpu;
+@@ -351,18 +352,26 @@ put:
+ 	return ret;
+ }
+ 
++static
+ void ltt_event_commit(struct lib_ring_buffer_ctx *ctx)
+ {
+ 	lib_ring_buffer_commit(&client_config, ctx);
+ 	lib_ring_buffer_put_cpu(&client_config);
+ }
+ 
++static
+ void ltt_event_write(struct lib_ring_buffer_ctx *ctx, const void *src,
+ 		     size_t len)
+ {
+ 	lib_ring_buffer_write(&client_config, ctx, src, len);
+ }
+ 
++static
++wait_queue_head_t *ltt_get_reader_wait_queue(struct ltt_channel *chan)
++{
++	return &chan->chan->read_wait;
++}
++
+ static struct ltt_transport ltt_relay_transport = {
+ 	.name = "relay-" RING_BUFFER_MODE_TEMPLATE_STRING,
+ 	.owner = THIS_MODULE,
+@@ -374,6 +383,7 @@ static struct ltt_transport ltt_relay_transport = {
+ 		.event_reserve = ltt_event_reserve,
+ 		.event_commit = ltt_event_commit,
+ 		.event_write = ltt_event_write,
++		.get_reader_wait_queue = ltt_get_reader_wait_queue,
+ 	},
+ };
+ 
+diff --git a/drivers/staging/lttng/ltt-ring-buffer-metadata-client.h b/drivers/staging/lttng/ltt-ring-buffer-metadata-client.h
+index 830e799..68ce958 100644
+--- a/drivers/staging/lttng/ltt-ring-buffer-metadata-client.h
++++ b/drivers/staging/lttng/ltt-ring-buffer-metadata-client.h
+@@ -14,10 +14,6 @@
+ #include "ltt-events.h"
+ #include "ltt-tracer.h"
+ 
+-#ifndef CHAR_BIT
+-#define CHAR_BIT 8
+-#endif
+-
+ struct metadata_packet_header {
+ 	uint32_t magic;			/* 0x75D11D57 */
+ 	uint8_t  trace_uuid[16];	/* Unique Universal Identifier */
+@@ -193,22 +189,31 @@ void ltt_buffer_read_close(struct lib_ring_buffer *buf)
+ 	
+ }
+ 
++static
+ int ltt_event_reserve(struct lib_ring_buffer_ctx *ctx)
+ {
+ 	return lib_ring_buffer_reserve(&client_config, ctx);
+ }
+ 
++static
+ void ltt_event_commit(struct lib_ring_buffer_ctx *ctx)
+ {
+ 	lib_ring_buffer_commit(&client_config, ctx);
+ }
+ 
++static
+ void ltt_event_write(struct lib_ring_buffer_ctx *ctx, const void *src,
+ 		     size_t len)
+ {
+ 	lib_ring_buffer_write(&client_config, ctx, src, len);
+ }
+ 
++static
++wait_queue_head_t *ltt_get_reader_wait_queue(struct ltt_channel *chan)
++{
++	return &chan->chan->read_wait;
++}
++
+ static struct ltt_transport ltt_relay_transport = {
+ 	.name = "relay-" RING_BUFFER_MODE_TEMPLATE_STRING,
+ 	.owner = THIS_MODULE,
+@@ -220,6 +225,7 @@ static struct ltt_transport ltt_relay_transport = {
+ 		.event_reserve = ltt_event_reserve,
+ 		.event_commit = ltt_event_commit,
+ 		.event_write = ltt_event_write,
++		.get_reader_wait_queue = ltt_get_reader_wait_queue,
+ 	},
+ };
+ 
+diff --git a/drivers/staging/lttng/ltt-tracer.h b/drivers/staging/lttng/ltt-tracer.h
+index 1540a28..3bb5523 100644
+--- a/drivers/staging/lttng/ltt-tracer.h
++++ b/drivers/staging/lttng/ltt-tracer.h
+@@ -23,6 +23,10 @@
+ #include "ltt-tracer-core.h"
+ #include "ltt-events.h"
+ 
++#ifndef CHAR_BIT
++#define CHAR_BIT 8
++#endif
++
+ /* Number of bytes to log with a read/write event */
+ #define LTT_LOG_RW_SIZE			32L
+ 
+@@ -109,6 +113,16 @@ struct event_header {
+ 
+ #define LTT_MAX_SMALL_SIZE		0xFFFFU
+ 
++static inline
++size_t ltt_get_header_alignment(void)
++{
++#ifdef RING_BUFFER_ALIGN
++	return sizeof(struct event_header) * CHAR_BIT;
++#else
++	return CHAR_BIT;
++#endif
++}
++
+ /*
+  * We use asm/timex.h : cpu_khz/HZ variable in here : we might have to deal
+  * specifically with CPU frequency scaling someday, so using an interpolation
+@@ -161,6 +175,12 @@ struct packet_header {
+ #define LTT_TRACER_VERSION_MINOR	0
+ 
+ /*
++ * Number of milliseconds to retry before failing metadata writes on buffer full
++ * condition. (10 seconds)
++ */
++#define LTTNG_METADATA_TIMEOUT_MSEC	10000
++
++/*
+  * Size reserved for high priority events (interrupts, NMI, BH) at the end of a
+  * nearly full buffer. User space won't use this last amount of space when in
+  * blocking mode. This space also includes the event header that would be
+diff --git a/drivers/staging/lttng/probes/lttng-events-reset.h b/drivers/staging/lttng/probes/lttng-events-reset.h
+index a764f43..1ac6f76 100644
+--- a/drivers/staging/lttng/probes/lttng-events-reset.h
++++ b/drivers/staging/lttng/probes/lttng-events-reset.h
+@@ -6,6 +6,9 @@
+ #undef __field_ext
+ #define __field_ext(_type, _item, _filter_type)
+ 
++#undef __field_network
++#define __field_network(_type, _item)
++
+ #undef __array
+ #define __array(_type, _item, _length)
+ 
+diff --git a/drivers/staging/lttng/probes/lttng-events.h b/drivers/staging/lttng/probes/lttng-events.h
+index a739bbc..f64e021 100644
+--- a/drivers/staging/lttng/probes/lttng-events.h
++++ b/drivers/staging/lttng/probes/lttng-events.h
+@@ -42,7 +42,7 @@
+ 		PARAMS(tstruct), PARAMS(assign), PARAMS(print))		\
+ 
+ /*
+- * Stage 0.1 of the trace events.
++ * Stage 1 of the trace events.
+  *
+  * Create dummy trace calls for each events, verifying that the LTTng module
+  * TRACE_EVENT headers match the kernel arguments. Will be optimized out by the
+@@ -64,7 +64,7 @@ void trace_##_name(_proto);
+ #include TRACE_INCLUDE(TRACE_INCLUDE_FILE)
+ 
+ /*
+- * Stage 1 of the trace events.
++ * Stage 2 of the trace events.
+  *
+  * Create event field type metadata section.
+  * Each event produce an array of fields.
+@@ -76,43 +76,59 @@ void trace_##_name(_proto);
+ 
+ #undef __field
+ #define __field(_type, _item)					\
+-	{ .name = #_item, .type = { .atype = atype_integer, .name = #_type} },
++	{							\
++	  .name = #_item,					\
++	  .type = __type_integer(_type, __BYTE_ORDER),		\
++	},
+ 
+ #undef __field_ext
+ #define __field_ext(_type, _item, _filter_type)		__field(_type, _item)
+ 
++#undef __field_network
++#define __field_network(_type, _item)				\
++	{							\
++	  .name = #_item,					\
++	  .type = __type_integer(_type, __BIG_ENDIAN),		\
++	},
++
+ #undef __array
+ #define __array(_type, _item, _length)				\
+ 	{							\
+-		.name = #_item,					\
+-		.type = {					\
++	  .name = #_item,					\
++	  .type =						\
++		{						\
+ 		  .atype = atype_array,				\
+-		  .name = NULL,					\
+-		  .u.array.elem_type = #_type,			\
+-		  .u.array.length = _length,			\
++		  .u.array =					\
++			{					\
++			    .length = _length,			\
++			    .elem_type = __type_integer(_type, __BYTE_ORDER), \
++			},					\
+ 		},						\
+ 	},
+ 
+ #undef __dynamic_array
+ #define __dynamic_array(_type, _item, _length)			\
+ 	{							\
+-		.name = #_item,					\
+-		.type = {					\
++	  .name = #_item,					\
++	  .type =						\
++		{						\
+ 		  .atype = atype_sequence,			\
+-		  .name = NULL,					\
+-		  .u.sequence.elem_type = #_type,		\
+-		  .u.sequence.length_type = "u32",		\
++		  .u.sequence =					\
++			{					\
++			    .length_type = __type_integer(u32, __BYTE_ORDER), \
++			    .elem_type = __type_integer(_type, __BYTE_ORDER), \
++			},					\
+ 		},						\
+ 	},
+ 
+ #undef __string
+ #define __string(_item, _src)					\
+ 	{							\
+-		.name = #_item,					\
+-		.type = {					\
++	  .name = #_item,					\
++	  .type =						\
++		{						\
+ 		  .atype = atype_string,			\
+-		  .name = NULL,					\
+-		  .u.string.encoding = lttng_encode_UTF8,	\
++		  .u.basic.string.encoding = lttng_encode_UTF8,	\
+ 		},						\
+ 	},
+ 
+@@ -127,8 +143,10 @@ void trace_##_name(_proto);
+ 
+ #include TRACE_INCLUDE(TRACE_INCLUDE_FILE)
+ 
++#undef __type_integer
++
+ /*
+- * Stage 1.1 of the trace events.
++ * Stage 3 of the trace events.
+  *
+  * Create probe callback prototypes.
+  */
+@@ -145,7 +163,7 @@ static void __event_probe__##_name(void *__data, _proto);
+ #include TRACE_INCLUDE(TRACE_INCLUDE_FILE)
+ 
+ /*
+- * Stage 2 of the trace events.
++ * Stage 4 of the trace events.
+  *
+  * Create an array of events.
+  */
+@@ -175,7 +193,7 @@ static const struct lttng_event_desc TP_ID(__event_desc___, TRACE_SYSTEM)[] = {
+ 
+ 
+ /*
+- * Stage 2.1 of the trace events.
++ * Stage 5 of the trace events.
+  *
+  * Create a toplevel descriptor for the whole probe.
+  */
+@@ -193,120 +211,7 @@ static struct lttng_probe_desc TP_ID(__probe_desc___, TRACE_SYSTEM) = {
+ #undef TP_ID
+ 
+ /*
+- * Stage 3 of the trace events.
+- *
+- * Create seq file metadata output.
+- */
+-
+-#define TP_ID1(_token, _system)	_token##_system
+-#define TP_ID(_token, _system)	TP_ID1(_token, _system)
+-
+-static void *TP_ID(__lttng_seq_start__, TRACE_SYSTEM)(struct seq_file *m,
+-						      loff_t *pos)
+-{
+-	const struct lttng_event_desc *desc =
+-		&TP_ID(__event_desc___, TRACE_SYSTEM)[*pos];
+-
+-	if (desc > &TP_ID(__event_desc___, TRACE_SYSTEM)
+-			[ARRAY_SIZE(TP_ID(__event_desc___, TRACE_SYSTEM)) - 1])
+-		return NULL;
+-	return (void *) desc;
+-}
+-
+-static void *TP_ID(__lttng_seq_next__, TRACE_SYSTEM)(struct seq_file *m,
+-						     void *p, loff_t *ppos)
+-{
+-	const struct lttng_event_desc *desc =
+-		&TP_ID(__event_desc___, TRACE_SYSTEM)[++(*ppos)];
+-
+-	if (desc > &TP_ID(__event_desc___, TRACE_SYSTEM)
+-			[ARRAY_SIZE(TP_ID(__event_desc___, TRACE_SYSTEM)) - 1])
+-		return NULL;
+-	return (void *) desc;
+-}
+-
+-static void TP_ID(__lttng_seq_stop__, TRACE_SYSTEM)(struct seq_file *m,
+-						    void *p)
+-{
+-}
+-
+-static int TP_ID(__lttng_seq_show__, TRACE_SYSTEM)(struct seq_file *m,
+-						   void *p)
+-{
+-	const struct lttng_event_desc *desc = p;
+-	int i;
+-
+-	seq_printf(m,	"event {\n"
+-			"\tname = %s;\n"
+-			"\tid = UNKNOWN;\n"
+-			"\tstream = UNKNOWN;\n"
+-			"\tfields = {\n",
+-			desc->name);
+-	for (i = 0; i < desc->nr_fields; i++) {
+-		if (desc->fields[i].type.name)	/* Named type */
+-			seq_printf(m,	"\t\t%s",
+-					desc->fields[i].type.name);
+-		else				/* Nameless type */
+-			lttng_print_event_type(m, 2, &desc->fields[i].type);
+-		seq_printf(m,	" %s;\n", desc->fields[i].name);
+-	}
+-	seq_printf(m,	"\t};\n");
+-	seq_printf(m,	"};\n");
+-	return 0;
+-}
+-
+-static const
+-struct seq_operations TP_ID(__lttng_types_seq_ops__, TRACE_SYSTEM) = {
+-	.start = TP_ID(__lttng_seq_start__, TRACE_SYSTEM),
+-	.next = TP_ID(__lttng_seq_next__, TRACE_SYSTEM),
+-	.stop = TP_ID(__lttng_seq_stop__, TRACE_SYSTEM),
+-	.show = TP_ID(__lttng_seq_show__, TRACE_SYSTEM),
+-};
+-
+-static int
+-TP_ID(__lttng_types_open__, TRACE_SYSTEM)(struct inode *inode, struct file *file)
+-{
+-	return seq_open(file, &TP_ID(__lttng_types_seq_ops__, TRACE_SYSTEM));
+-}
+-
+-static const
+-struct file_operations TP_ID(__lttng_types_fops__, TRACE_SYSTEM) = {
+-        .open = TP_ID(__lttng_types_open__, TRACE_SYSTEM),
+-        .read = seq_read,
+-        .llseek = seq_lseek,
+-        .release = seq_release_private,
+-};
+-
+-static struct dentry *TP_ID(__lttng_types_dentry__, TRACE_SYSTEM);
+-
+-static int TP_ID(__lttng_types_init__, TRACE_SYSTEM)(void)
+-{
+-	int ret = 0;
+-
+-	TP_ID(__lttng_types_dentry__, TRACE_SYSTEM) =
+-		debugfs_create_file("lttng-events-" __stringify(TRACE_SYSTEM),
+-				    S_IWUSR, NULL, NULL,
+-				    &TP_ID(__lttng_types_fops__, TRACE_SYSTEM));
+-	if (IS_ERR(TP_ID(__lttng_types_dentry__, TRACE_SYSTEM))
+-	    || !TP_ID(__lttng_types_dentry__, TRACE_SYSTEM)) {
+-		printk(KERN_ERR "Error creating LTTng type export file\n");
+-		ret = -ENOMEM;
+-		goto error;
+-	}
+-error:
+-	return ret;
+-}
+-
+-static void TP_ID(__lttng_types_exit__, TRACE_SYSTEM)(void)
+-{
+-	debugfs_remove(TP_ID(__lttng_types_dentry__, TRACE_SYSTEM));
+-}
+-
+-#undef TP_ID1
+-#undef TP_ID
+-
+-/*
+- * Stage 4 of the trace events.
++ * Stage 6 of the trace events.
+  *
+  * Create static inline function that calculates event size.
+  */
+@@ -360,10 +265,8 @@ static inline size_t __event_get_size__##_name(size_t *__dynamic_len, _proto) \
+ 
+ #include TRACE_INCLUDE(TRACE_INCLUDE_FILE)
+ 
+-
+-
+ /*
+- * Stage 5 of the trace events.
++ * Stage 7 of the trace events.
+  *
+  * Create static inline function that calculates event payload alignment.
+  */
+@@ -410,7 +313,7 @@ static inline size_t __event_get_align__##_name(_proto)			      \
+ 
+ 
+ /*
+- * Stage 6 of the trace events.
++ * Stage 8 of the trace events.
+  *
+  * Create structure declaration that allows the "assign" macros to access the
+  * field types.
+@@ -448,7 +351,7 @@ struct __event_typemap__##_name {					      \
+ 
+ 
+ /*
+- * Stage 7 of the trace events.
++ * Stage 9 of the trace events.
+  *
+  * Create the probe function : call even size calculation and write event data
+  * into the buffer.
+@@ -583,7 +486,7 @@ static void __event_probe__##_name(void *__data, _proto)		      \
+ #include TRACE_INCLUDE(TRACE_INCLUDE_FILE)
+ 
+ /*
+- * Stage 8 of the trace events.
++ * Stage 10 of the trace events.
+  *
+  * Register/unregister probes at module load/unload.
+  */
+@@ -599,12 +502,7 @@ static void __event_probe__##_name(void *__data, _proto)		      \
+ 
+ static int TP_ID(__lttng_events_init__, TRACE_SYSTEM)(void)
+ {
+-	int ret;
+-
+ 	wrapper_vmalloc_sync_all();
+-	ret = TP_ID(__lttng_types_init__, TRACE_SYSTEM)();
+-	if (ret)
+-		return ret;
+ 	return ltt_probe_register(&TP_ID(__probe_desc___, TRACE_SYSTEM));
+ }
+ 
+@@ -612,7 +510,6 @@ module_init_eval(__lttng_events_init__, TRACE_SYSTEM);
+ 
+ static void TP_ID(__lttng_events_exit__, TRACE_SYSTEM)(void)
+ {
+-	TP_ID(__lttng_types_exit__, TRACE_SYSTEM)();
+ 	ltt_probe_unregister(&TP_ID(__probe_desc___, TRACE_SYSTEM));
+ }
+ 
+diff --git a/drivers/staging/lttng/probes/lttng-type-list.h b/drivers/staging/lttng/probes/lttng-type-list.h
+index 4782caf..84acc4e 100644
+--- a/drivers/staging/lttng/probes/lttng-type-list.h
++++ b/drivers/staging/lttng/probes/lttng-type-list.h
+@@ -1,53 +1,5 @@
+ /* Type list, used to create metadata */
+ 
+-TRACE_EVENT_TYPE(long, integer)
+-TRACE_EVENT_TYPE(unsigned long, integer)
+-TRACE_EVENT_TYPE(int, integer)
+-TRACE_EVENT_TYPE(unsigned int, integer)
+-TRACE_EVENT_TYPE(short, integer)
+-TRACE_EVENT_TYPE(unsigned short, integer)
+-TRACE_EVENT_TYPE(char, integer)
+-TRACE_EVENT_TYPE(signed char, integer)
+-TRACE_EVENT_TYPE(unsigned char, integer)
+-TRACE_EVENT_TYPE(bool, integer)
+-TRACE_EVENT_TYPE(size_t, integer)
+-TRACE_EVENT_TYPE(ssize_t, integer)
+-TRACE_EVENT_TYPE(loff_t, integer)
+-TRACE_EVENT_TYPE(u64, integer)
+-TRACE_EVENT_TYPE(u32, integer)
+-TRACE_EVENT_TYPE(u16, integer)
+-TRACE_EVENT_TYPE(u8, integer)
+-TRACE_EVENT_TYPE(s64, integer)
+-TRACE_EVENT_TYPE(s32, integer)
+-TRACE_EVENT_TYPE(s16, integer)
+-TRACE_EVENT_TYPE(s8, integer)
+-TRACE_EVENT_TYPE(void *, integer)
+-
+-/* Kernel-specific types */
+-TRACE_EVENT_TYPE(pid_t, integer)
+-TRACE_EVENT_TYPE(tid_t, integer)
+-TRACE_EVENT_TYPE(uid_t, integer)
+-TRACE_EVENT_TYPE(gid_t, integer)
+-TRACE_EVENT_TYPE(ino_t, integer)
+-TRACE_EVENT_TYPE(sector_t, integer)
+-TRACE_EVENT_TYPE(blkcnt_t, integer)
+-TRACE_EVENT_TYPE(pgoff_t, integer)
+-TRACE_EVENT_TYPE(gfp_t, integer)
+-TRACE_EVENT_TYPE(dev_t, integer)
+-TRACE_EVENT_TYPE(umode_t, integer)
+-TRACE_EVENT_TYPE(clockid_t, integer)
+-TRACE_EVENT_TYPE(cputime_t, integer)
+-
+-/* Aliases needed by kernel instrumentation */
+-TRACE_EVENT_TYPE(struct page *, integer)
+-TRACE_EVENT_TYPE(unsigned, integer)
+-TRACE_EVENT_TYPE(__u32, integer)
+-TRACE_EVENT_TYPE(__u16, integer)
+-
+-/* Arrays */
+-TRACE_EVENT_TYPE(task_comm, array, char, TASK_COMM_LEN)
+-
+-#include <linux/hrtimer.h>
+ /* Enumerations */
+ TRACE_EVENT_ENUM(hrtimer_mode,
+         V(HRTIMER_MODE_ABS),
+@@ -59,9 +11,3 @@ TRACE_EVENT_ENUM(hrtimer_mode,
+ )
+ 
+ TRACE_EVENT_TYPE(hrtimer_mode, enum, unsigned char)
+-
+-/* Tests */
+-
+-TRACE_EVENT_TYPE(__be32, integer_ext, __BIG_ENDIAN)
+-TRACE_EVENT_TYPE(testseq, sequence, unsigned int, size_t)
+-TRACE_EVENT_TYPE(teststring, string, UTF8)
+diff --git a/drivers/staging/lttng/probes/lttng-types.c b/drivers/staging/lttng/probes/lttng-types.c
+index c447b7d..ecd4c86 100644
+--- a/drivers/staging/lttng/probes/lttng-types.c
++++ b/drivers/staging/lttng/probes/lttng-types.c
+@@ -8,193 +8,29 @@
+ 
+ #include <linux/module.h>
+ #include <linux/types.h>
+-#include <linux/seq_file.h>
+-#include <linux/jbd.h>	/* tid_t */
+-#include <linux/debugfs.h>
+ #include "../wrapper/vmalloc.h"	/* for wrapper_vmalloc_sync_all() */
++#include "../ltt-events.h"
+ #include "lttng-types.h"
+-
+-struct dentry *lttng_types_dentry;
+-
+-#undef ENTRY
+-#define ENTRY(name)	[atype_##name] = #name
+-
+-const char * const astract_types[NR_ABSTRACT_TYPES] = {
+-	ENTRY(integer),
+-	ENTRY(enum),
+-	ENTRY(array),
+-	ENTRY(sequence),
+-	ENTRY(string),
+-};
+-
+-#undef ENTRY
+-#define ENTRY(name)	[lttng_encode_##name] = #name
+-
+-const char * const string_encodings[NR_STRING_ENCODINGS] = {
+-	ENTRY(UTF8),
+-	ENTRY(ASCII),
+-};
++#include <linux/hrtimer.h>
+ 
+ #define STAGE_EXPORT_ENUMS
+ #include "lttng-types.h"
+ #include "lttng-type-list.h"
+ #undef STAGE_EXPORT_ENUMS
+ 
+-struct lttng_type lttng_types[] = {
++struct lttng_enum lttng_enums[] = {
+ #define STAGE_EXPORT_TYPES
+ #include "lttng-types.h"
+ #include "lttng-type-list.h"
+ #undef STAGE_EXPORT_TYPES
+ };
+ 
+-static void print_indent(struct seq_file *m, unsigned int indent)
+-{
+-	int i;
+-
+-	for (i = 0; i < indent; i++)
+-		seq_printf(m, "\t");
+-}
+-
+-static void print_enum(struct seq_file *m, unsigned int indent,
+-		       const struct lttng_enum *lttng_enum)
+-{
+-	int i;
+-
+-	for (i = 0; i < lttng_enum->len; i++) {
+-		print_indent(m, indent);
+-		if (lttng_enum->entries[i].start == lttng_enum->entries[i].end)
+-			seq_printf(m,	"{ %llu, %s },\n",
+-					lttng_enum->entries[i].start,
+-					lttng_enum->entries[i].string);
+-		else
+-			seq_printf(m,	"{ { %llu, %llu }, %s },\n",
+-					lttng_enum->entries[i].start,
+-					lttng_enum->entries[i].end,
+-					lttng_enum->entries[i].string);
+-	}
+-}
+-
+-void lttng_print_event_type(struct seq_file *m, unsigned int indent,
+-			    const struct lttng_type *type)
+-{
+-	print_indent(m, indent);
+-	switch(type->atype) {
+-	case atype_integer:
+-		seq_printf(m,	"type %s%s{ parent = %s; size = %u; signed = %u; align = %u;",
+-				type->name ? : "", type->name ? " " : "",
+-				astract_types[type->atype],
+-				type->u.integer.size,
+-				type->u.integer.signedness,
+-				type->u.integer.alignment);
+-		if (type->u.integer.reverse_byte_order)
+-			seq_printf(m, 	" byte_order = %s;",
+-					(__BYTE_ORDER == __LITTLE_ENDIAN) ?
+-					"be" : "le");
+-		seq_printf(m, 	" }");
+-		break;
+-	case atype_enum:
+-		seq_printf(m,	"type %s%s{ parent = %s; parent.parent = %s; map = {\n",
+-				type->name ? : "", type->name ? " " : "",
+-				astract_types[type->atype],
+-				type->u.enumeration.parent_type);
+-		print_enum(m, indent + 2, &type->u.enumeration.def);
+-		print_indent(m, indent + 1);
+-		seq_printf(m,	"};\n");
+-		print_indent(m, indent);
+-		seq_printf(m,	"}");
+-		break;
+-	case atype_array:
+-		seq_printf(m,	"type %s%s{ parent = %s; elem_type = %s; length = %u; }",
+-				type->name ? : "", type->name ? " " : "",
+-				astract_types[type->atype],
+-				type->u.array.elem_type,
+-				type->u.array.length);
+-		break;
+-	case atype_sequence:
+-		seq_printf(m,	"type %s%s{ parent = %s; elem_type = %s; length_type = %s; }",
+-				type->name ? : "", type->name ? " " : "",
+-				astract_types[type->atype],
+-				type->u.sequence.elem_type,
+-				type->u.sequence.length_type);
+-		break;
+-	case atype_string:
+-		seq_printf(m,	"type %s%s{ parent = %s; encoding = %s; }",
+-				type->name ? : "", type->name ? " " : "",
+-				astract_types[type->atype],
+-				string_encodings[type->u.string.encoding]);
+-		break;
+-	default:
+-		seq_printf(m,	"<<< unknown abstract type %s for type %s%s>>>",
+-				astract_types[type->atype],
+-				type->name ? : "", type->name ? " " : "");
+-	}
+-}
+-EXPORT_SYMBOL_GPL(lttng_print_event_type);
+-
+-static void *lttng_seq_start(struct seq_file *m, loff_t *pos)
+-{
+-	struct lttng_type *type = &lttng_types[*pos];
+-
+-	if (type > &lttng_types[ARRAY_SIZE(lttng_types) - 1])
+-		return NULL;
+-	return type;
+-}
+-
+-static void *lttng_seq_next(struct seq_file *m, void *v, loff_t *ppos)
+-{
+-	struct lttng_type *type = &lttng_types[++(*ppos)];
+-
+-	if (type > &lttng_types[ARRAY_SIZE(lttng_types) - 1])
+-		return NULL;
+-	return type;
+-}
+-
+-static void lttng_seq_stop(struct seq_file *m, void *v)
+-{
+-}
+-
+-static int lttng_seq_show(struct seq_file *m, void *v)
+-{
+-	struct lttng_type *type = v;
+-
+-	lttng_print_event_type(m, 0, type);
+-	seq_printf(m, ";\n");
+-	return 0;
+-}
+-
+-static const struct seq_operations lttng_types_seq_ops = {
+-	.start = lttng_seq_start,
+-	.next = lttng_seq_next,
+-	.stop = lttng_seq_stop,
+-	.show = lttng_seq_show,
+-};
+-
+-static int
+-lttng_types_open(struct inode *inode, struct file *file)
+-{
+-	return seq_open(file, &lttng_types_seq_ops);
+-}
+-
+-static const struct file_operations lttng_types_fops = {
+-	.open = lttng_types_open,
+-        .read = seq_read,
+-	.llseek = seq_lseek,
+-	.release = seq_release_private,
+-};
+-
+ static int lttng_types_init(void)
+ {
+ 	int ret = 0;
+ 
+ 	wrapper_vmalloc_sync_all();
+-	lttng_types_dentry = debugfs_create_file("lttng-types", S_IWUSR,
+-					NULL, NULL, &lttng_types_fops);
+-	if (IS_ERR(lttng_types_dentry) || !lttng_types_dentry) {
+-		printk(KERN_ERR "Error creating LTTng type export file\n");
+-		ret = -ENOMEM;
+-		goto error;
+-	}
+-error:
++	/* TODO */
+ 	return ret;
+ }
+ 
+@@ -202,7 +38,6 @@ module_init(lttng_types_init);
+ 
+ static void lttng_types_exit(void)
+ {
+-	debugfs_remove(lttng_types_dentry);
+ }
+ 
+ module_exit(lttng_types_exit);
+diff --git a/drivers/staging/lttng/probes/lttng-types.h b/drivers/staging/lttng/probes/lttng-types.h
+index cbe1dea..bbae874 100644
+--- a/drivers/staging/lttng/probes/lttng-types.h
++++ b/drivers/staging/lttng/probes/lttng-types.h
+@@ -28,9 +28,6 @@
+ # include <endian.h>
+ #endif
+ 
+-void lttng_print_event_type(struct seq_file *m, unsigned int indent,
+-			    const struct lttng_type *type);
+-
+ #endif /* _LTTNG_PROBES_LTTNG_TYPES_H */
+ 
+ 
+@@ -63,58 +60,15 @@ void lttng_print_event_type(struct seq_file *m, unsigned int indent,
+ 
+ #ifdef STAGE_EXPORT_TYPES
+ 
+-#undef TRACE_EVENT_TYPE___integer_ext
+-#define TRACE_EVENT_TYPE___integer_ext(_name, _byte_order)	\
+-		{						\
+-		  .atype = atype_integer,			\
+-		  .name = #_name,				\
+-		  .u.integer.size = sizeof(_name) * 8,		\
+-		  .u.integer.alignment = __alignof__(_name) * 8,\
+-		  .u.integer.signedness = is_signed_type(_name),\
+-		  .u.integer.reverse_byte_order = ((_byte_order) != __BYTE_ORDER),\
+-		},
+-
+-#undef TRACE_EVENT_TYPE___integer
+-#define TRACE_EVENT_TYPE___integer(_name, _unused)		\
+-		TRACE_EVENT_TYPE___integer_ext(_name, __BYTE_ORDER)
+-
+ #undef TRACE_EVENT_TYPE___enum
+-#define TRACE_EVENT_TYPE___enum(_name, _parent_type)		\
+-		{						\
+-		  .atype = atype_enum,				\
+-		  .name = #_name,				\
+-		  .u.enumeration.parent_type = #_parent_type,	\
+-		  .u.enumeration.def.entries = __trace_event_enum_##_name, \
+-		  .u.enumeration.def.len = ARRAY_SIZE(__trace_event_enum_##_name), \
+-		},
+-
+-#undef TRACE_EVENT_TYPE___array
+-#define TRACE_EVENT_TYPE___array(_name, _elem_type, _length)	\
+-		{						\
+-		  .atype = atype_array,				\
+-		  .name = #_name,				\
+-		  .u.array.elem_type = #_elem_type,		\
+-		  .u.array.length = _length,			\
++#define TRACE_EVENT_TYPE___enum(_name, _container_type)			\
++		{							\
++		  .name = #_name,					\
++		  .container_type = __type_integer(_container_type, __BYTE_ORDER), \
++		  .entries = __trace_event_enum_##_name, \
++		  .len = ARRAY_SIZE(__trace_event_enum_##_name), \
+ 		},
+ 
+-#undef TRACE_EVENT_TYPE___sequence
+-#define TRACE_EVENT_TYPE___sequence(_name, _elem_type, _length_type)	\
+-		{						\
+-		  .atype = atype_sequence,			\
+-		  .name = #_name,				\
+-		  .u.sequence.elem_type = #_elem_type,		\
+-		  .u.sequence.length_type = #_length_type,	\
+-		},
+-
+-#undef TRACE_EVENT_TYPE___string
+-#define TRACE_EVENT_TYPE___string(_name, _encoding)		\
+-		{						\
+-		  .atype = atype_string,			\
+-		  .name = #_name,				\
+-		  .u.string.encoding = lttng_encode_##_encoding,\
+-		},
+-
+-
+ /* Local declaration */
+ #undef TRACE_EVENT_TYPE
+ #define TRACE_EVENT_TYPE(_name, _abstract_type, args...)	\
+-- 
+2.0.2
+
