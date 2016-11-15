@@ -1,0 +1,468 @@
+From 327ad9f37e141aed7163eb3ca32b9f5195b31204 Mon Sep 17 00:00:00 2001
+From: "Kexin(Casey) Chen" <Casey.Chen@windriver.com>
+Date: Wed, 21 Sep 2016 15:26:46 -0700
+Subject: [PATCH 17/28] kgdb,mips: Add in kernel software single stepping
+
+Add MIPS software single stepping
+
+Signed-off-by: Wally Gleemer <wally.gleemer@windriver.com>
+Signed-off-by: Jason Wessel <jason.wessel@windriver.com>
+
+Adjust hunk #1 #3 #4 of arch/mips/kernel/kgdb.c
+
+Signed-off-by: He Zhe <zhe.he@windriver.com>
+
+Signed-off-by: Kexin(Casey) Chen <Casey.Chen@windriver.com>
+---
+ arch/mips/kernel/kgdb.c | 373 +++++++++++++++++++++++++++++++++++++++++++++++-
+ drivers/misc/kgdbts.c   |   2 +-
+ 2 files changed, 370 insertions(+), 5 deletions(-)
+
+diff --git a/arch/mips/kernel/kgdb.c b/arch/mips/kernel/kgdb.c
+index 2b305e4..3f549d6 100644
+--- a/arch/mips/kernel/kgdb.c
++++ b/arch/mips/kernel/kgdb.c
+@@ -27,6 +27,7 @@
+ #include <linux/kdebug.h>
+ #include <linux/sched.h>
+ #include <linux/smp.h>
++#include <linux/uaccess.h>
+ #include <asm/inst.h>
+ #include <asm/fpu.h>
+ #include <asm/cacheflush.h>
+@@ -34,6 +35,20 @@
+ #include <asm/sigcontext.h>
+ #include <asm/uaccess.h>
+ 
++/* <WRS_ADDED> */
++#ifdef DEBUG_IT
++#define PRINTK(args...) printk(KERN_ALERT args)
++#else
++#define PRINTK(args...)
++#endif /* DEBUG_IT */
++
++static unsigned long stepped_address;
++static unsigned int  stepped_opcode;
++static int stepped_cp0_status_ie;
++
++static unsigned long mipsGetNpc(struct pt_regs *pRegs);
++/* </WRS_ADDED> */
++
+ static struct hard_trap_info {
+ 	unsigned char tt;	/* Trap type code for MIPS R3xxx and R4xxx */
+ 	unsigned char signo;	/* Signal that we map this trap into */
+@@ -196,6 +211,14 @@ out:
+ 
+ }
+ 
++struct kgdb_arch arch_kgdb_ops = {
++#ifdef CONFIG_CPU_LITTLE_ENDIAN
++	.gdb_bpt_instr = {0xd},
++#else
++	.gdb_bpt_instr = {0x00, 0x00, 0x00, 0x0d},
++#endif
++};
++
+ void arch_kgdb_breakpoint(void)
+ {
+ 	__asm__ __volatile__(
+@@ -291,6 +314,11 @@ static int kgdb_mips_notify(struct notifier_block *self, unsigned long cmd,
+ 	struct pt_regs *regs = args->regs;
+ 	int trap = (regs->cp0_cause & 0x7c) >> 2;
+ 	mm_segment_t old_fs;
++	int ss_trap = trap;
++	int error;
++
++	PRINTK("%s at 0x%lx (trap %d)\n", __func__,
++	       regs->cp0_epc, trap);
+ 
+ #ifdef CONFIG_KPROBES
+ 	/*
+@@ -312,7 +340,52 @@ static int kgdb_mips_notify(struct notifier_block *self, unsigned long cmd,
+ 	if (atomic_read(&kgdb_active) != -1)
+ 		kgdb_nmicallback(smp_processor_id(), regs);
+ 
+-	if (kgdb_handle_exception(trap, compute_signal(trap), cmd, regs)) {
++	if (trap == 9 && stepped_opcode != 0) {
++		PRINTK("Step done at 0x%lx putting back 0x%x\n",
++		       stepped_address, stepped_opcode);
++
++		/* restores original instruction */
++		error = probe_kernel_write((char *)stepped_address,
++					   (char *) &stepped_opcode,
++					   BREAK_INSTR_SIZE);
++		if (error != 0) {
++			PRINTK("Unable to restore original instruction\n");
++			printk(KERN_CRIT "KGDB: FATAL ERROR on instruction" \
++			       "restore at 0x%lx", stepped_address);
++		}
++
++		flush_icache_range(stepped_address,
++				   stepped_address + 4);
++
++		if (regs->cp0_epc == stepped_address)
++			ss_trap = 0;
++
++		/* Restore original interrupts in cpsr regs */
++		regs->cp0_status |= stepped_cp0_status_ie;
++		stepped_opcode = 0;
++	}
++#ifdef DEBUG_IT
++	else {
++		int op;
++		unsigned long addr = regs->cp0_epc;
++
++		PRINTK("%s: It's very likely an actual BP.\n", __func__);
++
++		if (probe_kernel_read((unsigned char *) &op,
++				      (char *) addr,
++				      BREAK_INSTR_SIZE) != 0) {
++			PRINTK("Unable to read memory at 0x%lx\n", addr);
++		} else {
++			PRINTK("op is 0x%x\n", op);
++			if (op != *(unsigned long *)arch_kgdb_ops.gdb_bpt_instr)
++				PRINTK("OOPS this is not a bp !\n");
++			else
++				PRINTK("YES this is a bp !\n");
++		}
++	}
++#endif /* DEBUG_IT */
++
++	if (kgdb_handle_exception(ss_trap, compute_signal(trap), cmd, regs)) {
+ 		set_fs(old_fs);
+ 		return NOTIFY_DONE;
+ 	}
+@@ -363,18 +436,70 @@ int kgdb_arch_handle_exception(int vector, int signo, int err_code,
+ 	char *ptr;
+ 	unsigned long address;
+ 	int cpu = smp_processor_id();
++	int error;
+ 
+ 	switch (remcom_in_buffer[0]) {
+-	case 's':
++	case 's': {
++		unsigned long next_addr;
++
++		PRINTK("KGDB: s command at 0x%lx\n", regs->cp0_epc);
++
++		/* handle the optional parameter */
++		ptr = &remcom_in_buffer[1];
++		if (kgdb_hex2long (&ptr, &address))
++			regs->cp0_epc = address;
++
++		atomic_set(&kgdb_cpu_doing_single_step, -1);
++
++		next_addr = mipsGetNpc(regs);
++		stepped_address = next_addr;
++		PRINTK("KGDB next pc 0x%lx\n", next_addr);
++
++		/* Saves original instruction */
++		error = probe_kernel_read((char *) &stepped_opcode,
++					  (char *)next_addr,
++					  BREAK_INSTR_SIZE);
++		if (error != 0) {
++			PRINTK("Unable to access opcode at next pc 0x%lx\n",
++			       next_addr);
++			return error;
++		}
++
++		/* Sets the temporary breakpoint */
++		error = probe_kernel_write((char *)next_addr,
++					   arch_kgdb_ops.gdb_bpt_instr,
++					   BREAK_INSTR_SIZE);
++		if (error != 0) {
++			PRINTK("Unable to write tmp BP at next pc 0x%lx\n",
++			       next_addr);
++			return error;
++		}
++
++		stepped_cp0_status_ie = regs->cp0_status & ST0_IE;
++
++		/* masks interrupts */
++		regs->cp0_status &= ~ST0_IE;
++
++		/* Flush cache */
++		flush_icache_range((long)next_addr,
++				   (long)next_addr + 4);
++		atomic_set(&kgdb_cpu_doing_single_step, cpu);
++
++		PRINTK("step armed over 0x%lx\n", regs->cp0_epc);
++
++		return 0;
++	}
+ 	case 'c':
++		PRINTK("KGDB: c command at 0x%lx\n", regs->cp0_epc);
++
+ 		/* handle the optional parameter */
+ 		ptr = &remcom_in_buffer[1];
+ 		if (kgdb_hex2long(&ptr, &address))
+ 			regs->cp0_epc = address;
+ 
+ 		atomic_set(&kgdb_cpu_doing_single_step, -1);
+-		if (remcom_in_buffer[0] == 's')
+-			atomic_set(&kgdb_cpu_doing_single_step, cpu);
++
++		PRINTK("%s done OK\n", __func__);
+ 
+ 		return 0;
+ 	}
+@@ -409,3 +534,243 @@ void kgdb_arch_exit(void)
+ {
+ 	unregister_die_notifier(&kgdb_notifier);
+ }
++
++/* Copyright (c) 1996-2001 Wind River Systems, Inc. */
++/* <WRS_ADDED> */
++static unsigned long mipsGetNpc(struct pt_regs *pRegs)
++{
++	int	rsVal;
++	int	rtVal;
++	int ptr;
++	unsigned long	disp;
++	unsigned int  machInstr;
++	unsigned long npc;
++	unsigned long pc;
++
++	if (pRegs == NULL)
++		panic("%s: NULL pRegs !\n", __func__);
++
++#if 0
++	/*
++	 * If we are in a branch delay slot, the pc has been changed
++	 * in the breakpoint handler to match with the breakpoint
++	 * address.  It is modified to have its normal value.
++	 */
++
++	if (pRegs->cp0_cause & CAUSE_BD)
++		pRegs->cp0_epc--;
++#endif	/* 0 */
++
++	pc        = pRegs->cp0_epc;
++	machInstr = *(unsigned int *)pc;
++
++	/* Default instruction is the next one. */
++
++	npc = pc + 4;
++
++	/*
++	 * Do not report the instruction in a branch delay slot as the
++	 * next pc.  Doing so will mess up the WDB_STEP_OVER case as
++	 * the branch instruction is re-executed.
++	 */
++
++	/*
++	 * Check if we are on a branch likely instruction, which will nullify
++	 * the instruction in the slot if the branch is taken.
++	 * Also, pre-extract some of the instruction fields just to make coding
++	 * easier.
++	 */
++
++	rsVal = pRegs->regs[(machInstr >> 21) & 0x1f];
++	rtVal = pRegs->regs[(machInstr >> 16) & 0x1f];
++	ptr   = (machInstr >> 16) & 0x1f;
++	disp = ((int) ((machInstr & 0x0000ffff) << 16)) >> 14;
++	if ((machInstr & 0xf3ff0000) == 0x41020000)	{
++		/* BCzFL  */
++		int copId = (machInstr >> 26) & 0x03;
++		npc = pc + 8;
++		switch (copId) {
++		case 1:
++#if 0
++#ifndef SOFT_FLOAT
++			if ((pRegs->fpcsr & FP_COND) != FP_COND)
++				npc = disp + pc + 4;
++#endif	/* !SOFT_FLOAT */
++#endif /* 0 */
++			break;
++		}
++	} else if ((machInstr & 0xf3ff0000) == 0x41030000) {
++		/* BCzTL  */
++		int copId = (machInstr >> 26) & 0x03;
++		npc = pc + 8;
++		switch (copId) {
++		case 1:
++#if 0
++#ifndef SOFT_FLOAT
++			if ((pRegs->fpcsr & FP_COND) == FP_COND)
++				npc = disp + pc + 4;
++#endif	/* !SOFT_FLOAT */
++#endif /* 0 */
++			break;
++		}
++	} else if (((machInstr & 0xfc1f0000) == 0x04130000)
++		   || ((machInstr & 0xfc1f0000) == 0x04030000)) {
++		/* BGEZALL*/
++		/* BGEZL  */
++		if (rsVal >= 0)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	} else if ((machInstr & 0xfc1f0000) == 0x5c000000) {
++		/* BGTZL  */
++		if (rsVal > 0)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	} else if ((machInstr & 0xfc1f0000) == 0x58000000) {
++		/* BLEZL  */
++		if (rsVal <= 0)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	} else if (((machInstr & 0xfc1f0000) == 0x04120000)
++		   || ((machInstr & 0xfc1f0000) == 0x04020000)) {
++		/* BLTZALL*/
++		/* BLTZL  */
++		if (rsVal < 0)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	} else if ((machInstr & 0xfc000000) == 0x50000000) {
++		/* BEQL   */
++		if (rsVal == rtVal)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	} else if ((machInstr & 0xfc000000) == 0x54000000) {
++		/* BNEL   */
++		if (rsVal != rtVal)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	} else if (((machInstr & 0xfc000000) == 0x08000000) ||
++		   ((machInstr & 0xfc000000) == 0x0c000000)) {
++		/* J    */
++		/* JAL  */
++		npc = ((machInstr & 0x03ffffff) << 2) |
++#ifdef CONFIG_CPU_MIPS64
++	       (pc        & 0xfffffffff0000000ULL);
++#else
++	       (pc        & 0xf0000000);
++#endif
++	} else if (((machInstr & 0xfc1f07ff) == 0x00000009)
++		   || ((machInstr & 0xfc1fffff) == 0x00000008)) {
++		/* JALR */
++		/* JR   */
++		npc = pRegs->regs[(machInstr >> 21) & 0x1f];
++	} else if ((machInstr & 0xf3ff0000) == 0x41000000) {
++		/* BCzF   */
++		int copId = (machInstr >> 26) & 0x03;
++		npc = pc + 8;
++		switch (copId) {
++		case 1:
++#if 0
++#ifndef SOFT_FLOAT
++			if ((pRegs->fpcsr & FP_COND) != FP_COND)
++				npc = disp + pc + 4;
++#endif	/* !SOFT_FLOAT */
++#endif /* 0 */
++			break;
++		}
++	} else if ((machInstr & 0xf3ff0000) == 0x41010000) {
++		/* BCzT   */
++		int copId = (machInstr >> 26) & 0x03;
++		npc = pc + 8;
++		switch (copId) {
++		case 1:
++#if 0
++#ifndef SOFT_FLOAT
++			if ((pRegs->fpcsr & FP_COND) == FP_COND)
++				npc = disp + pc + 4;
++#endif	/* !SOFT_FLOAT */
++#endif /* 0 */
++			break;
++		}
++	} else if ((machInstr & 0xfc000000) == 0x10000000) {
++		/* BEQ    */
++		if (rsVal == rtVal)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	} else if (((machInstr & 0xfc1f0000) == 0x04010000)
++		   || ((machInstr & 0xfc1f0000) == 0x04110000)) {
++		/* BGEZ   */
++		/* BGEZAL */
++		if (rsVal >= 0)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	} else if ((machInstr & 0xfc1f0000) == 0x1c000000) {
++		/* BGTZ   */
++		if (rsVal > 0)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	} else if ((machInstr & 0xfc1f0000) == 0x18000000) {
++		/* BLEZ   */
++		if (rsVal <= 0)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	} else if (((machInstr & 0xfc1f0000) == 0x04000000)
++		   || ((machInstr & 0xfc1f0000) == 0x04100000)) {
++		/* BLTZ   */
++		/* BLTZAL */
++		if (rsVal < 0)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	} else if ((machInstr & 0xfc000000) == 0x14000000) {
++		/* BNE    */
++		if (rsVal != rtVal)
++			npc = disp + pc + 4;
++		else
++			npc = pc + 8;
++	}
++   /* Cavium specific */
++
++	else if ((machInstr & 0xfc000000) == 0xc8000000) {
++		/* BBIT0  */
++		/* branch if bit is Zero */
++		if ((rsVal >> ptr) & 1)
++			npc = pc + 8;
++		else /* cond is true */
++			npc = disp + pc + 4;
++	} else if ((machInstr & 0xfc000000) == 0xd8000000) {
++		/* BBIT032  */
++		/* branch if bit is Zero */
++		if ((rsVal >> (ptr + 32)) & 1)
++			npc = pc + 8;
++		else /* cond is true */
++			npc = disp + pc + 4;
++	} else if ((machInstr & 0xfc000000) == 0xe8000000) {
++		/* BBIT1  */
++		/* branch if bit is Set */
++		if ((rsVal >> ptr) & 1)
++			npc = disp + pc + 4;
++		else /* cond is true */
++			npc = pc + 8;
++	} else if ((machInstr & 0xfc000000) == 0xf8000000) {
++		/* BBIT132  */
++		/* branch if bit is Set */
++		if ((rsVal >> (ptr + 32)) & 1)
++			npc = disp + pc + 4;
++		else /* cond is true */
++			npc = pc + 8;
++	} else {
++		/* normal instruction */
++	}
++
++	return npc;
++}
++/* </WRS_ADDED> */
+diff --git a/drivers/misc/kgdbts.c b/drivers/misc/kgdbts.c
+index 136b133..40f258b 100644
+--- a/drivers/misc/kgdbts.c
++++ b/drivers/misc/kgdbts.c
+@@ -138,7 +138,7 @@ static int hw_break_val2;
+ static int cont_instead_of_sstep;
+ static unsigned long cont_thread_id;
+ static unsigned long sstep_thread_id;
+-#if defined(CONFIG_MIPS) || defined(CONFIG_SPARC)
++#if defined(CONFIG_SPARC)
+ static int arch_needs_sstep_emulation = 1;
+ #else
+ static int arch_needs_sstep_emulation;
+-- 
+2.0.2
+

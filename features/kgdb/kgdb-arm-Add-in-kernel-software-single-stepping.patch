@@ -1,0 +1,523 @@
+From ee3d8a3a4e786ff22623beea8b7153b42e51e748 Mon Sep 17 00:00:00 2001
+From: "Kexin(Casey) Chen" <Casey.Chen@windriver.com>
+Date: Wed, 21 Sep 2016 15:11:08 -0700
+Subject: [PATCH 13/28] kgdb,arm: Add in kernel software single stepping
+
+Add ARM software single stepping
+
+Signed-off-by: Wally Gleemer <wally.gleemer@windriver.com>
+Signed-off-by: Jason Wessel <jason.wessel@windriver.com>
+
+Adjust hunk #1 of arch/arm/kernel/kgdb.c
+
+Signed-off-by: He Zhe <zhe.he@windriver.com>
+
+Signed-off-by: Kexin(Casey) Chen <Casey.Chen@windriver.com>
+---
+ arch/arm/kernel/kgdb.c | 444 +++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/misc/kgdbts.c  |   2 +-
+ 2 files changed, 445 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/kernel/kgdb.c b/arch/arm/kernel/kgdb.c
+index 9232cae..33e1e7c 100644
+--- a/arch/arm/kernel/kgdb.c
++++ b/arch/arm/kernel/kgdb.c
+@@ -17,6 +17,43 @@
+ #include <asm/patch.h>
+ #include <asm/traps.h>
+ 
++/* <WRS_ADDED> */
++#include <asm/cacheflush.h>
++
++#define BIT32(n) ((uint32_t)1U << (n))
++#define BITSET(x, n) (((uint32_t)(x) & (1U<<(n))) >> (n))
++#define BITS(x, m, n) (((uint32_t)((x) & (BIT32(n) - BIT32(m) +\
++					BIT32(n)))) >> (m))
++
++/* #define DEBUG_IT */
++#ifdef DEBUG_IT
++#define PRINTK(args...) printk(KERN_ALERT args)
++#else
++#define PRINTK(args...)
++#endif /* DEBUG_IT */
++
++/*
++ * ccTable is used to determine whether an instruction will be executed,
++ * according to the flags in the PSR and the condition field of the
++ * instruction. The table has an entry for each possible value of the
++ * condition field of the instruction. Each bit indicates whether a particular
++ * combination of flags will cause the instruction to be executed. Since
++ * ther are four flags, this makes 16 possible TRUE/FALSE values.
++ */
++
++static uint32_t ccTable[] = {
++	0xF0F0, 0x0F0F, 0xCCCC, 0x3333, 0xFF00, 0x00FF, 0xAAAA, 0x5555,
++	0x0C0C, 0xF3F3, 0xAA55, 0x55AA, 0x0A05, 0xF5FA, 0xFFFF, 0x0000
++};
++
++static uint32_t *stepped_address;
++static uint32_t stepped_opcode;
++static uint32_t stepped_cpsr_it_mask;
++static uint32_t *armGetNpc(uint32_t instr,	/* the current instruction */
++			struct pt_regs *pRegs);	/* pointer to task registers */
++
++/* </WRS_ADDED> */
++
+ struct dbg_reg_def_t dbg_reg_def[DBG_MAX_REG_NUM] =
+ {
+ 	{ "r0", 4, offsetof(struct pt_regs, ARM_r0)},
+@@ -105,6 +142,7 @@ void kgdb_arch_set_pc(struct pt_regs *regs, unsigned long pc)
+ }
+ 
+ static int compiled_break;
++static struct undef_hook kgdb_brkpt_hook;
+ 
+ int kgdb_arch_handle_exception(int exception_vector, int signo,
+ 			       int err_code, char *remcom_in_buffer,
+@@ -113,6 +151,7 @@ int kgdb_arch_handle_exception(int exception_vector, int signo,
+ {
+ 	unsigned long addr;
+ 	char *ptr;
++	int error;
+ 
+ 	switch (remcom_in_buffer[0]) {
+ 	case 'D':
+@@ -133,6 +172,83 @@ int kgdb_arch_handle_exception(int exception_vector, int signo,
+ 		compiled_break = 0;
+ 
+ 		return 0;
++	case 's':
++	{
++		uint32_t *next_addr;
++		uint32_t currentInst;
++
++		/*
++		 * Do a software step. We assume that the host
++		 * debuuger has already REMOVED the breakpoint, so if
++		 * we read the memory, we have the REAL instruction.
++		 */
++		PRINTK("KGDB: s command\n");
++
++		/* Try to read optional parameter, PC unchanged if
++		 * none
++		 */
++		ptr = &remcom_in_buffer[1];
++		if (kgdb_hex2long(&ptr, &addr))
++			linux_regs->ARM_pc = addr;
++
++		atomic_set(&kgdb_cpu_doing_single_step, -1);
++
++		/* Read the current instruction at the PC */
++		error = probe_kernel_read(&currentInst,
++					  (char *)linux_regs->ARM_pc,
++					  BREAK_INSTR_SIZE);
++		if (error)
++			return -EINVAL;
++		PRINTK("KGDB current pc %lx %x\n",
++		       linux_regs->ARM_pc, currentInst);
++
++		/* Compute the next address */
++		next_addr = armGetNpc(currentInst, linux_regs);
++		stepped_address = next_addr;
++
++		PRINTK("KGDB next pc %x\n", next_addr);
++
++		/* Saves original instruction */
++		error = probe_kernel_read(&stepped_opcode,
++					  (char *) next_addr,
++					  BREAK_INSTR_SIZE);
++		if (error != 0) {
++			PRINTK("Unable to access opcode at next pc 0x%x\n",
++			       (int)next_addr);
++			return error;
++			break;
++		}
++
++		/* Sets the temporary breakpoint */
++		error = probe_kernel_write((char *)next_addr,
++					   (char *)&kgdb_brkpt_hook.instr_val,
++					   BREAK_INSTR_SIZE);
++		if (error != 0) {
++			PRINTK("Unable to write tmp BP at next pc 0x%x\n",
++			       (int)next_addr);
++			return error;
++			break;
++		}
++
++		/*
++		 * Store the value of F & I bit
++		 * in order to restore them later.
++		 *
++		 * Mask the interrupts
++		 */
++		stepped_cpsr_it_mask =
++			linux_regs->ARM_cpsr & (PSR_F_BIT | PSR_I_BIT);
++		linux_regs->ARM_cpsr |= PSR_F_BIT | PSR_I_BIT;
++
++		/* Flush and return */
++		flush_icache_range((long)next_addr,
++				   (long)next_addr + 4);
++		if (kgdb_contthread)
++			atomic_set(&kgdb_cpu_doing_single_step,
++				   smp_processor_id());
++		return 0;
++		break;
++	}
+ 	}
+ 
+ 	return -1;
+@@ -140,6 +256,32 @@ int kgdb_arch_handle_exception(int exception_vector, int signo,
+ 
+ static int kgdb_brk_fn(struct pt_regs *regs, unsigned int instr)
+ {
++	int error;
++
++	/* If we have been single-stepping, put back the old instruction.
++	 * We use stepped_address in case we have stopped more than one
++	 * instruction away. */
++	if (stepped_opcode != 0) {
++		PRINTK("Step done at %x putting back %x\n",
++		       stepped_address, stepped_opcode);
++		/* restores original instruction */
++		error = probe_kernel_write((char *)stepped_address,
++					   (char *) &stepped_opcode,
++					   BREAK_INSTR_SIZE);
++		if (error != 0)	{
++			PRINTK("Unable to restore original instruction\n");
++			return 1;
++		}
++
++		flush_icache_range((long)stepped_address,
++				   (long)stepped_address + 4);
++		/* Restore original interrupts in cpsr regs */
++		/* Clean the I & F bits */
++		regs->ARM_cpsr &= ~(PSR_F_BIT | PSR_I_BIT);
++		/* Add the original values */
++		regs->ARM_cpsr |= stepped_cpsr_it_mask;
++	}
++	stepped_opcode = 0;
+ 	kgdb_handle_exception(1, SIGTRAP, 0, regs);
+ 
+ 	return 0;
+@@ -280,3 +422,305 @@ struct kgdb_arch arch_kgdb_ops = {
+ 	.gdb_bpt_instr		= {0xe7, 0xff, 0xde, 0xfe}
+ #endif
+ };
++
++/* Copyright (c) 1996-2001 Wind River Systems, Inc. */
++/* From dbgArmLib.c */
++/* <WRS_ADDED> */
++/*
++ * The following is borrowed from vxWorks
++ */
++
++static uint32_t armShiftedRegVal(struct pt_regs *pRegs,
++				 uint32_t instr,
++				 int cFlag)
++{
++	uint32_t res, shift, rm, rs, shiftType;
++
++	rm = BITS(instr, 0, 3);
++	shiftType = BITS(instr, 5, 6);
++
++	if (BITSET(instr, 4)) {
++		rs = BITS(instr, 8, 11);
++		shift =
++		    (rs == 15 ? (uint32_t) pRegs->ARM_pc + 8 :
++		     pRegs->uregs[rs]) & 0xFF;
++	} else {
++		shift = BITS(instr, 7, 11);
++	}
++
++	res = rm == 15 ? (uint32_t) pRegs->ARM_pc + (BITSET(instr, 4) ? 12 : 8)
++	    : pRegs->uregs[rm];
++
++	switch (shiftType) {
++	case 0:		/* LSL */
++		res = shift >= 32 ? 0 : res << shift;
++		break;
++
++	case 1:		/* LSR */
++		res = shift >= 32 ? 0 : res >> shift;
++		break;
++
++	case 2:		/* ASR */
++		if (shift >= 32)
++			shift = 31;
++		res = (res & 0x80000000L) ? ~((~res) >> shift) : res >> shift;
++		break;
++
++	case 3:		/* ROR */
++		shift &= 31;
++		if (shift == 0)
++			res = (res >> 1) | (cFlag ? 0x80000000L : 0);
++		else
++			res = (res >> shift) | (res << (32 - shift));
++		break;
++	}
++	return res;
++
++}				/* armShiftedRegVal() */
++
++static uint32_t *armGetNpc(uint32_t instr,	/* the current instruction */
++			struct pt_regs *pRegs)	/* pointer to task registers */
++{
++	uint32_t pc;		/* current program counter */
++	uint32_t nPc;		/* next program counter */
++
++	/*
++	 * Early versions of this file looked at the PSR to determine
++	 * whether the CPU was in ARM state or Thumb state and decode
++	 * the next instruction accordingly. This has been removed
++	 * since there is to be no support for ARM/Thumb interworking.
++	 */
++
++	pc = (uint32_t) pRegs->ARM_pc;	/* current PC as a uint32_t */
++	nPc = pc + 4;		/* default */
++
++	PRINTK("nPc %x CPSR %x\n", nPc, pRegs->ARM_cpsr);
++
++	/*
++	 * Now examine the instruction
++	 * First, check the current condition codes against the condition
++	 * field of the instruction since, if this instruction is not going
++	 * to be executed, we can return immediately
++	 *
++	 * The following code is a translation of the code supplied by ARM
++	 * for instruction decoding (EAN-26). Note that this version, unlike
++	 * the original assembly language version cannot generate unaligned
++	 * accesses which might be faulted by some systems.
++	 *
++	 * Briefly, there are 16 entries in ccTable, one for each possible
++	 * value of the condition part of an instruction. Each entry has one
++	 * bit for each possible value of the flags in the PSR. The table
++	 * entry is extracted using the condition part of the instruction and
++	 * the bits are indexed using the value obtained by extracting the
++	 * flags from the PSR. If the bit so obtained is 1, the instruction
++	 * will be executed.
++	 */
++
++	PRINTK("Index %x\n", ((instr >> 28) & 0xF));
++	PRINTK("Value %x\n", (ccTable[(instr >> 28) & 0xF]));
++	PRINTK("CPSRd %x\n", (pRegs->ARM_cpsr >> 28) & 0xF);
++	PRINTK(KERN_ALERT "Res %x\n",	\
++	       ((ccTable[(instr >> 28) & 0xF] >> \
++		 ((pRegs->ARM_cpsr >> 28) & 0xF))));
++
++	if (((ccTable[(instr >> 28) & 0xF] >>
++	      ((pRegs->ARM_cpsr >> 28) & 0xF)) & 1) == 0)
++		return (uint32_t *) nPc; /* instruction will not be executed */
++
++	/*
++	 * This instruction WILL be executed so look at its type
++	 * We're looking for anything that affects the PC e.g.
++	 *    B
++	 *    BL
++	 *    any data processing op where PC is the destination
++	 *    any LDR with the PC as the destination
++	 *    any LDM with the PC in the list of registers to be loaded
++	 *
++	 * Following code is derived from the ARM symbolic debugger.
++	 */
++
++	switch (BITS(instr, 24, 27)) {
++	case 1:		/* check for halfword or signed byte load to PC */
++		if (BITSET(instr, 4) && BITSET(instr, 7) && BITSET(instr, 20) &&
++		    BITS(instr, 5, 6) != 0 && BITS(instr, 12, 15) == 15)
++			break;	/* bad instruction */
++
++		/* FALL THROUGH */
++
++	case 0:		/* data processing */
++	case 2:
++	case 3:
++		{
++			uint32_t rn, op1, op2, cFlag;
++
++			if (BITS(instr, 12, 15) != 15)
++				/* Rd */
++				/* operation does not affect PC */
++				break;
++
++			if (BITS(instr, 22, 25) == 0 && BITS(instr, 4, 7) == 9)
++				/* multiply with PC as destination not
++				 * allowed */
++				break;
++
++			if (BITS(instr, 4, 23) == 0x2FFF1) {
++				/* BX */
++				rn = BITS(instr, 0, 3);
++				nPc = (rn == 15 ? pc + 8 :
++				       pRegs->uregs[rn]) & ~1;
++				break;
++			}
++
++			if (BITS(instr, 4, 23) == 0x2FFF3) {
++				/* BLX */
++				rn = BITS(instr, 0, 3);
++				nPc = (rn == 15 ? pc + 8 : pRegs->uregs[rn]);
++				break;
++			}
++
++			cFlag = BITSET(pRegs->ARM_cpsr, 29);
++			rn = BITS(instr, 16, 19);
++			op1 = rn == 15 ? pc + 8 : pRegs->uregs[rn];
++
++			if (BITSET(instr, 25)) {
++				uint32_t immVal, rotate;
++
++				immVal = BITS(instr, 0, 7);
++				rotate = 2 * BITS(instr, 8, 11);
++				op2 =
++				    (immVal >> rotate) | (immVal <<
++							  (32 - rotate));
++			} else
++				op2 = armShiftedRegVal(pRegs, instr, cFlag);
++
++			switch (BITS(instr, 21, 24)) {
++			case 0x0:	/* AND */
++				nPc = op1 & op2;
++				break;
++			case 0x1:	/* EOR */
++				nPc = op1 ^ op2;
++				break;
++			case 0x2:	/* SUB */
++				nPc = op1 - op2;
++				break;
++			case 0x3:	/* RSB */
++				nPc = op2 - op1;
++				break;
++			case 0x4:	/* ADD */
++				nPc = op1 + op2;
++				break;
++			case 0x5:	/* ADC */
++				nPc = op1 + op2 + cFlag;
++				break;
++			case 0x6:	/* SBC */
++				nPc = op1 - op2 + cFlag;
++				break;
++			case 0x7:	/* RSC */
++				nPc = op2 - op1 + cFlag;
++				break;
++			case 0x8:	/* TST */
++			case 0x9:	/* TEQ */
++			case 0xa:	/* CMP */
++			case 0xb:	/* CMN */
++				break;
++			case 0xc:	/* ORR */
++				nPc = op1 | op2;
++				break;
++			case 0xd:	/* MOV */
++				nPc = op2;
++				break;
++			case 0xe:	/* BIC */
++				nPc = op1 & ~op2;
++				break;
++			case 0xf:	/* MVN */
++				nPc = ~op2;
++				break;
++			}
++		}
++		break;
++
++	case 4:		/* data transfer */
++	case 5:
++	case 6:
++	case 7:
++		if (BITSET(instr, 20) && BITS(instr, 12, 15) == 15 &&
++		    !BITSET(instr, 22))
++			/* load, PC and not a byte load */
++		{
++			uint32_t rn, cFlag, base;
++			int32_t offset;
++
++			rn = BITS(instr, 16, 19);
++			base = rn == 15 ? pc + 8 : pRegs->uregs[rn];
++			cFlag = BITSET(pRegs->ARM_cpsr, 29);
++			offset = BITSET(instr, 25)
++			    ? armShiftedRegVal(pRegs, instr, cFlag)
++			    : BITS(instr, 0, 11);
++
++			if (!BITSET(instr, 23))	/* down */
++				offset = -offset;
++
++			if (BITSET(instr, 24))	/* pre-indexed */
++				base += offset;
++
++			nPc = *(uint32_t *) base;
++
++			/*
++			 * don't check for nPc == pc like the ARM
++			 * debugger does but let the higher level (or
++			 * user) notice.
++			 */
++		}
++		break;
++
++	case 8:
++	case 9:		/* block transfer */
++		if (BITSET(instr, 20) && BITSET(instr, 15)) { /* loading PC */
++			uint32_t rn;
++			int32_t offset = 0;
++
++			rn = BITS(instr, 16, 19);
++			if (BITSET(instr, 23)) {	/* up */
++				uint32_t regBit, regList;
++
++				for (regList = BITS(instr, 0, 14); regList != 0;
++				     regList &= ~regBit) {
++					regBit = regList & (-regList);
++					offset += 4;
++				}
++				if (BITSET(instr, 24))	/* preincrement */
++					offset += 4;
++			} else if (BITSET(instr, 24))
++				/* predecrement */
++				offset = -4;
++
++			nPc = *(uint32_t *) (pRegs->uregs[rn] + offset);
++
++			/*
++			 * don't check for nPc == pc like the ARM
++			 * debugger does but let the higher level (or
++			 * user) notice.
++			 */
++		}
++		break;
++
++	case 0xA:		/* branch */
++	case 0xB:		/* branch & link */
++		/*
++		 * extract offset, sign extend it and add it to current PC,
++		 * adjusting for the pipeline
++		 */
++		nPc = pc + 8 + ((int32_t) (instr << 8) >> 6);
++		break;
++
++	case 0xC:
++	case 0xD:
++	case 0xE:		/* coproc ops */
++	case 0xF:		/* SWI */
++		break;
++	}
++
++	return (uint32_t *) nPc;
++
++}				/* armGetNpc() */
++/* </WRS_ADDED> */
+diff --git a/drivers/misc/kgdbts.c b/drivers/misc/kgdbts.c
+index 99635dd..136b133 100644
+--- a/drivers/misc/kgdbts.c
++++ b/drivers/misc/kgdbts.c
+@@ -138,7 +138,7 @@ static int hw_break_val2;
+ static int cont_instead_of_sstep;
+ static unsigned long cont_thread_id;
+ static unsigned long sstep_thread_id;
+-#if defined(CONFIG_ARM) || defined(CONFIG_MIPS) || defined(CONFIG_SPARC)
++#if defined(CONFIG_MIPS) || defined(CONFIG_SPARC)
+ static int arch_needs_sstep_emulation = 1;
+ #else
+ static int arch_needs_sstep_emulation;
+-- 
+2.0.2
+
