@@ -1,0 +1,187 @@
+From 5c8700aa612ee451675051b71bccb4cd89d7b6dc Mon Sep 17 00:00:00 2001
+From: Waiman Long <Waiman.Long@hpe.com>
+Date: Tue, 6 Sep 2016 13:22:10 -0400
+Subject: [PATCH] x86/hpet: Reduce HPET counter read contention
+
+commit f99fd22e4d4bc84880a8a3117311bbf0e3a6a9dc upstream.
+
+On a large system with many CPUs, using HPET as the clock source can
+have a significant impact on the overall system performance because
+of the following reasons:
+ 1) There is a single HPET counter shared by all the CPUs.
+ 2) HPET counter reading is a very slow operation.
+
+Using HPET as the default clock source may happen when, for example,
+the TSC clock calibration exceeds the allowable tolerance. Something
+the performance slowdown can be so severe that the system may crash
+because of a NMI watchdog soft lockup, for example.
+
+During the TSC clock calibration process, the default clock source
+will be set temporarily to HPET. For systems with many CPUs, it is
+possible that NMI watchdog soft lockup may occur occasionally during
+that short time period where HPET clocking is active as is shown in
+the kernel log below:
+
+[   71.646504] hpet0: 8 comparators, 64-bit 14.318180 MHz counter
+[   71.655313] Switching to clocksource hpet
+[   95.679135] BUG: soft lockup - CPU#144 stuck for 23s! [swapper/144:0]
+[   95.693363] BUG: soft lockup - CPU#145 stuck for 23s! [swapper/145:0]
+[   95.695580] BUG: soft lockup - CPU#582 stuck for 23s! [swapper/582:0]
+[   95.698128] BUG: soft lockup - CPU#357 stuck for 23s! [swapper/357:0]
+
+This patch addresses the above issues by reducing HPET read contention
+using the fact that if more than one CPUs are trying to access HPET at
+the same time, it will be more efficient when only one CPU in the group
+reads the HPET counter and shares it with the rest of the group instead
+of each group member trying to read the HPET counter individually.
+
+This is done by using a combination quadword that contains a 32-bit
+stored HPET value and a 32-bit spinlock.  The CPU that gets the lock
+will be responsible for reading the HPET counter and storing it in
+the quadword. The others will monitor the change in HPET value and
+lock status and grab the latest stored HPET value accordingly. This
+change is only enabled on 64-bit SMP configuration.
+
+On a 4-socket Haswell-EX box with 144 threads (HT on), running the
+AIM7 compute workload (1500 users) on a 4.8-rc1 kernel (HZ=1000)
+with and without the patch has the following performance numbers
+(with HPET or TSC as clock source):
+
+TSC		= 1042431 jobs/min
+HPET w/o patch	=  798068 jobs/min
+HPET with patch	= 1029445 jobs/min
+
+The perf profile showed a reduction of the %CPU time consumed by
+read_hpet from 11.19% without patch to 1.24% with patch.
+
+[ tglx: It's really sad that we need to have such hacks just to deal with
+  	the fact that cpu vendors have not managed to fix the TSC wreckage
+  	within 15+ years. Were They Forgetting? ]
+
+Signed-off-by: Waiman Long <Waiman.Long@hpe.com>
+Tested-by: Prarit Bhargava <prarit@redhat.com>
+Cc: Scott J Norton <scott.norton@hpe.com>
+Cc: Douglas Hatch <doug.hatch@hpe.com>
+Cc: Randy Wright <rwright@hpe.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Borislav Petkov <bp@suse.de>
+Link: http://lkml.kernel.org/r/1473182530-29175-1-git-send-email-Waiman.Long@hpe.com
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ arch/x86/kernel/hpet.c | 94 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 94 insertions(+)
+
+diff --git a/arch/x86/kernel/hpet.c b/arch/x86/kernel/hpet.c
+index c6dfd80..274fab9 100644
+--- a/arch/x86/kernel/hpet.c
++++ b/arch/x86/kernel/hpet.c
+@@ -756,10 +756,104 @@ static void hpet_reserve_msi_timers(struct hpet_data *hd)
+ /*
+  * Clock source related code
+  */
++#if defined(CONFIG_SMP) && defined(CONFIG_64BIT)
++/*
++ * Reading the HPET counter is a very slow operation. If a large number of
++ * CPUs are trying to access the HPET counter simultaneously, it can cause
++ * massive delay and slow down system performance dramatically. This may
++ * happen when HPET is the default clock source instead of TSC. For a
++ * really large system with hundreds of CPUs, the slowdown may be so
++ * severe that it may actually crash the system because of a NMI watchdog
++ * soft lockup, for example.
++ *
++ * If multiple CPUs are trying to access the HPET counter at the same time,
++ * we don't actually need to read the counter multiple times. Instead, the
++ * other CPUs can use the counter value read by the first CPU in the group.
++ *
++ * This special feature is only enabled on x86-64 systems. It is unlikely
++ * that 32-bit x86 systems will have enough CPUs to require this feature
++ * with its associated locking overhead. And we also need 64-bit atomic
++ * read.
++ *
++ * The lock and the hpet value are stored together and can be read in a
++ * single atomic 64-bit read. It is explicitly assumed that arch_spinlock_t
++ * is 32 bits in size.
++ */
++union hpet_lock {
++	struct {
++		arch_spinlock_t lock;
++		u32 value;
++	};
++	u64 lockval;
++};
++
++static union hpet_lock hpet __cacheline_aligned = {
++	{ .lock = __ARCH_SPIN_LOCK_UNLOCKED, },
++};
++
++static cycle_t read_hpet(struct clocksource *cs)
++{
++	unsigned long flags;
++	union hpet_lock old, new;
++
++	BUILD_BUG_ON(sizeof(union hpet_lock) != 8);
++
++	/*
++	 * Read HPET directly if in NMI.
++	 */
++	if (in_nmi())
++		return (cycle_t)hpet_readl(HPET_COUNTER);
++
++	/*
++	 * Read the current state of the lock and HPET value atomically.
++	 */
++	old.lockval = READ_ONCE(hpet.lockval);
++
++	if (arch_spin_is_locked(&old.lock))
++		goto contended;
++
++	local_irq_save(flags);
++	if (arch_spin_trylock(&hpet.lock)) {
++		new.value = hpet_readl(HPET_COUNTER);
++		/*
++		 * Use WRITE_ONCE() to prevent store tearing.
++		 */
++		WRITE_ONCE(hpet.value, new.value);
++		arch_spin_unlock(&hpet.lock);
++		local_irq_restore(flags);
++		return (cycle_t)new.value;
++	}
++	local_irq_restore(flags);
++
++contended:
++	/*
++	 * Contended case
++	 * --------------
++	 * Wait until the HPET value change or the lock is free to indicate
++	 * its value is up-to-date.
++	 *
++	 * It is possible that old.value has already contained the latest
++	 * HPET value while the lock holder was in the process of releasing
++	 * the lock. Checking for lock state change will enable us to return
++	 * the value immediately instead of waiting for the next HPET reader
++	 * to come along.
++	 */
++	do {
++		cpu_relax();
++		new.lockval = READ_ONCE(hpet.lockval);
++	} while ((new.value == old.value) && arch_spin_is_locked(&new.lock));
++
++	return (cycle_t)new.value;
++}
++#else
++/*
++ * For UP or 32-bit.
++ */
+ static cycle_t read_hpet(struct clocksource *cs)
+ {
+ 	return (cycle_t)hpet_readl(HPET_COUNTER);
+ }
++#endif
+ 
+ static struct clocksource clocksource_hpet = {
+ 	.name		= "hpet",
+-- 
+2.0.2
+
