@@ -1,0 +1,456 @@
+From 3d1328c503f28fc5bcacd5a1468de11f59116461 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris at chris-wilson.co.uk>
+Date: Tue, 30 Aug 2016 09:49:02 -0700
+Subject: [PATCH 53/68] drm/i915: Add support for stealing purgable stolen
+ pages
+
+commit df4a7ae767a4538eeee8a770cfaac209fae99359 from
+git://git.yoctoproject.org/linux-yocto-4.1
+
+If we run out of stolen memory when trying to allocate an object, see if
+we can reap enough purgeable objects to free up enough contiguous free
+space for the allocation. This is in principle very much like evicting
+objects to free up enough contiguous space in the vma when binding
+a new object - and you will be forgiven for thinking that the code looks
+very similar.
+
+At the moment, we do not allow userspace to allocate objects in stolen,
+so there is neither the memory pressure to trigger stolen eviction nor
+any purgeable objects inside the stolen arena. However, this will change
+in the near future, and so better management and defragmentation of
+stolen memory will become a real issue.
+
+v2: Remember to remove the drm_mm_node.
+
+v3: Rebased to the latest drm-intel-nightly (Ankit)
+
+v4: corrected if-else braces format (Tvrtko/kerneldoc)
+
+v5: Rebased to the latest drm-intel-nightly (Ankit)
+Added a seperate list to maintain purgable objects from stolen memory
+region (Chris/Daniel)
+
+v6: Compiler optimization (merging 2 single loops into one for() loop),
+corrected code for object eviction, retire_requests before starting
+object eviction (Chris)
+
+v7: Added kernel doc for i915_gem_object_create_stolen()
+
+v8: Check for struct_mutex lock before creating object from stolen
+region (Tvrtko)
+
+v9: Renamed variables to make usage clear, added comment, removed onetime
+used macro (Tvrtko)
+
+v10: Avoid masking of error when stolen_alloc fails (Tvrtko)
+
+v11: Renamed stolen_link to tmp_link, as it may be used for other
+purposes too (Chris)
+Used ERR_CAST to cast error pointers while returning
+
+v12: Added lockdep_assert before starting stolen-backed object
+eviction (Chris)
+
+v13: Rebased
+
+Testcase: igt/gem_stolen
+
+Signed-off-by: Chris Wilson <chris at chris-wilson.co.uk>
+Signed-off-by: Ankitprasad Sharma <ankitprasad.r.sharma@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Bob Paauwe <bob.j.paauwe@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c    |    6 +-
+ drivers/gpu/drm/i915/i915_drv.h        |   17 +++-
+ drivers/gpu/drm/i915/i915_gem.c        |   15 +++
+ drivers/gpu/drm/i915/i915_gem_stolen.c |  171 ++++++++++++++++++++++++++++----
+ drivers/gpu/drm/i915/intel_pm.c        |    4 +-
+ 5 files changed, 188 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index a416b4e..5f66cb5 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -178,7 +178,7 @@ describe_obj(struct seq_file *m, struct drm_i915_gem_object *obj)
+ 		seq_puts(m, ")");
+ 	}
+ 	if (obj->stolen)
+-		seq_printf(m, " (stolen: %08llx)", obj->stolen->start);
++		seq_printf(m, " (stolen: %08llx)", obj->stolen->base.start);
+ 	if (obj->pin_display || obj->fault_mappable) {
+ 		char s[3], *t = s;
+ 		if (obj->pin_display)
+@@ -257,9 +257,9 @@ static int obj_rank_by_stolen(void *priv,
+ 	struct drm_i915_gem_object *b =
+ 		container_of(B, struct drm_i915_gem_object, obj_exec_link);
+ 
+-	if (a->stolen->start < b->stolen->start)
++	if (a->stolen->base.start < b->stolen->base.start)
+ 		return -1;
+-	if (a->stolen->start > b->stolen->start)
++	if (a->stolen->base.start > b->stolen->base.start)
+ 		return 1;
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index fac0a3a..609b18d 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1329,6 +1329,12 @@ struct intel_l3_parity {
+ 	int which_slice;
+ };
+ 
++struct i915_stolen_node {
++	struct drm_mm_node base;
++	struct list_head mm_link;
++	struct drm_i915_gem_object *obj;
++};
++
+ struct i915_gem_mm {
+ 	/** Memory allocator for GTT stolen memory */
+ 	struct drm_mm stolen;
+@@ -1346,6 +1352,13 @@ struct i915_gem_mm {
+ 	 */
+ 	struct list_head unbound_list;
+ 
++	/**
++	 * List of stolen objects that have been marked as purgeable and
++	 * thus available for reaping if we need more space for a new
++	 * allocation. Ordered by time of marking purgeable.
++	 */
++	struct list_head stolen_list;
++
+ 	/** Usable portion of the GTT for GEM */
+ 	unsigned long stolen_base; /* limited to low memory (32-bit) */
+ 
+@@ -2240,7 +2253,7 @@ struct drm_i915_gem_object {
+ 	struct list_head vma_list;
+ 
+ 	/** Stolen memory for this object, instead of being backed by shmem. */
+-	struct drm_mm_node *stolen;
++	struct i915_stolen_node *stolen;
+ 	struct list_head global_list;
+ 
+ 	struct list_head engine_list[I915_NUM_ENGINES];
+@@ -2248,6 +2261,8 @@ struct drm_i915_gem_object {
+ 	struct list_head obj_exec_link;
+ 
+ 	struct list_head batch_pool_link;
++	/** Used to link an object to a list temporarily */
++	struct list_head tmp_link;
+ 
+ 	/**
+ 	 * This is set if the object is on the active lists (has pending
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 126614f..5f83426 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -5209,6 +5209,20 @@ i915_gem_madvise_ioctl(struct drm_device *dev, void *data,
+ 	if (obj->madv == I915_MADV_DONTNEED && obj->pages == NULL)
+ 		i915_gem_object_truncate(obj);
+ 
++	if (obj->stolen) {
++		switch (obj->madv) {
++		case I915_MADV_WILLNEED:
++			list_del_init(&obj->stolen->mm_link);
++			break;
++		case I915_MADV_DONTNEED:
++			list_move(&obj->stolen->mm_link,
++				  &dev_priv->mm.stolen_list);
++			break;
++		default:
++			break;
++		}
++	}
++
+ 	args->retained = obj->madv != __I915_MADV_PURGED;
+ 
+ out:
+@@ -5875,6 +5889,7 @@ i915_gem_load_init(struct drm_device *dev)
+ 	INIT_LIST_HEAD(&dev_priv->context_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.unbound_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.bound_list);
++	INIT_LIST_HEAD(&dev_priv->mm.stolen_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.fence_list);
+ 	for (i = 0; i < I915_NUM_ENGINES; i++)
+ 		init_engine_lists(&dev_priv->engine[i]);
+diff --git a/drivers/gpu/drm/i915/i915_gem_stolen.c b/drivers/gpu/drm/i915/i915_gem_stolen.c
+index ddb31bb..1c0149c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/i915_gem_stolen.c
+@@ -545,7 +545,8 @@ i915_gem_object_release_stolen(struct drm_i915_gem_object *obj)
+ 	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
+ 
+ 	if (obj->stolen) {
+-		i915_gem_stolen_remove_node(dev_priv, obj->stolen);
++		list_del(&obj->stolen->mm_link);
++		i915_gem_stolen_remove_node(dev_priv, &obj->stolen->base);
+ 		kfree(obj->stolen);
+ 		obj->stolen = NULL;
+ 	}
+@@ -558,7 +559,7 @@ static const struct drm_i915_gem_object_ops i915_gem_object_stolen_ops = {
+ 
+ static struct drm_i915_gem_object *
+ _i915_gem_object_create_stolen(struct drm_device *dev,
+-			       struct drm_mm_node *stolen)
++			       struct i915_stolen_node *stolen)
+ {
+ 	struct drm_i915_gem_object *obj;
+ 	struct sg_table *pages;
+@@ -567,11 +568,12 @@ _i915_gem_object_create_stolen(struct drm_device *dev,
+ 	if (obj == NULL)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	drm_gem_private_object_init(dev, &obj->base, stolen->size);
++	drm_gem_private_object_init(dev, &obj->base, stolen->base.size);
+ 	i915_gem_object_init(obj, &i915_gem_object_stolen_ops);
+ 
+ 	pages = i915_pages_create_for_stolen(dev,
+-					     stolen->start, stolen->size);
++					     stolen->base.start,
++					     stolen->base.size);
+ 	if (IS_ERR(pages)) {
+ 		i915_gem_object_free(obj);
+ 		return ERR_CAST(pages);
+@@ -585,24 +587,112 @@ _i915_gem_object_create_stolen(struct drm_device *dev,
+ 	i915_gem_object_pin_pages(obj);
+ 	obj->stolen = stolen;
+ 
++	stolen->obj = obj;
++	INIT_LIST_HEAD(&stolen->mm_link);
++
+ 	obj->base.read_domains = I915_GEM_DOMAIN_CPU | I915_GEM_DOMAIN_GTT;
+ 	obj->cache_level = HAS_LLC(dev) ? I915_CACHE_LLC : I915_CACHE_NONE;
+ 
+ 	return obj;
+ }
+ 
+-struct drm_i915_gem_object *
+-i915_gem_object_create_stolen(struct drm_device *dev, u64 size)
++static bool
++mark_free(struct drm_i915_gem_object *obj, struct list_head *unwind)
++{
++	BUG_ON(obj->stolen == NULL);
++
++	if (obj->madv != I915_MADV_DONTNEED)
++		return false;
++
++	if (obj->pin_display)
++		return false;
++
++	list_add(&obj->tmp_link, unwind);
++	return drm_mm_scan_add_block(&obj->stolen->base);
++}
++
++static int
++stolen_evict(struct drm_i915_private *dev_priv, u64 size)
+ {
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_i915_gem_object *obj;
+-	struct drm_mm_node *stolen;
+-	int ret;
++	struct list_head unwind, evict;
++	struct i915_stolen_node *iter;
++	int ret, active;
+ 
+-	if (!drm_mm_initialized(&dev_priv->mm.stolen))
+-		return ERR_PTR(-ENODEV);
++	lockdep_assert_held(&dev_priv->dev->struct_mutex);
++	drm_mm_init_scan(&dev_priv->mm.stolen, size, 0, 0);
++	INIT_LIST_HEAD(&unwind);
++
++	/* Retire all requests before creating the evict list */
++	i915_gem_retire_requests(dev_priv->dev);
++
++	for (active = 0; active <= 1; active++) {
++		list_for_each_entry(iter, &dev_priv->mm.stolen_list, mm_link) {
++			if (iter->obj->active != active)
++				continue;
++
++			if (mark_free(iter->obj, &unwind))
++				goto found;
++		}
++	}
++
++found:
++	INIT_LIST_HEAD(&evict);
++	while (!list_empty(&unwind)) {
++		obj = list_first_entry(&unwind,
++				       struct drm_i915_gem_object,
++				       tmp_link);
++		list_del(&obj->tmp_link);
++
++		if (drm_mm_scan_remove_block(&obj->stolen->base)) {
++			list_add(&obj->tmp_link, &evict);
++			drm_gem_object_reference(&obj->base);
++		}
++	}
++
++	ret = 0;
++	while (!list_empty(&evict)) {
++		obj = list_first_entry(&evict,
++				       struct drm_i915_gem_object,
++				       tmp_link);
++		list_del(&obj->tmp_link);
++
++		if (ret == 0) {
++			struct i915_vma *vma, *vma_next;
++
++			list_for_each_entry_safe(vma, vma_next,
++						 &obj->vma_list,
++						 obj_link)
++				if (i915_vma_unbind(vma))
++					break;
++
++			/* Stolen pins its pages to prevent the
++			 * normal shrinker from processing stolen
++			 * objects.
++			 */
++			i915_gem_object_unpin_pages(obj);
++
++			ret = i915_gem_object_put_pages(obj);
++			if (ret == 0) {
++				i915_gem_object_release_stolen(obj);
++				obj->madv = __I915_MADV_PURGED;
++			} else {
++				i915_gem_object_pin_pages(obj);
++			}
++		}
++
++		drm_gem_object_unreference(&obj->base);
++	}
++
++	return ret;
++}
++
++static struct i915_stolen_node *
++stolen_alloc(struct drm_i915_private *dev_priv, u64 size)
++{
++	struct i915_stolen_node *stolen;
++	int ret;
+ 
+-	DRM_DEBUG_KMS("creating stolen object: size=%llx\n", size);
+ 	if (size == 0)
+ 		return ERR_PTR(-EINVAL);
+ 
+@@ -610,17 +700,60 @@ i915_gem_object_create_stolen(struct drm_device *dev, u64 size)
+ 	if (!stolen)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	ret = i915_gem_stolen_insert_node(dev_priv, stolen, size, 4096);
++	ret = i915_gem_stolen_insert_node(dev_priv, &stolen->base, size, 4096);
++	if (ret == 0)
++		goto out;
++
++	/* No more stolen memory available, or too fragmented.
++	 * Try evicting purgeable objects and search again.
++	 */
++	ret = stolen_evict(dev_priv, size);
++	if (ret == 0)
++		ret = i915_gem_stolen_insert_node(dev_priv, &stolen->base,
++						  size, 4096);
++out:
+ 	if (ret) {
+ 		kfree(stolen);
+ 		return ERR_PTR(ret);
+ 	}
+ 
++	return stolen;
++}
++
++/**
++ * i915_gem_object_create_stolen() - creates object using the stolen memory
++ * @dev:	drm device
++ * @size:	size of the object requested
++ *
++ * i915_gem_object_create_stolen() tries to allocate memory for the object
++ * from the stolen memory region. If not enough memory is found, it tries
++ * evicting purgeable objects and searching again.
++ *
++ * Returns: Object pointer - success and error pointer - failure
++ */
++struct drm_i915_gem_object *
++i915_gem_object_create_stolen(struct drm_device *dev, u64 size)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_i915_gem_object *obj;
++	struct i915_stolen_node *stolen;
++
++	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
++
++	if (!drm_mm_initialized(&dev_priv->mm.stolen))
++		return ERR_PTR(-ENODEV);
++
++	DRM_DEBUG_KMS("creating stolen object: size=%llx\n", size);
++
++	stolen = stolen_alloc(dev_priv, size);
++	if (IS_ERR(stolen))
++		return ERR_CAST(stolen);
++
+ 	obj = _i915_gem_object_create_stolen(dev, stolen);
+ 	if (!IS_ERR(obj))
+ 		return obj;
+ 
+-	i915_gem_stolen_remove_node(dev_priv, stolen);
++	i915_gem_stolen_remove_node(dev_priv, &stolen->base);
+ 	kfree(stolen);
+ 	return obj;
+ }
+@@ -634,7 +767,7 @@ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct i915_address_space *ggtt = &dev_priv->ggtt.base;
+ 	struct drm_i915_gem_object *obj;
+-	struct drm_mm_node *stolen;
++	struct i915_stolen_node *stolen;
+ 	struct i915_vma *vma;
+ 	int ret;
+ 
+@@ -655,10 +788,10 @@ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
+ 	if (!stolen)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	stolen->start = stolen_offset;
+-	stolen->size = size;
++	stolen->base.start = stolen_offset;
++	stolen->base.size = size;
+ 	mutex_lock(&dev_priv->mm.stolen_lock);
+-	ret = drm_mm_reserve_node(&dev_priv->mm.stolen, stolen);
++	ret = drm_mm_reserve_node(&dev_priv->mm.stolen, &stolen->base);
+ 	mutex_unlock(&dev_priv->mm.stolen_lock);
+ 	if (ret) {
+ 		DRM_DEBUG_KMS("failed to allocate stolen space\n");
+@@ -669,7 +802,7 @@ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
+ 	obj = _i915_gem_object_create_stolen(dev, stolen);
+ 	if (IS_ERR(obj)) {
+ 		DRM_DEBUG_KMS("failed to allocate stolen object\n");
+-		i915_gem_stolen_remove_node(dev_priv, stolen);
++		i915_gem_stolen_remove_node(dev_priv, &stolen->base);
+ 		kfree(stolen);
+ 		return obj;
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 9c8bd69..4f0760a 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -5674,7 +5674,7 @@ static void valleyview_check_pctx(struct drm_i915_private *dev_priv)
+ 	unsigned long pctx_addr = I915_READ(VLV_PCBR) & ~4095;
+ 
+ 	WARN_ON(pctx_addr != dev_priv->mm.stolen_base +
+-			     dev_priv->vlv_pctx->stolen->start);
++			     dev_priv->vlv_pctx->stolen->base.start);
+ }
+ 
+ 
+@@ -5749,7 +5749,7 @@ static void valleyview_setup_pctx(struct drm_device *dev)
+ 		goto out;
+ 	}
+ 
+-	pctx_paddr = dev_priv->mm.stolen_base + pctx->stolen->start;
++	pctx_paddr = dev_priv->mm.stolen_base + pctx->stolen->base.start;
+ 	I915_WRITE(VLV_PCBR, pctx_paddr);
+ 
+ out:
+-- 
+1.7.5.4
+

@@ -1,0 +1,505 @@
+From 9a84f4b410ac0c6750fb5500cd103aec77d25d07 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 30 Aug 2016 09:49:04 -0700
+Subject: [PATCH 55/68] drm/i915: Migrate stolen objects before hibernation
+
+commit 0e5300bdecf11fdf5cfbd2a7635cf34da3a64b13 from
+git://git.yoctoproject.org/linux-yocto-4.1
+
+Ville reminded us that stolen memory is not preserved across
+hibernation, and a result of this was that context objects now being
+allocated from stolen were being corrupted on S4 and promptly hanging
+the GPU on resume.
+
+We want to utilise stolen for as much as possible (nothing else will use
+that wasted memory otherwise), so we need a strategy for handling
+general objects allocated from stolen and hibernation. A simple solution
+is to do a CPU copy through the GTT of the stolen object into a fresh
+shmemfs backing store and thenceforth treat it as a normal objects. This
+can be refined in future to either use a GPU copy to avoid the slow
+uncached reads (though it's hibernation!) and recreate stolen objects
+upon resume/first-use. For now, a simple approach should suffice for
+testing the object migration.
+
+v2:
+Swap PTE for pinned bindings over to the shmemfs. This adds a
+complicated dance, but is required as many stolen objects are likely to
+be pinned for use by the hardware. Swapping the PTEs should not result
+in externally visible behaviour, as each PTE update should be atomic and
+the two pages identical. (danvet)
+
+safe-by-default, or the principle of least surprise. We need a new flag
+to mark objects that we can wilfully discard and recreate across
+hibernation. (danvet)
+
+Just use the global_list rather than invent a new stolen_list. This is
+the slowpath hibernate and so adding a new list and the associated
+complexity isn't worth it.
+
+v3: Rebased on drm-intel-nightly (Ankit)
+
+v4: Use insert_page to map stolen memory backed pages for migration to
+shmem (Chris)
+
+v5: Acquire mutex lock while copying stolen buffer objects to shmem (Chris)
+
+v6: Handled file leak, Splitted object migration function, added kerneldoc
+for migrate_stolen_to_shmemfs() function (Tvrtko)
+Use i915 wrapper function for drm_mm_insert_node_in_range()
+
+v7: Keep the object in cpu domain after get_pages, remove the object from
+the unbound list only when marked PURGED, Corrected split of object migration
+function (Chris)
+
+v8: Split i915_gem_freeze(), removed redundant use of barrier, corrected
+use of set_to_cpu_domain() (Chris)
+
+v9: Replaced WARN_ON by BUG_ON and added a comment explaining it
+(Daniel/Tvrtko)
+
+v10: Document use of barriers (Chris)
+
+v11: Resolved list corruption due to not removing obj from global_list
+if no reference to pages is held, Rebased (Ankit)
+
+v12: Rebase (Ankit)
+
+Signed-off-by: Chris Wilson <chris at chris-wilson.co.uk>
+Signed-off-by: Ankitprasad Sharma <ankitprasad.r.sharma@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Bob Paauwe <bob.j.paauwe@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.c         |   18 +++-
+ drivers/gpu/drm/i915/i915_drv.h         |   10 ++
+ drivers/gpu/drm/i915/i915_gem.c         |  202 +++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/i915_gem_stolen.c  |   49 ++++++++
+ drivers/gpu/drm/i915/intel_display.c    |    3 +
+ drivers/gpu/drm/i915/intel_fbdev.c      |    6 +
+ drivers/gpu/drm/i915/intel_pm.c         |    2 +
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    6 +
+ 8 files changed, 284 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 1a5ca9a..847acda 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -1063,6 +1063,22 @@ static int i915_pm_suspend(struct device *dev)
+ 	return i915_drm_suspend(drm_dev);
+ }
+ 
++/* freeze: before creating the hibernation_image */
++static int i915_pm_freeze(struct device *dev)
++{
++	int ret;
++
++	ret = i915_gem_freeze(pci_get_drvdata(to_pci_dev(dev)));
++	if (ret)
++		return ret;
++
++	ret = i915_pm_suspend(dev);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
+ static int i915_pm_suspend_late(struct device *dev)
+ {
+ 	struct drm_device *drm_dev = dev_to_i915(dev)->dev;
+@@ -1666,7 +1682,7 @@ static const struct dev_pm_ops i915_pm_ops = {
+ 	 * @restore, @restore_early : called after rebooting and restoring the
+ 	 *                            hibernation image [PMSG_RESTORE]
+ 	 */
+-	.freeze = i915_pm_suspend,
++	.freeze = i915_pm_freeze,
+ 	.freeze_late = i915_pm_suspend_late,
+ 	.thaw_early = i915_pm_resume_early,
+ 	.thaw = i915_pm_resume,
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 609b18d..52f1fb9 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2288,6 +2288,12 @@ struct drm_i915_gem_object {
+ 	 * Advice: are the backing pages purgeable?
+ 	 */
+ 	unsigned int madv:2;
++	/**
++	 * Whereas madv is for userspace, there are certain situations
++	 * where we want I915_MADV_DONTNEED behaviour on internal objects
++	 * without conflating the userspace setting.
++	 */
++	unsigned int internal_volatile:1;
+ 
+ 	/**
+ 	 * Current tiling mode for the object.
+@@ -3270,6 +3276,9 @@ int i915_gem_l3_remap(struct drm_i915_gem_request *req, int slice);
+ void i915_gem_init_swizzling(struct drm_device *dev);
+ void i915_gem_cleanup_engines(struct drm_device *dev);
+ int __must_check i915_gpu_idle(struct drm_device *dev);
++int __must_check i915_gem_freeze(struct drm_device *dev);
++int __must_check
++i915_gem_object_migrate_stolen_to_shmemfs(struct drm_i915_gem_object *obj);
+ int __must_check i915_gem_suspend(struct drm_device *dev);
+ void __i915_add_request(struct drm_i915_gem_request *req,
+ 			struct drm_i915_gem_object *batch_obj,
+@@ -3497,6 +3506,7 @@ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
+ 					       u32 stolen_offset,
+ 					       u32 gtt_offset,
+ 					       u32 size);
++int __must_check i915_gem_stolen_freeze(struct drm_i915_private *i915);
+ 
+ /* i915_gem_shrinker.c */
+ unsigned long i915_gem_shrink(struct drm_i915_private *dev_priv,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index e0d01c5..cb150fc 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -5416,12 +5416,27 @@ static const struct drm_i915_gem_object_ops i915_gem_object_ops = {
+ 	.put_pages = i915_gem_object_put_pages_gtt,
+ };
+ 
++static struct address_space *
++i915_gem_set_inode_gfp(struct drm_device *dev, struct file *file)
++{
++	struct address_space *mapping = file_inode(file)->i_mapping;
++	gfp_t mask;
++
++	mask = GFP_HIGHUSER | __GFP_RECLAIMABLE;
++	if (IS_CRESTLINE(dev) || IS_BROADWATER(dev)) {
++		/* 965gm cannot relocate objects above 4GiB. */
++		mask &= ~__GFP_HIGHMEM;
++		mask |= __GFP_DMA32;
++	}
++	mapping_set_gfp_mask(mapping, mask);
++
++	return mapping;
++}
++
+ struct drm_i915_gem_object *i915_gem_alloc_object(struct drm_device *dev,
+ 						  size_t size)
+ {
+ 	struct drm_i915_gem_object *obj;
+-	struct address_space *mapping;
+-	gfp_t mask;
+ 
+ 	obj = i915_gem_object_alloc(dev);
+ 	if (obj == NULL)
+@@ -5432,15 +5447,7 @@ struct drm_i915_gem_object *i915_gem_alloc_object(struct drm_device *dev,
+ 		return NULL;
+ 	}
+ 
+-	mask = GFP_HIGHUSER | __GFP_RECLAIMABLE;
+-	if (IS_CRESTLINE(dev) || IS_BROADWATER(dev)) {
+-		/* 965gm cannot relocate objects above 4GiB. */
+-		mask &= ~__GFP_HIGHMEM;
+-		mask |= __GFP_DMA32;
+-	}
+-
+-	mapping = file_inode(obj->base.filp)->i_mapping;
+-	mapping_set_gfp_mask(mapping, mask);
++	i915_gem_set_inode_gfp(dev, obj->base.filp);
+ 
+ 	i915_gem_object_init(obj, &i915_gem_object_ops);
+ 
+@@ -5613,6 +5620,179 @@ i915_gem_stop_engines(struct drm_device *dev)
+ 		dev_priv->gt.stop_engine(engine);
+ }
+ 
++static int
++copy_content(struct drm_i915_gem_object *obj,
++		struct drm_i915_private *i915,
++		struct address_space *mapping)
++{
++	struct i915_ggtt *ggtt = &i915->ggtt;
++	struct drm_mm_node node;
++	int ret, i;
++
++	ret = i915_gem_object_set_to_gtt_domain(obj, false);
++	if (ret)
++		return ret;
++
++	/* stolen objects are already pinned to prevent shrinkage */
++	memset(&node, 0, sizeof(node));
++	ret = insert_mappable_node(i915, &node, PAGE_SIZE);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < obj->base.size / PAGE_SIZE; i++) {
++		struct page *page;
++		void *__iomem src;
++		void *dst;
++
++		ggtt->base.insert_page(&ggtt->base,
++				       i915_gem_object_get_dma_address(obj, i),
++				       node.start,
++				       I915_CACHE_NONE, 0);
++
++		page = shmem_read_mapping_page(mapping, i);
++		if (IS_ERR(page)) {
++			ret = PTR_ERR(page);
++			break;
++		}
++
++		src = io_mapping_map_atomic_wc(ggtt->mappable, node.start);
++		dst = kmap_atomic(page);
++		wmb(); /* flush modifications to the GGTT (insert_page) */
++		memcpy_fromio(dst, src, PAGE_SIZE);
++		wmb(); 	/* flush the write before we modify the GGTT */
++		kunmap_atomic(dst);
++		io_mapping_unmap_atomic(src);
++
++		put_page(page);
++	}
++
++	ggtt->base.clear_range(&ggtt->base,
++			       node.start, node.size,
++			       true);
++	remove_mappable_node(&node);
++	if (ret)
++		return ret;
++
++	return i915_gem_object_set_to_cpu_domain(obj, true);
++}
++
++/**
++ * i915_gem_object_migrate_stolen_to_shmemfs() - migrates a stolen backed
++ * object to shmemfs
++ * @obj: stolen backed object to be migrated
++ *
++ * Returns: 0 on successful migration, errno on failure
++ */
++
++int
++i915_gem_object_migrate_stolen_to_shmemfs(struct drm_i915_gem_object *obj)
++{
++	struct drm_i915_private *i915 = to_i915(obj->base.dev);
++	struct i915_vma *vma, *vn;
++	struct file *file;
++	struct address_space *mapping;
++	struct sg_table *stolen_pages, *shmemfs_pages;
++	int ret;
++
++	if (WARN_ON_ONCE(i915_gem_object_needs_bit17_swizzle(obj)))
++		return -EINVAL;
++
++	file = shmem_file_setup("drm mm object", obj->base.size, VM_NORESERVE);
++	if (IS_ERR(file))
++		return PTR_ERR(file);
++	mapping = i915_gem_set_inode_gfp(obj->base.dev, file);
++
++	list_for_each_entry_safe(vma, vn, &obj->vma_list, obj_link)
++		if (i915_vma_unbind(vma))
++			continue;
++
++	if (obj->madv != I915_MADV_WILLNEED && list_empty(&obj->vma_list)) {
++		/* Discard the stolen reservation, and replace with
++		 * an unpopulated shmemfs object.
++		 */
++		obj->madv = __I915_MADV_PURGED;
++	} else {
++		ret = copy_content(obj, i915, mapping);
++		if (ret)
++			goto err_file;
++	}
++
++	stolen_pages = obj->pages;
++	obj->pages = NULL;
++
++	obj->base.filp = file;
++
++	/* Recreate any pinned binding with pointers to the new storage */
++	if (!list_empty(&obj->vma_list)) {
++		ret = i915_gem_object_get_pages_gtt(obj);
++		if (ret) {
++			obj->pages = stolen_pages;
++			goto err_file;
++		}
++
++		obj->get_page.sg = obj->pages->sgl;
++		obj->get_page.last = 0;
++
++		list_for_each_entry(vma, &obj->vma_list, obj_link) {
++			if (!drm_mm_node_allocated(&vma->node))
++				continue;
++
++			/* As vma is already allocated and only the PTEs
++			 * have to be reprogrammed, makes this vma_bind
++			 * call extremely unlikely to fail.
++			 */
++			BUG_ON(i915_vma_bind(vma,
++					      obj->cache_level,
++					      PIN_UPDATE));
++		}
++	} else {
++		/* Remove object from global list if no reference to the
++		 * pages is held.
++		 */
++		list_del(&obj->global_list);
++	}
++
++	/* drop the stolen pin and backing */
++	shmemfs_pages = obj->pages;
++	obj->pages = stolen_pages;
++
++	i915_gem_object_unpin_pages(obj);
++	obj->ops->put_pages(obj);
++	if (obj->ops->release)
++		obj->ops->release(obj);
++
++	obj->ops = &i915_gem_object_ops;
++	obj->pages = shmemfs_pages;
++
++	return 0;
++
++err_file:
++	fput(file);
++	obj->base.filp = NULL;
++	return ret;
++}
++
++int
++i915_gem_freeze(struct drm_device *dev)
++{
++	/* Called before i915_gem_suspend() when hibernating */
++	struct drm_i915_private *i915 = to_i915(dev);
++	int ret;
++
++	ret = i915_mutex_lock_interruptible(dev);
++	if (ret)
++		return ret;
++
++	/* Across hibernation, the stolen area is not preserved.
++	 * Anything inside stolen must copied back to normal
++	 * memory if we wish to preserve it.
++	 */
++	ret = i915_gem_stolen_freeze(i915);
++
++	mutex_unlock(&dev->struct_mutex);
++	return ret;
++}
++
+ int
+ i915_gem_suspend(struct drm_device *dev)
+ {
+diff --git a/drivers/gpu/drm/i915/i915_gem_stolen.c b/drivers/gpu/drm/i915/i915_gem_stolen.c
+index 1c0149c..ccfe06c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/i915_gem_stolen.c
+@@ -845,3 +845,52 @@ err:
+ 	drm_gem_object_unreference(&obj->base);
+ 	return ERR_PTR(ret);
+ }
++
++int i915_gem_stolen_freeze(struct drm_i915_private *i915)
++{
++	struct drm_i915_gem_object *obj, *tmp;
++	struct list_head *phase[] = {
++		&i915->mm.unbound_list, &i915->mm.bound_list, NULL
++	}, **p;
++	int ret = 0;
++
++	for (p = phase; *p; p++) {
++		struct list_head migrate;
++		int ret;
++
++		INIT_LIST_HEAD(&migrate);
++		list_for_each_entry_safe(obj, tmp, *p, global_list) {
++			if (obj->stolen == NULL)
++				continue;
++
++			if (obj->internal_volatile)
++				continue;
++
++			/* In the general case, this object may only be alive
++			 * due to an active reference, and that may disappear
++			 * when we unbind any of the objects (and so wait upon
++			 * the GPU and retire requests). To prevent one of the
++			 * objects from disappearing beneath us, we need to
++			 * take a reference to each as we build the migration
++			 * list.
++			 *
++			 * This is similar to the strategy required whilst
++			 * shrinking or evicting objects (for the same reason).
++			 */
++			drm_gem_object_reference(&obj->base);
++			list_move(&obj->global_list, &migrate);
++		}
++
++		ret = 0;
++		list_for_each_entry_safe(obj, tmp, &migrate, global_list) {
++			if (ret == 0)
++				ret = i915_gem_object_migrate_stolen_to_shmemfs(obj);
++			drm_gem_object_unreference(&obj->base);
++		}
++		list_splice(&migrate, *p);
++		if (ret)
++			break;
++	}
++
++	return ret;
++}
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 88c64f2..ddc3967 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2479,6 +2479,9 @@ intel_alloc_initial_plane_obj(struct intel_crtc *crtc,
+ 		return false;
+ 	}
+ 
++	/* Not to be preserved across hibernation */
++	obj->internal_volatile = true;
++
+ 	obj->tiling_mode = plane_config->tiling;
+ 	if (obj->tiling_mode == I915_TILING_X)
+ 		obj->stride = fb->pitches[0];
+diff --git a/drivers/gpu/drm/i915/intel_fbdev.c b/drivers/gpu/drm/i915/intel_fbdev.c
+index fded480a..77e1150 100644
+--- a/drivers/gpu/drm/i915/intel_fbdev.c
++++ b/drivers/gpu/drm/i915/intel_fbdev.c
+@@ -156,6 +156,12 @@ static int intelfb_alloc(struct drm_fb_helper *helper,
+ 		goto out;
+ 	}
+ 
++	/* Discard the contents of the BIOS fb across hibernation.
++	 * We really want to completely throwaway the earlier fbdev
++	 * and reconfigure it anyway.
++	 */
++	obj->internal_volatile = true;
++
+ 	fb = __intel_framebuffer_create(dev, &mode_cmd, obj);
+ 	if (IS_ERR(fb)) {
+ 		drm_gem_object_unreference(&obj->base);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 4f0760a..0d5f204 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -5753,6 +5753,8 @@ static void valleyview_setup_pctx(struct drm_device *dev)
+ 	I915_WRITE(VLV_PCBR, pctx_paddr);
+ 
+ out:
++	/* The power context need not be preserved across hibernation */
++	pctx->internal_volatile = true;
+ 	DRM_DEBUG_DRIVER("PCBR: 0x%08x\n", I915_READ(VLV_PCBR));
+ 	dev_priv->vlv_pctx = pctx;
+ 	mutex_unlock(&dev->struct_mutex);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index cc70168..e0c70f6 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2206,6 +2206,12 @@ static int intel_alloc_ringbuffer_obj(struct drm_device *dev,
+ 	if (obj == NULL)
+ 		return -ENOMEM;
+ 
++	/* Ringbuffer objects are by definition volatile - only the commands
++	 * between HEAD and TAIL need to be preserved and whilst there are
++	 * any commands there, the ringbuffer is pinned by activity.
++	 */
++	obj->internal_volatile = true;
++
+ 	/* mark ring buffers as read-only from GPU side by default */
+ 	obj->gt_ro = 1;
+ 
+-- 
+1.7.5.4
+
