@@ -1,0 +1,155 @@
+From 6d463d244d7937cee1514123449a908fdaa72411 Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Thu, 20 Mar 2014 22:11:17 -0700
+Subject: [PATCH 2/3] futex: revert back to the explicit waiter counting code
+
+commit 11d4616bd07f38d496bd489ed8fad1dc4d928823 upstream
+
+Srikar Dronamraju reports that commit b0c29f79ecea ("futexes: Avoid
+taking the hb->lock if there's nothing to wake up") causes java threads
+getting stuck on futexes when runing specjbb on a power7 numa box.
+
+The cause appears to be that the powerpc spinlocks aren't using the same
+ticket lock model that we use on x86 (and other) architectures, which in
+turn result in the "spin_is_locked()" test in hb_waiters_pending()
+occasionally reporting an unlocked spinlock even when there are pending
+waiters.
+
+So this reinstates Davidlohr Bueso's original explicit waiter counting
+code, which I had convinced Davidlohr to drop in favor of figuring out
+the pending waiters by just using the existing state of the spinlock and
+the wait queue.
+
+Reported-and-tested-by: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+Original-code-by: Davidlohr Bueso <davidlohr@hp.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Zhang Xiao <xiao.zhang@windriver.com>
+---
+ kernel/futex.c |   57 ++++++++++++++++++++++++++++++++++++++++++++-----------
+ 1 files changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/kernel/futex.c b/kernel/futex.c
+index 66573a7..fa215d1 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -148,6 +148,7 @@ static const struct futex_q futex_q_init = {
+  * waiting on a futex.
+  */
+ struct futex_hash_bucket {
++	atomic_t waiters;
+ 	spinlock_t lock;
+ 	struct plist_head chain;
+ };
+@@ -165,22 +166,37 @@ static inline void futex_get_mm(union futex_key *key)
+ 	smp_mb__after_atomic_inc();
+ }
+ 
+-static inline bool hb_waiters_pending(struct futex_hash_bucket *hb)
++/*
++ * Reflects a new waiter being added to the waitqueue.
++ */
++static inline void hb_waiters_inc(struct futex_hash_bucket *hb)
++ {
++ #ifdef CONFIG_SMP
++       atomic_inc(&hb->waiters);
++        /*
++	 * Full barrier (A), see the ordering comment above.
++         */
++	smp_mb__after_atomic_inc();
++#endif
++}
++
++/*
++ * Reflects a waiter being removed from the waitqueue by wakeup
++ * paths.
++ */
++static inline void hb_waiters_dec(struct futex_hash_bucket *hb)
+ {
+ #ifdef CONFIG_SMP
+-	/*
+-	 * Tasks trying to enter the critical region are most likely
+-	 * potential waiters that will be added to the plist. Ensure
+-	 * that wakers won't miss to-be-slept tasks in the window between
+-	 * the wait call and the actual plist_add.
+-	 */
+-	if (spin_is_locked(&hb->lock))
+-		return true;
+-	smp_rmb(); /* Make sure we check the lock state first */
++	atomic_dec(&hb->waiters);
++#endif
++}
+ 
+-	return !plist_head_empty(&hb->chain);
++static inline bool hb_waiters_pending(struct futex_hash_bucket *hb)
++{
++#ifdef CONFIG_SMP
++	return atomic_read(&hb->waiters);
+ #else
+-	return true;
++	return 1;
+ #endif
+ }
+ 
+@@ -952,6 +968,7 @@ static void __unqueue_futex(struct futex_q *q)
+ 
+ 	hb = container_of(q->lock_ptr, struct futex_hash_bucket, lock);
+ 	plist_del(&q->list, &hb->chain);
++	hb_waiters_dec(hb);
+ }
+ 
+ /*
+@@ -1243,7 +1260,9 @@ void requeue_futex(struct futex_q *q, struct futex_hash_bucket *hb1,
+ 	 */
+ 	if (likely(&hb1->chain != &hb2->chain)) {
+ 		plist_del(&q->list, &hb1->chain);
++		hb_waiters_dec(hb1);
+ 		plist_add(&q->list, &hb2->chain);
++		hb_waiters_inc(hb2);
+ 		q->lock_ptr = &hb2->lock;
+ 	}
+ 	get_futex_key_refs(key2);
+@@ -1645,6 +1664,17 @@ static inline struct futex_hash_bucket *queue_lock(struct futex_q *q)
+ 	struct futex_hash_bucket *hb;
+ 
+ 	hb = hash_futex(&q->key);
++
++	/*
++	 * Increment the counter before taking the lock so that
++	 * a potential waker won't miss a to-be-slept task that is
++	 * waiting for the spinlock. This is safe as all queue_lock()
++	 * users end up calling queue_me(). Similarly, for housekeeping,
++	 * decrement the counter at queue_unlock() when some error has
++	 * occurred and we don't end up adding the task to the list.
++	 */
++	hb_waiters_inc(hb);
++
+ 	q->lock_ptr = &hb->lock;
+ 
+ 	spin_lock(&hb->lock); /* implies MB (A) */
+@@ -1656,6 +1686,7 @@ queue_unlock(struct futex_q *q, struct futex_hash_bucket *hb)
+ 	__releases(&hb->lock)
+ {
+ 	spin_unlock(&hb->lock);
++	hb_waiters_dec(hb);
+ }
+ 
+ /**
+@@ -2379,6 +2410,7 @@ int handle_early_requeue_pi_wakeup(struct futex_hash_bucket *hb,
+ 		 * Unqueue the futex_q and determine which it was.
+ 		 */
+ 		plist_del(&q->list, &hb->chain);
++		hb_waiters_dec(hb);
+ 
+ 		/* Handle spurious wakeups gracefully */
+ 		ret = -EWOULDBLOCK;
+@@ -2964,6 +2996,7 @@ static int __init futex_init(void)
+ 	futex_detect_cmpxchg();
+ 
+ 	for (i = 0; i < ARRAY_SIZE(futex_queues); i++) {
++		atomic_set(&futex_queues[i].waiters, 0);
+ 		plist_head_init(&futex_queues[i].chain);
+ 		spin_lock_init(&futex_queues[i].lock);
+ 	}
+-- 
+1.7.5.4
+
