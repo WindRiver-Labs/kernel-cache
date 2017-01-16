@@ -2,6 +2,8 @@ git checkout		standard/arm-versatile-926ejs
 git merge --no-edit	standard/base		|| bash
 git checkout		standard/beaglebone
 git merge --no-edit	standard/base		|| bash
+git checkout		standard/cav-octeontx
+git merge --no-edit	standard/base		|| bash
 git checkout		standard/edgerouter
 git merge --no-edit	standard/base		|| bash
 git checkout		standard/fsl-mpc8315e-rdb
@@ -34,6 +36,13 @@ git merge --no-edit	standard/tiny/base		|| bash
 git checkout		standard/tiny/intel-x86-64
 git merge --no-edit	standard/tiny/base		|| bash
 
+git checkout		standard/cgl/base
+git merge --no-edit	standard/base		|| bash
+git checkout		standard/cgl/intel-x86-32
+git merge		standard/cgl/base
+git checkout		standard/cgl/intel-x86-64
+git merge		standard/cgl/base
+
 git checkout		standard/nxp/base
 git merge --no-edit	standard/base		|| bash
 git checkout		standard/nxp/sdk-2-0/base
@@ -42,6 +51,9 @@ git checkout		standard/nxp/sdk-2-0/nxp-ls10xx
 git merge --no-edit	standard/nxp/sdk-2-0/base		|| bash
 git checkout		standard/nxp/sdk-2-0/nxp-t4xxx
 git merge --no-edit	standard/nxp/sdk-2-0/base		|| bash
+
+git checkout		standard/preempt-rt/cav-octeontx
+git merge --no-edit	standard/preempt-rt/base		|| bash
 
 git checkout		standard/preempt-rt/intel
 git merge --no-edit	standard/preempt-rt/base		|| bash
