@@ -1,0 +1,415 @@
+From 4e8b3e296dbb4fa5edab6308eaeef287197ae980 Mon Sep 17 00:00:00 2001
+From: Li Zhou <li.zhou@windriver.com>
+Date: Tue, 20 Dec 2016 14:55:18 +0800
+Subject: [PATCH 2/2] tipc: remove interface state mirroring in bearer
+
+commit 512137eeff00f73a8a62e481a6575f1556cf962c upstream.
+
+struct 'tipc_bearer' is a generic representation of the underlying
+media type, and exists in a one-to-one relationship to each interface
+TIPC is using. The struct contains a 'blocked' flag that mirrors the
+operational and execution state of the represented interface, and is
+updated through notification calls from the latter. The users of
+tipc_bearer are checking this flag before each attempt to send a
+packet via the interface.
+
+This state mirroring serves no purpose in the current code base. TIPC
+links will not discover a media failure any faster through this
+mechanism, and in reality the flag only adds overhead at packet
+sending and reception.
+
+Furthermore, the fact that the flag needs to be protected by a spinlock
+aggregated into tipc_bearer has turned out to cause a serious and
+completely unnecessary deadlock problem.
+
+CPU0                                    CPU1
+----                                    ----
+Time 0: bearer_disable()                link_timeout()
+Time 1:   spin_lock_bh(&b_ptr->lock)      tipc_link_push_queue()
+Time 2:   tipc_link_delete()                tipc_bearer_blocked(b_ptr)
+Time 3:     k_cancel_timer(&req->timer)       spin_lock_bh(&b_ptr->lock)
+Time 4:       del_timer_sync(&req->timer)
+
+I.e., del_timer_sync() on CPU0 never returns, because the timer handler
+on CPU1 is waiting for the bearer lock.
+
+We eliminate the 'blocked' flag from struct tipc_bearer, along with all
+tests on this flag. This not only resolves the deadlock, but also
+simplifies and speeds up the data path execution of TIPC. It also fits
+well into our ongoing effort to make the locking policy simpler and
+more manageable.
+
+An effect of this change is that we can get rid of functions such as
+tipc_bearer_blocked(), tipc_continue() and tipc_block_bearer().
+We replace the latter with a new function, tipc_reset_bearer(), which
+resets all links associated to the bearer immediately after an
+interface goes down.
+
+A user might notice one slight change in link behaviour after this
+change. When an interface goes down, (e.g. through a NETDEV_DOWN
+event) all attached links will be reset immediately, instead of
+leaving it to each link to detect the failure through a timer-driven
+mechanism. We consider this an improvement, and see no obvious risks
+with the new behavior.
+
+Signed-off-by: Erik Hugne <erik.hugne@ericsson.com>
+Reviewed-by: Ying Xue <ying.xue@windriver.com>
+Reviewed-by: Paul Gortmaker <Paul.Gortmaker@windriver.com>
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Li Zhou <li.zhou@windriver.com>
+---
+ net/tipc/bcast.c     |    6 -----
+ net/tipc/bearer.c    |   33 ++---------------------------
+ net/tipc/bearer.h    |    6 +----
+ net/tipc/discover.c  |   17 +++-----------
+ net/tipc/eth_media.c |   14 +----------
+ net/tipc/ib_media.c  |   14 +----------
+ net/tipc/link.c      |   55 ++++++++++++++-----------------------------------
+ 7 files changed, 28 insertions(+), 117 deletions(-)
+
+diff --git a/net/tipc/bcast.c b/net/tipc/bcast.c
+index bf27554..51e0ee7 100644
+--- a/net/tipc/bcast.c
++++ b/net/tipc/bcast.c
+@@ -617,12 +617,6 @@ static int tipc_bcbearer_send(struct sk_buff *buf,
+ 		if (!p)
+ 			break; /* No more bearers to try */
+ 
+-		if (tipc_bearer_blocked(p)) {
+-			if (!s || tipc_bearer_blocked(s))
+-				continue; /* Can't use either bearer */
+-			b = s;
+-		}
+-
+ 		tipc_nmap_diff(&bcbearer->remains, &b->nodes,
+ 			       &bcbearer->remains_new);
+ 		if (bcbearer->remains_new.count == bcbearer->remains.count)
+diff --git a/net/tipc/bearer.c b/net/tipc/bearer.c
+index 05c84f9..40492cb 100644
+--- a/net/tipc/bearer.c
++++ b/net/tipc/bearer.c
+@@ -275,31 +275,6 @@ void tipc_bearer_remove_dest(struct tipc_bearer *b_ptr, u32 dest)
+ 	tipc_disc_remove_dest(b_ptr->link_req);
+ }
+ 
+-/*
+- * Interrupt enabling new requests after bearer blocking:
+- * See bearer_send().
+- */
+-void tipc_continue(struct tipc_bearer *b)
+-{
+-	spin_lock_bh(&b->lock);
+-	b->blocked = 0;
+-	spin_unlock_bh(&b->lock);
+-}
+-
+-/*
+- * tipc_bearer_blocked - determines if bearer is currently blocked
+- */
+-int tipc_bearer_blocked(struct tipc_bearer *b)
+-{
+-	int res;
+-
+-	spin_lock_bh(&b->lock);
+-	res = b->blocked;
+-	spin_unlock_bh(&b->lock);
+-
+-	return res;
+-}
+-
+ /**
+  * tipc_enable_bearer - enable bearer with the given name
+  */
+@@ -420,17 +395,16 @@ exit:
+ }
+ 
+ /**
+- * tipc_block_bearer - Block the bearer, and reset all its links
++ * tipc_reset_bearer - Reset all links established over this bearer
+  */
+-int tipc_block_bearer(struct tipc_bearer *b_ptr)
++int tipc_reset_bearer(struct tipc_bearer *b_ptr)
+ {
+ 	struct tipc_link *l_ptr;
+ 	struct tipc_link *temp_l_ptr;
+ 
+ 	read_lock_bh(&tipc_net_lock);
+-	pr_info("Blocking bearer <%s>\n", b_ptr->name);
++	pr_info("Resetting bearer <%s>\n", b_ptr->name);
+ 	spin_lock_bh(&b_ptr->lock);
+-	b_ptr->blocked = 1;
+ 	list_for_each_entry_safe(l_ptr, temp_l_ptr, &b_ptr->links, link_list) {
+ 		struct tipc_node *n_ptr = l_ptr->owner;
+ 
+@@ -455,7 +429,6 @@ static void bearer_disable(struct tipc_bearer *b_ptr)
+ 
+ 	pr_info("Disabling bearer <%s>\n", b_ptr->name);
+ 	spin_lock_bh(&b_ptr->lock);
+-	b_ptr->blocked = 1;
+ 	b_ptr->media->disable_bearer(b_ptr);
+ 	list_for_each_entry_safe(l_ptr, temp_l_ptr, &b_ptr->links, link_list) {
+ 		tipc_link_delete(l_ptr);
+diff --git a/net/tipc/bearer.h b/net/tipc/bearer.h
+index 4b36d10..3cd42a8 100644
+--- a/net/tipc/bearer.h
++++ b/net/tipc/bearer.h
+@@ -108,7 +108,6 @@ struct tipc_media {
+  * struct tipc_bearer - TIPC bearer structure
+  * @usr_handle: pointer to additional media-specific information about bearer
+  * @mtu: max packet size bearer can support
+- * @blocked: non-zero if bearer is blocked
+  * @lock: spinlock for controlling access to bearer
+  * @addr: media-specific address associated with bearer
+  * @name: bearer name (format = media:interface)
+@@ -130,7 +129,6 @@ struct tipc_media {
+ struct tipc_bearer {
+ 	void *usr_handle;			/* initalized by media */
+ 	u32 mtu;				/* initalized by media */
+-	int blocked;				/* initalized by media */
+ 	struct tipc_media_addr addr;		/* initalized by media */
+ 	char name[TIPC_MAX_BEARER_NAME];
+ 	spinlock_t lock;
+@@ -163,8 +161,7 @@ int tipc_register_media(struct tipc_media *m_ptr);
+ 
+ void tipc_recv_msg(struct sk_buff *buf, struct tipc_bearer *tb_ptr);
+ 
+-int  tipc_block_bearer(struct tipc_bearer *b_ptr);
+-void tipc_continue(struct tipc_bearer *tb_ptr);
++int  tipc_reset_bearer(struct tipc_bearer *b_ptr);
+ 
+ int tipc_enable_bearer(const char *bearer_name, u32 disc_domain, u32 priority);
+ int tipc_disable_bearer(const char *name);
+@@ -194,7 +191,6 @@ void tipc_bearer_remove_dest(struct tipc_bearer *b_ptr, u32 dest);
+ struct tipc_bearer *tipc_bearer_find(const char *name);
+ struct tipc_bearer *tipc_bearer_find_interface(const char *if_name);
+ struct tipc_media *tipc_media_find(const char *name);
+-int tipc_bearer_blocked(struct tipc_bearer *b_ptr);
+ void tipc_bearer_stop(void);
+ 
+ /**
+diff --git a/net/tipc/discover.c b/net/tipc/discover.c
+index eedff58..ab8c002 100644
+--- a/net/tipc/discover.c
++++ b/net/tipc/discover.c
+@@ -240,7 +240,7 @@ void tipc_disc_recv_msg(struct sk_buff *buf, struct tipc_bearer *b_ptr)
+ 	/* Accept discovery message & send response, if necessary */
+ 	link_fully_up = link_working_working(link);
+ 
+-	if ((type == DSC_REQ_MSG) && !link_fully_up && !b_ptr->blocked) {
++	if ((type == DSC_REQ_MSG) && !link_fully_up) {
+ 		rbuf = tipc_disc_init_msg(DSC_RESP_MSG, orig, b_ptr);
+ 		if (rbuf) {
+ 			tipc_bearer_send(b_ptr, rbuf, &media_addr);
+@@ -289,16 +289,6 @@ void tipc_disc_remove_dest(struct tipc_link_req *req)
+ }
+ 
+ /**
+- * disc_send_msg - send link setup request message
+- * @req: ptr to link request structure
+- */
+-static void disc_send_msg(struct tipc_link_req *req)
+-{
+-	if (!req->bearer->blocked)
+-		tipc_bearer_send(req->bearer, req->buf, &req->dest);
+-}
+-
+-/**
+  * disc_timeout - send a periodic link setup request
+  * @req: ptr to link request structure
+  *
+@@ -323,7 +313,8 @@ static void disc_timeout(struct tipc_link_req *req)
+ 	 * hold at fast polling rate if don't have any associated nodes,
+ 	 * otherwise hold at slow polling rate
+ 	 */
+-	disc_send_msg(req);
++	tipc_bearer_send(req->bearer, req->buf, &req->dest);
++
+ 
+ 	req->timer_intv *= 2;
+ 	if (req->num_nodes)
+@@ -369,7 +360,7 @@ int tipc_disc_create(struct tipc_bearer *b_ptr,
+ 	k_init_timer(&req->timer, (Handler)disc_timeout, (unsigned long)req);
+ 	k_start_timer(&req->timer, req->timer_intv);
+ 	b_ptr->link_req = req;
+-	disc_send_msg(req);
++	tipc_bearer_send(req->bearer, req->buf, &req->dest);
+ 	return 0;
+ }
+ 
+diff --git a/net/tipc/eth_media.c b/net/tipc/eth_media.c
+index 9c3ef81..e616b37 100644
+--- a/net/tipc/eth_media.c
++++ b/net/tipc/eth_media.c
+@@ -208,7 +208,6 @@ static int enable_bearer(struct tipc_bearer *tb_ptr)
+ 	tb_ptr->bcast_addr.media_id = TIPC_MEDIA_TYPE_ETH;
+ 	tb_ptr->bcast_addr.broadcast = 1;
+ 	tb_ptr->mtu = dev->mtu;
+-	tb_ptr->blocked = 0;
+ 	eth_media_addr_set(tb_ptr, &tb_ptr->addr, (char *)dev->dev_addr);
+ 	return 0;
+ }
+@@ -272,20 +271,11 @@ static int recv_notification(struct notifier_block *nb, unsigned long evt,
+ 	switch (evt) {
+ 	case NETDEV_CHANGE:
+ 		if (netif_carrier_ok(dev))
+-			tipc_continue(eb_ptr->bearer);
+-		else
+-			tipc_block_bearer(eb_ptr->bearer);
+-		break;
+-	case NETDEV_UP:
+-		tipc_continue(eb_ptr->bearer);
+-		break;
++			break;
+ 	case NETDEV_DOWN:
+-		tipc_block_bearer(eb_ptr->bearer);
+-		break;
+ 	case NETDEV_CHANGEMTU:
+ 	case NETDEV_CHANGEADDR:
+-		tipc_block_bearer(eb_ptr->bearer);
+-		tipc_continue(eb_ptr->bearer);
++		tipc_reset_bearer(eb_ptr->bearer);
+ 		break;
+ 	case NETDEV_UNREGISTER:
+ 	case NETDEV_CHANGENAME:
+diff --git a/net/tipc/ib_media.c b/net/tipc/ib_media.c
+index 0a49c2e..c8e536e 100644
+--- a/net/tipc/ib_media.c
++++ b/net/tipc/ib_media.c
+@@ -201,7 +201,6 @@ static int enable_bearer(struct tipc_bearer *tb_ptr)
+ 	tb_ptr->bcast_addr.media_id = TIPC_MEDIA_TYPE_IB;
+ 	tb_ptr->bcast_addr.broadcast = 1;
+ 	tb_ptr->mtu = dev->mtu;
+-	tb_ptr->blocked = 0;
+ 	ib_media_addr_set(tb_ptr, &tb_ptr->addr, (char *)dev->dev_addr);
+ 	return 0;
+ }
+@@ -265,20 +264,11 @@ static int recv_notification(struct notifier_block *nb, unsigned long evt,
+ 	switch (evt) {
+ 	case NETDEV_CHANGE:
+ 		if (netif_carrier_ok(dev))
+-			tipc_continue(ib_ptr->bearer);
+-		else
+-			tipc_block_bearer(ib_ptr->bearer);
+-		break;
+-	case NETDEV_UP:
+-		tipc_continue(ib_ptr->bearer);
+-		break;
++			break;
+ 	case NETDEV_DOWN:
+-		tipc_block_bearer(ib_ptr->bearer);
+-		break;
+ 	case NETDEV_CHANGEMTU:
+ 	case NETDEV_CHANGEADDR:
+-		tipc_block_bearer(ib_ptr->bearer);
+-		tipc_continue(ib_ptr->bearer);
++		tipc_reset_bearer(ib_ptr->bearer);
+ 		break;
+ 	case NETDEV_UNREGISTER:
+ 	case NETDEV_CHANGENAME:
+diff --git a/net/tipc/link.c b/net/tipc/link.c
+index 50f1488..5f6db96 100644
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@ -876,8 +876,7 @@ int tipc_link_send_buf(struct tipc_link *l_ptr, struct sk_buff *buf)
+ 		return link_send_long_buf(l_ptr, buf);
+ 
+ 	/* Packet can be queued or sent. */
+-	if (likely(!tipc_bearer_blocked(l_ptr->b_ptr) &&
+-		   !link_congested(l_ptr))) {
++	if (likely(!link_congested(l_ptr))) {
+ 		link_add_to_outqueue(l_ptr, buf, msg);
+ 
+ 		tipc_bearer_send(l_ptr->b_ptr, buf, &l_ptr->media_addr);
+@@ -1043,14 +1042,13 @@ static int link_send_buf_fast(struct tipc_link *l_ptr, struct sk_buff *buf,
+ 
+ 	if (likely(!link_congested(l_ptr))) {
+ 		if (likely(msg_size(msg) <= l_ptr->max_pkt)) {
+-			if (likely(!tipc_bearer_blocked(l_ptr->b_ptr))) {
+-				link_add_to_outqueue(l_ptr, buf, msg);
+-				tipc_bearer_send(l_ptr->b_ptr, buf,
+-						 &l_ptr->media_addr);
+-				l_ptr->unacked_window = 0;
+-				return res;
+-			}
+-		} else
++			link_add_to_outqueue(l_ptr, buf, msg);
++			tipc_bearer_send(l_ptr->b_ptr, buf,
++					 &l_ptr->media_addr);
++			l_ptr->unacked_window = 0;
++			return res;
++		}
++		else
+ 			*used_max_pkt = l_ptr->max_pkt;
+ 	}
+ 	return tipc_link_send_buf(l_ptr, buf);  /* All other cases */
+@@ -1137,8 +1135,7 @@ exit:
+ 				goto exit;
+ 
+ 			/* Exit if link (or bearer) is congested */
+-			if (link_congested(l_ptr) ||
+-			    tipc_bearer_blocked(l_ptr->b_ptr)) {
++			if (link_congested(l_ptr)) {
+ 				res = link_schedule_port(l_ptr,
+ 							 sender->ref, res);
+ 				goto exit;
+@@ -1408,9 +1405,6 @@ void tipc_link_push_queue(struct tipc_link *l_ptr)
+ {
+ 	u32 res;
+ 
+-	if (tipc_bearer_blocked(l_ptr->b_ptr))
+-		return;
+-
+ 	do {
+ 		res = tipc_link_push_packet(l_ptr);
+ 	} while (!res);
+@@ -1492,26 +1486,15 @@ void tipc_link_retransmit(struct tipc_link *l_ptr, struct sk_buff *buf,
+ 
+ 	msg = buf_msg(buf);
+ 
+-	if (tipc_bearer_blocked(l_ptr->b_ptr)) {
+-		if (l_ptr->retransm_queue_size == 0) {
+-			l_ptr->retransm_queue_head = msg_seqno(msg);
+-			l_ptr->retransm_queue_size = retransmits;
+-		} else {
+-			pr_err("Unexpected retransmit on link %s (qsize=%d)\n",
+-			       l_ptr->name, l_ptr->retransm_queue_size);
++	/* Detect repeated retransmit failures */
++	if (l_ptr->last_retransmitted == msg_seqno(msg)) {
++		if (++l_ptr->stale_count > 100) {
++			link_retransmit_failure(l_ptr, buf);
++			return;
+ 		}
+-		return;
+ 	} else {
+-		/* Detect repeated retransmit failures on unblocked bearer */
+-		if (l_ptr->last_retransmitted == msg_seqno(msg)) {
+-			if (++l_ptr->stale_count > 100) {
+-				link_retransmit_failure(l_ptr, buf);
+-				return;
+-			}
+-		} else {
+-			l_ptr->last_retransmitted = msg_seqno(msg);
+-			l_ptr->stale_count = 1;
+-		}
++		l_ptr->last_retransmitted = msg_seqno(msg);
++		l_ptr->stale_count = 1;
+ 	}
+ 
+ 	while (retransmits && (buf != l_ptr->next_out) && buf) {
+@@ -1984,12 +1967,6 @@ void tipc_link_send_proto_msg(struct tipc_link *l_ptr, u32 msg_typ,
+ 
+ 	skb_copy_to_linear_data(buf, msg, sizeof(l_ptr->proto_msg));
+ 
+-	/* Defer message if bearer is already blocked */
+-	if (tipc_bearer_blocked(l_ptr->b_ptr)) {
+-		l_ptr->proto_msg_queue = buf;
+-		return;
+-	}
+-
+ 	tipc_bearer_send(l_ptr->b_ptr, buf, &l_ptr->media_addr);
+ 	l_ptr->unacked_window = 0;
+ 	kfree_skb(buf);
+-- 
+1.7.5.4
+
