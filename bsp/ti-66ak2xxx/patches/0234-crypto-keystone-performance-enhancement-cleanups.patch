@@ -1,0 +1,800 @@
+From 8716a192ce3d8b28ad207f8744cef53573d3405d Mon Sep 17 00:00:00 2001
+From: Sandeep Nair <sandeep_n@ti.com>
+Date: Thu, 17 Oct 2013 19:02:20 -0400
+Subject: [PATCH 234/257] crypto: keystone: performance enhancement cleanups
+
+Following changes are being done in this patch:
+ 1. use slab cache allocator for dma context.
+    changes the context memory allocation for Tx DMA request
+    to use slab cache for performance.
+
+ 2. move Tx DMA completion handling to tasklet
+    Handling of Tx DMA completion is now done in a tasklet context.
+
+ 3. change IRQ lock to bottom half lock
+    Replaces the IRQ spinlock used during DMA submission
+    to bottom half spinlock.
+
+ 4. modified the workaround for the pktdma HW bug
+    The changes for the workaround are wrapped under the macro
+    SA_ENABLE_PKTDMA_WORKAROUND. The details of the HW issue are
+    mentioned in the source file.
+    with these changes now crypto requests will be dropped on
+    the following 2 conditions:
+    (a) insufficient Tx DMA descriptors for pkt submission.
+    (b) insufficient buffers in 2nd Rx pool.(PKTDMA issue
+        workaround).
+
+ 5. Improved SG list copy routines
+    Earlier function from the crypto scatterwalk implemenation
+    was being used for copying SG list buffers. This patch
+    re-implements those functions to remove the cache maintenance
+    overheads.
+
+Signed-off-by: Sandeep Nair <sandeep_n@ti.com>
+(cherry picked from commit 56e0ae2ef2a1952a98a51e68949ff99bf3b0e35a)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/crypto/keystone-sa.c | 401 ++++++++++++++++++++++++++++++-------------
+ 1 file changed, 278 insertions(+), 123 deletions(-)
+
+diff --git a/drivers/crypto/keystone-sa.c b/drivers/crypto/keystone-sa.c
+index 5edb965..dbfaef2 100644
+--- a/drivers/crypto/keystone-sa.c
++++ b/drivers/crypto/keystone-sa.c
+@@ -49,6 +49,16 @@
+ 
+ #include "keystone-sa.h"
+ 
++/* PKTDMA can get stuck if its request for a second buffer
++ * is not met for packet's whose size is greater than the
++ * buffer size in the first Rx buffer pool.
++ * This is a bug in keystone DMA engine HW.
++ * To take care of this situation the driver needs to ensure that it does
++ * not cause starvation for the second buffer.
++ * Below define is to enable that workaround in the code.
++ */
++#define SA_ENABLE_PKTDMA_WORKAROUND
++
+ /* Enable the below macro for testing with run-time
+  * self tests in the cryptographic algorithm manager
+  * framework */
+@@ -63,9 +73,13 @@
+ 
+ /* Number of 32 bit words in EPIB  */
+ #define SA_DMA_NUM_EPIB_WORDS	4
++
+ /* Number of 32 bit words in PS data  */
+ #define SA_DMA_NUM_PS_WORDS	16
+ 
++/* Number of meta data elements passed in descriptor to SA */
++#define SA_NUM_DMA_META_ELEMS	2
++
+ /* Maximum number of simultaeneous security contexts
+  * supported by the driver */
+ #define SA_MAX_NUM_CTX	512
+@@ -154,18 +168,14 @@ struct sa_drv_stats {
+ 	atomic_t rx_pkts;
+ };
+ 
+-/*
+- * Minimum number of descriptors to be always
+- * available in the Rx free queue
+- */
+-#define SA_MIN_RX_DESCS	4
+-
+ /* Crypto driver instance data */
+ struct keystone_crypto_data {
+ 	struct platform_device	*pdev;
+ 	struct clk		*clk;
+ 	struct tasklet_struct	rx_task;
++	struct tasklet_struct	tx_task;
+ 	struct dma_pool		*sc_pool;
++	struct kmem_cache	*dma_req_ctx_cache;
+ 	struct sa_regs		*regs;
+ 	struct sa_trng_regs	*trng_regs;
+ 	struct sa_dma_data	dma_data;
+@@ -173,8 +183,10 @@ struct keystone_crypto_data {
+ 
+ 	/* lock for SC-ID allocation */
+ 	spinlock_t		scid_lock;
+-	/* lock to prevent irq scheduling while dmaengine_submit() */
+-	spinlock_t		irq_lock;
++	/* lock to prevent bottom half scheduling during
++	 * dmaengine_submit()
++	 */
++	spinlock_t		bh_lock;
+ 	/* lock for reading random data from TRNG */
+ 	spinlock_t		trng_lock;
+ 
+@@ -192,21 +204,16 @@ struct keystone_crypto_data {
+ 	/* Driver stats */
+ 	struct sa_drv_stats	stats;
+ 
+-	/*
+-	 * Number of pkts pending crypto processing completion
+-	 * beyond which the driver will start dropping crypto
+-	 * requests.
+-	 */
+-	int			tx_thresh;
+-
+-	/*
+-	 * Number of pkts pending crypto processing completion
+-	 */
+-	atomic_t		pend_compl;
++	/* Number of buffers available in the 2nd buffer pool */
++#ifdef SA_ENABLE_PKTDMA_WORKAROUND
++	atomic_t		rx_dma_page_cnt;
++#endif
++	/* Number of Tx DMA descriptors available */
++	atomic_t		tx_dma_desc_cnt;
+ };
+ 
+ /* Packet structure used in Rx */
+-#define SA_SGLIST_SIZE	(MAX_SKB_FRAGS + 2)
++#define SA_SGLIST_SIZE	(MAX_SKB_FRAGS + SA_NUM_DMA_META_ELEMS)
+ struct sa_packet {
+ 	struct scatterlist		 sg[SA_SGLIST_SIZE];
+ 	int				 sg_ents;
+@@ -1098,7 +1105,7 @@ static int sg_count(struct scatterlist *sg, int len)
+ {
+ 	int sg_nents = 0;
+ 
+-	while (len > 0) {
++	while (sg && (len > 0)) {
+ 		sg_nents++;
+ 		len -= sg->length;
+ 		sg = scatterwalk_sg_next(sg);
+@@ -1115,7 +1122,7 @@ static int sg_len(struct scatterlist *sg)
+ 
+ 	while (sg) {
+ 		len += sg->length;
+-		sg = sg_next(sg);
++		sg = scatterwalk_sg_next(sg);
+ 	}
+ 	return len;
+ }
+@@ -1134,9 +1141,56 @@ static inline void sa_clone_sg(struct scatterlist *src,
+ 	}
+ }
+ 
++static inline unsigned int sa_scatterwalk_sglen(struct scatter_walk *walk)
++{
++	return walk->sg->offset + walk->sg->length - walk->offset;
++}
++
++static inline void *sa_scatterwalk_vaddr(struct scatter_walk *walk)
++{
++	return sg_virt(walk->sg) + (walk->offset - walk->sg->offset);
++}
++
++static inline void sa_scatterwalk_sgdone(struct scatter_walk *walk, size_t len)
++{
++	if (walk->offset >= walk->sg->offset + walk->sg->length)
++		scatterwalk_start(walk, scatterwalk_sg_next(walk->sg));
++}
++
++/* scatterwalk_copychunks() for mapped SG list */
++static inline void sa_scatterwalk_copychunks(void *buf,
++				struct scatter_walk *walk, unsigned int nbytes,
++				int out)
++{
++	for (;;) {
++		unsigned int len_this_sg = sa_scatterwalk_sglen(walk);
++
++		if (len_this_sg > nbytes)
++			len_this_sg = nbytes;
++
++		if (out)
++			memcpy(sa_scatterwalk_vaddr(walk), buf,
++					len_this_sg);
++		else
++			memcpy(buf, sa_scatterwalk_vaddr(walk),
++					len_this_sg);
++
++		scatterwalk_advance(walk, len_this_sg);
++
++		if (nbytes == len_this_sg)
++			break;
++
++		buf += len_this_sg;
++		nbytes -= len_this_sg;
++
++		sa_scatterwalk_sgdone(walk, len_this_sg);
++	}
++}
++
+ /* Copy buffer content from SRC SG list to DST SG list */
+-static int sg_copy(struct scatterlist *src, struct scatterlist *dst,
+-		unsigned int src_offset, unsigned int dst_offset, int len)
++static int sa_sg_copy(struct scatterlist *src, struct scatterlist *dst,
++		unsigned int src_offset, unsigned int dst_offset,
++		size_t len)
+ {
+ 	struct scatter_walk walk;
+ 	int sglen, cplen;
+@@ -1158,18 +1212,40 @@ static int sg_copy(struct scatterlist *src, struct scatterlist *dst,
+ 	scatterwalk_start(&walk, dst);
+ 	scatterwalk_advance(&walk, dst_offset);
+ 	while (src && (len > 0)) {
+-		cplen = min(len, (int)(src->length - src_offset));
++		cplen = min((int)len, (int)(src->length - src_offset));
+ 		if (likely(cplen))
+-			scatterwalk_copychunks(sg_virt(src) +
++			sa_scatterwalk_copychunks(sg_virt(src) +
+ 						src_offset, &walk, cplen, 1);
+ 		len -= cplen;
+ 		src = sg_next(src);
+ 		src_offset = 0;
+ 	}
+-	scatterwalk_done(&walk, 1, 0);
+ 	return 0;
+ }
+ 
++void sa_scatterwalk_copy(void *buf, struct scatterlist *sg,
++			      unsigned int start, unsigned int nbytes, int out)
++{
++	struct scatter_walk walk;
++	unsigned int offset = 0;
++
++	if (!nbytes)
++		return;
++
++	for (;;) {
++		scatterwalk_start(&walk, sg);
++
++		if (start < offset + sg->length)
++			break;
++
++		offset += sg->length;
++		sg = scatterwalk_sg_next(sg);
++	}
++
++	scatterwalk_advance(&walk, start - offset);
++	sa_scatterwalk_copychunks(buf, &walk, nbytes, out);
++}
++
+ /************************************************************/
+ /*		DMA notifcation handlers			*/
+ /************************************************************/
+@@ -1178,30 +1254,20 @@ static int sg_copy(struct scatterlist *src, struct scatterlist *dst,
+ static void sa_tx_dma_cb(void *data)
+ {
+ 	struct sa_dma_req_ctx *ctx = data;
+-	enum dma_status status;
+-
+-	if (unlikely(ctx->cookie <= 0))
+-		WARN(1, "invalid dma cookie == %d", ctx->cookie);
+-	else {
+-		status = dma_async_is_tx_complete(ctx->tx_chan,
+-				ctx->cookie, NULL, NULL);
+-		WARN((status != DMA_SUCCESS),
+-				"dma completion failure, status == %d", status);
+-	}
+ 
+ 	dma_unmap_sg(&ctx->dev_data->pdev->dev,
+ 		&ctx->sg_tbl.sgl[ctx->map_idx],
+ 		ctx->sg_tbl.nents, DMA_TO_DEVICE);
+ 
+-	if (likely(ctx->sg_tbl.sgl))
+-		sg_free_table(&ctx->sg_tbl);
+-
+ 	if (likely(ctx->pkt)) {
+-		atomic_inc(&ctx->dev_data->pend_compl);
++		atomic_add(ctx->sg_tbl.nents, &ctx->dev_data->tx_dma_desc_cnt);
+ 		atomic_inc(&ctx->dev_data->stats.tx_pkts);
+ 	}
+ 
+-	kfree(ctx);
++	if (likely(ctx->sg_tbl.sgl))
++		sg_free_table(&ctx->sg_tbl);
++
++	kmem_cache_free(ctx->dev_data->dma_req_ctx_cache, ctx);
+ }
+ 
+ /* Rx completion callback */
+@@ -1217,14 +1283,15 @@ static void sa_desc_rx_complete(void *arg)
+ 	u32 *psdata;
+ 
+ 	frags = 0;
+-	sg = sg_next(&rx->sg[2]);
++	sg = sg_next(&rx->sg[SA_NUM_DMA_META_ELEMS]);
+ 
+-	while ((frags < (SA_SGLIST_SIZE - 3)) && sg) {
++	while ((frags < (SA_SGLIST_SIZE - (SA_NUM_DMA_META_ELEMS + 1))) && sg) {
+ 		++frags;
+ 		sg = sg_next(sg);
+ 	}
+ 
+-	dma_unmap_sg(dev, &rx->sg[2], frags + 1, DMA_FROM_DEVICE);
++	dma_unmap_sg(dev, &rx->sg[SA_NUM_DMA_META_ELEMS], frags + 1,
++			DMA_FROM_DEVICE);
+ 
+ 	psdata = rx->psdata;
+ 	alg_type = psdata[0] & CRYPTO_ALG_TYPE_MASK;
+@@ -1263,7 +1330,7 @@ static void sa_desc_rx_complete(void *arg)
+ 
+ 		/* if encryption, copy the authentication tag */
+ 		if (enc) {
+-			scatterwalk_map_and_copy(
++			sa_scatterwalk_copy(
+ 					&psdata[SA_NUM_PSDATA_CTX_WORDS],
+ 					req->dst, enc_len,
+ 					auth_size, 1);
+@@ -1276,8 +1343,9 @@ static void sa_desc_rx_complete(void *arg)
+ 		} else  {
+ 			/* Verify the authentication tag */
+ 			u8 auth_tag[SA_MAX_AUTH_TAG_SZ];
+-			scatterwalk_map_and_copy(auth_tag, req->src, enc_len,
++			sa_scatterwalk_copy(auth_tag, req->src, enc_len,
+ 					auth_size, 0);
++
+ 			err = memcmp(&psdata[SA_NUM_PSDATA_CTX_WORDS],
+ 					auth_tag, auth_size) ? -EBADMSG : 0;
+ 			if (unlikely(err))
+@@ -1294,8 +1362,8 @@ static void sa_desc_rx_complete(void *arg)
+ 		}
+ 
+ 		/* Copy the encrypted/decrypted data */
+-		if (unlikely(sg_copy(&rx->sg[2], req->dst, enc_offset, 0,
+-					enc_len)))
++		if (unlikely(sa_sg_copy(&rx->sg[SA_NUM_DMA_META_ELEMS],
++					req->dst, enc_offset, 0, enc_len)))
+ 			err = -EBADMSG;
+ 
+ aead_err:
+@@ -1303,18 +1371,19 @@ aead_err:
+ 	}
+ 
+ 	/* Free the Rx buffer */
+-	sg = sg_next(&rx->sg[2]);
++	sg = sg_next(&rx->sg[SA_NUM_DMA_META_ELEMS]);
+ 	while (sg) {
+ 		free_page((unsigned long)sg_virt(sg));
+ 		sg = sg_next(sg);
++#ifdef SA_ENABLE_PKTDMA_WORKAROUND
++		if (likely(dev_data))
++			atomic_dec(&dev_data->rx_dma_page_cnt);
++#endif
+ 	}
+ 	kfree(rx);
+ 
+-	/* update completion pending count */
+-	if (dev_data) {
+-		atomic_dec(&dev_data->pend_compl);
++	if (likely(dev_data))
+ 		atomic_inc(&dev_data->stats.rx_pkts);
+-	}
+ 	return;
+ }
+ 
+@@ -1350,21 +1419,24 @@ static struct dma_async_tx_descriptor *sa_rxpool_alloc(void *arg,
+ 		sg_set_buf(&p_info->sg[0], p_info->epib, sizeof(p_info->epib));
+ 		sg_set_buf(&p_info->sg[1], p_info->psdata,
+ 				sizeof(p_info->psdata));
+-		sg_set_buf(&p_info->sg[2], p_info->data, bufsize);
++		sg_set_buf(&p_info->sg[SA_NUM_DMA_META_ELEMS], p_info->data,
++				bufsize);
+ 
+-		p_info->sg_ents = 2 + dma_map_sg(dev, &p_info->sg[2], 1,
+-							DMA_FROM_DEVICE);
+-		if (unlikely(p_info->sg_ents != 3)) {
++		p_info->sg_ents = SA_NUM_DMA_META_ELEMS +
++			dma_map_sg(dev, &p_info->sg[SA_NUM_DMA_META_ELEMS], 1,
++				DMA_FROM_DEVICE);
++		if (unlikely(p_info->sg_ents != (SA_NUM_DMA_META_ELEMS + 1))) {
+ 			dev_err(dev, "dma map failed\n");
+ 			kfree(p_info);
+ 			return NULL;
+ 		}
+ 
+ 		desc = dmaengine_prep_slave_sg(p_info->chan, p_info->sg,
+-					       3, DMA_DEV_TO_MEM,
++					       p_info->sg_ents, DMA_DEV_TO_MEM,
+ 					       DMA_HAS_EPIB | DMA_HAS_PSINFO);
+ 		if (unlikely(IS_ERR_OR_NULL(desc))) {
+-			dma_unmap_sg(dev, &p_info->sg[2], 1, DMA_FROM_DEVICE);
++			dma_unmap_sg(dev, &p_info->sg[SA_NUM_DMA_META_ELEMS],
++					1, DMA_FROM_DEVICE);
+ 			kfree(p_info);
+ 			err = PTR_ERR(desc);
+ 			if (err != -ENOMEM)
+@@ -1415,6 +1487,9 @@ static struct dma_async_tx_descriptor *sa_rxpool_alloc(void *arg,
+ 
+ 		desc->callback_param = bufptr;
+ 		desc->callback = sa_desc_rx_complete2nd;
++#ifdef SA_ENABLE_PKTDMA_WORKAROUND
++		atomic_inc(&dev_data->rx_dma_page_cnt);
++#endif
+ 	}
+ 
+ 	return desc;
+@@ -1429,7 +1504,8 @@ static void sa_rxpool_free(void *arg, unsigned q_num, unsigned bufsize,
+ 	if (q_num == 0) {
+ 		struct sa_packet *p_info = desc->callback_param;
+ 		dma_unmap_sg(&dev_data->pdev->dev,
+-				&p_info->sg[2], 1, DMA_FROM_DEVICE);
++				&p_info->sg[SA_NUM_DMA_META_ELEMS], 1,
++				DMA_FROM_DEVICE);
+ 		kfree(p_info);
+ 	} else {
+ 		void *bufptr = desc->callback_param;
+@@ -1466,6 +1542,26 @@ static void sa_chan_work_handler(unsigned long data)
+ 	return;
+ }
+ 
++/* DMA channel tx notify callback */
++static void sa_dma_notify_tx_compl(struct dma_chan *dma_chan, void *arg)
++{
++	struct keystone_crypto_data *dev_data = arg;
++
++	dmaengine_pause(dev_data->dma_data.tx_chan);
++	tasklet_schedule(&dev_data->tx_task);
++	return;
++}
++
++/* Tx task tasklet code */
++static void sa_tx_task(unsigned long data)
++{
++	struct keystone_crypto_data *crypto =
++		(struct keystone_crypto_data *)data;
++
++	dma_poll(crypto->dma_data.tx_chan, -1);
++	dmaengine_resume(crypto->dma_data.tx_chan);
++	return;
++}
+ /* Setup DMA configurations */
+ static int sa_setup_dma(struct keystone_crypto_data *dev_data)
+ {
+@@ -1498,6 +1594,7 @@ static int sa_setup_dma(struct keystone_crypto_data *dev_data)
+ 			dma_data->tx_chan_name);
+ 		goto err_out;
+ 	}
++	dma_set_notify(dma_data->tx_chan, sa_dma_notify_tx_compl, dev_data);
+ 
+ 	/* Setup Rx DMA channel */
+ 	dma_data->rx_chan =
+@@ -2184,17 +2281,20 @@ static int sa_tear_sc(struct sa_ctx_info *ctx,
+ 	struct sa_dma_req_ctx *dma_ctx;
+ 	struct sa_swinfo swinfo;
+ 	dma_cookie_t cookie;
+-	unsigned long flags;
+ 	u16 queue_id;
+ 	int ret = 0;
+ 	u8 flow_id;
+ 
+-	dma_ctx = kmalloc(sizeof(struct sa_dma_req_ctx), 0);
+-	if (!dma_ctx)
+-		return -ENOMEM;
++	dma_ctx = kmem_cache_alloc(pdata->dma_req_ctx_cache, GFP_KERNEL);
++	if (!dma_ctx) {
++		ret = -ENOMEM;
++		goto err;
++	}
+ 
+-	if (sg_alloc_table(&dma_ctx->sg_tbl, 2, GFP_KERNEL))
+-		return -ENOMEM;
++	if (sg_alloc_table(&dma_ctx->sg_tbl, 2, GFP_KERNEL)) {
++		ret = -ENOMEM;
++		goto err;
++	}
+ 
+ 	queue_id = dma_get_rx_queue(ctx->rx_chan);
+ 	flow_id = dma_get_rx_flow(ctx->rx_chan);
+@@ -2241,10 +2341,10 @@ static int sa_tear_sc(struct sa_ctx_info *ctx,
+ 	desc->callback = sa_tx_dma_cb;
+ 	desc->callback_param = dma_ctx;
+ 
+-	spin_lock_irqsave(&pdata->irq_lock, flags);
++	spin_lock_bh(&pdata->bh_lock);
+ 	cookie = dmaengine_submit(desc);
+ 	dma_ctx->cookie = cookie;
+-	spin_unlock_irqrestore(&pdata->irq_lock, flags);
++	spin_unlock_bh(&pdata->bh_lock);
+ 
+ 	if (dma_submit_error(cookie)) {
+ 		dev_warn(keystone_dev, "failed to submit null pkt\n");
+@@ -2272,7 +2372,8 @@ static int sa_tear_sc(struct sa_ctx_info *ctx,
+ err:
+ 	atomic_inc(&pdata->stats.sc_tear_dropped);
+ 	sg_free_table(&dma_ctx->sg_tbl);
+-	kfree(dma_ctx);
++	if (dma_ctx)
++		kmem_cache_free(pdata->dma_req_ctx_cache, dma_ctx);
+ 	return ret;
+ }
+ 
+@@ -2563,35 +2664,24 @@ static int sa_aead_perform(struct aead_request *req, u8 *iv, int enc)
+ 	unsigned ivsize = crypto_aead_ivsize(tfm);
+ 	u8 enc_offset = req->assoclen + ivsize;
+ 	struct sa_dma_req_ctx *req_ctx = NULL;
++	int sg_nents = SA_NUM_DMA_META_ELEMS;
+ 	struct dma_async_tx_descriptor *desc;
+ 	int assoc_sgents, src_sgents;
+ 	int psdata_offset, ret = 0;
+-	unsigned long irq_flags;
+ 	u8 auth_offset = 0;
+ 	u8 *auth_iv = NULL;
+-	int sg_nents = 2; /* First 2 entries are for EPIB & PSDATA */
+ 	u8 *aad = NULL;
+ 	u8 aad_len = 0;
+ 	int sg_idx = 0;
+ 	u16 enc_len;
+ 	u16 auth_len;
+ 	u32 req_type;
+-
++#ifdef SA_ENABLE_PKTDMA_WORKAROUND
++	int n_bufs;
++#endif
+ 	gfp_t flags = req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP ?
+ 			GFP_KERNEL : GFP_ATOMIC;
+ 
+-	if (unlikely(atomic_read(&pdata->pend_compl) >= pdata->tx_thresh)) {
+-		ret = -EBUSY;
+-		goto err;
+-	}
+-
+-	req_ctx = kmalloc(sizeof(struct sa_dma_req_ctx), flags);
+-
+-	if (unlikely(req_ctx == NULL)) {
+-		ret = -ENOMEM;
+-		goto err;
+-	}
+-
+ 	enc_len = req->cryptlen;
+ 
+ 	/* req->cryptlen includes authsize when decrypting */
+@@ -2600,13 +2690,6 @@ static int sa_aead_perform(struct aead_request *req, u8 *iv, int enc)
+ 
+ 	auth_len = req->assoclen + ivsize + enc_len;
+ 
+-	memcpy(req_ctx->cmdl, sa_ctx->cmdl, sa_ctx->cmdl_size);
+-	/* Update Command Label */
+-	sa_update_cmdl(dev, enc_offset, enc_len,
+-			iv, auth_offset, auth_len,
+-			auth_iv, aad_len, aad,
+-			&sa_ctx->cmdl_upd_info, req_ctx->cmdl);
+-
+ 	/* Allocate descriptor & submit packet */
+ 	assoc_sgents = sg_count(req->assoc, req->assoclen);
+ 	sg_nents += assoc_sgents;
+@@ -2616,14 +2699,50 @@ static int sa_aead_perform(struct aead_request *req, u8 *iv, int enc)
+ 	if (likely(ivsize))
+ 		sg_nents += 1;
+ 
++	if (unlikely(atomic_sub_return((sg_nents - SA_NUM_DMA_META_ELEMS),
++				&pdata->tx_dma_desc_cnt) < 0)) {
++		ret = -EBUSY;
++		goto err_0;
++	}
++
++#ifdef SA_ENABLE_PKTDMA_WORKAROUND
++	n_bufs = auth_len - pdata->dma_data.rx_buffer_sizes[0];
++
++	if (n_bufs <= 0)
++		n_bufs = 0;
++	else {
++		n_bufs =
++		DIV_ROUND_UP(n_bufs, pdata->dma_data.rx_buffer_sizes[1]);
++	}
++
++	if (unlikely(atomic_read(&pdata->rx_dma_page_cnt) < n_bufs)) {
++		ret = -EBUSY;
++		goto err_0;
++	}
++#endif
++
++	req_ctx = kmem_cache_alloc(pdata->dma_req_ctx_cache, flags);
++
++	if (unlikely(req_ctx == NULL)) {
++		ret = -ENOMEM;
++		goto err_0;
++	}
++
+ 	if (unlikely(sg_alloc_table(&req_ctx->sg_tbl, sg_nents, flags))) {
+ 		ret = -ENOMEM;
+-		goto err;
++		goto err_1;
+ 	}
+ 
+ 	sg_set_buf(&req_ctx->sg_tbl.sgl[sg_idx++], sa_ctx->epib,
+ 			sizeof(sa_ctx->epib));
+ 
++	memcpy(req_ctx->cmdl, sa_ctx->cmdl, sa_ctx->cmdl_size);
++	/* Update Command Label */
++	sa_update_cmdl(dev, enc_offset, enc_len,
++			iv, auth_offset, auth_len,
++			auth_iv, aad_len, aad,
++			&sa_ctx->cmdl_upd_info, req_ctx->cmdl);
++
+ 	/* Last 2 words in PSDATA will have the crypto alg type &
+ 	 * crypto request pointer
+ 	 */
+@@ -2669,6 +2788,7 @@ static int sa_aead_perform(struct aead_request *req, u8 *iv, int enc)
+ 					&req_ctx->sg_tbl.sgl[req_ctx->map_idx],
+ 					(sg_nents - req_ctx->map_idx),
+ 					DMA_TO_DEVICE);
++
+ 	if (unlikely(req_ctx->sg_tbl.nents != (sg_nents - req_ctx->map_idx))) {
+ 		dev_warn_ratelimited(dev, "failed to map tx pkt\n");
+ 		ret = -EIO;
+@@ -2681,8 +2801,9 @@ static int sa_aead_perform(struct aead_request *req, u8 *iv, int enc)
+ 					(DMA_HAS_EPIB | DMA_HAS_PSINFO));
+ 
+ 	if (unlikely(IS_ERR_OR_NULL(desc))) {
+-		dma_unmap_sg(dev, &req_ctx->sg_tbl.sgl[2],
+-				(sg_nents - 2), DMA_TO_DEVICE);
++		dma_unmap_sg(dev, &req_ctx->sg_tbl.sgl[SA_NUM_DMA_META_ELEMS],
++				(sg_nents - SA_NUM_DMA_META_ELEMS),
++				DMA_TO_DEVICE);
+ 		dev_warn_ratelimited(dev, "failed to prep slave dma\n");
+ 		ret = -ENOBUFS;
+ 		goto err;
+@@ -2694,10 +2815,10 @@ static int sa_aead_perform(struct aead_request *req, u8 *iv, int enc)
+ 	desc->callback = sa_tx_dma_cb;
+ 	desc->callback_param = req_ctx;
+ 
+-	spin_lock_irqsave(&pdata->irq_lock, irq_flags);
++	spin_lock_bh(&pdata->bh_lock);
+ 	cookie = dmaengine_submit(desc);
+ 	req_ctx->cookie = cookie;
+-	spin_unlock_irqrestore(&pdata->irq_lock, irq_flags);
++	spin_unlock_bh(&pdata->bh_lock);
+ 
+ 	if (unlikely(dma_submit_error(cookie))) {
+ 		dev_warn_ratelimited(dev, "failed to submit tx pkt\n");
+@@ -2706,11 +2827,16 @@ static int sa_aead_perform(struct aead_request *req, u8 *iv, int enc)
+ 	}
+ 
+ 	return -EINPROGRESS;
++
+ err:
+-	atomic_inc(&pdata->stats.tx_dropped);
+ 	if (req_ctx && req_ctx->sg_tbl.sgl)
+ 		sg_free_table(&req_ctx->sg_tbl);
+-	kfree(req_ctx);
++err_1:
++	if (req_ctx)
++		kmem_cache_free(pdata->dma_req_ctx_cache, req_ctx);
++err_0:
++	atomic_add((sg_nents - SA_NUM_DMA_META_ELEMS), &pdata->tx_dma_desc_cnt);
++	atomic_inc(&pdata->stats.tx_dropped);
+ 	return ret;
+ }
+ 
+@@ -3338,6 +3464,8 @@ static int sa_read_dtb(struct device_node *node,
+ 	}
+ 	dev_dbg(dev, "tx_queue_depth %u\n", dma_data->tx_queue_depth);
+ 
++	atomic_set(&data->tx_dma_desc_cnt, dma_data->tx_queue_depth);
++
+ 	ret = of_property_read_string(node, "rx_channel",
+ 				      &dma_data->rx_chan_name);
+ 	if (ret < 0) {
+@@ -3358,8 +3486,6 @@ static int sa_read_dtb(struct device_node *node,
+ 		dev_dbg(dev, "rx_queue_depth[%d]= %u\n", i,
+ 				dma_data->rx_queue_depths[i]);
+ 
+-	data->tx_thresh = dma_data->rx_queue_depths[0] - SA_MIN_RX_DESCS;
+-
+ 	ret = of_property_read_u32_array(node, "rx_buffer_size",
+ 			dma_data->rx_buffer_sizes, KEYSTONE_QUEUES_PER_CHAN);
+ 	if (ret < 0) {
+@@ -3371,6 +3497,10 @@ static int sa_read_dtb(struct device_node *node,
+ 		dev_dbg(dev, "rx_buffer_size[%d]= %u\n", i,
+ 				dma_data->rx_buffer_sizes[i]);
+ 
++#ifdef SA_ENABLE_PKTDMA_WORKAROUND
++	atomic_set(&data->rx_dma_page_cnt, 0);
++#endif
++
+ 	if (of_property_read_u32_array(node, "sc-id", sc_id_range, 2)) {
+ 		data->sc_id_start = 0x7000;
+ 		data->sc_id_end = 0x70ff;
+@@ -3393,6 +3523,36 @@ static int sa_read_dtb(struct device_node *node,
+ 	return 0;
+ }
+ 
++static int sa_init_mem(struct keystone_crypto_data *crypto)
++{
++	struct device *dev = &crypto->pdev->dev;
++	/* Setup dma pool for security context buffers */
++	crypto->sc_pool = dma_pool_create("keystone-sc", dev,
++				SA_CTX_MAX_SZ , 64, 0);
++	if (!crypto->sc_pool) {
++		dev_err(dev, "Failed to create dma pool");
++		goto err;
++	}
++
++	/* Create a cache for Tx DMA request context */
++	crypto->dma_req_ctx_cache = KMEM_CACHE(sa_dma_req_ctx, 0);
++	if (!crypto->dma_req_ctx_cache) {
++		dev_err(dev, "Failed to create dma req cache");
++		goto err;
++	}
++	return 0;
++
++err:
++	return -1;
++}
++
++static void sa_free_mem(struct keystone_crypto_data *crypto)
++{
++	if (crypto->sc_pool)
++		dma_pool_destroy(crypto->sc_pool);
++	if (crypto->dma_req_ctx_cache)
++		kmem_cache_destroy(crypto->dma_req_ctx_cache);
++}
+ static int keystone_crypto_remove(struct platform_device *pdev)
+ {
+ 	struct keystone_crypto_data *crypto = platform_get_drvdata(pdev);
+@@ -3403,13 +3563,12 @@ static int keystone_crypto_remove(struct platform_device *pdev)
+ 	sa_unregister_rng(&pdev->dev);
+ 	/* Delete SYSFS entries */
+ 	sa_delete_sysfs_entries(crypto);
+-	/* Free Security context DMA pool */
+-	if (crypto->sc_pool)
+-		dma_pool_destroy(crypto->sc_pool);
+ 	/* Release DMA channels */
+ 	sa_teardown_dma(crypto);
+ 	/* Kill tasklets */
+ 	tasklet_kill(&crypto->rx_task);
++	/* Free memory pools used by the driver */
++	sa_free_mem(crypto);
+ 
+ 	clk_disable_unprepare(crypto->clk);
+ 	clk_put(crypto->clk);
+@@ -3474,6 +3633,21 @@ static int keystone_crypto_probe(struct platform_device *pdev)
+ 	tasklet_init(&crypto->rx_task, sa_chan_work_handler,
+ 		     (unsigned long) crypto);
+ 
++	tasklet_init(&crypto->tx_task, sa_tx_task, (unsigned long) crypto);
++
++	/* Initialize statistic counters */
++	atomic_set(&crypto->stats.tx_dropped, 0);
++	atomic_set(&crypto->stats.sc_tear_dropped, 0);
++	atomic_set(&crypto->stats.tx_pkts, 0);
++	atomic_set(&crypto->stats.rx_pkts, 0);
++
++	/* Initialize memory pools used by the driver */
++	if (sa_init_mem(crypto)) {
++		dev_err(dev, "Failed to create dma pool");
++		ret = -ENOMEM;
++		goto err;
++	}
++
+ 	/* Setup DMA channels */
+ 	if (sa_setup_dma(crypto)) {
+ 		dev_err(dev, "Failed to set DMA channels");
+@@ -3481,28 +3655,9 @@ static int keystone_crypto_probe(struct platform_device *pdev)
+ 		goto err;
+ 	}
+ 
+-	/* setup dma pool for security context buffers */
+-	crypto->sc_pool = dma_pool_create("keystone-sc", dev,
+-					SA_CTX_MAX_SZ , 64, 0);
+-	if (!crypto->sc_pool) {
+-		dev_err(dev, "Failed to create dma pool");
+-		ret = -ENOMEM;
+-		goto err;
+-	}
+-
+ 	/* Initialize the SC-ID allocation lock */
+ 	spin_lock_init(&crypto->scid_lock);
+ 
+-	/* Initialize the IRQ schedule prevention lock */
+-	spin_lock_init(&crypto->irq_lock);
+-
+-	/* Initialize counters */
+-	atomic_set(&crypto->stats.tx_dropped, 0);
+-	atomic_set(&crypto->stats.sc_tear_dropped, 0);
+-	atomic_set(&crypto->pend_compl, 0);
+-	atomic_set(&crypto->stats.tx_pkts, 0);
+-	atomic_set(&crypto->stats.rx_pkts, 0);
+-
+ 	/* Create sysfs entries */
+ 	ret = sa_create_sysfs_entries(crypto);
+ 	if (ret)
+-- 
+2.7.4
+

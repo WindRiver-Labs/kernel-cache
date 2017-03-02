@@ -1,0 +1,1333 @@
+From 94b90575a4ac86f4da49f90962a45318757a5e52 Mon Sep 17 00:00:00 2001
+From: Prabhu Kuttiyam <pkuttiyam@ti.com>
+Date: Mon, 12 Mar 2012 18:54:23 -0400
+Subject: [PATCH 064/257] hwqueue: keystone: add keystone hwqueue driver
+
+This commit adds an hwqueue driver for the keystone qmss hardware.  As of this
+commit, accumulator functionality is non-existent.
+
+Signed-off-by: Prabhu Kuttiyam <pkuttiyam@ti.com>
+Signed-off-by: Cyril Chemparathy <cyril@ti.com>
+
+hwqueue: keystone: avoid non-cacheable coherent allocs for descriptor regions
+
+This patch replaces the original dma coherent allocation with a cacheable
+allocation that is then mapped for dma usage.
+
+hwqueue: keystone: add optimization hints
+
+In addition to a few cosmetic fixes, this patch mainly adds branch
+optimization hints for the compiler's benefit.  We also prefetch descriptors
+on pop, and mournfully retry on finding an invalid descriptor on a hardware
+queue.
+
+hwqueue: cleanup unused keystone specific structures
+
+The hwqueue header had unnecessary remnant definitions from the
+pre-device-tree era.  These have been removed by this patch.
+
+hwqueue: align descriptor size to cache line size
+
+This patch aligns descriptor size to the cache line size at push.
+
+hwqueue: keystone: verify descriptor size on push
+
+This patch adds verification on descriptor size before pushing it to a
+hardware queue.
+
+hwqueue: keystone: scatter/gather support
+
+Signed-off-by: Sandeep Paulraj <s-paulraj@ti.com>
+
+hwqueue: keystone: add support for multiple queue managers
+
+On the next generation of keystone devices, there will be multiple
+instances of the queue manager. This commit adds support for
+multiple queue managers in the keystone hardware queue driver.
+On the current range of keystone devices we have only one queue
+manager. Thus we will have only one queue manager node in the
+device tree bindings.
+
+Signed-off-by: Sandeep Paulraj <s-paulraj@ti.com>
+
+hwqueue: setting up pools to explicitly choose region numbers
+
+Signed-off-by: Prabhu Kuttiyam <pkuttiyam@ti.com>
+
+hwqueue: keystone: add range ops support in core driver
+(cherry picked from commit f2b371664694758bc7d05eb44522dfea9a67b065)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/hwqueue/Kconfig            |   10 +
+ drivers/hwqueue/Makefile           |    1 +
+ drivers/hwqueue/keystone_hwqueue.c | 1045 ++++++++++++++++++++++++++++++++++++
+ drivers/hwqueue/keystone_hwqueue.h |  177 ++++++
+ 4 files changed, 1233 insertions(+)
+ create mode 100644 drivers/hwqueue/keystone_hwqueue.c
+ create mode 100644 drivers/hwqueue/keystone_hwqueue.h
+
+diff --git a/drivers/hwqueue/Kconfig b/drivers/hwqueue/Kconfig
+index c7194ec..83640ee 100644
+--- a/drivers/hwqueue/Kconfig
++++ b/drivers/hwqueue/Kconfig
+@@ -16,4 +16,14 @@ config HWQUEUE_TEST
+ 
+ 	  If unsure, say N.
+ 
++config HWQUEUE_KEYSTONE
++	tristate "Keystone Hardware Queue device"
++	depends on TI_KEYSTONE
++	default y if TI_KEYSTONE
++	select HWQUEUE
++	help
++	  Say y here to support the Keystone Hardware queue device
++
++	  If unsure, say N.
++
+ endmenu
+diff --git a/drivers/hwqueue/Makefile b/drivers/hwqueue/Makefile
+index cdab79f..1f5971f 100644
+--- a/drivers/hwqueue/Makefile
++++ b/drivers/hwqueue/Makefile
+@@ -4,3 +4,4 @@
+ 
+ obj-$(CONFIG_HWQUEUE)		+= hwqueue_core.o
+ obj-$(CONFIG_HWQUEUE_TEST)	+= hwqueue_test.o
++obj-$(CONFIG_HWQUEUE_KEYSTONE)	+= keystone_hwqueue.o
+diff --git a/drivers/hwqueue/keystone_hwqueue.c b/drivers/hwqueue/keystone_hwqueue.c
+new file mode 100644
+index 0000000..300b77d
+--- /dev/null
++++ b/drivers/hwqueue/keystone_hwqueue.c
+@@ -0,0 +1,1045 @@
++/*
++ * Keystone hardware queue driver
++ *
++ * Copyright (C) 2011 Texas Instruments Incorporated - http://www.ti.com
++ * Contact: Prabhu Kuttiyam <pkuttiyam@ti.com>
++ *	    Cyril Chemparathy <cyril@ti.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/io.h>
++#include <linux/bitops.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/hwqueue.h>
++#include <linux/platform_device.h>
++#include <linux/dma-mapping.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/of_address.h>
++#include <linux/firmware.h>
++#include <linux/interrupt.h>
++
++#include "hwqueue_internal.h"
++#include "keystone_hwqueue.h"
++
++static int khwq_match(struct hwqueue_instance *inst, unsigned flags)
++{
++	struct khwq_instance *kq = hwqueue_inst_to_priv(inst);
++	struct khwq_range_info *range;
++	int score = 0;
++
++	if (!kq)
++		return -ENOENT;
++
++	range = kq->range;
++	if (!range)
++		return -ENOENT;
++
++	if (range->flags & RANGE_RESERVED)
++		score += 1000;
++
++	if ((range->flags & RANGE_HAS_IRQ) &&
++	    !(flags & (O_LOWLATENCY | O_HIGHTHROUGHPUT)))
++		score += 100;
++	if (!(range->flags & RANGE_HAS_IRQ) &&
++	    (flags & (O_LOWLATENCY | O_HIGHTHROUGHPUT)))
++		score += 100;
++
++	return score;
++}
++
++static irqreturn_t khwq_int_handler(int irq, void *_instdata)
++{
++	struct hwqueue_instance *inst = _instdata;
++
++	hwqueue_notify(inst);
++
++	return IRQ_HANDLED;
++}
++
++static void khwq_set_notify(struct hwqueue_instance *inst, bool enabled)
++{
++	struct khwq_range_info *range;
++	struct khwq_instance *kq;
++	unsigned queue;
++
++	kq    = hwqueue_inst_to_priv(inst);
++	range = kq->range;
++
++	if (range->ops) {
++		if (range->ops->set_notify)
++			range->ops->set_notify(range, inst, enabled);
++	} else if (range->flags & RANGE_HAS_IRQ) {
++		queue = hwqueue_inst_to_id(inst) - range->queue_base;
++		if (enabled)
++			enable_irq(range->irq_base + queue);
++		else
++			disable_irq_nosync(range->irq_base + queue);
++	} else
++		hwqueue_set_poll(inst, enabled);
++}
++
++static int khwq_setup_irq(struct khwq_range_info *range,
++			  struct hwqueue_instance *inst)
++{
++	struct khwq_instance *kq = hwqueue_inst_to_priv(inst);
++	unsigned queue = hwqueue_inst_to_id(inst) - range->queue_base;
++	int ret = 0, irq;
++
++	if (range->flags & RANGE_HAS_IRQ) {
++		irq = range->irq_base + queue;
++
++		ret = request_irq(irq, khwq_int_handler, 0, kq->irq_name, inst);
++		if (ret >= 0)
++			disable_irq(irq);
++	}
++
++	return ret;
++}
++
++static void khwq_free_irq(struct hwqueue_instance *inst)
++{
++	struct khwq_instance *kq = hwqueue_inst_to_priv(inst);
++	struct khwq_range_info *range = kq->range;
++	unsigned id = hwqueue_inst_to_id(inst) - range->queue_base;
++	int irq;
++
++	if (range->flags & RANGE_HAS_IRQ) {
++		irq = range->irq_base + id;
++		free_irq(irq, inst);
++	}
++}
++
++static int khwq_open(struct hwqueue_instance *inst, unsigned flags)
++{
++	struct khwq_instance *kq = hwqueue_inst_to_priv(inst);
++	struct khwq_range_info *range = kq->range;
++
++	if (!range->ops)
++		return khwq_setup_irq(range, inst);
++	else if (range->ops->open_queue)
++		return range->ops->open_queue(range, inst, flags);
++	else
++		return 0;
++}
++
++static void khwq_close(struct hwqueue_instance *inst)
++{
++	struct khwq_instance *kq = hwqueue_inst_to_priv(inst);
++	struct khwq_range_info *range = kq->range;
++
++	if (!range->ops)
++		khwq_free_irq(inst);
++	else if (range->ops->close_queue)
++		range->ops->close_queue(range, inst);
++}
++
++static inline struct khwq_region *
++khwq_find_region_by_virt(struct khwq_device *kdev, struct khwq_instance *kq,
++			 void *virt)
++{
++	struct khwq_region *region;
++
++	if (likely(kq->last && kq->last->virt_start <= virt &&
++		   kq->last->virt_end > virt))
++		return kq->last;
++
++	for_each_region(kdev, region) {
++		if (region->virt_start <= virt && region->virt_end > virt) {
++			kq->last = region;
++			return kq->last;
++		}
++	}
++
++	return NULL;
++}
++
++static inline struct khwq_region *
++khwq_find_region_by_dma(struct khwq_device *kdev, struct khwq_instance *kq,
++			dma_addr_t dma)
++{
++	struct khwq_region *region;
++
++	if (likely(kq->last && kq->last->dma_start <= dma &&
++		   kq->last->dma_end > dma))
++		return kq->last;
++
++	for_each_region(kdev, region) {
++		if (region->dma_start <= dma && region->dma_end > dma) {
++			kq->last = region;
++			return kq->last;
++		}
++	}
++
++	return NULL;
++}
++
++static int khwq_push(struct hwqueue_instance *inst, dma_addr_t dma,
++		     unsigned size)
++{
++	unsigned id = hwqueue_inst_to_id(inst);
++	struct khwq_qmgr_info *qmgr;
++	u32 val;
++
++	qmgr = khwq_find_qmgr(inst);
++	if (!qmgr)
++		return -ENODEV;
++
++	val = (u32)dma | ((size / 16) - 1);
++
++	__raw_writel(val, &qmgr->reg_push[id].ptr_size_thresh);
++
++	return 0;
++}
++
++static dma_addr_t khwq_pop(struct hwqueue_instance *inst, unsigned *size)
++{
++	struct khwq_instance *kq = hwqueue_inst_to_priv(inst);
++	struct khwq_device *kdev = from_hdev(inst->hdev);
++	unsigned id = hwqueue_inst_to_id(inst);
++	struct khwq_qmgr_info *qmgr;
++	u32 val, desc_size;
++	dma_addr_t dma;
++
++	qmgr = khwq_find_qmgr(inst);
++	if (unlikely(!qmgr))
++		return -ENODEV;
++
++	val = __raw_readl(&qmgr->reg_pop[id].ptr_size_thresh);
++	if (unlikely(!val))
++		return 0;
++
++	dma = val & DESC_PTR_MASK;
++	desc_size = ((val & DESC_SIZE_MASK) + 1) * 16;
++
++	if (unlikely(size))
++		*size = desc_size;
++
++	return dma;
++}
++
++static int khwq_get_count(struct hwqueue_instance *inst)
++{
++	struct khwq_instance *kq = hwqueue_inst_to_priv(inst);
++	unsigned id = hwqueue_inst_to_id(inst);
++	struct khwq_qmgr_info *qmgr;
++
++	qmgr = khwq_find_qmgr(inst);
++	if (unlikely(!qmgr))
++		return -EINVAL;
++
++	return (__raw_readl(&qmgr->reg_peek[id].entry_count) +
++		atomic_read(&kq->desc_count));
++}
++
++static int khwq_flush(struct hwqueue_instance *inst)
++{
++	struct khwq_instance *kq = hwqueue_inst_to_priv(inst);
++	unsigned id = hwqueue_inst_to_id(inst);
++	struct khwq_qmgr_info *qmgr;
++
++	qmgr = khwq_find_qmgr(inst);
++	if (!qmgr)
++		return -ENODEV;
++
++	__raw_writel(0, &qmgr->reg_push[id].ptr_size_thresh);
++	return 0;
++}
++
++static int khwq_map(struct hwqueue_instance *inst, void *data, unsigned size,
++		    dma_addr_t *dma_ptr, unsigned *size_ptr)
++{
++	struct khwq_device *kdev = from_hdev(inst->hdev);
++	struct khwq_instance *kq = hwqueue_inst_to_priv(inst);
++	struct khwq_region *region;
++	dma_addr_t dma;
++
++	region = khwq_find_region_by_virt(kdev, kq, data);
++	if (!region)
++		return -EINVAL;
++
++	if (unlikely(!region || size > region->desc_size))
++		return -EINVAL;
++
++	size = min(size, region->desc_size);
++	size = ALIGN(size, SMP_CACHE_BYTES);
++	dma = region->dma_start + (data - region->virt_start);
++
++	if (WARN_ON(dma & DESC_SIZE_MASK))
++		return -EINVAL;
++	dma_sync_single_for_device(kdev->dev, dma, size, DMA_TO_DEVICE);
++
++	*dma_ptr = dma;
++	*size_ptr = size;
++	return 0;
++}
++
++static void *khwq_unmap(struct hwqueue_instance *inst, dma_addr_t dma,
++			unsigned desc_size)
++{
++	struct khwq_device *kdev = from_hdev(inst->hdev);
++	struct khwq_instance *kq = hwqueue_inst_to_priv(inst);
++	struct khwq_region *region;
++	void *data;
++
++	region = khwq_find_region_by_dma(kdev, kq, dma);
++	if (WARN_ON(!region))
++		return NULL;
++
++	desc_size = min(desc_size, region->desc_size);
++
++	data = region->virt_start + (dma - region->dma_start);
++
++	dma_sync_single_for_cpu(kdev->dev, dma, desc_size, DMA_FROM_DEVICE);
++
++	prefetch(data);
++
++	return data;
++}
++
++static struct hwqueue_device_ops khdev_ops = {
++	.match		= khwq_match,
++	.open		= khwq_open,
++	.set_notify	= khwq_set_notify,
++	.close		= khwq_close,
++	.push		= khwq_push,
++	.pop		= khwq_pop,
++	.get_count	= khwq_get_count,
++	.flush		= khwq_flush,
++	.map		= khwq_map,
++	.unmap		= khwq_unmap,
++};
++
++static struct khwq_region *
++khwq_find_match_region(struct khwq_device *kdev, struct khwq_pool_info *pool)
++{
++	struct khwq_region *region;
++
++	for_each_region(kdev, region) {
++		if (region->id != pool->region_id)
++			continue;
++		if ((region->num_desc - region->used_desc) < pool->num_desc)
++			continue;
++		return region;
++	}
++	return NULL;
++}
++
++/* Map the requested pools to regions, creating regions as we go */
++static void khwq_map_pools(struct khwq_device *kdev)
++{
++	struct khwq_region *region;
++	struct khwq_pool_info *pool;
++
++	for_each_pool(kdev, pool) {
++		/* find a matching region*/
++		region = khwq_find_match_region(kdev, pool);
++		if (!region) {
++			dev_err(kdev->dev, "failed to set up pool %s %d\n",
++				pool->name, pool->num_desc);
++			continue;
++		}
++
++		/* link this pool to the region... */
++		pool->region = region;
++		pool->region_offset = region->used_desc;
++		region->used_desc += pool->num_desc;
++
++		dev_dbg(kdev->dev, "pool %s: num:%d, size:%d, region:%d \n",
++			pool->name, pool->num_desc,
++			pool->desc_size, region->id);
++	}
++}
++
++static int khwq_setup_region(struct khwq_device *kdev,
++				       struct khwq_region *region)
++{
++	unsigned hw_num_desc, hw_desc_size, size;
++	int id = region->id;
++	struct khwq_reg_region __iomem  *regs;
++	struct khwq_qmgr_info *qmgr;
++	struct page *page;
++
++	/* unused region? */
++	if (!region->num_desc) {
++		dev_warn(kdev->dev, "unused region %s\n", region->name);
++		return 0;
++	}
++
++	/* get hardware descriptor value */
++	hw_num_desc = ilog2(region->num_desc - 1) + 1;
++
++	/* did we force fit ourselves into nothingness? */
++	if (region->num_desc < 32) {
++		region->num_desc = 0;
++		dev_warn(kdev->dev, "too few descriptors in region %s\n", region->name);
++		return 0;
++	}
++
++	size = region->num_desc * region->desc_size;
++	region->virt_start = alloc_pages_exact(size, GFP_KERNEL | GFP_DMA);
++	if (!region->virt_start) {
++		region->num_desc = 0;
++		dev_err(kdev->dev, "memory alloc failed for region %s\n", region->name);
++		return 0;
++	}
++	region->virt_end = region->virt_start + size;
++	page = virt_to_page(region->virt_start);
++
++	region->dma_start = dma_map_page(kdev->dev, page, 0, size,
++					 DMA_BIDIRECTIONAL);
++	if (dma_mapping_error(kdev->dev, region->dma_start)) {
++		region->num_desc = 0;
++		free_pages_exact(region->virt_start, size);
++		dev_err(kdev->dev, "dma map failed for region %s\n", region->name);
++		return 0;
++	}
++	region->dma_end  = region->dma_start + size;
++
++	dev_dbg(kdev->dev,
++		"region %s (%d): size:%d, link:%d@%d, phys:%08x-%08x, virt:%p-%p\n",
++		region->name, id, region->desc_size, region->num_desc,
++		region->link_index, region->dma_start, region->dma_end,
++		region->virt_start, region->virt_end);
++
++	hw_desc_size = (region->desc_size / 16) - 1;
++	hw_num_desc -= 5;
++
++	for_each_qmgr(kdev, qmgr) {
++		regs = qmgr->reg_region + id;
++		__raw_writel(region->dma_start, &regs->base);
++		__raw_writel(region->link_index, &regs->start_index);
++		__raw_writel(hw_desc_size << 16 | hw_num_desc,
++			     &regs->size_count);
++	}
++
++	return region->num_desc;
++}
++
++static const char *khwq_find_name(struct device_node *node)
++{
++	const char *name;
++
++	if (of_property_read_string(node, "label", &name) < 0)
++		name = node->name;
++	if (!name)
++		name = "unknown";
++	return name;
++}
++
++static int khwq_setup_regions(struct khwq_device *kdev,
++					struct device_node *regions)
++{
++	struct device *dev = kdev->dev;
++	struct khwq_region *region;
++	struct device_node *child;
++	u32 temp[2];
++	int ret;
++
++	for_each_child_of_node(regions, child) {
++		region = devm_kzalloc(dev, sizeof(*region), GFP_KERNEL);
++		if (!region) {
++			dev_err(dev, "out of memory allocating region\n");
++			return -ENOMEM;
++		}
++
++		region->name = khwq_find_name(child);
++		of_property_read_u32(child, "id", &region->id);
++		ret = of_property_read_u32_array(child, "values", temp, 2);
++		if (!ret) {
++			region->num_desc  = temp[0];
++			region->desc_size = temp[1];
++		} else {
++			dev_err(dev, "invalid region info %s\n", region->name);
++			devm_kfree(dev, region);
++			continue;
++		}
++
++		if (!of_property_read_u32(child, "link-id", &region->link_index)) {
++			dev_err(dev, "invalid link info %s\n", region->name);
++			devm_kfree(dev, region);
++			continue;
++		}
++
++		list_add_tail(&region->list, &kdev->regions);
++	}
++	if (list_empty(&kdev->regions)) {
++		dev_err(dev, "no valid region information found\n");
++		return -ENODEV;
++	}
++
++	khwq_map_pools(kdev);
++
++	/* Next, we run through the regions and set things up */
++	for_each_region(kdev, region)
++		khwq_setup_region(kdev, region);
++
++	return 0;
++}
++
++/* carve out descriptors and push into named queues */
++static void khwq_fill_pools(struct khwq_device *kdev)
++{
++	struct khwq_region *region;
++	struct khwq_pool_info *pool;
++	dma_addr_t dma_addr;
++	unsigned dma_size;
++	int ret, i;
++
++	for_each_pool(kdev, pool) {
++		pool->queue = hwqueue_open(pool->name, HWQUEUE_ANY,
++					   O_CREAT | O_RDWR | O_NONBLOCK);
++		if (IS_ERR_OR_NULL(pool->queue)) {
++			dev_err(kdev->dev,
++				"failed to open queue for pool %s, error %ld\n",
++				pool->name, PTR_ERR(pool->queue));
++			pool->queue = NULL;
++			continue;
++		}
++
++		region = pool->region;
++
++		if (!region || !region->num_desc) {
++			dev_err(kdev->dev, "no region for pool %s\n",
++				pool->name);
++			continue;
++		}
++
++		pool->desc_size = region->desc_size;
++		for (i = 0; i < pool->num_desc; i++) {
++			int index = pool->region_offset + i;
++			void *desc;
++
++			desc = region->virt_start + region->desc_size * index;
++			ret = hwqueue_map(pool->queue, desc, pool->desc_size,
++					  &dma_addr, &dma_size);
++			if (ret < 0) {
++				WARN_ONCE(ret, "failed map pool queue %s\n",
++					  pool->name);
++				continue;
++			}
++			ret = hwqueue_push(pool->queue, dma_addr, dma_size);
++			WARN_ONCE(ret, "failed push to pool queue %s\n",
++				  pool->name);
++		}
++	}
++}
++
++static int khwq_get_link_ram(struct khwq_device *kdev,
++				       const char *name,
++				       struct khwq_link_ram_block *block)
++{
++	struct platform_device *pdev = to_platform_device(kdev->dev);
++	struct device_node *node = pdev->dev.of_node;
++	u32 temp[2];
++
++	/*
++	 * Note: link ram resources are specified in "entry" sized units. In
++	 * reality, although entries are ~40bits in hardware, we treat them as
++	 * 64-bit entities here.
++	 *
++	 * For example, to specify the internal link ram for Keystone-I class
++	 * devices, we would set the linkram0 resource to 0x80000-0x83fff.
++	 *
++	 * This gets a bit weird when other link rams are used.  For example,
++	 * if the range specified is 0x0c000000-0x0c003fff (i.e., 16K entries
++	 * in MSMC SRAM), the actual memory used is 0x0c000000-0x0c020000,
++	 * which accounts for 64-bits per entry, for 16K entries.
++	 */
++	if (!of_property_read_u32_array(node, name , temp, 2)) {
++		if (temp[0]) {
++			/*
++			 * queue_base specified => using internal or onchip
++			 * link ram WARNING - we do not "reserve" this block
++			 */
++			block->phys = (dma_addr_t)temp[0];
++			block->virt = NULL;
++			block->size = temp[1];
++		} else {
++			block->size = temp[1];
++			/* queue_base not specific => allocate requested size */
++			block->virt = dmam_alloc_coherent(kdev->dev,
++							  8 * block->size, &block->phys,
++							  GFP_KERNEL);
++			if (!block->virt) {
++				dev_err(kdev->dev, "failed to alloc linkram\n");
++				return -ENOMEM;
++			}
++		}
++	} else
++		return -ENODEV;
++	return 0;
++}
++
++static int khwq_setup_link_ram(struct khwq_device *kdev)
++{
++	struct khwq_link_ram_block *block;
++	struct khwq_qmgr_info *qmgr;
++
++	for_each_qmgr(kdev, qmgr) {
++		block = &kdev->link_rams[0];
++		dev_dbg(kdev->dev, "linkram0: phys:%x, virt:%p, size:%x\n",
++			block->phys, block->virt, block->size);
++		__raw_writel(block->phys, &qmgr->reg_config->link_ram_base0);
++		__raw_writel(block->size, &qmgr->reg_config->link_ram_size0);
++
++		block++;
++		if (!block->size)
++			return 0;
++
++		dev_dbg(kdev->dev, "linkram1: phys:%x, virt:%p, size:%x\n",
++			block->phys, block->virt, block->size);
++		__raw_writel(block->phys, &qmgr->reg_config->link_ram_base1);
++	}
++
++	return 0;
++}
++
++static int khwq_setup_queue_range(struct khwq_device *kdev,
++				 struct device_node *node)
++{
++	struct device *dev = kdev->dev;
++	struct khwq_range_info *range;
++	struct khwq_qmgr_info *qmgr;
++	u32 temp[2], start, end, id, index;
++	int ret;
++
++	range = devm_kzalloc(dev, sizeof(*range), GFP_KERNEL);
++	if (!range) {
++		dev_err(dev, "out of memory allocating range\n");
++		return -ENOMEM;
++	}
++
++	range->kdev = kdev;
++	range->name = khwq_find_name(node);
++
++	ret = of_property_read_u32_array(node, "values", temp, 2);
++	if (!ret) {
++		range->queue_base = temp[0] - kdev->base_id;
++		range->num_queues = temp[1];
++	} else {
++		dev_err(dev, "invalid queue range %s\n", range->name);
++		devm_kfree(dev, range);
++		return -EINVAL;
++	}
++
++	ret = of_property_read_u32(node, "irq-base", &range->irq_base);
++	if (ret >= 0)
++		range->flags |= RANGE_HAS_IRQ;
++
++	if (of_get_property(node, "reserved", NULL))
++		range->flags |= RANGE_RESERVED;
++
++	/* set threshold to 1, and flush out the queues */
++	for_each_qmgr(kdev, qmgr) {
++		start = max(qmgr->start_queue, range->queue_base);
++		end   = min(qmgr->start_queue + qmgr->num_queues,
++			    range->queue_base + range->num_queues);
++		for (id = start; id < end; id++) {
++			index = id - qmgr->start_queue;
++			__raw_writel(THRESH_GTE | 1,
++				     &qmgr->reg_peek[index].ptr_size_thresh);
++			__raw_writel(0, &qmgr->reg_push[index].ptr_size_thresh);
++		}
++	}
++
++	list_add_tail(&range->list, &kdev->queue_ranges);
++
++	dev_dbg(dev, "added range %s: %d-%d, irqs %d-%d%s%s%s\n",
++		range->name, range->queue_base,
++		range->queue_base + range->num_queues - 1,
++		range->irq_base,
++		range->irq_base + range->num_queues - 1,
++		(range->flags & RANGE_HAS_IRQ) ? ", has irq" : "",
++		(range->flags & RANGE_RESERVED) ? ", reserved" : "");
++
++	return 0;
++}
++
++static void khwq_free_queue_range(struct khwq_device *kdev,
++				  struct khwq_range_info *range)
++{
++	if (range->ops && range->ops->free_range)
++		range->ops->free_range(range);
++	list_del(&range->list);
++	devm_kfree(kdev->dev, range);
++}
++
++static int khwq_setup_queue_ranges(struct khwq_device *kdev,
++				  struct device_node *queues)
++{
++	struct device_node *child;
++	int ret;
++
++	for_each_child_of_node(queues, child) {
++		ret = khwq_setup_queue_range(kdev, child);
++		/* return value ignored, we init the rest... */
++	}
++
++	/* ... and barf if they all failed! */
++	if (list_empty(&kdev->queue_ranges)) {
++		dev_err(kdev->dev, "no valid queue range found\n");
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
++static void khwq_free_queue_ranges(struct khwq_device *kdev)
++{
++	struct khwq_range_info *range;
++
++	for (;;) {
++		range = first_queue_range(kdev);
++		if (!range)
++			break;
++		khwq_free_queue_range(kdev, range);
++	}
++}
++
++static int khwq_setup_pools(struct khwq_device *kdev, struct device_node *pools)
++{
++	struct device *dev = kdev->dev;
++	struct khwq_pool_info *pool;
++	struct device_node *child;
++	u32 temp[2];
++	int ret;
++
++	for_each_child_of_node(pools, child) {
++
++		pool = devm_kzalloc(dev, sizeof(*pool), GFP_KERNEL);
++		if (!pool) {
++			dev_err(dev, "out of memory allocating pool\n");
++			return -ENOMEM;
++		}
++
++		pool->name = khwq_find_name(child);
++
++		ret = of_property_read_u32_array(child, "values", temp, 2);
++		if (!ret) {
++			pool->num_desc  = temp[0];
++			pool->desc_size = temp[1];
++		} else {
++			dev_err(dev, "invalid queue pool %s\n", pool->name);
++			devm_kfree(dev, pool);
++			continue;
++		}
++
++		ret = of_property_read_u32(child, "region-id", &pool->region_id);
++		if (ret < 0) {
++			dev_err(dev, "invalid region id for pool %s\n", pool->name);
++			devm_kfree(dev, pool);
++			continue;
++		}
++
++		list_add_tail(&pool->list, &kdev->pools);
++
++		dev_info(dev, "added pool %s: %d descriptors of size %d\n",
++			pool->name, pool->num_desc, pool->desc_size);
++	}
++
++	if (list_empty(&kdev->pools)) {
++		dev_err(dev, "no valid descriptor pool found\n");
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
++static int khwq_init_qmgrs(struct khwq_device *kdev, struct device_node *qmgrs)
++{
++	struct device *dev = kdev->dev;
++	struct khwq_qmgr_info *qmgr;
++	struct device_node *child;
++	u32 temp[2];
++	int ret;
++
++	for_each_child_of_node(qmgrs, child) {
++		qmgr = devm_kzalloc(dev, sizeof(*qmgr), GFP_KERNEL);
++		if (!qmgr) {
++			dev_err(dev, "out of memory allocating qmgr\n");
++			return -ENOMEM;
++		}
++
++		ret = of_property_read_u32_array(child, "managed-queues",
++						 temp, 2);
++		if (!ret) {
++			qmgr->start_queue = temp[0];
++			qmgr->num_queues = temp[1];
++		} else {
++			dev_err(dev, "invalid qmgr queue range\n");
++			devm_kfree(dev, qmgr);
++			continue;
++		}
++
++		dev_info(dev, "qmgr start queue %d, number of queues %d\n",
++		       qmgr->start_queue, qmgr->num_queues);
++
++		qmgr->reg_peek		= of_iomap(child, 0);
++		qmgr->reg_status	= of_iomap(child, 1);
++		qmgr->reg_config	= of_iomap(child, 2);
++		qmgr->reg_region	= of_iomap(child, 3);
++		qmgr->reg_push		= of_iomap(child, 4);
++		qmgr->reg_pop		= of_iomap(child, 5);
++
++		if (!qmgr->reg_peek || !qmgr->reg_status || !qmgr->reg_config ||
++		    !qmgr->reg_region || !qmgr->reg_push || !qmgr->reg_pop) {
++			dev_err(dev, "failed to map qmgr regs\n");
++			if (qmgr->reg_peek)
++				iounmap(qmgr->reg_peek);
++			if (qmgr->reg_status)
++				iounmap(qmgr->reg_status);
++			if (qmgr->reg_config)
++				iounmap(qmgr->reg_config);
++			if (qmgr->reg_region)
++				iounmap(qmgr->reg_region);
++			if (qmgr->reg_push)
++				iounmap(qmgr->reg_push);
++			if (qmgr->reg_pop)
++				iounmap(qmgr->reg_pop);
++			kfree(qmgr);
++			continue;
++		}
++
++		list_add_tail(&qmgr->list, &kdev->qmgrs);
++
++		dev_info(dev, "added qmgr start queue %d, num of queues %d, "
++				"reg_peek %p, reg_status %p, reg_config %p, "
++				"reg_region %p, reg_push %p, reg_pop %p\n",
++				qmgr->start_queue, qmgr->num_queues,
++				qmgr->reg_peek, qmgr->reg_status,
++				qmgr->reg_config, qmgr->reg_region,
++				qmgr->reg_push, qmgr->reg_pop);
++	}
++
++	return 0;
++}
++
++static int khwq_init_queue(struct khwq_device *kdev,
++			   struct khwq_range_info *range,
++			   struct hwqueue_instance *inst)
++{
++	struct khwq_instance *kq = hwqueue_inst_to_priv(inst);
++	unsigned id = hwqueue_inst_to_id(inst) - range->queue_base;
++
++	kq->kdev = kdev;
++	kq->range = range;
++	kq->irq_num = -1;
++
++	scnprintf(kq->irq_name, sizeof(kq->irq_name),
++		  "hwqueue-%d", range->queue_base + id);
++
++	if (range->ops && range->ops->init_queue)
++		return range->ops->init_queue(range, inst);
++	else
++		return 0;
++}
++
++static int khwq_init_queues(struct khwq_device *kdev)
++{
++	struct hwqueue_device *hdev = to_hdev(kdev);
++	struct khwq_range_info *range;
++	int id, ret;
++
++	for_each_queue_range(kdev, range) {
++		if (range->ops && range->ops->init_range)
++			range->ops->init_range(range);
++		for (id = range->queue_base;
++		     id < range->queue_base + range->num_queues; id++) {
++			ret = khwq_init_queue(kdev, range,
++					      hwqueue_id_to_inst(hdev, id));
++			if (ret < 0)
++				return ret;
++		}
++	}
++	return 0;
++}
++
++static int khwq_probe(struct platform_device *pdev)
++{
++	struct device_node *node = pdev->dev.of_node;
++	struct device_node *qmgrs, *descs, *queues, *regions;
++	struct device *dev = &pdev->dev;
++	struct hwqueue_device *hdev;
++	struct khwq_device *kdev;
++	u32 temp[2];
++	int ret;
++
++	if (!node) {
++		dev_err(dev, "device tree info unavailable\n");
++		return -ENODEV;
++	}
++
++	qmgrs =  of_find_child_by_name(node, "qmgrs");
++	BUG_ON(!qmgrs);
++	if (!qmgrs) {
++		dev_err(dev, "queue manager info not specified\n");
++		return -ENODEV;
++	}
++
++	queues = of_find_child_by_name(node, "queues");
++	if (!queues) {
++		dev_err(dev, "queues not specified\n");
++		return -ENODEV;
++	}
++
++	descs =  of_find_child_by_name(node, "descriptors");
++	if (!descs) {
++		dev_err(dev, "descriptor pools not specified\n");
++		return -ENODEV;
++	}
++
++	regions =  of_find_child_by_name(node, "regions");
++	if (!regions) {
++		dev_err(dev, "region table not specified\n");
++		return -ENODEV;
++	}
++
++	kdev = devm_kzalloc(dev, sizeof(struct khwq_device), GFP_KERNEL);
++	if (!kdev) {
++		dev_err(dev, "memory allocation failed\n");
++		return -ENOMEM;
++	}
++
++	platform_set_drvdata(pdev, kdev);
++	kdev->dev = dev;
++	INIT_LIST_HEAD(&kdev->queue_ranges);
++	INIT_LIST_HEAD(&kdev->qmgrs);
++	INIT_LIST_HEAD(&kdev->pools);
++	INIT_LIST_HEAD(&kdev->regions);
++
++	if (of_property_read_u32_array(node, "range", temp, 2)) {
++		dev_err(dev, "hardware queue range not specified\n");
++		return -ENODEV;
++	}
++	kdev->base_id    = temp[0];
++	kdev->num_queues = temp[1];
++
++	/* Initialize queue managers using device tree configuration */
++	ret = khwq_init_qmgrs(kdev, qmgrs);
++	if (ret)
++		return ret;
++
++	/*
++	 * TODO: failure handling in this code is somewhere between moronic
++	 * and non-existant - needs to be fixed
++	 */
++
++	/* get usable queue range values from device tree */
++	ret = khwq_setup_queue_ranges(kdev, queues);
++	if (ret)
++		return ret;
++
++	/* Get descriptor pool values from device tree */
++	ret = khwq_setup_pools(kdev, descs);
++	if (ret) {
++		khwq_free_queue_ranges(kdev);
++		return ret;
++	}
++
++	ret = khwq_get_link_ram(kdev, "linkram0", &kdev->link_rams[0]);
++	if (ret) {
++		dev_err(kdev->dev, "could not setup linking ram\n");
++		return ret;
++	}
++
++	ret = khwq_get_link_ram(kdev, "linkram1", &kdev->link_rams[1]);
++	if (ret) {
++		/*
++		 * nothing really, we have one linking ram already, so we just
++		 * live within our means
++		 */
++	}
++
++	ret = khwq_setup_link_ram(kdev);
++	if (ret)
++		return ret;
++
++	ret = khwq_setup_regions(kdev, regions);
++	if (ret)
++		return ret;
++
++	/* initialize hwqueue device data */
++	hdev = to_hdev(kdev);
++	hdev->dev	 = dev;
++	hdev->base_id	 = kdev->base_id;
++	hdev->num_queues = kdev->num_queues;
++	hdev->priv_size	 = sizeof(struct khwq_instance);
++	hdev->ops	 = &khdev_ops;
++
++	/* register the hwqueue device */
++	ret = hwqueue_device_register(hdev);
++	if (ret < 0) {
++		dev_err(dev, "hwqueue registration failed\n");
++		return ret;
++	}
++
++	ret = khwq_init_queues(kdev);
++	if (ret < 0) {
++		dev_err(dev, "hwqueue initialization failed\n");
++		return ret;
++	}
++
++	khwq_fill_pools(kdev);
++
++	return 0;
++}
++
++static int khwq_remove(struct platform_device *pdev)
++{
++	struct khwq_device *kdev = platform_get_drvdata(pdev);
++	struct hwqueue_device *hdev = to_hdev(kdev);
++	int ret;
++
++	ret = hwqueue_device_unregister(hdev);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "hwqueue unregistration failed\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++/* Match table for of_platform binding */
++static struct of_device_id keystone_hwqueue_of_match[] = {
++	{ .compatible = "ti,keystone-hwqueue", },
++	{},
++};
++MODULE_DEVICE_TABLE(of, keystone_hwqueue_of_match);
++
++static struct platform_driver keystone_hwqueue_driver = {
++	.probe		= khwq_probe,
++	.remove		= khwq_remove,
++	.driver		= {
++		.name	= "keystone-hwqueue",
++		.owner	= THIS_MODULE,
++		.of_match_table = keystone_hwqueue_of_match,
++	},
++};
++
++static int __init keystone_hwqueue_init(void)
++{
++	return platform_driver_register(&keystone_hwqueue_driver);
++}
++subsys_initcall(keystone_hwqueue_init);
++
++static void __exit keystone_hwqueue_exit(void)
++{
++	platform_driver_unregister(&keystone_hwqueue_driver);
++}
++module_exit(keystone_hwqueue_exit);
++
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("Hardware queue driver for Keystone devices");
+diff --git a/drivers/hwqueue/keystone_hwqueue.h b/drivers/hwqueue/keystone_hwqueue.h
+new file mode 100644
+index 0000000..fb28b9d
+--- /dev/null
++++ b/drivers/hwqueue/keystone_hwqueue.h
+@@ -0,0 +1,177 @@
++/*
++ * Keystone hardware queue driver
++ *
++ * Copyright (C) 2011 Texas Instruments Incorporated - http://www.ti.com
++ * Contact: Prabhu Kuttiyam <pkuttiyam@ti.com>
++ *	    Cyril Chemparathy <cyril@ti.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++
++#ifndef __KEYSTONE_HWQUEUE_H__
++#define __KEYSTONE_HWQUEUE_H__
++
++#define DESC_SIZE_MASK	0xful
++#define DESC_PTR_MASK	(~DESC_SIZE_MASK)
++
++#define THRESH_GTE	BIT(7)
++#define THRESH_LT	0
++
++struct khwq_reg_config {
++	u32		revision;
++	u32		__pad1;
++	u32		divert;
++	u32		link_ram_base0;
++	u32		link_ram_size0;
++	u32		link_ram_base1;
++	u32		__pad2[2];
++	u32		starvation[0];
++};
++
++struct khwq_reg_region {
++	u32		base;
++	u32		start_index;
++	u32		size_count;
++	u32		__pad;
++};
++
++struct khwq_reg_queue {
++	u32		entry_count;
++	u32		byte_count;
++	u32		packet_size;
++	u32		ptr_size_thresh;
++};
++
++struct khwq_region {
++	const char	*name;
++	unsigned	 used_desc;
++	struct list_head list;
++	unsigned	 id;
++	unsigned	 desc_size;
++	unsigned	 num_desc;
++	unsigned	 fixed_mem;
++	dma_addr_t	 next_pool_addr;
++	dma_addr_t	 dma_start, dma_end;
++	void		*virt_start, *virt_end;
++	unsigned	 link_index;
++};
++
++struct khwq_pool_info {
++	const char		*name;
++	struct khwq_region	*region;
++	int			 region_offset;
++	int			 num_desc;
++	int			 desc_size;
++	int			 region_id;
++	struct hwqueue		*queue;
++	struct list_head	 list;
++};
++
++struct khwq_link_ram_block {
++	dma_addr_t	 phys;
++	void		*virt;
++	size_t		 size;
++};
++
++struct khwq_range_ops;
++
++struct khwq_range_info {
++	const char		*name;
++	struct khwq_device	*kdev;
++	unsigned		 queue_base;
++	unsigned		 num_queues;
++	unsigned		 irq_base;
++	unsigned		 flags;
++	struct list_head	 list;
++	struct khwq_range_ops	*ops;
++};
++
++struct khwq_range_ops {
++	int	(*init_range)(struct khwq_range_info *range);
++	int	(*free_range)(struct khwq_range_info *range);
++	int	(*init_queue)(struct khwq_range_info *range,
++			      struct hwqueue_instance *inst);
++	int	(*open_queue)(struct khwq_range_info *range,
++			      struct hwqueue_instance *inst, unsigned flags);
++	int	(*close_queue)(struct khwq_range_info *range,
++			       struct hwqueue_instance *inst);
++	int	(*set_notify)(struct khwq_range_info *range,
++			      struct hwqueue_instance *inst, bool enabled);
++};
++
++#define RANGE_RESERVED		BIT(0)
++#define RANGE_HAS_IRQ		BIT(1)
++
++struct khwq_qmgr_info {
++	unsigned			 start_queue;
++	unsigned			 num_queues;
++	struct khwq_reg_config __iomem	*reg_config;
++	struct khwq_reg_region __iomem	*reg_region;
++	struct khwq_reg_queue __iomem	*reg_push, *reg_pop, *reg_peek;
++	void __iomem			*reg_status;
++	struct list_head		 list;
++};
++
++struct khwq_device {
++	struct device			*dev;
++	struct hwqueue_device		 hdev;
++	struct list_head		 regions;
++	struct khwq_link_ram_block	 link_rams[2];
++	unsigned			 num_queues;
++	unsigned			 base_id;
++	struct list_head		 queue_ranges;
++	struct list_head		 pools;
++	struct list_head		 qmgrs;
++};
++
++struct khwq_instance {
++	struct khwq_device	*kdev;
++	struct khwq_range_info	*range;
++	struct khwq_region	*last; /* cache last region used */
++	struct khwq_qmgr_info	*qmgr; /* cache qmgr for the instance */
++	int			 irq_num; /*irq num -ve for non-irq queues */
++	char			 irq_name[32];
++};
++
++#define to_hdev(_kdev)		(&(_kdev)->hdev)
++#define from_hdev(_hdev)	container_of(_hdev, struct khwq_device, hdev)
++
++#define for_each_region(kdev, region)				\
++	list_for_each_entry(region, &kdev->regions, list)
++
++#define for_each_queue_range(kdev, range)			\
++	list_for_each_entry(range, &kdev->queue_ranges, list)
++
++#define first_queue_range(kdev)					\
++	list_first_entry(&kdev->queue_ranges, struct khwq_range_info, list)
++
++#define for_each_pool(kdev, pool)				\
++	list_for_each_entry(pool, &kdev->pools, list)
++
++#define for_each_qmgr(kdev, qmgr)				\
++	list_for_each_entry(qmgr, &kdev->qmgrs, list)
++
++static inline struct khwq_qmgr_info *
++khwq_find_qmgr(struct hwqueue_instance *inst)
++{
++	struct khwq_device *kdev = from_hdev(inst->hdev);
++	unsigned id = hwqueue_inst_to_id(inst);
++	struct khwq_qmgr_info *qmgr;
++
++	for_each_qmgr(kdev, qmgr) {
++		if ((id >= qmgr->start_queue) &&
++			(id < qmgr->start_queue + qmgr->num_queues))
++			return qmgr;
++	}
++
++	return NULL;
++}
++
++#endif /* __KEYSTONE_HWQUEUE_H__ */
+-- 
+2.7.4
+
