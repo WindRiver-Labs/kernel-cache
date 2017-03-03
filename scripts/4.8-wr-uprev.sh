@@ -104,6 +104,9 @@ git merge --no-edit	standard/cgl/nxp/base	|| bash
 
 # -rt
 
+git checkout		standard/preempt-rt/base
+git merge --no-edit	standard/base		|| bash
+
 git checkout		standard/preempt-rt/bcm-587xx
 git merge --no-edit	standard/preempt-rt/base		|| bash
 
