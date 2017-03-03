@@ -49,6 +49,9 @@ git merge --no-edit	standard/base		|| bash
 git checkout		standard/qemuppc
 git merge --no-edit	standard/base		|| bash
 
+git checkout 		standard/xilinx-zynq
+git merge --no-edit	standard/base		|| bash
+
 git checkout		standard/xilinx-zynqmp
 git merge --no-edit	standard/base		|| bash
 
@@ -135,6 +138,9 @@ git checkout		standard/preempt-rt/nxp-imx/sdk-4.1.15/base
 git merge --no-edit	standard/preempt-rt/nxp-imx/base	|| bash
 git checkout		standard/preempt-rt/nxp-imx/sdk-4.1.15/nxp-imx6
 git merge --no-edit	standard/preempt-rt/nxp-imx/base	|| bash
+
+git checkout		standard/preempt-rt/xilinx-zynq
+git merge --no-edit	standard/preempt-rt/base		|| bash
 
 git checkout		standard/preempt-rt/xilinx-zynqmp
 git merge --no-edit	standard/preempt-rt/base		|| bash
