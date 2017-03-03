@@ -1,0 +1,295 @@
+From a04c581248bdafee8b335c1f4f509784076d6c83 Mon Sep 17 00:00:00 2001
+From: Liu Ying <Ying.Liu@freescale.com>
+Date: Fri, 11 Sep 2015 16:03:06 +0800
+Subject: [PATCH 0856/1691] MLK-11316-3 video: mxc ipuv3 fb: Change pan display
+ mechanism for PRE workaround
+
+commit a04c581248bdafee8b335c1f4f509784076d6c83 from
+git://git.freescale.com/imx/linux-2.6-imx.git imx_4.1.15_1.0.0_ga
+
+In order to workaround the PRE SoC bug recorded by errata ERR009624, the
+software cannot write the PRE_CTRL register when the PRE writes the PRE_CTRL
+register automatically to set the ENABLE bit(bit0) to 1 in the PRE repeat mode.
+
+The software mechanism to set the PRE_CTRL register is different for PRE Y
+resolution higher than 9 lines and lower than or equal to 9 lines.
+
+For cases in which Y resolution is higher than 9 lines, before we update PRE
+shadow, we just need to wait until the PRE store engine status runs out of
+the problematic PRE automatic writing window.
+
+While for cases in which Y resolutin is lower than or equal to 9 lines, we
+have to update PRE shadow in the buffer flip interrupt handler.
+
+Signed-off-by: Liu Ying <Ying.Liu@freescale.com>
+(cherry picked from commit bd9c14e24aaf67926dfd31bd819ab0c87129fe4b)
+---
+ drivers/mxc/ipu3/pre.c                 | 34 ++++++++++++-
+ drivers/video/fbdev/mxc/mxc_ipuv3_fb.c | 91 +++++++++++++++++++++++++++-------
+ include/linux/ipu-v3-pre.h             |  8 ++-
+ 3 files changed, 112 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/mxc/ipu3/pre.c b/drivers/mxc/ipu3/pre.c
+index bd5f894..73b69ed 100644
+--- a/drivers/mxc/ipu3/pre.c
++++ b/drivers/mxc/ipu3/pre.c
+@@ -823,14 +823,18 @@ void ipu_pre_disable(int id)
+ }
+ EXPORT_SYMBOL(ipu_pre_disable);
+ 
+-int ipu_pre_set_fb_buffer(int id, unsigned long fb_paddr,
++int ipu_pre_set_fb_buffer(int id, bool resolve,
++			  unsigned long fb_paddr,
++			  unsigned int y_res,
+ 			  unsigned int x_crop,
+ 			  unsigned int y_crop,
+ 			  unsigned int sec_buf_off,
+ 			  unsigned int trd_buf_off)
+ {
+ 	struct ipu_pre_data *pre = get_pre(id);
++	unsigned int store_stat, store_block_y;
+ 	unsigned long lock_flags;
++	bool update = true;
+ 
+ 	if (!pre)
+ 		return -EINVAL;
+@@ -842,7 +846,33 @@ int ipu_pre_set_fb_buffer(int id, unsigned long fb_paddr,
+ 	pre_write(pre, BF_PRE_PREFETCH_ENGINE_OUTPUT_SIZE_ULC_OUTPUT_SIZE_ULC_X(x_crop) |
+ 		       BF_PRE_PREFETCH_ENGINE_OUTPUT_SIZE_ULC_OUTPUT_SIZE_ULC_Y(y_crop),
+ 		  HW_PRE_PREFETCH_ENGINE_OUTPUT_SIZE_ULC);
+-	pre_write(pre, BF_PRE_CTRL_SDW_UPDATE(1), HW_PRE_CTRL_SET);
++
++	/*
++	 * Update shadow only when store engine runs out of the problematic
++	 * window to workaround the SoC design bug recorded by errata ERR009624.
++	 */
++	if (y_res > IPU_PRE_SMALL_LINE) {
++		unsigned long timeout = jiffies + msecs_to_jiffies(20);
++
++		do {
++			if (time_after(jiffies, timeout)) {
++				update = false;
++				dev_warn(pre->dev, "timeout waiting for PRE "
++					"to run out of problematic window for "
++					"shadow update\n");
++				break;
++			}
++
++			store_stat = pre_read(pre, HW_PRE_STORE_ENGINE_STATUS);
++			store_block_y = (store_stat &
++				BM_PRE_STORE_ENGINE_STATUS_STORE_BLOCK_Y) >>
++				BP_PRE_STORE_ENGINE_STATUS_STORE_BLOCK_Y;
++		} while (store_block_y >=
++			 (y_res / (resolve ? 4 : 1) - 2) || store_block_y == 0);
++	}
++
++	if (update)
++		pre_write(pre, BF_PRE_CTRL_SDW_UPDATE(1), HW_PRE_CTRL_SET);
+ 	spin_unlock_irqrestore(&pre->lock, lock_flags);
+ 
+ 	return 0;
+diff --git a/drivers/video/fbdev/mxc/mxc_ipuv3_fb.c b/drivers/video/fbdev/mxc/mxc_ipuv3_fb.c
+index 355b477..77a634c 100644
+--- a/drivers/video/fbdev/mxc/mxc_ipuv3_fb.c
++++ b/drivers/video/fbdev/mxc/mxc_ipuv3_fb.c
+@@ -83,6 +83,11 @@ struct mxcfb_info {
+ 	bool on_the_fly;
+ 	uint32_t final_pfmt;
+ 	unsigned long gpu_sec_buf_off;
++	unsigned long base;
++	uint32_t x_crop;
++	uint32_t y_crop;
++	unsigned int sec_buf_off;
++	unsigned int trd_buf_off;
+ 	dma_addr_t store_addr;
+ 	dma_addr_t alpha_phy_addr0;
+ 	dma_addr_t alpha_phy_addr1;
+@@ -111,6 +116,7 @@ struct mxcfb_info {
+ 	uint32_t cur_ipu_pfmt;
+ 	uint32_t cur_fb_pfmt;
+ 	bool cur_prefetch;
++	spinlock_t spin_lock;	/* for PRE small yres cases */
+ };
+ 
+ struct mxcfb_pfmt {
+@@ -530,7 +536,9 @@ static int _setup_disp_channel2(struct fb_info *fbi)
+ 	 * so we call complete() for both mxc_fbi->flip_complete
+ 	 * and mxc_fbi->alpha_flip_complete.
+ 	 */
+-	complete(&mxc_fbi->flip_complete);
++	if (!mxc_fbi->prefetch ||
++	    (mxc_fbi->prefetch && !ipu_pre_yres_is_small(fbi->var.yres)))
++		complete(&mxc_fbi->flip_complete);
+ 	if (mxc_fbi->alpha_chan_en) {
+ 		mxc_fbi->cur_ipu_alpha_buf = 1;
+ 		init_completion(&mxc_fbi->alpha_flip_complete);
+@@ -2309,8 +2317,6 @@ mxcfb_pan_display(struct fb_var_screeninfo *var, struct fb_info *info)
+ 			  *mxc_graphic_fbi = NULL;
+ 	u_int y_bottom;
+ 	unsigned int fr_xoff, fr_yoff, fr_w, fr_h;
+-	unsigned int x_crop = 0, y_crop = 0;
+-	unsigned int sec_buf_off = 0, trd_buf_off = 0;
+ 	unsigned long base, ipu_base = 0, active_alpha_phy_addr = 0;
+ 	bool loc_alpha_en = false;
+ 	int fb_stride;
+@@ -2392,12 +2398,27 @@ mxcfb_pan_display(struct fb_var_screeninfo *var, struct fb_info *info)
+ 		if (mxc_fbi->cur_prefetch && (info->var.vmode & FB_VMODE_INTERLACED))
+ 			base += info->var.rotate ?
+ 				fr_w * bytes_per_pixel(fbi_to_pixfmt(info, true)) : 0;
+-	} else {
+-		x_crop = fr_xoff & ~(bw - 1);
+-		y_crop = fr_yoff & ~(bh - 1);
+ 	}
+ 
+ 	if (mxc_fbi->cur_prefetch) {
++		unsigned long lock_flags = 0;
++
++		if (ipu_pre_yres_is_small(info->var.yres))
++			/*
++			 * Update the PRE buffer address in the flip interrupt
++			 * handler in this case to workaround the SoC design
++			 * bug recorded by errata ERR009624.
++			 */
++			spin_lock_irqsave(&mxc_fbi->spin_lock, lock_flags);
++
++		if (mxc_fbi->resolve) {
++			mxc_fbi->x_crop = fr_xoff & ~(bw - 1);
++			mxc_fbi->y_crop = fr_yoff & ~(bh - 1);
++		} else {
++			mxc_fbi->x_crop = 0;
++			mxc_fbi->y_crop = 0;
++		}
++
+ 		ipu_get_channel_offset(fbi_to_pixfmt(info, true),
+ 				       info->var.xres,
+ 				       fr_h,
+@@ -2405,10 +2426,15 @@ mxcfb_pan_display(struct fb_var_screeninfo *var, struct fb_info *info)
+ 				       0, 0,
+ 				       fr_yoff,
+ 				       fr_xoff,
+-				       &sec_buf_off,
+-				       &trd_buf_off);
++				       &mxc_fbi->sec_buf_off,
++				       &mxc_fbi->trd_buf_off);
+ 		if (mxc_fbi->resolve)
+-			sec_buf_off = mxc_fbi->gpu_sec_buf_off;
++			mxc_fbi->sec_buf_off = mxc_fbi->gpu_sec_buf_off;
++
++		if (ipu_pre_yres_is_small(info->var.yres)) {
++			mxc_fbi->base = base;
++			spin_unlock_irqrestore(&mxc_fbi->spin_lock, lock_flags);
++		}
+ 	} else {
+ 		ipu_base = base;
+ 	}
+@@ -2441,10 +2467,15 @@ mxcfb_pan_display(struct fb_var_screeninfo *var, struct fb_info *info)
+ 		}
+ 	}
+ 
+-	ret = wait_for_completion_timeout(&mxc_fbi->flip_complete, HZ/2);
+-	if (ret == 0) {
+-		dev_err(info->device, "timeout when waiting for flip irq\n");
+-		return -ETIMEDOUT;
++	if (!mxc_fbi->cur_prefetch ||
++	    (mxc_fbi->cur_prefetch && !ipu_pre_yres_is_small(info->var.yres))) {
++		ret = wait_for_completion_timeout(&mxc_fbi->flip_complete,
++						  HZ/2);
++		if (ret == 0) {
++			dev_err(info->device, "timeout when waiting for flip "
++						"irq\n");
++			return -ETIMEDOUT;
++		}
+ 	}
+ 
+ 	if (!mxc_fbi->cur_prefetch) {
+@@ -2486,10 +2517,14 @@ next:
+ 
+ 			ipu_select_buffer(mxc_fbi->ipu, mxc_fbi->ipu_ch,
+ 					  IPU_INPUT_BUFFER, mxc_fbi->cur_ipu_buf);
+-		} else {
+-			ipu_pre_set_fb_buffer(mxc_fbi->pre_num, base,
+-					      x_crop, y_crop,
+-					      sec_buf_off, trd_buf_off);
++		} else if (!ipu_pre_yres_is_small(info->var.yres)) {
++			ipu_pre_set_fb_buffer(mxc_fbi->pre_num,
++					      mxc_fbi->resolve,
++					      base, info->var.yres,
++					      mxc_fbi->x_crop,
++					      mxc_fbi->y_crop,
++					      mxc_fbi->sec_buf_off,
++					      mxc_fbi->trd_buf_off);
+ 		}
+ 		ipu_clear_irq(mxc_fbi->ipu, mxc_fbi->ipu_ch_irq);
+ 		ipu_enable_irq(mxc_fbi->ipu, mxc_fbi->ipu_ch_irq);
+@@ -2518,6 +2553,16 @@ next:
+ 		return -EBUSY;
+ 	}
+ 
++	if (mxc_fbi->cur_prefetch && ipu_pre_yres_is_small(info->var.yres)) {
++		ret = wait_for_completion_timeout(&mxc_fbi->flip_complete,
++						  HZ/2);
++		if (ret == 0) {
++			dev_err(info->device, "timeout when waiting for flip "
++						"irq\n");
++			return -ETIMEDOUT;
++		}
++	}
++
+ 	dev_dbg(info->device, "Update complete\n");
+ 
+ 	info->var.yoffset = var->yoffset;
+@@ -2605,6 +2650,17 @@ static irqreturn_t mxcfb_irq_handler(int irq, void *dev_id)
+ 	struct fb_info *fbi = dev_id;
+ 	struct mxcfb_info *mxc_fbi = fbi->par;
+ 
++	if (mxc_fbi->cur_prefetch && ipu_pre_yres_is_small(fbi->var.yres)) {
++		spin_lock(&mxc_fbi->spin_lock);
++		ipu_pre_set_fb_buffer(mxc_fbi->pre_num,
++				      mxc_fbi->resolve,
++				      mxc_fbi->base, fbi->var.yres,
++				      mxc_fbi->x_crop, mxc_fbi->y_crop,
++				      mxc_fbi->sec_buf_off,
++				      mxc_fbi->trd_buf_off);
++		spin_unlock(&mxc_fbi->spin_lock);
++	}
++
+ 	complete(&mxc_fbi->flip_complete);
+ 	return IRQ_HANDLED;
+ }
+@@ -3382,6 +3438,7 @@ static int mxcfb_probe(struct platform_device *pdev)
+ 	mxcfbi->first_set_par = true;
+ 	mxcfbi->prefetch = plat_data->prefetch;
+ 	mxcfbi->pre_num = -1;
++	spin_lock_init(&mxcfbi->spin_lock);
+ 
+ 	ret = mxcfb_dispdrv_init(pdev, fbi);
+ 	if (ret < 0)
+diff --git a/include/linux/ipu-v3-pre.h b/include/linux/ipu-v3-pre.h
+index 1bf50ae..f5a26e5 100644
+--- a/include/linux/ipu-v3-pre.h
++++ b/include/linux/ipu-v3-pre.h
+@@ -90,7 +90,9 @@ int ipu_pre_config(int id, struct ipu_pre_context *config);
+ int ipu_pre_set_ctrl(unsigned int id, struct ipu_pre_context *config);
+ int ipu_pre_enable(int id);
+ void ipu_pre_disable(int id);
+-int ipu_pre_set_fb_buffer(int id, unsigned long fb_paddr,
++int ipu_pre_set_fb_buffer(int id, bool resolve,
++			  unsigned long fb_paddr,
++			  unsigned int y_res,
+ 			  unsigned int x_crop,
+ 			  unsigned int y_crop,
+ 			  unsigned int sec_buf_off,
+@@ -135,7 +137,9 @@ void ipu_pre_disable(int id)
+ 	return;
+ }
+ 
+-int ipu_pre_set_fb_buffer(int id, unsigned long fb_paddr,
++int ipu_pre_set_fb_buffer(int id, bool resolve,
++			  unsigned long fb_paddr,
++			  unsigned int y_res,
+ 			  unsigned int x_crop,
+ 			  unsigned int y_crop,
+ 			  unsigned int sec_buf_off,
+-- 
+1.9.1
+
