@@ -1,0 +1,458 @@
+From 9093edcdbb1636256c74f88aeb8496c439db2670 Mon Sep 17 00:00:00 2001
+From: Alex Dai <yu.dai@intel.com>
+Date: Mon, 7 Dec 2015 15:55:26 -0800
+Subject: [PATCH 1203/4706] drm/i915: Integrate GuC-based command submission
+
+commit 21088e3e3554191a4001d86b445a4f9e66ace331 from
+git://git.yoctoproject.org/linux-yocto-4.1
+
+GuC-based submission is mostly the same as execlist mode, up to
+intel_logical_ring_advance_and_submit(), where the context being
+dispatched would be added to the execlist queue; at this point
+we submit the context to the GuC backend instead.
+
+There are, however, a few other changes also required, notably:
+1.  Contexts must be pinned at GGTT addresses accessible by the GuC
+    i.e. NOT in the range [0..WOPCM_SIZE), so we have to add the
+    PIN_OFFSET_BIAS flag to the relevant GGTT-pinning calls.
+
+2.  The GuC's TLB must be invalidated after a context is pinned at
+    a new GGTT address.
+
+3.  GuC firmware uses the one page before Ring Context as shared data.
+    Therefore, whenever driver wants to get base address of LRC, we
+    will offset one page for it. LRC_PPHWSP_PN is defined as the page
+    number of LRCA.
+
+4.  In the work queue used to pass requests to the GuC, the GuC
+    firmware requires the ring-tail-offset to be represented as an
+    11-bit value, expressed in QWords. Therefore, the ringbuffer
+    size must be reduced to the representable range (4 pages).
+
+v2:
+    Defer adding #defines until needed [Chris Wilson]
+    Rationalise type declarations [Chris Wilson]
+
+v4:
+    Squashed kerneldoc patch into here [Daniel Vetter]
+
+v5:
+    Update request->tail in code common to both GuC and execlist modes.
+    Add a private version of lr_context_update(), as sharing the
+        execlist version leads to race conditions when the CPU and
+        the GuC both update TAIL in the context image.
+    Conversion of error-captured HWS page to string must account
+        for offset from start of object to actual HWS (LRC_PPHWSP_PN).
+
+Issue: VIZ-4884
+Signed-off-by: Alex Dai <yu.dai@intel.com>
+Signed-off-by: Dave Gordon <david.s.gordon@intel.com>
+Reviewed-by: Tom O'Rourke <Tom.O'Rourke@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit d1675198ed1f21aec6e036336e4340c40b726497)
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+
+Conflicts:
+	drivers/gpu/drm/i915/intel_lrc.c
+---
+ drivers/gpu/drm/i915/i915_debugfs.c        |    2 +-
+ drivers/gpu/drm/i915/i915_gpu_error.c      |   14 +++---
+ drivers/gpu/drm/i915/i915_guc_submission.c |   79 ++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_guc.h           |    1 +
+ drivers/gpu/drm/i915/intel_lrc.c           |   55 +++++++++++++------
+ drivers/gpu/drm/i915/intel_lrc.h           |    6 ++
+ 6 files changed, 127 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 95ced87..b2a7540 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -1995,7 +1995,7 @@ static void i915_dump_lrc_obj(struct seq_file *m,
+ 		return;
+ 	}
+ 
+-	page = i915_gem_object_get_page(ctx_obj, 1);
++	page = i915_gem_object_get_page(ctx_obj, LRC_STATE_PN);
+ 	if (!WARN_ON(page == NULL)) {
+ 		reg_state = kmap_atomic(page);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 0d0a7b1..493e9b2 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -462,17 +462,17 @@ int i915_error_state_to_str(struct drm_i915_error_state_buf *m,
+ 		}
+ 
+ 		if ((obj = error->ring[i].hws_page)) {
+-			err_printf(m, "%s --- HW Status = 0x%08x\n",
+-				   dev_priv->ring[i].name,
+-				   lower_32_bits(obj->gtt_offset));
++			err_printf(m, "%s --- HW Status = 0x%08llx\n",
++				dev_priv->ring[i].name,
++				obj->gtt_offset + LRC_PPHWSP_PN * PAGE_SIZE);
+ 			offset = 0;
+ 			for (elt = 0; elt < PAGE_SIZE/16; elt += 4) {
+ 				err_printf(m, "[%04x] %08x %08x %08x %08x\n",
+ 					   offset,
+-					   obj->pages[0][elt],
+-					   obj->pages[0][elt+1],
+-					   obj->pages[0][elt+2],
+-					   obj->pages[0][elt+3]);
++					   obj->pages[LRC_PPHWSP_PN][elt],
++					   obj->pages[LRC_PPHWSP_PN][elt+1],
++					   obj->pages[LRC_PPHWSP_PN][elt+2],
++					   obj->pages[LRC_PPHWSP_PN][elt+3]);
+ 					offset += 16;
+ 			}
+ 		}
+diff --git a/drivers/gpu/drm/i915/i915_guc_submission.c b/drivers/gpu/drm/i915/i915_guc_submission.c
+index 3352b85..ec70393 100644
+--- a/drivers/gpu/drm/i915/i915_guc_submission.c
++++ b/drivers/gpu/drm/i915/i915_guc_submission.c
+@@ -364,18 +364,58 @@ static void guc_init_proc_desc(struct intel_guc *guc,
+ static void guc_init_ctx_desc(struct intel_guc *guc,
+ 			      struct i915_guc_client *client)
+ {
++	struct intel_context *ctx = client->owner;
+ 	struct guc_context_desc desc;
+ 	struct sg_table *sg;
++	int i;
+ 
+ 	memset(&desc, 0, sizeof(desc));
+ 
+ 	desc.attribute = GUC_CTX_DESC_ATTR_ACTIVE | GUC_CTX_DESC_ATTR_KERNEL;
+ 	desc.context_id = client->ctx_index;
+ 	desc.priority = client->priority;
+-	desc.engines_used = (1 << RCS) | (1 << VCS) | (1 << BCS) |
+-			    (1 << VECS) | (1 << VCS2); /* all engines */
+ 	desc.db_id = client->doorbell_id;
+ 
++	for (i = 0; i < I915_NUM_RINGS; i++) {
++		struct guc_execlist_context *lrc = &desc.lrc[i];
++		struct intel_ringbuffer *ringbuf = ctx->engine[i].ringbuf;
++		struct intel_engine_cs *ring;
++		struct drm_i915_gem_object *obj;
++		uint64_t ctx_desc;
++
++		/* TODO: We have a design issue to be solved here. Only when we
++		 * receive the first batch, we know which engine is used by the
++		 * user. But here GuC expects the lrc and ring to be pinned. It
++		 * is not an issue for default context, which is the only one
++		 * for now who owns a GuC client. But for future owner of GuC
++		 * client, need to make sure lrc is pinned prior to enter here.
++		 */
++		obj = ctx->engine[i].state;
++		if (!obj)
++			break;	/* XXX: continue? */
++
++		ring = ringbuf->ring;
++		ctx_desc = intel_lr_context_descriptor(ctx, ring);
++		lrc->context_desc = (u32)ctx_desc;
++
++		/* The state page is after PPHWSP */
++		lrc->ring_lcra = i915_gem_obj_ggtt_offset(obj) +
++				LRC_STATE_PN * PAGE_SIZE;
++		lrc->context_id = (client->ctx_index << GUC_ELC_CTXID_OFFSET) |
++				(ring->id << GUC_ELC_ENGINE_OFFSET);
++
++		obj = ringbuf->obj;
++
++		lrc->ring_begin = i915_gem_obj_ggtt_offset(obj);
++		lrc->ring_end = lrc->ring_begin + obj->base.size - 1;
++		lrc->ring_next_free_location = lrc->ring_begin;
++		lrc->ring_current_tail_pointer_value = 0;
++
++		desc.engines_used |= (1 << ring->id);
++	}
++
++	WARN_ON(desc.engines_used == 0);
++
+ 	/*
+ 	 * The CPU address is only needed at certain points, so kmap_atomic on
+ 	 * demand instead of storing it in the ctx descriptor.
+@@ -501,6 +541,29 @@ static int guc_add_workqueue_item(struct i915_guc_client *gc,
+ 	return 0;
+ }
+ 
++#define CTX_RING_BUFFER_START		0x08
++
++/* Update the ringbuffer pointer in a saved context image */
++static void lr_context_update(struct drm_i915_gem_request *rq)
++{
++	enum intel_ring_id ring_id = rq->ring->id;
++	struct drm_i915_gem_object *ctx_obj = rq->ctx->engine[ring_id].state;
++	struct drm_i915_gem_object *rb_obj = rq->ringbuf->obj;
++	struct page *page;
++	uint32_t *reg_state;
++
++	BUG_ON(!ctx_obj);
++	WARN_ON(!i915_gem_obj_is_pinned(ctx_obj));
++	WARN_ON(!i915_gem_obj_is_pinned(rb_obj));
++
++	page = i915_gem_object_get_page(ctx_obj, LRC_STATE_PN);
++	reg_state = kmap_atomic(page);
++
++	reg_state[CTX_RING_BUFFER_START+1] = i915_gem_obj_ggtt_offset(rb_obj);
++
++	kunmap_atomic(reg_state);
++}
++
+ /**
+  * i915_guc_submit() - Submit commands through GuC
+  * @client:	the guc client where commands will go through
+@@ -517,6 +580,10 @@ int i915_guc_submit(struct i915_guc_client *client,
+ 	unsigned long flags;
+ 	int q_ret, b_ret;
+ 
++	/* Need this because of the deferred pin ctx and ring */
++	/* Shall we move this right after ring is pinned? */
++	lr_context_update(rq);
++
+ 	spin_lock_irqsave(&client->wq_lock, flags);
+ 
+ 	q_ret = guc_add_workqueue_item(client, rq);
+@@ -643,11 +710,13 @@ static void guc_client_free(struct drm_device *dev,
+  * 		The kernel client to replace ExecList submission is created with
+  * 		NORMAL priority. Priority of a client for scheduler can be HIGH,
+  * 		while a preemption context can use CRITICAL.
++ * @ctx		the context to own the client (we use the default render context)
+  *
+  * Return:	An i915_guc_client object if success.
+  */
+ static struct i915_guc_client *guc_client_alloc(struct drm_device *dev,
+-						uint32_t priority)
++						uint32_t priority,
++						struct intel_context *ctx)
+ {
+ 	struct i915_guc_client *client;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -660,6 +729,7 @@ static struct i915_guc_client *guc_client_alloc(struct drm_device *dev,
+ 
+ 	client->doorbell_id = GUC_INVALID_DOORBELL_ID;
+ 	client->priority = priority;
++	client->owner = ctx;
+ 	client->guc = guc;
+ 
+ 	client->ctx_index = (uint32_t)ida_simple_get(&guc->ctx_ids, 0,
+@@ -793,10 +863,11 @@ int i915_guc_submission_enable(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_guc *guc = &dev_priv->guc;
++	struct intel_context *ctx = dev_priv->ring[RCS].default_context;
+ 	struct i915_guc_client *client;
+ 
+ 	/* client for execbuf submission */
+-	client = guc_client_alloc(dev, GUC_CTX_PRIORITY_KMD_NORMAL);
++	client = guc_client_alloc(dev, GUC_CTX_PRIORITY_KMD_NORMAL, ctx);
+ 	if (!client) {
+ 		DRM_ERROR("Failed to create execbuf guc_client\n");
+ 		return -ENOMEM;
+diff --git a/drivers/gpu/drm/i915/intel_guc.h b/drivers/gpu/drm/i915/intel_guc.h
+index 92658ce..4ec2d27 100644
+--- a/drivers/gpu/drm/i915/intel_guc.h
++++ b/drivers/gpu/drm/i915/intel_guc.h
+@@ -29,6 +29,7 @@
+ 
+ struct i915_guc_client {
+ 	struct drm_i915_gem_object *client_obj;
++	struct intel_context *owner;
+ 	struct intel_guc *guc;
+ 	uint32_t priority;
+ 	uint32_t ctx_index;
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 91dfad5..a3f04a0 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -263,7 +263,8 @@ int intel_sanitize_enable_execlists(struct drm_device *dev, int enable_execlists
+  */
+ u32 intel_execlists_ctx_id(struct drm_i915_gem_object *ctx_obj)
+ {
+-	u32 lrca = i915_gem_obj_ggtt_offset(ctx_obj);
++	u32 lrca = i915_gem_obj_ggtt_offset(ctx_obj) +
++			LRC_PPHWSP_PN * PAGE_SIZE;
+ 
+ 	/* LRCA is required to be 4K aligned so the more significant 20 bits
+ 	 * are globally unique */
+@@ -276,7 +277,8 @@ uint64_t intel_lr_context_descriptor(struct intel_context *ctx,
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_gem_object *ctx_obj = ctx->engine[ring->id].state;
+ 	uint64_t desc;
+-	uint64_t lrca = i915_gem_obj_ggtt_offset(ctx_obj);
++	uint64_t lrca = i915_gem_obj_ggtt_offset(ctx_obj) +
++			LRC_PPHWSP_PN * PAGE_SIZE;
+ 
+ 	WARN_ON(lrca & 0xFFFFFFFF00000FFFULL);
+ 
+@@ -350,7 +352,7 @@ static int execlists_update_context(struct drm_i915_gem_request *rq)
+ 	WARN_ON(!i915_gem_obj_is_pinned(ctx_obj));
+ 	WARN_ON(!i915_gem_obj_is_pinned(rb_obj));
+ 
+-	page = i915_gem_object_get_page(ctx_obj, 1);
++	page = i915_gem_object_get_page(ctx_obj, LRC_STATE_PN);
+ 	reg_state = kmap_atomic(page);
+ 
+ 	reg_state[CTX_RING_TAIL+1] = rq->tail;
+@@ -550,8 +552,6 @@ static int execlists_context_queue(struct drm_i915_gem_request *request)
+ 
+ 	i915_gem_request_reference(request);
+ 
+-	request->tail = request->ringbuf->tail;
+-
+ 	spin_lock_irq(&ring->execlist_lock);
+ 
+ 	list_for_each_entry(cursor, &ring->execlist_queue, execlist_link)
+@@ -704,13 +704,19 @@ static void
+ intel_logical_ring_advance_and_submit(struct drm_i915_gem_request *request)
+ {
+ 	struct intel_engine_cs *ring = request->ring;
++	struct drm_i915_private *dev_priv = request->i915;
+ 
+ 	intel_logical_ring_advance(request->ringbuf);
+ 
++	request->tail = request->ringbuf->tail;
++
+ 	if (intel_ring_stopped(ring))
+ 		return;
+ 
+-	execlists_context_queue(request);
++	if (dev_priv->guc.execbuf_client)
++		i915_guc_submit(dev_priv->guc.execbuf_client, request);
++	else
++		execlists_context_queue(request);
+ }
+ 
+ static void __wrap_ring_buffer(struct intel_ringbuffer *ringbuf)
+@@ -1000,6 +1006,7 @@ int logical_ring_flush_all_caches(struct drm_i915_gem_request *req)
+ 
+ static int intel_lr_context_pin(struct drm_i915_gem_request *rq)
+ {
++	struct drm_i915_private *dev_priv = rq->i915;
+ 	struct intel_engine_cs *ring = rq->ring;
+ 	struct drm_i915_gem_object *ctx_obj = rq->ctx->engine[ring->id].state;
+ 	struct intel_ringbuffer *ringbuf = rq->ringbuf;
+@@ -1007,8 +1014,8 @@ static int intel_lr_context_pin(struct drm_i915_gem_request *rq)
+ 
+ 	WARN_ON(!mutex_is_locked(&ring->dev->struct_mutex));
+ 	if (rq->ctx->engine[ring->id].pin_count++ == 0) {
+-		ret = i915_gem_obj_ggtt_pin(ctx_obj,
+-				GEN8_LR_CONTEXT_ALIGN, 0);
++		ret = i915_gem_obj_ggtt_pin(ctx_obj, GEN8_LR_CONTEXT_ALIGN,
++				PIN_OFFSET_BIAS | GUC_WOPCM_TOP);
+ 		if (ret)
+ 			goto reset_pin_count;
+ 
+@@ -1016,7 +1023,9 @@ static int intel_lr_context_pin(struct drm_i915_gem_request *rq)
+ 		if (ret)
+ 			goto unpin_ctx_obj;
+ 
+-		ctx_obj->dirty = true;
++		/* Invalidate GuC TLB. */
++		if (i915.enable_guc_submission)
++			I915_WRITE(GEN8_GTCR, GEN8_GTCR_INVALIDATE);
+ 	}
+ 
+ 	return ret;
+@@ -2165,7 +2174,7 @@ populate_lr_context(struct intel_context *ctx, struct drm_i915_gem_object *ctx_o
+ 
+ 	/* The second page of the context object contains some fields which must
+ 	 * be set up prior to the first execution. */
+-	page = i915_gem_object_get_page(ctx_obj, 1);
++	page = i915_gem_object_get_page(ctx_obj, LRC_STATE_PN);
+ 	reg_state = kmap_atomic(page);
+ 
+ 	/* A context is actually a big batch buffer with several MI_LOAD_REGISTER_IMM
+@@ -2335,12 +2344,13 @@ static void lrc_setup_hardware_status_page(struct intel_engine_cs *ring,
+ 		struct drm_i915_gem_object *default_ctx_obj)
+ {
+ 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++	struct page *page;
+ 
+-	/* The status page is offset 0 from the default context object
+-	 * in LRC mode. */
+-	ring->status_page.gfx_addr = i915_gem_obj_ggtt_offset(default_ctx_obj);
+-	ring->status_page.page_addr =
+-			kmap(sg_page(default_ctx_obj->pages->sgl));
++	/* The HWSP is part of the default context object in LRC mode. */
++	ring->status_page.gfx_addr = i915_gem_obj_ggtt_offset(default_ctx_obj)
++			+ LRC_PPHWSP_PN * PAGE_SIZE;
++	page = i915_gem_object_get_page(default_ctx_obj, LRC_PPHWSP_PN);
++	ring->status_page.page_addr = kmap(page);
+ 	ring->status_page.obj = default_ctx_obj;
+ 
+ 	I915_WRITE(RING_HWS_PGA(ring->mmio_base),
+@@ -2366,6 +2376,7 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ {
+ 	const bool is_global_default_ctx = (ctx == ring->default_context);
+ 	struct drm_device *dev = ring->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_i915_gem_object *ctx_obj;
+ 	uint32_t context_size;
+ 	struct intel_ringbuffer *ringbuf;
+@@ -2376,6 +2387,9 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 
+ 	context_size = round_up(get_lr_context_size(ring), 4096);
+ 
++	/* One extra page as the sharing data between driver and GuC */
++	context_size += PAGE_SIZE * LRC_PPHWSP_PN;
++
+ 	ctx_obj = i915_gem_alloc_object(dev, context_size);
+ 	if (!ctx_obj) {
+ 		DRM_DEBUG_DRIVER("Alloc LRC backing obj failed.\n");
+@@ -2383,13 +2397,18 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 	}
+ 
+ 	if (is_global_default_ctx) {
+-		ret = i915_gem_obj_ggtt_pin(ctx_obj, GEN8_LR_CONTEXT_ALIGN, 0);
++		ret = i915_gem_obj_ggtt_pin(ctx_obj, GEN8_LR_CONTEXT_ALIGN,
++				PIN_OFFSET_BIAS | GUC_WOPCM_TOP);
+ 		if (ret) {
+ 			DRM_DEBUG_DRIVER("Pin LRC backing obj failed: %d\n",
+ 					ret);
+ 			drm_gem_object_unreference(&ctx_obj->base);
+ 			return ret;
+ 		}
++
++		/* Invalidate GuC TLB. */
++		if (i915.enable_guc_submission)
++			I915_WRITE(GEN8_GTCR, GEN8_GTCR_INVALIDATE);
+ 	}
+ 
+ 	ringbuf = kzalloc(sizeof(*ringbuf), GFP_KERNEL);
+@@ -2402,7 +2421,7 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 
+ 	ringbuf->ring = ring;
+ 
+-	ringbuf->size = 32 * PAGE_SIZE;
++	ringbuf->size = 4 * PAGE_SIZE;
+ 	ringbuf->effective_size = ringbuf->size;
+ 	ringbuf->head = 0;
+ 	ringbuf->tail = 0;
+@@ -2502,7 +2521,7 @@ void intel_lr_context_reset(struct drm_device *dev,
+ 			WARN(1, "Failed get_pages for context obj\n");
+ 			continue;
+ 		}
+-		page = i915_gem_object_get_page(ctx_obj, 1);
++		page = i915_gem_object_get_page(ctx_obj, LRC_STATE_PN);
+ 		reg_state = kmap_atomic(page);
+ 
+ 		reg_state[CTX_RING_HEAD+1] = 0;
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index a2bc3de..ab73152 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -70,6 +70,12 @@ static inline void intel_logical_ring_emit(struct intel_ringbuffer *ringbuf,
+ }
+ 
+ /* Logical Ring Contexts */
++
++/* One extra page is added before LRC for GuC as shared data */
++#define LRC_GUCSHR_PN	(0)
++#define LRC_PPHWSP_PN	(LRC_GUCSHR_PN + 1)
++#define LRC_STATE_PN	(LRC_PPHWSP_PN + 1)
++
+ void intel_lr_context_free(struct intel_context *ctx);
+ int intel_lr_context_deferred_create(struct intel_context *ctx,
+ 				     struct intel_engine_cs *ring);
+-- 
+1.7.5.4
+

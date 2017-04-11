@@ -1,0 +1,262 @@
+From 046e2f2298c5b84333ea505ea94d5a73c4c585c3 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 7 Apr 2015 16:20:32 +0100
+Subject: [PATCH 0053/4706] drm/i915: Deminish contribution of wait-boosting
+ from clients
+
+commit 1854d5ca0dd7a9fc11243ff220a3e93fce2b4d3e upstream
+
+With boosting for missed pageflips, we have a much stronger indication
+of when we need to (temporarily) boost GPU frequency to ensure smooth
+delivery of frames. So now only allow each client to perform one RPS boost
+in each period of GPU activity due to stalling on results.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Deepak S <deepak.s@linux.intel.com>
+Reviewed-by: Deepak S <deepak.s@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   39 +++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h     |    9 +++++--
+ drivers/gpu/drm/i915/i915_gem.c     |   35 +++++++------------------------
+ drivers/gpu/drm/i915/intel_drv.h    |    3 +-
+ drivers/gpu/drm/i915/intel_pm.c     |   18 +++++++++++++--
+ 5 files changed, 70 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 0189cee..54d3305 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -2242,6 +2242,44 @@ static int i915_ppgtt_info(struct seq_file *m, void *data)
+ 	return 0;
+ }
+ 
++static int i915_rps_boost_info(struct seq_file *m, void *data)
++{
++	struct drm_info_node *node = m->private;
++	struct drm_device *dev = node->minor->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_file *file;
++	int ret;
++
++	ret = mutex_lock_interruptible(&dev->struct_mutex);
++	if (ret)
++		return ret;
++
++	ret = mutex_lock_interruptible(&dev_priv->rps.hw_lock);
++	if (ret)
++		goto unlock;
++
++	list_for_each_entry_reverse(file, &dev->filelist, lhead) {
++		struct drm_i915_file_private *file_priv = file->driver_priv;
++		struct task_struct *task;
++
++		rcu_read_lock();
++		task = pid_task(file->pid, PIDTYPE_PID);
++		seq_printf(m, "%s [%d]: %d boosts%s\n",
++			   task ? task->comm : "<unknown>",
++			   task ? task->pid : -1,
++			   file_priv->rps_boosts,
++			   list_empty(&file_priv->rps_boost) ? "" : ", active");
++		rcu_read_unlock();
++	}
++	seq_printf(m, "Kernel boosts: %d\n", dev_priv->rps.boosts);
++
++	mutex_unlock(&dev_priv->rps.hw_lock);
++unlock:
++	mutex_unlock(&dev->struct_mutex);
++
++	return ret;
++}
++
+ static int i915_llc(struct seq_file *m, void *data)
+ {
+ 	struct drm_info_node *node = m->private;
+@@ -4707,6 +4745,7 @@ static const struct drm_info_list i915_debugfs_list[] = {
+ 	{"i915_ddb_info", i915_ddb_info, 0},
+ 	{"i915_sseu_status", i915_sseu_status, 0},
+ 	{"i915_drrs_status", i915_drrs_status, 0},
++	{"i915_rps_boost_info", i915_rps_boost_info, 0},
+ };
+ #define I915_DEBUGFS_ENTRIES ARRAY_SIZE(i915_debugfs_list)
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 86edfae..1f26d31 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1044,6 +1044,8 @@ struct intel_gen6_power_mgmt {
+ 
+ 	bool enabled;
+ 	struct delayed_work delayed_resume_work;
++	struct list_head clients;
++	unsigned boosts;
+ 
+ 	/* manual wa residency calculations */
+ 	struct intel_rps_ei up_ei, down_ei;
+@@ -2191,12 +2193,13 @@ struct drm_i915_file_private {
+ 	struct {
+ 		spinlock_t lock;
+ 		struct list_head request_list;
+-		struct delayed_work idle_work;
+ 	} mm;
+ 	struct idr context_idr;
+ 
+-	atomic_t rps_wait_boost;
+-	struct  intel_engine_cs *bsd_ring;
++	struct list_head rps_boost;
++	struct intel_engine_cs *bsd_ring;
++
++	unsigned rps_boosts;
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index f9f1835..26d2fcf 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1181,14 +1181,6 @@ static bool missed_irq(struct drm_i915_private *dev_priv,
+ 	return test_bit(ring->id, &dev_priv->gpu_error.missed_irq_rings);
+ }
+ 
+-static bool can_wait_boost(struct drm_i915_file_private *file_priv)
+-{
+-	if (file_priv == NULL)
+-		return true;
+-
+-	return !atomic_xchg(&file_priv->rps_wait_boost, true);
+-}
+-
+ /**
+  * __i915_wait_request - wait until execution of request has finished
+  * @req: duh!
+@@ -1230,13 +1222,8 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
+ 	timeout_expire = timeout ?
+ 		jiffies + nsecs_to_jiffies_timeout((u64)*timeout) : 0;
+ 
+-	if (INTEL_INFO(dev)->gen >= 6 && ring->id == RCS && can_wait_boost(file_priv)) {
+-		gen6_rps_boost(dev_priv);
+-		if (file_priv)
+-			mod_delayed_work(dev_priv->wq,
+-					 &file_priv->mm.idle_work,
+-					 msecs_to_jiffies(100));
+-	}
++	if (ring->id == RCS && INTEL_INFO(dev)->gen >= 6)
++		gen6_rps_boost(dev_priv, file_priv);
+ 
+ 	if (!irq_test_in_progress && WARN_ON(!ring->irq_get(ring)))
+ 		return -ENODEV;
+@@ -5044,8 +5031,6 @@ void i915_gem_release(struct drm_device *dev, struct drm_file *file)
+ {
+ 	struct drm_i915_file_private *file_priv = file->driver_priv;
+ 
+-	cancel_delayed_work_sync(&file_priv->mm.idle_work);
+-
+ 	/* Clean up our request list when the client is going away, so that
+ 	 * later retire_requests won't dereference our soon-to-be-gone
+ 	 * file_priv.
+@@ -5061,15 +5046,12 @@ void i915_gem_release(struct drm_device *dev, struct drm_file *file)
+ 		request->file_priv = NULL;
+ 	}
+ 	spin_unlock(&file_priv->mm.lock);
+-}
+-
+-static void
+-i915_gem_file_idle_work_handler(struct work_struct *work)
+-{
+-	struct drm_i915_file_private *file_priv =
+-		container_of(work, typeof(*file_priv), mm.idle_work.work);
+ 
+-	atomic_set(&file_priv->rps_wait_boost, false);
++	if (!list_empty(&file_priv->rps_boost)) {
++		mutex_lock(&to_i915(dev)->rps.hw_lock);
++		list_del(&file_priv->rps_boost);
++		mutex_unlock(&to_i915(dev)->rps.hw_lock);
++	}
+ }
+ 
+ int i915_gem_open(struct drm_device *dev, struct drm_file *file)
+@@ -5086,11 +5068,10 @@ int i915_gem_open(struct drm_device *dev, struct drm_file *file)
+ 	file->driver_priv = file_priv;
+ 	file_priv->dev_priv = dev->dev_private;
+ 	file_priv->file = file;
++	INIT_LIST_HEAD(&file_priv->rps_boost);
+ 
+ 	spin_lock_init(&file_priv->mm.lock);
+ 	INIT_LIST_HEAD(&file_priv->mm.request_list);
+-	INIT_DELAYED_WORK(&file_priv->mm.idle_work,
+-			  i915_gem_file_idle_work_handler);
+ 
+ 	ret = i915_gem_context_open(dev, file);
+ 	if (ret)
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 805a175..1a7cda3 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1261,7 +1261,8 @@ void gen6_update_ring_freq(struct drm_device *dev);
+ void gen6_rps_busy(struct drm_i915_private *dev_priv);
+ void gen6_rps_reset_ei(struct drm_i915_private *dev_priv);
+ void gen6_rps_idle(struct drm_i915_private *dev_priv);
+-void gen6_rps_boost(struct drm_i915_private *dev_priv);
++void gen6_rps_boost(struct drm_i915_private *dev_priv,
++		    struct drm_i915_file_private *file_priv);
+ void intel_queue_rps_boost_for_request(struct drm_device *dev,
+ 				       struct drm_i915_gem_request *rq);
+ void ilk_wm_get_hw_state(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 1f11d68..0f41f3a 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -4089,10 +4089,14 @@ void gen6_rps_idle(struct drm_i915_private *dev_priv)
+ 		dev_priv->rps.last_adj = 0;
+ 		I915_WRITE(GEN6_PMINTRMSK, 0xffffffff);
+ 	}
++
++	while (!list_empty(&dev_priv->rps.clients))
++		list_del_init(dev_priv->rps.clients.next);
+ 	mutex_unlock(&dev_priv->rps.hw_lock);
+ }
+ 
+-void gen6_rps_boost(struct drm_i915_private *dev_priv)
++void gen6_rps_boost(struct drm_i915_private *dev_priv,
++		    struct drm_i915_file_private *file_priv)
+ {
+ 	u32 val;
+ 
+@@ -4100,9 +4104,16 @@ void gen6_rps_boost(struct drm_i915_private *dev_priv)
+ 	val = dev_priv->rps.max_freq_softlimit;
+ 	if (dev_priv->rps.enabled &&
+ 	    dev_priv->mm.busy &&
+-	    dev_priv->rps.cur_freq < val) {
++	    dev_priv->rps.cur_freq < val &&
++	    (file_priv == NULL || list_empty(&file_priv->rps_boost))) {
+ 		intel_set_rps(dev_priv->dev, val);
+ 		dev_priv->rps.last_adj = 0;
++
++		if (file_priv != NULL) {
++			list_add(&file_priv->rps_boost, &dev_priv->rps.clients);
++			file_priv->rps_boosts++;
++		} else
++			dev_priv->rps.boosts++;
+ 	}
+ 	mutex_unlock(&dev_priv->rps.hw_lock);
+ }
+@@ -6780,7 +6791,7 @@ static void __intel_rps_boost_work(struct work_struct *work)
+ 	struct request_boost *boost = container_of(work, struct request_boost, work);
+ 
+ 	if (!i915_gem_request_completed(boost->rq, true))
+-		gen6_rps_boost(to_i915(boost->rq->ring->dev));
++		gen6_rps_boost(to_i915(boost->rq->ring->dev), NULL);
+ 
+ 	i915_gem_request_unreference__unlocked(boost->rq);
+ 	kfree(boost);
+@@ -6813,6 +6824,7 @@ void intel_pm_setup(struct drm_device *dev)
+ 
+ 	INIT_DELAYED_WORK(&dev_priv->rps.delayed_resume_work,
+ 			  intel_gen6_powersave_work);
++	INIT_LIST_HEAD(&dev_priv->rps.clients);
+ 
+ 	dev_priv->pm.suspended = false;
+ }
+-- 
+1.7.5.4
+

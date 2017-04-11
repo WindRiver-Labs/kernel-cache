@@ -1,0 +1,277 @@
+From 4e2b9739004735b7d7a53f03c07c6672de0783ee Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 4 Aug 2016 07:52:44 +0100
+Subject: [PATCH 3854/4706] drm/i915: Track active vma requests
+
+commit b0decaf75bd902a11c932005c88924947ac00b8c upstream
+
+Hook the vma itself into the i915_gem_request_retire() so that we can
+accurately track when a solitary vma is inactive (as opposed to having
+to wait for the entire object to be idle). This improves the interaction
+when using multiple contexts (with full-ppgtt) and eliminates some
+frequent list walking when retiring objects after a completed request.
+
+A side-effect is that we get an active vma reference for free. The
+consequence of this is shown in the next patch...
+
+v2: Update inline names to be consistent with
+i915_gem_object_get_active()
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1470293567-10811-25-git-send-email-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_debugfs.c        |    2 +-
+ drivers/gpu/drm/i915/i915_gem.c            |   50 +++++++++++++++------------
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   10 +++++-
+ drivers/gpu/drm/i915/i915_gem_gtt.c        |   20 +++++++++++
+ drivers/gpu/drm/i915/i915_gem_gtt.h        |   33 ++++++++++++++++++
+ 5 files changed, 91 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 1309377..f7806be 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -365,7 +365,7 @@ static int per_file_stats(int id, void *ptr, void *data)
+ 				continue;
+ 		}
+ 
+-		if (obj->active) /* XXX per-vma statistic */
++		if (i915_vma_is_active(vma))
+ 			stats->active += vma->node.size;
+ 		else
+ 			stats->inactive += vma->node.size;
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index da49965..a7a7bf9 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2348,7 +2348,6 @@ i915_gem_object_retire__read(struct i915_gem_active *active,
+ 	int idx = request->engine->id;
+ 	struct drm_i915_gem_object *obj =
+ 		container_of(active, struct drm_i915_gem_object, last_read[idx]);
+-	struct i915_vma *vma;
+ 
+ 	GEM_BUG_ON((obj->active & (1 << idx)) == 0);
+ 
+@@ -2360,12 +2359,9 @@ i915_gem_object_retire__read(struct i915_gem_active *active,
+ 	 * so that we don't steal from recently used but inactive objects
+ 	 * (unless we are forced to ofc!)
+ 	 */
+-	list_move_tail(&obj->global_list, &request->i915->mm.bound_list);
+-
+-	list_for_each_entry(vma, &obj->vma_list, obj_link) {
+-		if (!list_empty(&vma->vm_link))
+-			list_move_tail(&vma->vm_link, &vma->vm->inactive_list);
+-	}
++	if (obj->bind_count)
++		list_move_tail(&obj->global_list,
++			       &request->i915->mm.bound_list);
+ 
+ 	i915_gem_object_put(obj);
+ }
+@@ -2798,8 +2794,29 @@ static void __i915_vma_iounmap(struct i915_vma *vma)
+ static int __i915_vma_unbind(struct i915_vma *vma, bool wait)
+ {
+ 	struct drm_i915_gem_object *obj = vma->obj;
++	unsigned long active;
+ 	int ret;
+ 
++	/* First wait upon any activity as retiring the request may
++	 * have side-effects such as unpinning or even unbinding this vma.
++	 */
++	active = i915_vma_get_active(vma);
++	if (active && wait) {
++		int idx;
++
++		for_each_active(active, idx) {
++			ret = i915_gem_active_retire(&vma->last_read[idx],
++						   &vma->vm->dev->struct_mutex);
++			if (ret)
++				return ret;
++		}
++
++		GEM_BUG_ON(i915_vma_is_active(vma));
++	}
++
++	if (vma->pin_count)
++		return -EBUSY;
++
+ 	if (list_empty(&vma->obj_link))
+ 		return 0;
+ 
+@@ -2808,18 +2825,9 @@ static int __i915_vma_unbind(struct i915_vma *vma, bool wait)
+ 		return 0;
+ 	}
+ 
+-	if (vma->pin_count)
+-		return -EBUSY;
+-
+ 	GEM_BUG_ON(obj->bind_count == 0);
+ 	GEM_BUG_ON(!obj->pages);
+ 
+-	if (wait) {
+-		ret = i915_gem_object_wait_rendering(obj, false);
+-		if (ret)
+-			return ret;
+-	}
+-
+ 	if (vma->is_ggtt && vma->ggtt_view.type == I915_GGTT_VIEW_NORMAL) {
+ 		i915_gem_object_finish_gtt(obj);
+ 
+@@ -3202,9 +3210,6 @@ i915_gem_object_flush_cpu_write_domain(struct drm_i915_gem_object *obj)
+ int
+ i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj, bool write)
+ {
+-	struct drm_device *dev = obj->base.dev;
+-	struct drm_i915_private *dev_priv = to_i915(dev);
+-	struct i915_ggtt *ggtt = &dev_priv->ggtt;
+ 	uint32_t old_write_domain, old_read_domains;
+ 	struct i915_vma *vma;
+ 	int ret;
+@@ -3257,9 +3262,10 @@ i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj, bool write)
+ 
+ 	/* And bump the LRU for this access */
+ 	vma = i915_gem_obj_to_ggtt(obj);
+-	if (vma && drm_mm_node_allocated(&vma->node) && !obj->active)
+-		list_move_tail(&vma->vm_link,
+-			       &ggtt->base.inactive_list);
++	if (vma &&
++	    drm_mm_node_allocated(&vma->node) &&
++	    !i915_vma_is_active(vma))
++		list_move_tail(&vma->vm_link, &vma->vm->inactive_list);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index eb8ed79..4c4a7a6 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1149,7 +1149,13 @@ void i915_vma_move_to_active(struct i915_vma *vma,
+ 
+ 	obj->dirty = 1; /* be paranoid  */
+ 
+-	/* Add a reference if we're newly entering the active list. */
++	/* Add a reference if we're newly entering the active list.
++	 * The order in which we add operations to the retirement queue is
++	 * vital here: mark_active adds to the start of the callback list,
++	 * such that subsequent callbacks are called first. Therefore we
++	 * add the active reference first and queue for it to be dropped
++	 * *last*.
++	 */
+ 	if (obj->active == 0)
+ 		i915_gem_object_get(obj);
+ 	obj->active |= 1 << idx;
+@@ -1174,6 +1180,8 @@ void i915_vma_move_to_active(struct i915_vma *vma,
+ 		}
+ 	}
+ 
++	i915_vma_set_active(vma, idx);
++	i915_gem_active_set(&vma->last_read[idx], req);
+ 	list_move_tail(&vma->vm_link, &vma->vm->active_list);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index ac2be3d..68f0e51 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -3331,12 +3331,30 @@ void i915_gem_restore_gtt_mappings(struct drm_device *dev)
+ 	i915_ggtt_flush(dev_priv);
+ }
+ 
++static void
++i915_vma_retire(struct i915_gem_active *active,
++		struct drm_i915_gem_request *rq)
++{
++	const unsigned int idx = rq->engine->id;
++	struct i915_vma *vma =
++		container_of(active, struct i915_vma, last_read[idx]);
++
++	GEM_BUG_ON(!i915_vma_has_active_engine(vma, idx));
++
++	i915_vma_clear_active(vma, idx);
++	if (i915_vma_is_active(vma))
++		return;
++
++	list_move_tail(&vma->vm_link, &vma->vm->inactive_list);
++}
++
+ static struct i915_vma *
+ __i915_gem_vma_create(struct drm_i915_gem_object *obj,
+ 		      struct i915_address_space *vm,
+ 		      const struct i915_ggtt_view *ggtt_view)
+ {
+ 	struct i915_vma *vma;
++	int i;
+ 
+ 	if (WARN_ON(i915_is_ggtt(vm) != !!ggtt_view))
+ 		return ERR_PTR(-EINVAL);
+@@ -3348,6 +3366,8 @@ __i915_gem_vma_create(struct drm_i915_gem_object *obj,
+ 	INIT_LIST_HEAD(&vma->vm_link);
+ 	INIT_LIST_HEAD(&vma->obj_link);
+ 	INIT_LIST_HEAD(&vma->exec_list);
++	for (i = 0; i < ARRAY_SIZE(vma->last_read); i++)
++		init_request_active(&vma->last_read[i], i915_vma_retire);
+ 	vma->vm = vm;
+ 	vma->obj = obj;
+ 	vma->is_ggtt = i915_is_ggtt(vm);
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index cf8e3fc..bfd3c11 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -36,6 +36,8 @@
+ 
+ #include <linux/io-mapping.h>
+ 
++#include "i915_gem_request.h"
++
+ struct drm_i915_file_private;
+ 
+ typedef uint32_t gen6_pte_t;
+@@ -179,6 +181,9 @@ struct i915_vma {
+ 	struct i915_address_space *vm;
+ 	void __iomem *iomap;
+ 
++	unsigned int active;
++	struct i915_gem_active last_read[I915_NUM_ENGINES];
++
+ 	/** Flags and address space this VMA is bound to */
+ #define GLOBAL_BIND	(1<<0)
+ #define LOCAL_BIND	(1<<1)
+@@ -222,6 +227,34 @@ struct i915_vma {
+ #define DRM_I915_GEM_OBJECT_MAX_PIN_COUNT 0xf
+ };
+ 
++static inline unsigned int i915_vma_get_active(const struct i915_vma *vma)
++{
++	return vma->active;
++}
++
++static inline bool i915_vma_is_active(const struct i915_vma *vma)
++{
++	return i915_vma_get_active(vma);
++}
++
++static inline void i915_vma_set_active(struct i915_vma *vma,
++				       unsigned int engine)
++{
++	vma->active |= BIT(engine);
++}
++
++static inline void i915_vma_clear_active(struct i915_vma *vma,
++					 unsigned int engine)
++{
++	vma->active &= ~BIT(engine);
++}
++
++static inline bool i915_vma_has_active_engine(const struct i915_vma *vma,
++					      unsigned int engine)
++{
++	return vma->active & BIT(engine);
++}
++
+ struct i915_page_dma {
+ 	struct page *page;
+ 	union {
+-- 
+1.7.5.4
+

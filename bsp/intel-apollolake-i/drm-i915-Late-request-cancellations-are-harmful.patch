@@ -1,0 +1,299 @@
+From 54d109aff5825f4b7bbf8ae56ca8ff3824f5dbff Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 13 Apr 2016 17:35:15 +0100
+Subject: [PATCH 2822/4706] drm/i915: Late request cancellations are harmful
+
+commit aa9b78104fe3210758fa9e6c644e9a108d371e8b upstream
+
+Conceptually, each request is a record of a hardware transaction - we
+build up a list of pending commands and then either commit them to
+hardware, or cancel them. However, whilst building up the list of
+pending commands, we may modify state outside of the request and make
+references to the pending request. If we do so and then cancel that
+request, external objects then point to the deleted request leading to
+both graphical and memory corruption.
+
+The easiest example is to consider object/VMA tracking. When we mark an
+object as active in a request, we store a pointer to this, the most
+recent request, in the object. Then we want to free that object, we wait
+for the most recent request to be idle before proceeding (otherwise the
+hardware will write to pages now owned by the system, or we will attempt
+to read from those pages before the hardware is finished writing). If
+the request was cancelled instead, that wait completes immediately. As a
+result, all requests must be committed and not cancelled if the external
+state is unknown.
+
+All that remains of i915_gem_request_cancel() users are just a couple of
+extremely unlikely allocation failures, so remove the API entirely.
+
+A consequence of committing all incomplete requests is that we generate
+excess breadcrumbs and fill the ring much more often with dummy work. We
+have completely undone the outstanding_last_seqno optimisation.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=93907
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Cc: stable@vger.kernel.org
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/1460565315-7748-16-git-send-email-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    2 -
+ drivers/gpu/drm/i915/i915_gem.c            |   50 +++++++++++----------------
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   15 ++------
+ drivers/gpu/drm/i915/intel_display.c       |    2 +-
+ drivers/gpu/drm/i915/intel_lrc.c           |    4 +--
+ drivers/gpu/drm/i915/intel_overlay.c       |    8 ++--
+ 6 files changed, 30 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 1b44773..19ba5c9 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2330,7 +2330,6 @@ struct drm_i915_gem_request {
+ struct drm_i915_gem_request * __must_check
+ i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 		       struct intel_context *ctx);
+-void i915_gem_request_cancel(struct drm_i915_gem_request *req);
+ void i915_gem_request_free(struct kref *req_ref);
+ int i915_gem_request_add_to_client(struct drm_i915_gem_request *req,
+ 				   struct drm_file *file);
+@@ -2887,7 +2886,6 @@ int i915_gem_sw_finish_ioctl(struct drm_device *dev, void *data,
+ 			     struct drm_file *file_priv);
+ void i915_gem_execbuffer_move_to_active(struct list_head *vmas,
+ 					struct drm_i915_gem_request *req);
+-void i915_gem_execbuffer_retire_commands(struct i915_execbuffer_params *params);
+ int i915_gem_ringbuffer_submission(struct i915_execbuffer_params *params,
+ 				   struct drm_i915_gem_execbuffer2 *args,
+ 				   struct list_head *vmas);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 9ab4b4d..c0f7a83 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2789,7 +2789,8 @@ __i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 		 * fully prepared. Thus it can be cleaned up using the proper
+ 		 * free code.
+ 		 */
+-		i915_gem_request_cancel(req);
++		intel_ring_reserved_space_cancel(req->ringbuf);
++		i915_gem_request_unreference(req);
+ 		return ret;
+ 	}
+ 
+@@ -2826,13 +2827,6 @@ i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 	return err ? ERR_PTR(err) : req;
+ }
+ 
+-void i915_gem_request_cancel(struct drm_i915_gem_request *req)
+-{
+-	intel_ring_reserved_space_cancel(req->ringbuf);
+-
+-	i915_gem_request_unreference(req);
+-}
+-
+ struct drm_i915_gem_request *
+ i915_gem_find_active_request(struct intel_engine_cs *engine)
+ {
+@@ -3442,12 +3436,9 @@ int i915_gpu_idle(struct drm_device *dev)
+ 				return PTR_ERR(req);
+ 
+ 			ret = i915_switch_context(req);
+-			if (ret) {
+-				i915_gem_request_cancel(req);
+-				return ret;
+-			}
+-
+ 			i915_add_request_no_flush(req);
++			if (ret)
++				return ret;
+ 		}
+ 
+ 		ret = intel_engine_idle(engine);
+@@ -4947,34 +4938,33 @@ i915_gem_init_hw(struct drm_device *dev)
+ 		req = i915_gem_request_alloc(engine, NULL);
+ 		if (IS_ERR(req)) {
+ 			ret = PTR_ERR(req);
+-			i915_gem_cleanup_engines(dev);
+-			goto out;
++			break;
+ 		}
+ 
+ 		if (engine->id == RCS) {
+-			for (j = 0; j < NUM_L3_SLICES(dev); j++)
+-				i915_gem_l3_remap(req, j);
++			for (j = 0; j < NUM_L3_SLICES(dev); j++) {
++				ret = i915_gem_l3_remap(req, j);
++				if (ret)
++					goto err_request;
++			}
+ 		}
+ 
+ 		ret = i915_ppgtt_init_ring(req);
+-		if (ret && ret != -EIO) {
+-			DRM_ERROR("PPGTT enable %s failed %d\n",
+-				  engine->name, ret);
+-			i915_gem_request_cancel(req);
+-			i915_gem_cleanup_engines(dev);
+-			goto out;
+-		}
++		if (ret)
++			goto err_request;
+ 
+ 		ret = i915_gem_context_enable(req);
+-		if (ret && ret != -EIO) {
+-			DRM_ERROR("Context enable %s failed %d\n",
++		if (ret)
++			goto err_request;
++
++err_request:
++		i915_add_request_no_flush(req);
++		if (ret) {
++			DRM_ERROR("Failed to enable %s, error=%d\n",
+ 				  engine->name, ret);
+-			i915_gem_request_cancel(req);
+ 			i915_gem_cleanup_engines(dev);
+-			goto out;
++			break;
+ 		}
+-
+-		i915_add_request_no_flush(req);
+ 	}
+ 
+ out:
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 6f9d8a7..97ec304 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1137,7 +1137,7 @@ i915_gem_execbuffer_move_to_active(struct list_head *vmas,
+ 	}
+ }
+ 
+-void
++static void
+ i915_gem_execbuffer_retire_commands(struct i915_execbuffer_params *params)
+ {
+ 	/* Unconditionally force add_request to emit a full flush. */
+@@ -1322,7 +1322,6 @@ i915_gem_ringbuffer_submission(struct i915_execbuffer_params *params,
+ 	trace_i915_gem_ring_dispatch(params->request, params->dispatch_flags);
+ 
+ 	i915_gem_execbuffer_move_to_active(vmas, params->request);
+-	i915_gem_execbuffer_retire_commands(params);
+ 
+ 	return 0;
+ }
+@@ -1624,7 +1623,7 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 
+ 	ret = i915_gem_request_add_to_client(req, file);
+ 	if (ret)
+-		goto err_batch_unpin;
++		goto err_request;
+ 
+ 	/*
+ 	 * Save assorted stuff away to pass through to *_submission().
+@@ -1641,6 +1640,8 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	params->request                 = req;
+ 
+ 	ret = dev_priv->gt.execbuf_submit(params, args, &eb->vmas);
++err_request:
++	i915_gem_execbuffer_retire_commands(params);
+ 
+ err_batch_unpin:
+ 	/*
+@@ -1657,14 +1658,6 @@ err:
+ 	i915_gem_context_unreference(ctx);
+ 	eb_destroy(eb);
+ 
+-	/*
+-	 * If the request was created but not successfully submitted then it
+-	 * must be freed again. If it was submitted then it is being tracked
+-	 * on the active request list and no clean up is required here.
+-	 */
+-	if (ret && !IS_ERR_OR_NULL(req))
+-		i915_gem_request_cancel(req);
+-
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ pre_mutex_err:
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 9b93d35..60fad81 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -11688,7 +11688,7 @@ cleanup_unpin:
+ 	intel_unpin_fb_obj(fb, crtc->primary->state->rotation);
+ cleanup_pending:
+ 	if (!IS_ERR_OR_NULL(request))
+-		i915_gem_request_cancel(request);
++		i915_add_request_no_flush(request);
+ 	atomic_dec(&intel_crtc->unpin_work_count);
+ 	mutex_unlock(&dev->struct_mutex);
+ cleanup:
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index c5dba68..7693efa 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1007,7 +1007,6 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
+ 	trace_i915_gem_ring_dispatch(params->request, params->dispatch_flags);
+ 
+ 	i915_gem_execbuffer_move_to_active(vmas, params->request);
+-	i915_gem_execbuffer_retire_commands(params);
+ 
+ 	return 0;
+ }
+@@ -2700,13 +2699,12 @@ int intel_lr_context_deferred_alloc(struct intel_context *ctx,
+ 		}
+ 
+ 		ret = engine->init_context(req);
++		i915_add_request_no_flush(req);
+ 		if (ret) {
+ 			DRM_ERROR("ring init context: %d\n",
+ 				ret);
+-			i915_gem_request_cancel(req);
+ 			goto error_ringbuf;
+ 		}
+-		i915_add_request_no_flush(req);
+ 	}
+ 	return 0;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_overlay.c b/drivers/gpu/drm/i915/intel_overlay.c
+index 6694e92..bcc3b6a 100644
+--- a/drivers/gpu/drm/i915/intel_overlay.c
++++ b/drivers/gpu/drm/i915/intel_overlay.c
+@@ -247,7 +247,7 @@ static int intel_overlay_on(struct intel_overlay *overlay)
+ 
+ 	ret = intel_ring_begin(req, 4);
+ 	if (ret) {
+-		i915_gem_request_cancel(req);
++		i915_add_request_no_flush(req);
+ 		return ret;
+ 	}
+ 
+@@ -290,7 +290,7 @@ static int intel_overlay_continue(struct intel_overlay *overlay,
+ 
+ 	ret = intel_ring_begin(req, 2);
+ 	if (ret) {
+-		i915_gem_request_cancel(req);
++		i915_add_request_no_flush(req);
+ 		return ret;
+ 	}
+ 
+@@ -356,7 +356,7 @@ static int intel_overlay_off(struct intel_overlay *overlay)
+ 
+ 	ret = intel_ring_begin(req, 6);
+ 	if (ret) {
+-		i915_gem_request_cancel(req);
++		i915_add_request_no_flush(req);
+ 		return ret;
+ 	}
+ 
+@@ -431,7 +431,7 @@ static int intel_overlay_release_old_vid(struct intel_overlay *overlay)
+ 
+ 		ret = intel_ring_begin(req, 2);
+ 		if (ret) {
+-			i915_gem_request_cancel(req);
++			i915_add_request_no_flush(req);
+ 			return ret;
+ 		}
+ 
+-- 
+1.7.5.4
+

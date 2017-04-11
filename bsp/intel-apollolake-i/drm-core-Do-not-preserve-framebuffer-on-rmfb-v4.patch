@@ -1,0 +1,150 @@
+From 994c5086cdd96bbe7eedd3b58b663323f78019df Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date: Wed, 4 May 2016 14:38:26 +0200
+Subject: [PATCH 2934/4706] drm/core: Do not preserve framebuffer on rmfb, v4.
+
+commit f2d580b9a8149735cbc4b59c4a8df60173658140 upstream
+
+It turns out that preserving framebuffers after the rmfb call breaks
+vmwgfx userspace. This was originally introduced because it was thought
+nobody relied on the behavior, but unfortunately it seems there are
+exceptions.
+
+drm_framebuffer_remove may fail with -EINTR now, so a straight revert
+is impossible. There is no way to remove the framebuffer from the lists
+and active planes without introducing a race because of the different
+locking requirements. Instead call drm_framebuffer_remove from a
+workqueue, which is unaffected by signals.
+
+Changes since v1:
+- Add comment.
+Changes since v2:
+- Add fastpath for refcount = 1. (danvet)
+Changes since v3:
+- Rebased.
+- Restore lastclose framebuffer removal too.
+
+Cc: stable@vger.kernel.org #v4.4+
+Fixes: 13803132818c ("drm/core: Preserve the framebuffer after removing it.")
+Testcase: kms_rmfb_basic
+References: https://lists.freedesktop.org/archives/dri-devel/2016-March/102876.html
+Cc: Thomas Hellstrom <thellstrom@vmware.com>
+Cc: David Herrmann <dh.herrmann@gmail.com>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Tested-by: Thomas Hellstrom <thellstrom@vmware.com> #v3
+Tested-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/6c63ca37-0e7e-ac7f-a6d2-c7822e3d611f@linux.intel.com
+---
+ drivers/gpu/drm/drm_crtc.c |   63 +++++++++++++++++++++++++++++++++++++++-----
+ 1 files changed, 56 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
+index a9c0a43..70f9c68 100644
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -3462,6 +3462,24 @@ int drm_mode_addfb2(struct drm_device *dev,
+ 	return 0;
+ }
+ 
++struct drm_mode_rmfb_work {
++	struct work_struct work;
++	struct list_head fbs;
++};
++
++static void drm_mode_rmfb_work_fn(struct work_struct *w)
++{
++	struct drm_mode_rmfb_work *arg = container_of(w, typeof(*arg), work);
++
++	while (!list_empty(&arg->fbs)) {
++		struct drm_framebuffer *fb =
++			list_first_entry(&arg->fbs, typeof(*fb), filp_head);
++
++		list_del_init(&fb->filp_head);
++		drm_framebuffer_remove(fb);
++	}
++}
++
+ /**
+  * drm_mode_rmfb - remove an FB from the configuration
+  * @dev: drm device for the ioctl
+@@ -3502,12 +3520,29 @@ int drm_mode_rmfb(struct drm_device *dev,
+ 	list_del_init(&fb->filp_head);
+ 	mutex_unlock(&file_priv->fbs_lock);
+ 
+-	/* we now own the reference that was stored in the fbs list */
+-	drm_framebuffer_unreference(fb);
+-
+ 	/* drop the reference we picked up in framebuffer lookup */
+ 	drm_framebuffer_unreference(fb);
+ 
++	/*
++	 * we now own the reference that was stored in the fbs list
++	 *
++	 * drm_framebuffer_remove may fail with -EINTR on pending signals,
++	 * so run this in a separate stack as there's no way to correctly
++	 * handle this after the fb is already removed from the lookup table.
++	 */
++	if (drm_framebuffer_read_refcount(fb) > 1) {
++		struct drm_mode_rmfb_work arg;
++
++		INIT_WORK_ONSTACK(&arg.work, drm_mode_rmfb_work_fn);
++		INIT_LIST_HEAD(&arg.fbs);
++		list_add_tail(&fb->filp_head, &arg.fbs);
++
++		schedule_work(&arg.work);
++		flush_work(&arg.work);
++		destroy_work_on_stack(&arg.work);
++	} else
++		drm_framebuffer_unreference(fb);
++
+ 	return 0;
+ 
+ fail_unref:
+@@ -3657,7 +3692,6 @@ out_err1:
+ 	return ret;
+ }
+ 
+-
+ /**
+  * drm_fb_release - remove and free the FBs on this file
+  * @priv: drm file for the ioctl
+@@ -3672,6 +3706,9 @@ out_err1:
+ void drm_fb_release(struct drm_file *priv)
+ {
+ 	struct drm_framebuffer *fb, *tfb;
++	struct drm_mode_rmfb_work arg;
++
++	INIT_LIST_HEAD(&arg.fbs);
+ 
+ 	/*
+ 	 * When the file gets released that means no one else can access the fb
+@@ -3684,10 +3721,22 @@ void drm_fb_release(struct drm_file *priv)
+ 	 * at it any more.
+ 	 */
+ 	list_for_each_entry_safe(fb, tfb, &priv->fbs, filp_head) {
+-		list_del_init(&fb->filp_head);
++		if (drm_framebuffer_read_refcount(fb) > 1) {
++			list_move_tail(&fb->filp_head, &arg.fbs);
++		} else {
++			list_del_init(&fb->filp_head);
+ 
+-		/* This drops the fpriv->fbs reference. */
+-		drm_framebuffer_unreference(fb);
++			/* This drops the fpriv->fbs reference. */
++			drm_framebuffer_unreference(fb);
++		}
++	}
++
++	if (!list_empty(&arg.fbs)) {
++		INIT_WORK_ONSTACK(&arg.work, drm_mode_rmfb_work_fn);
++
++		schedule_work(&arg.work);
++		flush_work(&arg.work);
++		destroy_work_on_stack(&arg.work);
+ 	}
+ }
+ 
+-- 
+1.7.5.4
+

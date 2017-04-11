@@ -1,0 +1,222 @@
+From 86b2da9fc917053986a8d5d926e7e2300623cca1 Mon Sep 17 00:00:00 2001
+From: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Date: Mon, 26 Oct 2015 16:27:49 -0200
+Subject: [PATCH 1937/4706] drm/i915: use a single intel_fbc_work struct
+
+commit 128d735606d4e43bc6a56432cf66a68c2753bdce upstream
+
+This was already on my TODO list, and was requested both by Chris and
+Ville, for different reasons. The advantages are avoiding a frequent
+malloc/free pair, and the locality of having the work structure
+embedded in dev_priv. The maximum used memory is also smaller since
+previously we could have multiple allocated intel_fbc_work structs at
+the same time, and now we'll always have a single one - the one
+embedded on dev_priv. Of course, we're now using a little more memory
+on the cases where there's nothing scheduled.
+
+The biggest challenge here is to keep everything synchronized the way
+it was before.
+
+Currently, when we try to activate FBC, we allocate a new
+intel_fbc_work structure. Then later when we conclude we must delay
+the FBC activation a little more, we allocate a new intel_fbc_work
+struct, and then adjust dev_priv->fbc.fbc_work to point to the new
+struct. So when the old work runs - at intel_fbc_work_fn() - it will
+check that dev_priv->fbc.fbc_work points to something else, so it does
+nothing. Everything is also protected by fbc.lock.
+
+Just cancelling the old delayed work doesn't work because we might
+just cancel it after the work function already started to run, but
+while it is still waiting to grab fbc.lock. That's why we use the
+"dev_priv->fbc.fbc_work == work" check described in the paragraph
+above.
+
+So now that we have a single work struct we have to introduce a new
+way to synchronize everything. So we're making the work function a
+normal work instead of a delayed work, and it will be responsible for
+sleeping the appropriate amount of time itself. This way, after it
+wakes up it can grab the lock, ask "were we delayed or cancelled?" and
+then go back to sleep, enable FBC or give up.
+
+v2:
+  - Spelling fixes.
+  - Rebase after changing the patch order.
+  - Fix ms/jiffies confusion.
+
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk> (v1)
+Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/
+---
+ drivers/gpu/drm/i915/i915_drv.h  |    6 ++-
+ drivers/gpu/drm/i915/intel_fbc.c |  107 +++++++++++++++++---------------------
+ 2 files changed, 52 insertions(+), 61 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 223671e..b06ad60 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -919,9 +919,11 @@ struct i915_fbc {
+ 	bool active;
+ 
+ 	struct intel_fbc_work {
+-		struct delayed_work work;
++		bool scheduled;
++		struct work_struct work;
+ 		struct drm_framebuffer *fb;
+-	} *fbc_work;
++		unsigned long enable_jiffies;
++	} work;
+ 
+ 	const char *no_fbc_reason;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_fbc.c b/drivers/gpu/drm/i915/intel_fbc.c
+index 8460e3d..07d3342 100644
+--- a/drivers/gpu/drm/i915/intel_fbc.c
++++ b/drivers/gpu/drm/i915/intel_fbc.c
+@@ -392,85 +392,72 @@ static void intel_fbc_activate(const struct drm_framebuffer *fb)
+ 
+ static void intel_fbc_work_fn(struct work_struct *__work)
+ {
+-	struct intel_fbc_work *work =
+-		container_of(to_delayed_work(__work),
+-			     struct intel_fbc_work, work);
+-	struct drm_i915_private *dev_priv = work->fb->dev->dev_private;
+-	struct drm_framebuffer *crtc_fb = dev_priv->fbc.crtc->base.primary->fb;
++	struct drm_i915_private *dev_priv =
++		container_of(__work, struct drm_i915_private, fbc.work.work);
++	struct intel_fbc_work *work = &dev_priv->fbc.work;
++	struct intel_crtc *crtc = dev_priv->fbc.crtc;
++	int delay_ms = 50;
++
++retry:
++	/* Delay the actual enabling to let pageflipping cease and the
++	 * display to settle before starting the compression. Note that
++	 * this delay also serves a second purpose: it allows for a
++	 * vblank to pass after disabling the FBC before we attempt
++	 * to modify the control registers.
++	 *
++	 * A more complicated solution would involve tracking vblanks
++	 * following the termination of the page-flipping sequence
++	 * and indeed performing the enable as a co-routine and not
++	 * waiting synchronously upon the vblank.
++	 *
++	 * WaFbcWaitForVBlankBeforeEnable:ilk,snb
++	 */
++	wait_remaining_ms_from_jiffies(work->enable_jiffies, delay_ms);
+ 
+ 	mutex_lock(&dev_priv->fbc.lock);
+-	if (work == dev_priv->fbc.fbc_work) {
+-		/* Double check that we haven't switched fb without cancelling
+-		 * the prior work.
+-		 */
+-		if (crtc_fb == work->fb)
+-			intel_fbc_activate(work->fb);
+ 
+-		dev_priv->fbc.fbc_work = NULL;
++	/* Were we cancelled? */
++	if (!work->scheduled)
++		goto out;
++
++	/* Were we delayed again while this function was sleeping? */
++	if (time_after(work->enable_jiffies + msecs_to_jiffies(delay_ms),
++		       jiffies)) {
++		mutex_unlock(&dev_priv->fbc.lock);
++		goto retry;
+ 	}
+-	mutex_unlock(&dev_priv->fbc.lock);
+ 
+-	kfree(work);
++	if (crtc->base.primary->fb == work->fb)
++		intel_fbc_activate(work->fb);
++
++	work->scheduled = false;
++
++out:
++	mutex_unlock(&dev_priv->fbc.lock);
+ }
+ 
+ static void intel_fbc_cancel_work(struct drm_i915_private *dev_priv)
+ {
+ 	WARN_ON(!mutex_is_locked(&dev_priv->fbc.lock));
+-
+-	if (dev_priv->fbc.fbc_work == NULL)
+-		return;
+-
+-	/* Synchronisation is provided by struct_mutex and checking of
+-	 * dev_priv->fbc.fbc_work, so we can perform the cancellation
+-	 * entirely asynchronously.
+-	 */
+-	if (cancel_delayed_work(&dev_priv->fbc.fbc_work->work))
+-		/* tasklet was killed before being run, clean up */
+-		kfree(dev_priv->fbc.fbc_work);
+-
+-	/* Mark the work as no longer wanted so that if it does
+-	 * wake-up (because the work was already running and waiting
+-	 * for our mutex), it will discover that is no longer
+-	 * necessary to run.
+-	 */
+-	dev_priv->fbc.fbc_work = NULL;
++	dev_priv->fbc.work.scheduled = false;
+ }
+ 
+ static void intel_fbc_schedule_activation(struct intel_crtc *crtc)
+ {
+-	struct intel_fbc_work *work;
+ 	struct drm_i915_private *dev_priv = crtc->base.dev->dev_private;
++	struct intel_fbc_work *work = &dev_priv->fbc.work;
+ 
+ 	WARN_ON(!mutex_is_locked(&dev_priv->fbc.lock));
+ 
+-	intel_fbc_cancel_work(dev_priv);
+-
+-	work = kzalloc(sizeof(*work), GFP_KERNEL);
+-	if (work == NULL) {
+-		DRM_ERROR("Failed to allocate FBC work structure\n");
+-		intel_fbc_activate(crtc->base.primary->fb);
+-		return;
+-	}
+-
++	/* It is useless to call intel_fbc_cancel_work() in this function since
++	 * we're not releasing fbc.lock, so it won't have an opportunity to grab
++	 * it to discover that it was cancelled. So we just update the expected
++	 * jiffy count. */
+ 	work->fb = crtc->base.primary->fb;
+-	INIT_DELAYED_WORK(&work->work, intel_fbc_work_fn);
++	work->scheduled = true;
++	work->enable_jiffies = jiffies;
+ 
+-	dev_priv->fbc.fbc_work = work;
+-
+-	/* Delay the actual enabling to let pageflipping cease and the
+-	 * display to settle before starting the compression. Note that
+-	 * this delay also serves a second purpose: it allows for a
+-	 * vblank to pass after disabling the FBC before we attempt
+-	 * to modify the control registers.
+-	 *
+-	 * A more complicated solution would involve tracking vblanks
+-	 * following the termination of the page-flipping sequence
+-	 * and indeed performing the enable as a co-routine and not
+-	 * waiting synchronously upon the vblank.
+-	 *
+-	 * WaFbcWaitForVBlankBeforeEnable:ilk,snb
+-	 */
+-	schedule_delayed_work(&work->work, msecs_to_jiffies(50));
++	schedule_work(&work->work);
+ }
+ 
+ static void __intel_fbc_deactivate(struct drm_i915_private *dev_priv)
+@@ -1106,9 +1093,11 @@ void intel_fbc_init(struct drm_i915_private *dev_priv)
+ {
+ 	enum pipe pipe;
+ 
++	INIT_WORK(&dev_priv->fbc.work.work, intel_fbc_work_fn);
+ 	mutex_init(&dev_priv->fbc.lock);
+ 	dev_priv->fbc.enabled = false;
+ 	dev_priv->fbc.active = false;
++	dev_priv->fbc.work.scheduled = false;
+ 
+ 	if (!HAS_FBC(dev_priv)) {
+ 		dev_priv->fbc.no_fbc_reason = "unsupported by this chipset";
+-- 
+1.7.5.4
+

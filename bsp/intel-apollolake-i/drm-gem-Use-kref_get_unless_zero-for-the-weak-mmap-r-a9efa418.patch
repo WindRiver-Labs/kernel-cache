@@ -1,0 +1,227 @@
+From 14abb55fb6057e960b13c9e36802adc35d6c1c78 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Thu, 15 Oct 2015 11:33:43 +0200
+Subject: [PATCH 1535/4706] drm/gem: Use kref_get_unless_zero for the weak
+ mmap references
+
+commit 2225cfe46bcc7558d9e371d1bc117df2df1fbacd upstream
+
+Compared to wrapping the final kref_put with dev->struct_mutex this
+allows us to only acquire the offset manager look both in the final
+cleanup and in the lookup. Which has the upside that no locks leak out
+of the core abstractions. But it means that we need to hold a
+temporary reference to the object while checking mmap constraints, to
+make sure the object doesn't disappear. Extended the critical region
+would have worked too, but would result in more leaky locking.
+
+Also, this is the final bit which required dev->struct_mutex in gem
+core, now modern drivers can be completely struct_mutex free!
+
+This needs a new drm_vma_offset_exact_lookup_locked and makes both
+drm_vma_offset_exact_lookup and drm_vma_offset_lookup unused.
+
+v2: Don't leak object references in failure paths (David).
+
+v3: Add a comment from Chris explaining how the ordering works, with
+the slight adjustment that I dropped any mention of struct_mutex since
+with this patch it's now immaterial ot core gem.
+
+Cc: David Herrmann <dh.herrmann@gmail.com>
+Reviewed-by: David Herrmann <dh.herrmann@gmail.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: http://mid.gmane.org/1444901623-18918-1-git-send-email-daniel.vetter@ffwll.ch
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+---
+ drivers/gpu/drm/drm_gem.c         |   40 +++++++++++++++++++++++++-----------
+ drivers/gpu/drm/drm_vma_manager.c |   40 +++++++++++-------------------------
+ include/drm/drm_vma_manager.h     |   22 +++++--------------
+ 3 files changed, 46 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index ab8ea422..64353d4 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -862,30 +862,46 @@ int drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
+ {
+ 	struct drm_file *priv = filp->private_data;
+ 	struct drm_device *dev = priv->minor->dev;
+-	struct drm_gem_object *obj;
++	struct drm_gem_object *obj = NULL;
+ 	struct drm_vma_offset_node *node;
+ 	int ret;
+ 
+ 	if (drm_device_is_unplugged(dev))
+ 		return -ENODEV;
+ 
+-	mutex_lock(&dev->struct_mutex);
++	drm_vma_offset_lock_lookup(dev->vma_offset_manager);
++	node = drm_vma_offset_exact_lookup_locked(dev->vma_offset_manager,
++						  vma->vm_pgoff,
++						  vma_pages(vma));
++	if (likely(node)) {
++		obj = container_of(node, struct drm_gem_object, vma_node);
++		/*
++		 * When the object is being freed, after it hits 0-refcnt it
++		 * proceeds to tear down the object. In the process it will
++		 * attempt to remove the VMA offset and so acquire this
++		 * mgr->vm_lock.  Therefore if we find an object with a 0-refcnt
++		 * that matches our range, we know it is in the process of being
++		 * destroyed and will be freed as soon as we release the lock -
++		 * so we have to check for the 0-refcnted object and treat it as
++		 * invalid.
++		 */
++		if (!kref_get_unless_zero(&obj->refcount))
++			obj = NULL;
++	}
++	drm_vma_offset_unlock_lookup(dev->vma_offset_manager);
+ 
+-	node = drm_vma_offset_exact_lookup(dev->vma_offset_manager,
+-					   vma->vm_pgoff,
+-					   vma_pages(vma));
+-	if (!node) {
+-		mutex_unlock(&dev->struct_mutex);
++	if (!obj)
+ 		return -EINVAL;
+-	} else if (!drm_vma_node_is_allowed(node, filp)) {
+-		mutex_unlock(&dev->struct_mutex);
++
++	if (!drm_vma_node_is_allowed(node, filp)) {
++		drm_gem_object_unreference_unlocked(obj);
+ 		return -EACCES;
+ 	}
+ 
+-	obj = container_of(node, struct drm_gem_object, vma_node);
+-	ret = drm_gem_mmap_obj(obj, drm_vma_node_size(node) << PAGE_SHIFT, vma);
++	ret = drm_gem_mmap_obj(obj, drm_vma_node_size(node) << PAGE_SHIFT,
++			       vma);
+ 
+-	mutex_unlock(&dev->struct_mutex);
++	drm_gem_object_unreference_unlocked(obj);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/drm_vma_manager.c b/drivers/gpu/drm/drm_vma_manager.c
+index 68c1f32..2f2ecde 100644
+--- a/drivers/gpu/drm/drm_vma_manager.c
++++ b/drivers/gpu/drm/drm_vma_manager.c
+@@ -112,7 +112,7 @@ void drm_vma_offset_manager_destroy(struct drm_vma_offset_manager *mgr)
+ EXPORT_SYMBOL(drm_vma_offset_manager_destroy);
+ 
+ /**
+- * drm_vma_offset_lookup() - Find node in offset space
++ * drm_vma_offset_lookup_locked() - Find node in offset space
+  * @mgr: Manager object
+  * @start: Start address for object (page-based)
+  * @pages: Size of object (page-based)
+@@ -122,37 +122,21 @@ EXPORT_SYMBOL(drm_vma_offset_manager_destroy);
+  * region and the given node will be returned, as long as the node spans the
+  * whole requested area (given the size in number of pages as @pages).
+  *
+- * RETURNS:
+- * Returns NULL if no suitable node can be found. Otherwise, the best match
+- * is returned. It's the caller's responsibility to make sure the node doesn't
+- * get destroyed before the caller can access it.
+- */
+-struct drm_vma_offset_node *drm_vma_offset_lookup(struct drm_vma_offset_manager *mgr,
+-						  unsigned long start,
+-						  unsigned long pages)
+-{
+-	struct drm_vma_offset_node *node;
+-
+-	read_lock(&mgr->vm_lock);
+-	node = drm_vma_offset_lookup_locked(mgr, start, pages);
+-	read_unlock(&mgr->vm_lock);
+-
+-	return node;
+-}
+-EXPORT_SYMBOL(drm_vma_offset_lookup);
+-
+-/**
+- * drm_vma_offset_lookup_locked() - Find node in offset space
+- * @mgr: Manager object
+- * @start: Start address for object (page-based)
+- * @pages: Size of object (page-based)
++ * Note that before lookup the vma offset manager lookup lock must be acquired
++ * with drm_vma_offset_lock_lookup(). See there for an example. This can then be
++ * used to implement weakly referenced lookups using kref_get_unless_zero().
+  *
+- * Same as drm_vma_offset_lookup() but requires the caller to lock offset lookup
+- * manually. See drm_vma_offset_lock_lookup() for an example.
++ * Example:
++ *     drm_vma_offset_lock_lookup(mgr);
++ *     node = drm_vma_offset_lookup_locked(mgr);
++ *     if (node)
++ *         kref_get_unless_zero(container_of(node, sth, entr));
++ *     drm_vma_offset_unlock_lookup(mgr);
+  *
+  * RETURNS:
+  * Returns NULL if no suitable node can be found. Otherwise, the best match
+- * is returned.
++ * is returned. It's the caller's responsibility to make sure the node doesn't
++ * get destroyed before the caller can access it.
+  */
+ struct drm_vma_offset_node *drm_vma_offset_lookup_locked(struct drm_vma_offset_manager *mgr,
+ 							 unsigned long start,
+diff --git a/include/drm/drm_vma_manager.h b/include/drm/drm_vma_manager.h
+index 089cb73..2f63dd5 100644
+--- a/include/drm/drm_vma_manager.h
++++ b/include/drm/drm_vma_manager.h
+@@ -54,9 +54,6 @@ void drm_vma_offset_manager_init(struct drm_vma_offset_manager *mgr,
+ 				 unsigned long page_offset, unsigned long size);
+ void drm_vma_offset_manager_destroy(struct drm_vma_offset_manager *mgr);
+ 
+-struct drm_vma_offset_node *drm_vma_offset_lookup(struct drm_vma_offset_manager *mgr,
+-						  unsigned long start,
+-						  unsigned long pages);
+ struct drm_vma_offset_node *drm_vma_offset_lookup_locked(struct drm_vma_offset_manager *mgr,
+ 							   unsigned long start,
+ 							   unsigned long pages);
+@@ -71,25 +68,25 @@ bool drm_vma_node_is_allowed(struct drm_vma_offset_node *node,
+ 			     struct file *filp);
+ 
+ /**
+- * drm_vma_offset_exact_lookup() - Look up node by exact address
++ * drm_vma_offset_exact_lookup_locked() - Look up node by exact address
+  * @mgr: Manager object
+  * @start: Start address (page-based, not byte-based)
+  * @pages: Size of object (page-based)
+  *
+- * Same as drm_vma_offset_lookup() but does not allow any offset into the node.
++ * Same as drm_vma_offset_lookup_locked() but does not allow any offset into the node.
+  * It only returns the exact object with the given start address.
+  *
+  * RETURNS:
+  * Node at exact start address @start.
+  */
+ static inline struct drm_vma_offset_node *
+-drm_vma_offset_exact_lookup(struct drm_vma_offset_manager *mgr,
+-			    unsigned long start,
+-			    unsigned long pages)
++drm_vma_offset_exact_lookup_locked(struct drm_vma_offset_manager *mgr,
++				   unsigned long start,
++				   unsigned long pages)
+ {
+ 	struct drm_vma_offset_node *node;
+ 
+-	node = drm_vma_offset_lookup(mgr, start, pages);
++	node = drm_vma_offset_lookup_locked(mgr, start, pages);
+ 	return (node && node->vm_node.start == start) ? node : NULL;
+ }
+ 
+@@ -108,13 +105,6 @@ drm_vma_offset_exact_lookup(struct drm_vma_offset_manager *mgr,
+  * not call any other VMA helpers while holding this lock.
+  *
+  * Note: You're in atomic-context while holding this lock!
+- *
+- * Example:
+- *   drm_vma_offset_lock_lookup(mgr);
+- *   node = drm_vma_offset_lookup_locked(mgr);
+- *   if (node)
+- *       kref_get_unless_zero(container_of(node, sth, entr));
+- *   drm_vma_offset_unlock_lookup(mgr);
+  */
+ static inline void drm_vma_offset_lock_lookup(struct drm_vma_offset_manager *mgr)
+ {
+-- 
+1.7.5.4
+

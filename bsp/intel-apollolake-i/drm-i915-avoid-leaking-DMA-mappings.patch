@@ -1,0 +1,220 @@
+From 273bb27e758287e2b559aa2e31b33d9eb21e4667 Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Thu, 9 Jul 2015 12:59:05 +0300
+Subject: [PATCH 0499/4706] drm/i915: avoid leaking DMA mappings
+
+commit e227330223a7721b4284c3921651bd9ca8f3581a upstream
+
+We have 3 types of DMA mappings for GEM objects:
+1. physically contiguous for stolen and for objects needing contiguous
+   memory
+2. DMA-buf mappings imported via a DMA-buf attach operation
+3. SG DMA mappings for shmem backed and userptr objects
+
+For 1. and 2. the lifetime of the DMA mapping matches the lifetime of the
+corresponding backing pages and so in practice we create/release the
+mapping in the object's get_pages/put_pages callback.
+
+For 3. the lifetime of the mapping matches that of any existing GPU binding
+of the object, so we'll create the mapping when the object is bound to
+the first vma and release the mapping when the object is unbound from its
+last vma.
+
+Since the object can be bound to multiple vmas, we can end up creating a
+new DMA mapping in the 3. case even if the object already had one. This
+is not allowed by the DMA API and can lead to leaked mapping data and
+IOMMU memory space starvation in certain cases. For example HW IOMMU
+drivers (intel_iommu) allocate a new range from their memory space
+whenever a mapping is created, silently overriding a pre-existing
+mapping.
+
+Fix this by moving the creation/removal of DMA mappings to the object's
+get_pages/put_pages callbacks. These callbacks already check for and do
+an early return in case of any nested calls. This way objects of the 3.
+case also become more like the other object types.
+
+I noticed this issue by enabling DMA debugging, which got disabled after
+a while due to its internal mapping tables getting full. It also reported
+errors in connection to random other drivers that did a DMA mapping for
+an address that was previously mapped by i915 but was never released.
+Besides these diagnostic messages and the memory space starvation
+problem for IOMMUs, I'm not aware of this causing a real issue.
+
+The fix is based on a patch from Chris.
+
+v2:
+- move the DMA mapping create/remove calls to the get_pages/put_pages
+  callbacks instead of adding new callbacks for these (Chris)
+v3:
+- also fix the get_page cache logic on the userptr async path (Chris)
+
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: stable@vger.kernel.org
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/i915_gem.c         |   31 ++++++++++++++++---------------
+ drivers/gpu/drm/i915/i915_gem_userptr.c |   29 +++++++++++++++++++++++++++--
+ 2 files changed, 43 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 716e5ac..95b92ad 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2139,6 +2139,8 @@ i915_gem_object_put_pages_gtt(struct drm_i915_gem_object *obj)
+ 		obj->base.read_domains = obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+ 	}
+ 
++	i915_gem_gtt_finish_object(obj);
++
+ 	if (i915_gem_object_needs_bit17_swizzle(obj))
+ 		i915_gem_object_save_bit_17_swizzle(obj);
+ 
+@@ -2199,6 +2201,7 @@ i915_gem_object_get_pages_gtt(struct drm_i915_gem_object *obj)
+ 	struct sg_page_iter sg_iter;
+ 	struct page *page;
+ 	unsigned long last_pfn = 0;	/* suppress gcc warning */
++	int ret;
+ 	gfp_t gfp;
+ 
+ 	/* Assert that the object is not currently in any GPU domain. As it
+@@ -2246,8 +2249,10 @@ i915_gem_object_get_pages_gtt(struct drm_i915_gem_object *obj)
+ 			 */
+ 			i915_gem_shrink_all(dev_priv);
+ 			page = shmem_read_mapping_page(mapping, i);
+-			if (IS_ERR(page))
++			if (IS_ERR(page)) {
++				ret = PTR_ERR(page);
+ 				goto err_pages;
++			}
+ 		}
+ #ifdef CONFIG_SWIOTLB
+ 		if (swiotlb_nr_tbl()) {
+@@ -2276,6 +2281,10 @@ i915_gem_object_get_pages_gtt(struct drm_i915_gem_object *obj)
+ 		sg_mark_end(sg);
+ 	obj->pages = st;
+ 
++	ret = i915_gem_gtt_prepare_object(obj);
++	if (ret)
++		goto err_pages;
++
+ 	if (i915_gem_object_needs_bit17_swizzle(obj))
+ 		i915_gem_object_do_bit_17_swizzle(obj);
+ 
+@@ -2300,10 +2309,10 @@ err_pages:
+ 	 * space and so want to translate the error from shmemfs back to our
+ 	 * usual understanding of ENOMEM.
+ 	 */
+-	if (PTR_ERR(page) == -ENOSPC)
+-		return -ENOMEM;
+-	else
+-		return PTR_ERR(page);
++	if (ret == -ENOSPC)
++		ret = -ENOMEM;
++
++	return ret;
+ }
+ 
+ /* Ensure that the associated pages are gathered from the backing storage
+@@ -3248,10 +3257,8 @@ int i915_vma_unbind(struct i915_vma *vma)
+ 
+ 	/* Since the unbound list is global, only move to that list if
+ 	 * no more VMAs exist. */
+-	if (list_empty(&obj->vma_list)) {
+-		i915_gem_gtt_finish_object(obj);
++	if (list_empty(&obj->vma_list))
+ 		list_move_tail(&obj->global_list, &dev_priv->mm.unbound_list);
+-	}
+ 
+ 	/* And finally now the object is completely decoupled from this vma,
+ 	 * we can drop its hold on the backing storage and allow it to be
+@@ -3769,22 +3776,16 @@ search_free:
+ 		goto err_remove_node;
+ 	}
+ 
+-	ret = i915_gem_gtt_prepare_object(obj);
+-	if (ret)
+-		goto err_remove_node;
+-
+ 	trace_i915_vma_bind(vma, flags);
+ 	ret = i915_vma_bind(vma, obj->cache_level, flags);
+ 	if (ret)
+-		goto err_finish_gtt;
++		goto err_remove_node;
+ 
+ 	list_move_tail(&obj->global_list, &dev_priv->mm.bound_list);
+ 	list_add_tail(&vma->mm_list, &vm->inactive_list);
+ 
+ 	return vma;
+ 
+-err_finish_gtt:
+-	i915_gem_gtt_finish_object(obj);
+ err_remove_node:
+ 	drm_mm_remove_node(&vma->node);
+ err_free_vma:
+diff --git a/drivers/gpu/drm/i915/i915_gem_userptr.c b/drivers/gpu/drm/i915/i915_gem_userptr.c
+index 1f4e5a3..8fd431b 100644
+--- a/drivers/gpu/drm/i915/i915_gem_userptr.c
++++ b/drivers/gpu/drm/i915/i915_gem_userptr.c
+@@ -545,6 +545,26 @@ err:
+ 	return ret;
+ }
+ 
++static int
++__i915_gem_userptr_set_pages(struct drm_i915_gem_object *obj,
++			     struct page **pvec, int num_pages)
++{
++	int ret;
++
++	ret = st_set_pages(&obj->pages, pvec, num_pages);
++	if (ret)
++		return ret;
++
++	ret = i915_gem_gtt_prepare_object(obj);
++	if (ret) {
++		sg_free_table(obj->pages);
++		kfree(obj->pages);
++		obj->pages = NULL;
++	}
++
++	return ret;
++}
++
+ static void
+ __i915_gem_userptr_get_pages_worker(struct work_struct *_work)
+ {
+@@ -584,9 +604,12 @@ __i915_gem_userptr_get_pages_worker(struct work_struct *_work)
+ 	if (obj->userptr.work != &work->work) {
+ 		ret = 0;
+ 	} else if (pinned == num_pages) {
+-		ret = st_set_pages(&obj->pages, pvec, num_pages);
++		ret = __i915_gem_userptr_set_pages(obj, pvec, num_pages);
+ 		if (ret == 0) {
+ 			list_add_tail(&obj->global_list, &to_i915(dev)->mm.unbound_list);
++			obj->get_page.sg = obj->pages->sgl;
++			obj->get_page.last = 0;
++
+ 			pinned = 0;
+ 		}
+ 	}
+@@ -693,7 +716,7 @@ i915_gem_userptr_get_pages(struct drm_i915_gem_object *obj)
+ 			}
+ 		}
+ 	} else {
+-		ret = st_set_pages(&obj->pages, pvec, num_pages);
++		ret = __i915_gem_userptr_set_pages(obj, pvec, num_pages);
+ 		if (ret == 0) {
+ 			obj->userptr.work = NULL;
+ 			pinned = 0;
+@@ -715,6 +738,8 @@ i915_gem_userptr_put_pages(struct drm_i915_gem_object *obj)
+ 	if (obj->madv != I915_MADV_WILLNEED)
+ 		obj->dirty = 0;
+ 
++	i915_gem_gtt_finish_object(obj);
++
+ 	for_each_sg_page(obj->pages->sgl, &sg_iter, obj->pages->nents, 0) {
+ 		struct page *page = sg_page_iter_page(&sg_iter);
+ 
+-- 
+1.7.5.4
+

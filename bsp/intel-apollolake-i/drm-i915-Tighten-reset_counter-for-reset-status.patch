@@ -1,0 +1,275 @@
+From 10a2792e9e53da347aafbd85bf3b718d440f9842 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 13 Apr 2016 17:35:05 +0100
+Subject: [PATCH 2813/4706] drm/i915: Tighten reset_counter for reset status
+
+commit d98c52cf4fa2bb7116a89f1132fc773b1cfa6436 upstream
+
+In the reset_counter, we use two bits to track a GPU hang and reset. The
+low bit is a "reset-in-progress" flag that we set to signal when we need
+to break waiters in order for the recovery task to grab the mutex. As
+soon as the recovery task has the mutex, we can clear that flag (which
+we do by incrementing the reset_counter thereby incrementing the gobal
+reset epoch). By clearing that flag when the recovery task holds the
+struct_mutex, we can forgo a second flag that simply tells GEM to ignore
+the "reset-in-progress" flag.
+
+The second flag we store in the reset_counter is whether the
+reset failed and we consider the GPU terminally wedged. Whilst this flag
+is set, all access to the GPU (at least through GEM rather than direct mmio
+access) is verboten.
+
+PS: Fun is in store, as in the future we want to move from a global
+reset epoch to a per-engine reset engine with request recovery.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/1460565315-7748-6-git-send-email-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |    4 +-
+ drivers/gpu/drm/i915/i915_drv.c     |   39 ++++++++++++++++++++--------------
+ drivers/gpu/drm/i915/i915_drv.h     |    3 --
+ drivers/gpu/drm/i915/i915_gem.c     |   27 ++++++++----------------
+ drivers/gpu/drm/i915/i915_irq.c     |   21 +-----------------
+ 5 files changed, 36 insertions(+), 58 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 05a2d58..ab843a6 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -4707,7 +4707,7 @@ i915_wedged_get(void *data, u64 *val)
+ 	struct drm_device *dev = data;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+-	*val = i915_reset_counter(&dev_priv->gpu_error);
++	*val = i915_terminally_wedged(&dev_priv->gpu_error);
+ 
+ 	return 0;
+ }
+@@ -4726,7 +4726,7 @@ i915_wedged_set(void *data, u64 val)
+ 	 * while it is writing to 'i915_wedged'
+ 	 */
+ 
+-	if (i915_reset_in_progress_or_wedged(&dev_priv->gpu_error))
++	if (i915_reset_in_progress(&dev_priv->gpu_error))
+ 		return -EAGAIN;
+ 
+ 	intel_runtime_pm_get(dev_priv);
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 1fca409..701d188 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -907,23 +907,32 @@ int i915_resume_switcheroo(struct drm_device *dev)
+ int i915_reset(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	bool simulated;
++	struct i915_gpu_error *error = &dev_priv->gpu_error;
++	unsigned reset_counter;
+ 	int ret;
+ 
+ 	intel_reset_gt_powersave(dev);
+ 
+ 	mutex_lock(&dev->struct_mutex);
+ 
+-	i915_gem_reset(dev);
++	/* Clear any previous failed attempts at recovery. Time to try again. */
++	atomic_andnot(I915_WEDGED, &error->reset_counter);
+ 
+-	simulated = dev_priv->gpu_error.stop_rings != 0;
++	/* Clear the reset-in-progress flag and increment the reset epoch. */
++	reset_counter = atomic_inc_return(&error->reset_counter);
++	if (WARN_ON(__i915_reset_in_progress(reset_counter))) {
++		ret = -EIO;
++		goto error;
++	}
++
++	i915_gem_reset(dev);
+ 
+ 	ret = intel_gpu_reset(dev, ALL_ENGINES);
+ 
+ 	/* Also reset the gpu hangman. */
+-	if (simulated) {
++	if (error->stop_rings != 0) {
+ 		DRM_INFO("Simulated gpu hang, resetting stop_rings\n");
+-		dev_priv->gpu_error.stop_rings = 0;
++		error->stop_rings = 0;
+ 		if (ret == -ENODEV) {
+ 			DRM_INFO("Reset not implemented, but ignoring "
+ 				 "error for simulated gpu hangs\n");
+@@ -936,8 +945,7 @@ int i915_reset(struct drm_device *dev)
+ 
+ 	if (ret) {
+ 		DRM_ERROR("Failed to reset chip: %i\n", ret);
+-		mutex_unlock(&dev->struct_mutex);
+-		return ret;
++		goto error;
+ 	}
+ 
+ 	intel_overlay_reset(dev_priv);
+@@ -956,20 +964,14 @@ int i915_reset(struct drm_device *dev)
+ 	 * was running at the time of the reset (i.e. we weren't VT
+ 	 * switched away).
+ 	 */
+-
+-	/* Used to prevent gem_check_wedged returning -EAGAIN during gpu reset */
+-	dev_priv->gpu_error.reload_in_reset = true;
+-
+ 	ret = i915_gem_init_hw(dev);
+-
+-	dev_priv->gpu_error.reload_in_reset = false;
+-
+-	mutex_unlock(&dev->struct_mutex);
+ 	if (ret) {
+ 		DRM_ERROR("Failed hw init on reset %d\n", ret);
+-		return ret;
++		goto error;
+ 	}
+ 
++	mutex_unlock(&dev->struct_mutex);
++
+ 	/*
+ 	 * rps/rc6 re-init is necessary to restore state lost after the
+ 	 * reset and the re-install of gt irqs. Skip for ironlake per
+@@ -980,6 +982,11 @@ int i915_reset(struct drm_device *dev)
+ 		intel_enable_gt_powersave(dev);
+ 
+ 	return 0;
++
++error:
++	atomic_or(I915_WEDGED, &error->reset_counter);
++	mutex_unlock(&dev->struct_mutex);
++	return ret;
+ }
+ 
+ static int i915_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index cdbf000..1c6e2eb 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1399,9 +1399,6 @@ struct i915_gpu_error {
+ 
+ 	/* For missed irq/seqno simulation. */
+ 	unsigned int test_irq_rings;
+-
+-	/* Used to prevent gem_check_wedged returning -EAGAIN during gpu reset   */
+-	bool reload_in_reset;
+ };
+ 
+ enum modeset_restore {
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 6f5e26e..66ddbde 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -83,9 +83,7 @@ i915_gem_wait_for_error(struct i915_gpu_error *error)
+ {
+ 	int ret;
+ 
+-#define EXIT_COND (!i915_reset_in_progress_or_wedged(error) || \
+-		   i915_terminally_wedged(error))
+-	if (EXIT_COND)
++	if (!i915_reset_in_progress(error))
+ 		return 0;
+ 
+ 	/*
+@@ -94,17 +92,16 @@ i915_gem_wait_for_error(struct i915_gpu_error *error)
+ 	 * we should simply try to bail out and fail as gracefully as possible.
+ 	 */
+ 	ret = wait_event_interruptible_timeout(error->reset_queue,
+-					       EXIT_COND,
++					       !i915_reset_in_progress(error),
+ 					       10*HZ);
+ 	if (ret == 0) {
+ 		DRM_ERROR("Timed out waiting for the gpu reset to complete\n");
+ 		return -EIO;
+ 	} else if (ret < 0) {
+ 		return ret;
++	} else {
++		return 0;
+ 	}
+-#undef EXIT_COND
+-
+-	return 0;
+ }
+ 
+ int i915_mutex_lock_interruptible(struct drm_device *dev)
+@@ -1113,22 +1110,16 @@ i915_gem_check_wedge(struct i915_gpu_error *error,
+ 		     bool interruptible)
+ {
+ 	if (i915_reset_in_progress_or_wedged(error)) {
++		/* Recovery complete, but the reset failed ... */
++		if (i915_terminally_wedged(error))
++			return -EIO;
++
+ 		/* Non-interruptible callers can't handle -EAGAIN, hence return
+ 		 * -EIO unconditionally for these. */
+ 		if (!interruptible)
+ 			return -EIO;
+ 
+-		/* Recovery complete, but the reset failed ... */
+-		if (i915_terminally_wedged(error))
+-			return -EIO;
+-
+-		/*
+-		 * Check if GPU Reset is in progress - we need intel_ring_begin
+-		 * to work properly to reinit the hw state while the gpu is
+-		 * still marked as reset-in-progress. Handle this with a flag.
+-		 */
+-		if (!error->reload_in_reset)
+-			return -EAGAIN;
++		return -EAGAIN;
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index c2269c1..be78f52 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2483,7 +2483,6 @@ static void i915_error_wake_up(struct drm_i915_private *dev_priv,
+ static void i915_reset_and_wakeup(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+-	struct i915_gpu_error *error = &dev_priv->gpu_error;
+ 	char *error_event[] = { I915_ERROR_UEVENT "=1", NULL };
+ 	char *reset_event[] = { I915_RESET_UEVENT "=1", NULL };
+ 	char *reset_done_event[] = { I915_ERROR_UEVENT "=0", NULL };
+@@ -2501,7 +2500,7 @@ static void i915_reset_and_wakeup(struct drm_device *dev)
+ 	 * the reset in-progress bit is only ever set by code outside of this
+ 	 * work we don't need to worry about any other races.
+ 	 */
+-	if (i915_reset_in_progress_or_wedged(error) && !i915_terminally_wedged(error)) {
++	if (i915_reset_in_progress(&dev_priv->gpu_error)) {
+ 		DRM_DEBUG_DRIVER("resetting chip\n");
+ 		kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE,
+ 				   reset_event);
+@@ -2529,25 +2528,9 @@ static void i915_reset_and_wakeup(struct drm_device *dev)
+ 
+ 		intel_runtime_pm_put(dev_priv);
+ 
+-		if (ret == 0) {
+-			/*
+-			 * After all the gem state is reset, increment the reset
+-			 * counter and wake up everyone waiting for the reset to
+-			 * complete.
+-			 *
+-			 * Since unlock operations are a one-sided barrier only,
+-			 * we need to insert a barrier here to order any seqno
+-			 * updates before
+-			 * the counter increment.
+-			 */
+-			smp_mb__before_atomic();
+-			atomic_inc(&dev_priv->gpu_error.reset_counter);
+-
++		if (ret == 0)
+ 			kobject_uevent_env(&dev->primary->kdev->kobj,
+ 					   KOBJ_CHANGE, reset_done_event);
+-		} else {
+-			atomic_or(I915_WEDGED, &error->reset_counter);
+-		}
+ 
+ 		/*
+ 		 * Note: The wake_up also serves as a memory barrier so that
+-- 
+1.7.5.4
+

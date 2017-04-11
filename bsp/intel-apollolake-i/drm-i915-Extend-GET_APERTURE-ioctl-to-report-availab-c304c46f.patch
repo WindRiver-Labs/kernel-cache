@@ -1,0 +1,323 @@
+From 2c827b7614b73229f75fc5d5401bfbe79ceff16c Mon Sep 17 00:00:00 2001
+From: Ankitprasad Sharma <ankitprasad.r.sharma@intel.com>
+Date: Tue, 30 Aug 2016 09:49:07 -0700
+Subject: [PATCH 4417/4706] drm/i915: Extend GET_APERTURE ioctl to report
+ available map space
+
+commit fd6edd0db97894e9f4b8d5896a1e736dd6727230 from
+git://git.yoctoproject.org/linux-yocto-4.1
+
+When constructing a batchbuffer, it is sometimes crucial to know the
+largest hole into which we can fit a fenceable buffer (for example when
+handling very large objects on gen2 and gen3). This depends on the
+fragmentation of pinned buffers inside the aperture, a question only the
+kernel can easily answer.
+
+This patch extends the current DRM_I915_GEM_GET_APERTURE ioctl to
+include a couple of new fields in its reply to userspace - the total
+amount of space available in the mappable region of the aperture and
+also the single largest block available.
+
+This is not quite what userspace wants to answer the question of whether
+this batch will fit as fences are also required to meet severe alignment
+constraints within the batch. For this purpose, a third conservative
+estimate of largest fence available is also provided. For when userspace
+needs more than one batch, we also provide the cumulative space
+available for fences such that it has some additional guidance to how
+much space it could allocate to fences. Conservatism still wins.
+
+This patch extends the GET_APERTURE ioctl to add support
+for getting total size and available size of the stolen region as
+well as single largest block available in the stolen region too.
+
+The patch also adds a debugfs file for convenient testing and
+reporting.
+
+v2: The first object cannot end at offset 0, so we can use last==0 to
+detect the empty list.
+
+v3: Expand all values to 64bit, just in case.
+    Report total mappable aperture size for userspace that cannot easily
+    determine it by inspecting the PCI device.
+
+v4: (Rodrigo) Fixed rebase conflicts.
+
+v5: Rebased to the latest drm-intel-nightly (Ankit)
+
+v6: Keeping limits to get_aperture ioctl, and moved changing numbers to
+debugfs, Addressed comments (Chris/Tvrtko)
+
+v7: Squashed stolen memory size patch to this one, Added a new version
+field to validate the map_size and stolen size values, Changed Author
+to me (Ankit) due to significant changes in the logic used to get size
+values
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Ankitprasad Sharma <ankitprasad.r.sharma@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Jeff McGee <jeff.mcgee@intel.com>
+Signed-off-by: Bob Paauwe <bob.j.paauwe@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c    |  143 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h        |    3 +
+ drivers/gpu/drm/i915/i915_gem.c        |    4 +
+ drivers/gpu/drm/i915/i915_gem_stolen.c |   27 ++++++
+ include/uapi/drm/i915_drm.h            |   16 ++++
+ 5 files changed, 193 insertions(+), 0 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 628d460..1ba32d4 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -502,6 +502,148 @@ static int i915_gem_object_info(struct seq_file *m, void *data)
+ 	return 0;
+ }
+ 
++static int vma_rank_by_ggtt(void *priv,
++			    struct list_head *A,
++			    struct list_head *B)
++{
++	struct i915_vma *a = list_entry(A, typeof(*a), exec_list);
++	struct i915_vma *b = list_entry(B, typeof(*b), exec_list);
++
++	return a->node.start - b->node.start;
++}
++
++static u32 __fence_size(struct drm_i915_private *dev_priv, u32 start, u32 end)
++{
++	u32 size = end - start;
++	u32 fence_size;
++
++	if (INTEL_INFO(dev_priv)->gen < 4) {
++		u32 fence_max;
++		u32 fence_next;
++
++		if (IS_GEN3(dev_priv)) {
++			fence_max = I830_FENCE_MAX_SIZE_VAL << 20;
++			fence_next = 1024*1024;
++		} else {
++			fence_max = I830_FENCE_MAX_SIZE_VAL << 19;
++			fence_next = 512*1024;
++		}
++
++		fence_max = min(fence_max, size);
++		fence_size = 0;
++		/* Find fence_size less than fence_max and power of 2 */
++		while (fence_next <= fence_max) {
++			u32 base = ALIGN(start, fence_next);
++			if (base + fence_next > end)
++				break;
++
++			fence_size = fence_next;
++			fence_next <<= 1;
++		}
++	} else {
++		fence_size = size;
++	}
++
++	return fence_size;
++}
++
++static int i915_gem_aperture_info(struct seq_file *m, void *data)
++{
++	struct drm_info_node *node = m->private;
++	struct drm_device *dev = node->minor->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct i915_ggtt *ggtt = &dev_priv->ggtt;
++	struct drm_i915_gem_get_aperture arg;
++	struct i915_vma *vma;
++	struct list_head map_list;
++	const uint64_t map_limit = ggtt->mappable_end;
++	uint64_t map_space, map_largest, fence_space, fence_largest;
++	uint64_t last, hole_size, stolen_free, stolen_largest;
++	int ret;
++
++	INIT_LIST_HEAD(&map_list);
++
++	map_space = map_largest = 0;
++	fence_space = fence_largest = 0;
++
++	ret = i915_gem_get_aperture_ioctl(node->minor->dev, &arg, NULL);
++	if (ret)
++		return ret;
++
++	mutex_lock(&dev->struct_mutex);
++
++	i915_gem_stolen_size_info(dev_priv, &stolen_free,
++				  &stolen_largest);
++
++	list_for_each_entry(vma, &ggtt->base.active_list, vm_link)
++		if (i915_vma_is_pinned(vma) &&
++			(vma->node.start + vma->node.size) <= map_limit)
++			list_add(&vma->exec_list, &map_list);
++	list_for_each_entry(vma, &ggtt->base.inactive_list, vm_link)
++		if (i915_vma_is_pinned(vma) &&
++			(vma->node.start + vma->node.size) <= map_limit)
++			list_add(&vma->exec_list, &map_list);
++
++	last = 0;
++	list_sort(NULL, &map_list, vma_rank_by_ggtt);
++	while (!list_empty(&map_list)) {
++		vma = list_first_entry(&map_list, typeof(*vma), exec_list);
++		list_del_init(&vma->exec_list);
++
++		if (last == 0)
++			goto skip_first;
++
++		hole_size = vma->node.start - last;
++		if (hole_size > map_largest)
++			map_largest = hole_size;
++		map_space += hole_size;
++
++		hole_size = __fence_size(dev_priv, last, vma->node.start);
++		if (hole_size > fence_largest)
++			fence_largest = hole_size;
++		fence_space += hole_size;
++
++skip_first:
++		last = vma->node.start + vma->node.size;
++	}
++	if (last < map_limit) {
++		hole_size = map_limit - last;
++		if (hole_size > map_largest)
++			map_largest = hole_size;
++		map_space += hole_size;
++
++		hole_size = __fence_size(dev_priv, last, map_limit);
++		if (hole_size > fence_largest)
++			fence_largest = hole_size;
++		fence_space += hole_size;
++	}
++
++	mutex_unlock(&dev->struct_mutex);
++
++	seq_printf(m, "Total size of the GTT: %llu bytes\n",
++		   arg.aper_size);
++	seq_printf(m, "Available space in the GTT: %llu bytes\n",
++		   arg.aper_available_size);
++	seq_printf(m, "Total space in the mappable aperture: %llu bytes\n",
++		   arg.map_total_size);
++	seq_printf(m, "Available space in the mappable aperture: %llu bytes\n",
++		   map_space);
++	seq_printf(m, "Single largest space in the mappable aperture: %llu bytes\n",
++		   map_largest);
++	seq_printf(m, "Available space for fences: %llu bytes\n",
++		   fence_space);
++	seq_printf(m, "Single largest fence available: %llu bytes\n",
++		   fence_largest);
++	seq_printf(m, "Total size of the stolen region: %llu bytes\n",
++		   arg.stolen_total_size);
++	seq_printf(m, "Available size of the stolen region: %llu bytes\n",
++		   stolen_free);
++	seq_printf(m, "Single largest area in the stolen region: %llu bytes\n",
++		   stolen_largest);
++
++	return 0;
++}
++
+ static int i915_gem_gtt_info(struct seq_file *m, void *data)
+ {
+ 	struct drm_info_node *node = m->private;
+@@ -5380,6 +5522,7 @@ static int i915_debugfs_create(struct dentry *root,
+ static const struct drm_info_list i915_debugfs_list[] = {
+ 	{"i915_capabilities", i915_capabilities, 0},
+ 	{"i915_gem_objects", i915_gem_object_info, 0},
++	{"i915_gem_aperture", i915_gem_aperture_info, 0},
+ 	{"i915_gem_gtt", i915_gem_gtt_info, 0},
+ 	{"i915_gem_pin_display", i915_gem_gtt_info, 0, (void *)1},
+ 	{"i915_gem_stolen", i915_gem_stolen_list_info },
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 618e9df..49e1913 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3550,6 +3550,9 @@ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
+ 					       u32 gtt_offset,
+ 					       u32 size);
+ int __must_check i915_gem_stolen_freeze(struct drm_i915_private *i915);
++void i915_gem_stolen_size_info(struct drm_i915_private *dev_priv,
++			       uint64_t *stolen_free,
++			       uint64_t *stolen_largest);
+ 
+ /* i915_gem_shrinker.c */
+ unsigned long i915_gem_shrink(struct drm_i915_private *dev_priv,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 81adc7d..ae0582f6 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -163,6 +163,10 @@ i915_gem_get_aperture_ioctl(struct drm_device *dev, void *data,
+ 
+ 	args->aper_size = ggtt->base.total;
+ 	args->aper_available_size = args->aper_size - pinned;
++	args->version = 1;
++	args->map_total_size = ggtt->mappable_end;
++	args->stolen_total_size =
++		dev_priv->mm.volatile_stolen ? 0 : ggtt->stolen_usable_size;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem_stolen.c b/drivers/gpu/drm/i915/i915_gem_stolen.c
+index ee31421..e9a9d70 100644
+--- a/drivers/gpu/drm/i915/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/i915_gem_stolen.c
+@@ -929,3 +929,30 @@ int i915_gem_stolen_freeze(struct drm_i915_private *i915)
+ 
+ 	return ret;
+ }
++
++
++void i915_gem_stolen_size_info(struct drm_i915_private *dev_priv,
++			       uint64_t *stolen_free,
++			       uint64_t *stolen_largest)
++{
++	struct drm_mm *mm = &dev_priv->mm.stolen;
++	struct drm_mm_node *hole;
++	uint64_t hole_size, hole_start, hole_end, largest_hole = 0;
++	uint64_t total_free = 0;
++
++	if (dev_priv->mm.volatile_stolen) {
++		*stolen_free = 0;
++		*stolen_largest = 0;
++		return;
++	}
++
++	drm_mm_for_each_hole(hole, mm, hole_start, hole_end) {
++			hole_size = hole_end - hole_start;
++			total_free += hole_size;
++			if (largest_hole < hole_size)
++				largest_hole = hole_size;
++	}
++
++	*stolen_free = total_free;
++	*stolen_largest = largest_hole;
++}
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 075506b..c3a3b51 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -1120,6 +1120,22 @@ struct drm_i915_gem_get_aperture {
+ 	 * bytes
+ 	 */
+ 	__u64 aper_available_size;
++
++	/**
++	 * Versioning to indicate if map_total_size and stolen_total_size
++	 * value returned are valid or not
++	 */
++	__u64 version;
++
++	/**
++	 * Total space in the mappable region of the aperture, in bytes
++	 */
++	__u64 map_total_size;
++
++	/**
++	 * Total space in the stolen region, in bytes
++	 */
++	__u64 stolen_total_size;
+ };
+ 
+ struct drm_i915_get_pipe_from_crtc_id {
+-- 
+1.7.5.4
+

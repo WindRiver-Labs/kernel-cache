@@ -1,0 +1,243 @@
+From 7af71dd6656564c458cca393a3b84a5bd2979065 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 7 Apr 2015 16:21:02 +0100
+Subject: [PATCH 0087/4706] drm/i915: Reduce locking in execlist command
+ submission
+
+commit a6111f7b6604e6cf98856839b56a2ae436fc0bab upstream
+
+This eliminates six needless spin lock/unlock pairs when writing out
+ELSP.
+
+v2: Respin with my preferred colour.
+v3: Mostly back to the original colour
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com> [v1]
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/i915_drv.h     |   18 ++++++
+ drivers/gpu/drm/i915/intel_lrc.c    |   16 +++---
+ drivers/gpu/drm/i915/intel_uncore.c |   98 +++++++++++++++++++++++++++--------
+ 3 files changed, 103 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 0fcd1ff..77517ba 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2538,6 +2538,13 @@ void intel_uncore_forcewake_get(struct drm_i915_private *dev_priv,
+ 				enum forcewake_domains domains);
+ void intel_uncore_forcewake_put(struct drm_i915_private *dev_priv,
+ 				enum forcewake_domains domains);
++/* Like above but the caller must manage the uncore.lock itself.
++ * Must be used with I915_READ_FW and friends.
++ */
++void intel_uncore_forcewake_get__locked(struct drm_i915_private *dev_priv,
++					enum forcewake_domains domains);
++void intel_uncore_forcewake_put__locked(struct drm_i915_private *dev_priv,
++					enum forcewake_domains domains);
+ void assert_forcewakes_inactive(struct drm_i915_private *dev_priv);
+ static inline bool intel_vgpu_active(struct drm_device *dev)
+ {
+@@ -3230,6 +3237,17 @@ int intel_freq_opcode(struct drm_i915_private *dev_priv, int val);
+ #define POSTING_READ(reg)	(void)I915_READ_NOTRACE(reg)
+ #define POSTING_READ16(reg)	(void)I915_READ16_NOTRACE(reg)
+ 
++/* These are untraced mmio-accessors that are only valid to be used inside
++ * criticial sections inside IRQ handlers where forcewake is explicitly
++ * controlled.
++ * Think twice, and think again, before using these.
++ * Note: Should only be used between intel_uncore_forcewake_irqlock() and
++ * intel_uncore_forcewake_irqunlock().
++ */
++#define I915_READ_FW(reg__) readl(dev_priv->regs + (reg__))
++#define I915_WRITE_FW(reg__, val__) writel(val__, dev_priv->regs + (reg__))
++#define POSTING_READ_FW(reg__) (void)I915_READ_FW(reg__)
++
+ /* "Broadcast RGB" property */
+ #define INTEL_BROADCAST_RGB_AUTO 0
+ #define INTEL_BROADCAST_RGB_FULL 1
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 6746627..9d69871 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -315,17 +315,19 @@ static void execlists_elsp_write(struct intel_engine_cs *ring,
+ 	desc[3] = (u32)(temp >> 32);
+ 	desc[2] = (u32)temp;
+ 
+-	intel_uncore_forcewake_get(dev_priv, FORCEWAKE_ALL);
+-	I915_WRITE(RING_ELSP(ring), desc[1]);
+-	I915_WRITE(RING_ELSP(ring), desc[0]);
+-	I915_WRITE(RING_ELSP(ring), desc[3]);
++	spin_lock(&dev_priv->uncore.lock);
++	intel_uncore_forcewake_get__locked(dev_priv, FORCEWAKE_ALL);
++	I915_WRITE_FW(RING_ELSP(ring), desc[1]);
++	I915_WRITE_FW(RING_ELSP(ring), desc[0]);
++	I915_WRITE_FW(RING_ELSP(ring), desc[3]);
+ 
+ 	/* The context is automatically loaded after the following */
+-	I915_WRITE(RING_ELSP(ring), desc[2]);
++	I915_WRITE_FW(RING_ELSP(ring), desc[2]);
+ 
+ 	/* ELSP is a wo register, so use another nearby reg for posting instead */
+-	POSTING_READ(RING_EXECLIST_STATUS(ring));
+-	intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
++	POSTING_READ_FW(RING_EXECLIST_STATUS(ring));
++	intel_uncore_forcewake_put__locked(dev_priv, FORCEWAKE_ALL);
++	spin_unlock(&dev_priv->uncore.lock);
+ }
+ 
+ static int execlists_update_context(struct drm_i915_gem_object *ctx_obj,
+diff --git a/drivers/gpu/drm/i915/intel_uncore.c b/drivers/gpu/drm/i915/intel_uncore.c
+index ff2a746..a6d8a3e 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -383,6 +383,26 @@ void intel_uncore_sanitize(struct drm_device *dev)
+ 	intel_disable_gt_powersave(dev);
+ }
+ 
++static void __intel_uncore_forcewake_get(struct drm_i915_private *dev_priv,
++					 enum forcewake_domains fw_domains)
++{
++	struct intel_uncore_forcewake_domain *domain;
++	enum forcewake_domain_id id;
++
++	if (!dev_priv->uncore.funcs.force_wake_get)
++		return;
++
++	fw_domains &= dev_priv->uncore.fw_domains;
++
++	for_each_fw_domain_mask(domain, fw_domains, dev_priv, id) {
++		if (domain->wake_count++)
++			fw_domains &= ~(1 << id);
++	}
++
++	if (fw_domains)
++		dev_priv->uncore.funcs.force_wake_get(dev_priv, fw_domains);
++}
++
+ /**
+  * intel_uncore_forcewake_get - grab forcewake domain references
+  * @dev_priv: i915 device instance
+@@ -400,41 +420,39 @@ void intel_uncore_forcewake_get(struct drm_i915_private *dev_priv,
+ 				enum forcewake_domains fw_domains)
+ {
+ 	unsigned long irqflags;
+-	struct intel_uncore_forcewake_domain *domain;
+-	enum forcewake_domain_id id;
+ 
+ 	if (!dev_priv->uncore.funcs.force_wake_get)
+ 		return;
+ 
+ 	WARN_ON(dev_priv->pm.suspended);
+ 
+-	fw_domains &= dev_priv->uncore.fw_domains;
+-
+ 	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
+-
+-	for_each_fw_domain_mask(domain, fw_domains, dev_priv, id) {
+-		if (domain->wake_count++)
+-			fw_domains &= ~(1 << id);
+-	}
+-
+-	if (fw_domains)
+-		dev_priv->uncore.funcs.force_wake_get(dev_priv, fw_domains);
+-
++	__intel_uncore_forcewake_get(dev_priv, fw_domains);
+ 	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
+ }
+ 
+ /**
+- * intel_uncore_forcewake_put - release a forcewake domain reference
++ * intel_uncore_forcewake_get__locked - grab forcewake domain references
+  * @dev_priv: i915 device instance
+- * @fw_domains: forcewake domains to put references
++ * @fw_domains: forcewake domains to get reference on
+  *
+- * This function drops the device-level forcewakes for specified
+- * domains obtained by intel_uncore_forcewake_get().
++ * See intel_uncore_forcewake_get(). This variant places the onus
++ * on the caller to explicitly handle the dev_priv->uncore.lock spinlock.
+  */
+-void intel_uncore_forcewake_put(struct drm_i915_private *dev_priv,
+-				enum forcewake_domains fw_domains)
++void intel_uncore_forcewake_get__locked(struct drm_i915_private *dev_priv,
++					enum forcewake_domains fw_domains)
++{
++	assert_spin_locked(&dev_priv->uncore.lock);
++
++	if (!dev_priv->uncore.funcs.force_wake_get)
++		return;
++
++	__intel_uncore_forcewake_get(dev_priv, fw_domains);
++}
++
++static void __intel_uncore_forcewake_put(struct drm_i915_private *dev_priv,
++					 enum forcewake_domains fw_domains)
+ {
+-	unsigned long irqflags;
+ 	struct intel_uncore_forcewake_domain *domain;
+ 	enum forcewake_domain_id id;
+ 
+@@ -443,8 +461,6 @@ void intel_uncore_forcewake_put(struct drm_i915_private *dev_priv,
+ 
+ 	fw_domains &= dev_priv->uncore.fw_domains;
+ 
+-	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
+-
+ 	for_each_fw_domain_mask(domain, fw_domains, dev_priv, id) {
+ 		if (WARN_ON(domain->wake_count == 0))
+ 			continue;
+@@ -455,10 +471,48 @@ void intel_uncore_forcewake_put(struct drm_i915_private *dev_priv,
+ 		domain->wake_count++;
+ 		fw_domain_arm_timer(domain);
+ 	}
++}
+ 
++/**
++ * intel_uncore_forcewake_put - release a forcewake domain reference
++ * @dev_priv: i915 device instance
++ * @fw_domains: forcewake domains to put references
++ *
++ * This function drops the device-level forcewakes for specified
++ * domains obtained by intel_uncore_forcewake_get().
++ */
++void intel_uncore_forcewake_put(struct drm_i915_private *dev_priv,
++				enum forcewake_domains fw_domains)
++{
++	unsigned long irqflags;
++
++	if (!dev_priv->uncore.funcs.force_wake_put)
++		return;
++
++	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
++	__intel_uncore_forcewake_put(dev_priv, fw_domains);
+ 	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
+ }
+ 
++/**
++ * intel_uncore_forcewake_put__locked - grab forcewake domain references
++ * @dev_priv: i915 device instance
++ * @fw_domains: forcewake domains to get reference on
++ *
++ * See intel_uncore_forcewake_put(). This variant places the onus
++ * on the caller to explicitly handle the dev_priv->uncore.lock spinlock.
++ */
++void intel_uncore_forcewake_put__locked(struct drm_i915_private *dev_priv,
++					enum forcewake_domains fw_domains)
++{
++	assert_spin_locked(&dev_priv->uncore.lock);
++
++	if (!dev_priv->uncore.funcs.force_wake_put)
++		return;
++
++	__intel_uncore_forcewake_put(dev_priv, fw_domains);
++}
++
+ void assert_forcewakes_inactive(struct drm_i915_private *dev_priv)
+ {
+ 	struct intel_uncore_forcewake_domain *domain;
+-- 
+1.7.5.4
+

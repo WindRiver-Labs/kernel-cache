@@ -1,0 +1,182 @@
+From fccdfed76ffb778483c45caab00e39c55e001877 Mon Sep 17 00:00:00 2001
+From: Lyude <cpaul@redhat.com>
+Date: Wed, 13 Apr 2016 10:58:31 -0400
+Subject: [PATCH 2900/4706] drm/dp_helper: Retry aux transactions on all
+ errors
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 82922da39190199260a726d7081a8ea4873e5fd6 upstream
+
+This is part of a patch series to migrate all of the workarounds for
+commonly seen behavior from bad sinks in intel_dp_dpcd_read_wake() to
+drm's DP helper.
+
+We cannot rely on sinks NACKing or deferring when they can't receive
+transactions, nor can we rely on any other sort of consistent error to
+know when we should stop retrying. As such, we need to just retry
+unconditionally on errors. We also make sure here to return the error we
+encountered during the first transaction, since it's possible that
+retrying the transaction might return a different error then we had
+originally.
+
+This, along with the previous patch, work around a weird bug with the
+ThinkPad T560's and it's dock. When resuming the laptop, it appears that
+there's a short period of time where we're unable to complete any aux
+transactions, as they all immediately timeout. The only machine I'm able
+to reproduce this on is the T560 as other production Skylake models seem
+to be fine. The period during which AUX transactions fail appears to be
+around 22ms long. AFAIK, the dock for the T560 never actually turns off,
+the only difference is that it's in SST mode at the start of the resume
+process, so it's unclear as to why it would need so much time to come
+back up.
+
+There's been a discussion on this issue going on for a while on the
+intel-gfx mailing list about this that has, in addition to including
+developers from Intel, also had the correspondence of one of the
+hardware engineers for Intel:
+
+http://www.spinics.net/lists/intel-gfx/msg88831.html
+http://www.spinics.net/lists/intel-gfx/msg88410.html
+
+We've already looked into a couple of possible explanations for the
+problem:
+
+- Calling intel_dp_mst_resume() before right fix.
+  intel_runtime_pm_enable_interrupts(). This was the first fix I tried,
+  and while it worked it definitely wasn't the right fix. This worked
+  because DP aux transactions don't actually require interrupts to work:
+
+	static uint32_t
+	intel_dp_aux_wait_done(struct intel_dp *intel_dp, bool has_aux_irq)
+	{
+		struct intel_digital_port *intel_dig_port = dp_to_dig_port(intel_dp);
+		struct drm_device *dev = intel_dig_port->base.base.dev;
+		struct drm_i915_private *dev_priv = dev->dev_private;
+		i915_reg_t ch_ctl = intel_dp->aux_ch_ctl_reg;
+		uint32_t status;
+		bool done;
+
+	#define C (((status = I915_READ_NOTRACE(ch_ctl)) & DP_AUX_CH_CTL_SEND_BUSY) == 0)
+		if (has_aux_irq)
+			done = wait_event_timeout(dev_priv->gmbus_wait_queue, C,
+						  msecs_to_jiffies_timeout(10));
+		else
+			done = wait_for_atomic(C, 10) == 0;
+		if (!done)
+			DRM_ERROR("dp aux hw did not signal timeout (has irq: %i)!\n",
+				  has_aux_irq);
+	#undef C
+
+		return status;
+	}
+
+  When there's no interrupts enabled, we end up timing out on the
+  wait_event_timeout() call, which causes us to check the DP status
+  register once to see if the transaction was successful or not. Since
+  this adds a 10ms delay to each aux transaction, it ends up adding a
+  long enough delay to the resume process for aux transactions to become
+  functional again. This gave us the illusion that enabling interrupts
+  had something to do with making things work again, and put me on the
+  wrong track for a while.
+
+- Interrupts occurring when we try to perform the aux transactions
+  required to put the dock back into MST mode. This isn't the problem,
+  as the only interrupts I've observed that come during this timeout
+  period are from the snd_hda_intel driver, and disabling that driver
+  doesn't appear to change the behavior at all.
+
+- Skylake's PSR block causing issues by performing aux transactions
+  while we try to bring the dock out of MST mode. Disabling PSR through
+  i915's command line options doesn't seem to change the behavior
+  either, nor does preventing the DMC firmware from being loaded.
+
+Since this investigation went on for about 2 weeks, we decided it would
+be better for the time being to just workaround this issue by making
+sure AUX transactions wait a short period of time before retrying.
+
+Signed-off-by: Lyude <cpaul@redhat.com>
+Tested-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/1460559513-32280-3-git-send-email-cpaul@redhat.com
+---
+ drivers/gpu/drm/drm_dp_helper.c |   42 ++++++++++++++++++++------------------
+ 1 files changed, 22 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_dp_helper.c b/drivers/gpu/drm/drm_dp_helper.c
+index 7dd330a..540c3e4 100644
+--- a/drivers/gpu/drm/drm_dp_helper.c
++++ b/drivers/gpu/drm/drm_dp_helper.c
+@@ -178,8 +178,8 @@ static int drm_dp_dpcd_access(struct drm_dp_aux *aux, u8 request,
+ 			      unsigned int offset, void *buffer, size_t size)
+ {
+ 	struct drm_dp_aux_msg msg;
+-	unsigned int retry;
+-	int err = 0;
++	unsigned int retry, native_reply;
++	int err = 0, ret = 0;
+ 
+ 	memset(&msg, 0, sizeof(msg));
+ 	msg.address = offset;
+@@ -196,37 +196,39 @@ static int drm_dp_dpcd_access(struct drm_dp_aux *aux, u8 request,
+ 	 * sufficient, bump to 32 which makes Dell 4k monitors happier.
+ 	 */
+ 	for (retry = 0; retry < 32; retry++) {
+-		if (err != 0 && err != -ETIMEDOUT) {
++		if (ret != 0 && ret != -ETIMEDOUT) {
+ 			usleep_range(AUX_RETRY_INTERVAL,
+ 				     AUX_RETRY_INTERVAL + 100);
+ 		}
+ 
+-		err = aux->transfer(aux, &msg);
+-		if (err < 0) {
+-			if (err == -EBUSY)
+-				continue;
+-
+-			goto unlock;
+-		}
++		ret = aux->transfer(aux, &msg);
+ 
+-		switch (msg.reply & DP_AUX_NATIVE_REPLY_MASK) {
+-		case DP_AUX_NATIVE_REPLY_ACK:
+-			if (err < size)
+-				err = -EPROTO;
+-			goto unlock;
++		if (ret > 0) {
++			native_reply = msg.reply & DP_AUX_NATIVE_REPLY_MASK;
++			if (native_reply == DP_AUX_NATIVE_REPLY_ACK) {
++				if (ret == size)
++					goto unlock;
+ 
+-		case DP_AUX_NATIVE_REPLY_NACK:
+-			err = -EIO;
+-			goto unlock;
++				ret = -EPROTO;
++			} else
++				ret = -EIO;
+ 		}
++
++		/*
++		 * We want the error we return to be the error we received on
++		 * the first transaction, since we may get a different error the
++		 * next time we retry
++		 */
++		if (!err)
++			err = ret;
+ 	}
+ 
+ 	DRM_DEBUG_KMS("too many retries, giving up\n");
+-	err = -EIO;
++	ret = err;
+ 
+ unlock:
+ 	mutex_unlock(&aux->hw_mutex);
+-	return err;
++	return ret;
+ }
+ 
+ /**
+-- 
+1.7.5.4
+

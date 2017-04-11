@@ -1,0 +1,215 @@
+From cf90711eb888d069cb30a8518b7e09b0fae725d2 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 1 Jul 2016 17:23:21 +0100
+Subject: [PATCH 3567/4706] drm/i915: Add a delay between interrupt and
+ inspecting the final seqno (ilk)
+
+commit f8973c217f07903247d222ab92ad37e2529aff2e upstream
+
+On Ironlake, there is no command nor register to ensure that the write
+from a MI_STORE command is completed (and coherent on the CPU) before the
+command parser continues. This means that the ordering between the seqno
+write and the subsequent user interrupt is undefined (like gen6+). So to
+ensure that the seqno write is completed after the final user interrupt
+we need to delay the read sufficiently to allow the write to complete.
+This delay is undefined by the bspec, and empirically requires 75us even
+though a register read combined with a clflush is less than 500ns. Hence,
+the delay is due to an on-chip buffer rather than the latency of the write
+to memory.
+
+Note that the render ring controls this by filling the PIPE_CONTROL fifo
+with stalling commands that force the earliest pipe-control with the
+seqno to be completed before the command parser continues. Given that we
+need a barrier operation for BSD, we may as well forgo the extra
+per-batch latency by using a common per-interrupt barrier.
+
+Studying the impact of adding the usleep shows that in both sequences of
+and individual synchronous no-op batches is negligible for the media
+engine (where the write now is unordered with the interrupt). Converting
+the render engine over from the current glutton of pie-controls over to
+the per-interrupt delays speeds up both the sequential and individual
+synchronous no-ops by 20% and 60%, respectively. This speed up holds
+even when looking at the throughput of small copies (4KiB->4MiB), both
+serial and synchronous, by about 20%. This is because despite adding a
+significant delay to the interrupt, in all likelihood we will see the
+seqno write without having to apply the barrier (only in the rare corner
+cases where the write is delayed on the last required is the delay
+necessary).
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=94307
+Testcase: igt/gem_sync #ilk
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1467390209-3576-12-git-send-email-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_irq.c         |   10 +---
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   81 +++++++------------------------
+ 2 files changed, 20 insertions(+), 71 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 8b476932..ba93ada 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1276,8 +1276,7 @@ static void ivybridge_parity_error_irq_handler(struct drm_i915_private *dev_priv
+ static void ilk_gt_irq_handler(struct drm_i915_private *dev_priv,
+ 			       u32 gt_iir)
+ {
+-	if (gt_iir &
+-	    (GT_RENDER_USER_INTERRUPT | GT_RENDER_PIPECTL_NOTIFY_INTERRUPT))
++	if (gt_iir & GT_RENDER_USER_INTERRUPT)
+ 		notify_ring(&dev_priv->engine[RCS]);
+ 	if (gt_iir & ILK_BSD_USER_INTERRUPT)
+ 		notify_ring(&dev_priv->engine[VCS]);
+@@ -1286,9 +1285,7 @@ static void ilk_gt_irq_handler(struct drm_i915_private *dev_priv,
+ static void snb_gt_irq_handler(struct drm_i915_private *dev_priv,
+ 			       u32 gt_iir)
+ {
+-
+-	if (gt_iir &
+-	    (GT_RENDER_USER_INTERRUPT | GT_RENDER_PIPECTL_NOTIFY_INTERRUPT))
++	if (gt_iir & GT_RENDER_USER_INTERRUPT)
+ 		notify_ring(&dev_priv->engine[RCS]);
+ 	if (gt_iir & GT_BSD_USER_INTERRUPT)
+ 		notify_ring(&dev_priv->engine[VCS]);
+@@ -3613,8 +3610,7 @@ static void gen5_gt_irq_postinstall(struct drm_device *dev)
+ 
+ 	gt_irqs |= GT_RENDER_USER_INTERRUPT;
+ 	if (IS_GEN5(dev)) {
+-		gt_irqs |= GT_RENDER_PIPECTL_NOTIFY_INTERRUPT |
+-			   ILK_BSD_USER_INTERRUPT;
++		gt_irqs |= ILK_BSD_USER_INTERRUPT;
+ 	} else {
+ 		gt_irqs |= GT_BLT_USER_INTERRUPT | GT_BSD_USER_INTERRUPT;
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 4dda985..1144ff8 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1593,67 +1593,22 @@ gen6_ring_sync(struct drm_i915_gem_request *waiter_req,
+ 	return 0;
+ }
+ 
+-#define PIPE_CONTROL_FLUSH(ring__, addr__)					\
+-do {									\
+-	intel_ring_emit(ring__, GFX_OP_PIPE_CONTROL(4) | PIPE_CONTROL_QW_WRITE |		\
+-		 PIPE_CONTROL_DEPTH_STALL);				\
+-	intel_ring_emit(ring__, (addr__) | PIPE_CONTROL_GLOBAL_GTT);			\
+-	intel_ring_emit(ring__, 0);							\
+-	intel_ring_emit(ring__, 0);							\
+-} while (0)
+-
+-static int
+-pc_render_add_request(struct drm_i915_gem_request *req)
++static void
++gen5_seqno_barrier(struct intel_engine_cs *ring)
+ {
+-	struct intel_engine_cs *engine = req->engine;
+-	u32 addr = engine->status_page.gfx_addr +
+-		(I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
+-	u32 scratch_addr = addr;
+-	int ret;
+-
+-	/* For Ironlake, MI_USER_INTERRUPT was deprecated and apparently
+-	 * incoherent with writes to memory, i.e. completely fubar,
+-	 * so we need to use PIPE_NOTIFY instead.
++	/* MI_STORE are internally buffered by the GPU and not flushed
++	 * either by MI_FLUSH or SyncFlush or any other combination of
++	 * MI commands.
+ 	 *
+-	 * However, we also need to workaround the qword write
+-	 * incoherence by flushing the 6 PIPE_NOTIFY buffers out to
+-	 * memory before requesting an interrupt.
++	 * "Only the submission of the store operation is guaranteed.
++	 * The write result will be complete (coherent) some time later
++	 * (this is practically a finite period but there is no guaranteed
++	 * latency)."
++	 *
++	 * Empirically, we observe that we need a delay of at least 75us to
++	 * be sure that the seqno write is visible by the CPU.
+ 	 */
+-	ret = intel_ring_begin(req, 32);
+-	if (ret)
+-		return ret;
+-
+-	intel_ring_emit(engine,
+-			GFX_OP_PIPE_CONTROL(4) |
+-			PIPE_CONTROL_QW_WRITE |
+-			PIPE_CONTROL_WRITE_FLUSH |
+-			PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE);
+-	intel_ring_emit(engine, addr | PIPE_CONTROL_GLOBAL_GTT);
+-	intel_ring_emit(engine, req->seqno);
+-	intel_ring_emit(engine, 0);
+-	PIPE_CONTROL_FLUSH(engine, scratch_addr);
+-	scratch_addr += 2 * CACHELINE_BYTES; /* write to separate cachelines */
+-	PIPE_CONTROL_FLUSH(engine, scratch_addr);
+-	scratch_addr += 2 * CACHELINE_BYTES;
+-	PIPE_CONTROL_FLUSH(engine, scratch_addr);
+-	scratch_addr += 2 * CACHELINE_BYTES;
+-	PIPE_CONTROL_FLUSH(engine, scratch_addr);
+-	scratch_addr += 2 * CACHELINE_BYTES;
+-	PIPE_CONTROL_FLUSH(engine, scratch_addr);
+-	scratch_addr += 2 * CACHELINE_BYTES;
+-	PIPE_CONTROL_FLUSH(engine, scratch_addr);
+-
+-	intel_ring_emit(engine,
+-			GFX_OP_PIPE_CONTROL(4) | PIPE_CONTROL_QW_WRITE |
+-			PIPE_CONTROL_WRITE_FLUSH |
+-			PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE |
+-			PIPE_CONTROL_NOTIFY);
+-	intel_ring_emit(engine, addr | PIPE_CONTROL_GLOBAL_GTT);
+-	intel_ring_emit(engine, req->seqno);
+-	intel_ring_emit(engine, 0);
+-	__intel_ring_advance(engine);
+-
+-	return 0;
++	usleep_range(125, 250);
+ }
+ 
+ static void
+@@ -2964,6 +2919,7 @@ static void intel_ring_init_irq(struct drm_i915_private *dev_priv,
+ 	} else if (INTEL_GEN(dev_priv) >= 5) {
+ 		engine->irq_get = gen5_ring_get_irq;
+ 		engine->irq_put = gen5_ring_put_irq;
++		engine->irq_seqno_barrier = gen5_seqno_barrier;
+ 	} else if (INTEL_GEN(dev_priv) >= 3) {
+ 		engine->irq_get = i9xx_ring_get_irq;
+ 		engine->irq_put = i9xx_ring_put_irq;
+@@ -3012,11 +2968,12 @@ int intel_init_render_ring_buffer(struct drm_device *dev)
+ 
+ 	intel_ring_default_vfuncs(dev_priv, engine);
+ 
++	engine->irq_enable_mask = GT_RENDER_USER_INTERRUPT;
++
+ 	if (INTEL_GEN(dev_priv) >= 8) {
+ 		engine->init_context = intel_rcs_ctx_init;
+ 		engine->add_request = gen8_render_add_request;
+ 		engine->flush = gen8_render_ring_flush;
+-		engine->irq_enable_mask = GT_RENDER_USER_INTERRUPT;
+ 		if (i915_semaphore_is_enabled(dev_priv))
+ 			engine->semaphore.signal = gen8_rcs_signal;
+ 	} else if (INTEL_GEN(dev_priv) >= 6) {
+@@ -3024,12 +2981,8 @@ int intel_init_render_ring_buffer(struct drm_device *dev)
+ 		engine->flush = gen7_render_ring_flush;
+ 		if (IS_GEN6(dev_priv))
+ 			engine->flush = gen6_render_ring_flush;
+-		engine->irq_enable_mask = GT_RENDER_USER_INTERRUPT;
+ 	} else if (IS_GEN5(dev_priv)) {
+-		engine->add_request = pc_render_add_request;
+ 		engine->flush = gen4_render_ring_flush;
+-		engine->irq_enable_mask = GT_RENDER_USER_INTERRUPT |
+-					GT_RENDER_PIPECTL_NOTIFY_INTERRUPT;
+ 	} else {
+ 		if (INTEL_GEN(dev_priv) < 4)
+ 			engine->flush = gen2_render_ring_flush;
+@@ -3048,7 +3001,7 @@ int intel_init_render_ring_buffer(struct drm_device *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (INTEL_GEN(dev_priv) >= 5) {
++	if (INTEL_GEN(dev_priv) >= 6) {
+ 		ret = intel_init_pipe_control(engine, 4096);
+ 		if (ret)
+ 			return ret;
+-- 
+1.7.5.4
+

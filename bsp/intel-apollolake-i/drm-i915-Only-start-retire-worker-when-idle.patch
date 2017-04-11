@@ -1,0 +1,534 @@
+From 0c45a9eb34ae43e8832c698f1089619de5d6f805 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 4 Jul 2016 08:08:31 +0100
+Subject: [PATCH 3587/4706] drm/i915: Only start retire worker when idle
+
+commit 67d97da34917fb0b21af4c0942a6e03b4b10c094 upstream
+
+The retire worker is a low frequency task that makes sure we retire
+outstanding requests if userspace is being lax. We only need to start it
+once as it remains active until the GPU is idle, so do a cheap test
+before the more expensive queue_work(). A consequence of this is that we
+need correct locking in the worker to make the hot path of request
+submission cheap. To keep the symmetry and keep hangcheck strictly bound
+by the GPU's wakelock, we move the cancel_sync(hangcheck) to the idle
+worker before dropping the wakelock.
+
+v2: Guard against RCU fouling the breadcrumbs bottom-half whilst we kick
+the waiter.
+v3: Remove the wakeref assertion squelching (now we hold a wakeref for
+the hangcheck, any rpm error there is genuine).
+v4: To prevent excess work when retiring requests, we split the busy
+flag into two, a boolean to denote whether we hold the wakeref and a
+bitmask of active engines.
+v5: Reorder cancelling hangcheck upon idling to avoid a race where we
+might cancel a hangcheck after being preempted by a new task
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+References: https://bugs.freedesktop.org/show_bug.cgi?id=88437
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1467616119-4093-1-git-send-email-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_debugfs.c        |    5 +-
+ drivers/gpu/drm/i915/i915_drv.c            |    2 -
+ drivers/gpu/drm/i915/i915_drv.h            |   56 ++++++------
+ drivers/gpu/drm/i915/i915_gem.c            |  135 +++++++++++++++++++---------
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    6 ++
+ drivers/gpu/drm/i915/i915_irq.c            |   15 +---
+ drivers/gpu/drm/i915/intel_display.c       |   25 -----
+ drivers/gpu/drm/i915/intel_pm.c            |    2 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |    4 +-
+ 9 files changed, 135 insertions(+), 115 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 7d3fe2e..8e157cc 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -2441,7 +2441,8 @@ static int i915_rps_boost_info(struct seq_file *m, void *data)
+ 	struct drm_file *file;
+ 
+ 	seq_printf(m, "RPS enabled? %d\n", dev_priv->rps.enabled);
+-	seq_printf(m, "GPU busy? %d\n", dev_priv->mm.busy);
++	seq_printf(m, "GPU busy? %s [%x]\n",
++		   yesno(dev_priv->gt.awake), dev_priv->gt.active_engines);
+ 	seq_printf(m, "CPU waiting? %d\n", count_irq_waiters(dev_priv));
+ 	seq_printf(m, "Frequency requested %d; min hard:%d, soft:%d; max soft:%d, hard:%d\n",
+ 		   intel_gpu_freq(dev_priv, dev_priv->rps.cur_freq),
+@@ -2785,7 +2786,7 @@ static int i915_runtime_pm_status(struct seq_file *m, void *unused)
+ 	if (!HAS_RUNTIME_PM(dev_priv))
+ 		seq_puts(m, "Runtime power management not supported\n");
+ 
+-	seq_printf(m, "GPU idle: %s\n", yesno(!dev_priv->mm.busy));
++	seq_printf(m, "GPU idle: %s\n", yesno(!dev_priv->gt.awake));
+ 	seq_printf(m, "IRQs disabled: %s\n",
+ 		   yesno(!intel_irqs_enabled(dev_priv)));
+ #ifdef CONFIG_PM
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 3cebce5..6bd15dd 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -2739,8 +2739,6 @@ static int intel_runtime_suspend(struct device *device)
+ 	i915_gem_release_all_mmaps(dev_priv);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+-	cancel_delayed_work_sync(&dev_priv->gpu_error.hangcheck_work);
+-
+ 	intel_guc_suspend(dev);
+ 
+ 	intel_suspend_gt_powersave(dev_priv);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index f0874e4..dcfa4cf 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1312,37 +1312,11 @@ struct i915_gem_mm {
+ 	struct list_head fence_list;
+ 
+ 	/**
+-	 * We leave the user IRQ off as much as possible,
+-	 * but this means that requests will finish and never
+-	 * be retired once the system goes idle. Set a timer to
+-	 * fire periodically while the ring is running. When it
+-	 * fires, go retire requests.
+-	 */
+-	struct delayed_work retire_work;
+-
+-	/**
+-	 * When we detect an idle GPU, we want to turn on
+-	 * powersaving features. So once we see that there
+-	 * are no more requests outstanding and no more
+-	 * arrive within a small period of time, we fire
+-	 * off the idle_work.
+-	 */
+-	struct delayed_work idle_work;
+-
+-	/**
+ 	 * Are we in a non-interruptible section of code like
+ 	 * modesetting?
+ 	 */
+ 	bool interruptible;
+ 
+-	/**
+-	 * Is the GPU currently considered idle, or busy executing userspace
+-	 * requests?  Whilst idle, we attempt to power down the hardware and
+-	 * display clocks. In order to reduce the effect on performance, there
+-	 * is a slight delay before we do so.
+-	 */
+-	bool busy;
+-
+ 	/* the indicator for dispatch video commands on two BSD rings */
+ 	unsigned int bsd_ring_dispatch_index;
+ 
+@@ -2043,6 +2017,34 @@ struct drm_i915_private {
+ 		int (*init_engines)(struct drm_device *dev);
+ 		void (*cleanup_engine)(struct intel_engine_cs *engine);
+ 		void (*stop_engine)(struct intel_engine_cs *engine);
++
++		/**
++		 * Is the GPU currently considered idle, or busy executing
++		 * userspace requests? Whilst idle, we allow runtime power
++		 * management to power down the hardware and display clocks.
++		 * In order to reduce the effect on performance, there
++		 * is a slight delay before we do so.
++		 */
++		unsigned int active_engines;
++		bool awake;
++
++		/**
++		 * We leave the user IRQ off as much as possible,
++		 * but this means that requests will finish and never
++		 * be retired once the system goes idle. Set a timer to
++		 * fire periodically while the ring is running. When it
++		 * fires, go retire requests.
++		 */
++		struct delayed_work retire_work;
++
++		/**
++		 * When we detect an idle GPU, we want to turn on
++		 * powersaving features. So once we see that there
++		 * are no more requests outstanding and no more
++		 * arrive within a small period of time, we fire
++		 * off the idle_work.
++		 */
++		struct delayed_work idle_work;
+ 	} gt;
+ 
+ 	/* perform PHY state sanity checks? */
+@@ -3315,7 +3317,7 @@ int __must_check i915_gem_set_seqno(struct drm_device *dev, u32 seqno);
+ struct drm_i915_gem_request *
+ i915_gem_find_active_request(struct intel_engine_cs *engine);
+ 
+-bool i915_gem_retire_requests(struct drm_i915_private *dev_priv);
++void i915_gem_retire_requests(struct drm_i915_private *dev_priv);
+ void i915_gem_retire_requests_ring(struct intel_engine_cs *engine);
+ 
+ static inline u32 i915_reset_counter(struct i915_gpu_error *error)
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index b7d2730..139163f 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2807,6 +2807,26 @@ i915_gem_get_seqno(struct drm_i915_private *dev_priv, u32 *seqno)
+ 	return 0;
+ }
+ 
++static void i915_gem_mark_busy(const struct intel_engine_cs *engine)
++{
++	struct drm_i915_private *dev_priv = engine->i915;
++
++	dev_priv->gt.active_engines |= intel_engine_flag(engine);
++	if (dev_priv->gt.awake)
++		return;
++
++	intel_runtime_pm_get_noresume(dev_priv);
++	dev_priv->gt.awake = true;
++
++	i915_update_gfx_val(dev_priv);
++	if (INTEL_GEN(dev_priv) >= 6)
++		gen6_rps_busy(dev_priv);
++
++	queue_delayed_work(dev_priv->wq,
++			   &dev_priv->gt.retire_work,
++			   round_jiffies_up_relative(HZ));
++}
++
+ /*
+  * NB: This function is not allowed to fail. Doing so would mean the the
+  * request is not being tracked for completion but the work itself is
+@@ -2817,7 +2837,6 @@ void __i915_add_request(struct drm_i915_gem_request *request,
+ 			bool flush_caches)
+ {
+ 	struct intel_engine_cs *engine;
+-	struct drm_i915_private *dev_priv;
+ 	struct intel_ringbuffer *ringbuf;
+ 	u32 request_start;
+ 	u32 reserved_tail;
+@@ -2827,7 +2846,6 @@ void __i915_add_request(struct drm_i915_gem_request *request,
+ 		return;
+ 
+ 	engine = request->engine;
+-	dev_priv = request->i915;
+ 	ringbuf = request->ringbuf;
+ 
+ 	/*
+@@ -2893,12 +2911,6 @@ void __i915_add_request(struct drm_i915_gem_request *request,
+ 	}
+ 	/* Not allowed to fail! */
+ 	WARN(ret, "emit|add_request failed: %d!\n", ret);
+-
+-	queue_delayed_work(dev_priv->wq,
+-			   &dev_priv->mm.retire_work,
+-			   round_jiffies_up_relative(HZ));
+-	intel_mark_busy(dev_priv);
+-
+ 	/* Sanity check that the reserved size was large enough. */
+ 	ret = intel_ring_get_tail(ringbuf) - request_start;
+ 	if (ret < 0)
+@@ -2907,6 +2919,8 @@ void __i915_add_request(struct drm_i915_gem_request *request,
+ 		  "Not enough space reserved (%d bytes) "
+ 		  "for adding the request (%d bytes)\n",
+ 		  reserved_tail, ret);
++
++	i915_gem_mark_busy(engine);
+ }
+ 
+ static bool i915_context_is_banned(struct drm_i915_private *dev_priv,
+@@ -3221,46 +3235,49 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *engine)
+ 	WARN_ON(i915_verify_lists(engine->dev));
+ }
+ 
+-bool
+-i915_gem_retire_requests(struct drm_i915_private *dev_priv)
++void i915_gem_retire_requests(struct drm_i915_private *dev_priv)
+ {
+ 	struct intel_engine_cs *engine;
+-	bool idle = true;
++
++	lockdep_assert_held(&dev_priv->dev->struct_mutex);
++
++	if (dev_priv->gt.active_engines == 0)
++		return;
++
++	GEM_BUG_ON(!dev_priv->gt.awake);
+ 
+ 	for_each_engine(engine, dev_priv) {
+ 		i915_gem_retire_requests_ring(engine);
+-		idle &= list_empty(&engine->request_list);
+-		if (i915.enable_execlists) {
+-			spin_lock_bh(&engine->execlist_lock);
+-			idle &= list_empty(&engine->execlist_queue);
+-			spin_unlock_bh(&engine->execlist_lock);
+-		}
++		if (list_empty(&engine->request_list))
++			dev_priv->gt.active_engines &= ~intel_engine_flag(engine);
+ 	}
+ 
+-	if (idle)
++	if (dev_priv->gt.active_engines == 0)
+ 		mod_delayed_work(dev_priv->wq,
+-				 &dev_priv->mm.idle_work,
++				 &dev_priv->gt.idle_work,
+ 				 msecs_to_jiffies(100));
+-
+-	return idle;
+ }
+ 
+ static void
+ i915_gem_retire_work_handler(struct work_struct *work)
+ {
+ 	struct drm_i915_private *dev_priv =
+-		container_of(work, typeof(*dev_priv), mm.retire_work.work);
++		container_of(work, typeof(*dev_priv), gt.retire_work.work);
+ 	struct drm_device *dev = dev_priv->dev;
+-	bool idle;
+ 
+ 	/* Come back later if the device is busy... */
+-	idle = false;
+ 	if (mutex_trylock(&dev->struct_mutex)) {
+-		idle = i915_gem_retire_requests(dev_priv);
++		i915_gem_retire_requests(dev_priv);
+ 		mutex_unlock(&dev->struct_mutex);
+ 	}
+-	if (!idle)
+-		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work,
++
++	/* Keep the retire handler running until we are finally idle.
++	 * We do not need to do this test under locking as in the worst-case
++	 * we queue the retire worker once too often.
++	 */
++	if (lockless_dereference(dev_priv->gt.awake))
++		queue_delayed_work(dev_priv->wq,
++				   &dev_priv->gt.retire_work,
+ 				   round_jiffies_up_relative(HZ));
+ }
+ 
+@@ -3268,25 +3285,55 @@ static void
+ i915_gem_idle_work_handler(struct work_struct *work)
+ {
+ 	struct drm_i915_private *dev_priv =
+-		container_of(work, typeof(*dev_priv), mm.idle_work.work);
++		container_of(work, typeof(*dev_priv), gt.idle_work.work);
+ 	struct drm_device *dev = dev_priv->dev;
+ 	struct intel_engine_cs *engine;
++	unsigned int stuck_engines;
++	bool rearm_hangcheck;
++
++	if (!READ_ONCE(dev_priv->gt.awake))
++		return;
++
++	if (READ_ONCE(dev_priv->gt.active_engines))
++		return;
++
++	rearm_hangcheck =
++		cancel_delayed_work_sync(&dev_priv->gpu_error.hangcheck_work);
++
++	if (!mutex_trylock(&dev->struct_mutex)) {
++		/* Currently busy, come back later */
++		mod_delayed_work(dev_priv->wq,
++				 &dev_priv->gt.idle_work,
++				 msecs_to_jiffies(50));
++		goto out_rearm;
++	}
++
++	if (dev_priv->gt.active_engines)
++		goto out_unlock;
+ 
+ 	for_each_engine(engine, dev_priv)
+-		if (!list_empty(&engine->request_list))
+-			return;
++		i915_gem_batch_pool_fini(&engine->batch_pool);
+ 
+-	/* we probably should sync with hangcheck here, using cancel_work_sync.
+-	 * Also locking seems to be fubar here, engine->request_list is protected
+-	 * by dev->struct_mutex. */
++	GEM_BUG_ON(!dev_priv->gt.awake);
++	dev_priv->gt.awake = false;
++	rearm_hangcheck = false;
+ 
+-	intel_mark_idle(dev_priv);
++	stuck_engines = intel_kick_waiters(dev_priv);
++	if (unlikely(stuck_engines)) {
++		DRM_DEBUG_DRIVER("kicked stuck waiters...missed irq\n");
++		dev_priv->gpu_error.missed_irq_rings |= stuck_engines;
++	}
+ 
+-	if (mutex_trylock(&dev->struct_mutex)) {
+-		for_each_engine(engine, dev_priv)
+-			i915_gem_batch_pool_fini(&engine->batch_pool);
++	if (INTEL_GEN(dev_priv) >= 6)
++		gen6_rps_idle(dev_priv);
++	intel_runtime_pm_put(dev_priv);
++out_unlock:
++	mutex_unlock(&dev->struct_mutex);
+ 
+-		mutex_unlock(&dev->struct_mutex);
++out_rearm:
++	if (rearm_hangcheck) {
++		GEM_BUG_ON(!dev_priv->gt.awake);
++		i915_queue_hangcheck(dev_priv);
+ 	}
+ }
+ 
+@@ -4419,7 +4466,7 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+ 
+ 	ret = __i915_wait_request(target, true, NULL, NULL);
+ 	if (ret == 0)
+-		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work, 0);
++		queue_delayed_work(dev_priv->wq, &dev_priv->gt.retire_work, 0);
+ 
+ 	i915_gem_request_unreference(target);
+ 
+@@ -4937,13 +4984,13 @@ i915_gem_suspend(struct drm_device *dev)
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	cancel_delayed_work_sync(&dev_priv->gpu_error.hangcheck_work);
+-	cancel_delayed_work_sync(&dev_priv->mm.retire_work);
+-	flush_delayed_work(&dev_priv->mm.idle_work);
++	cancel_delayed_work_sync(&dev_priv->gt.retire_work);
++	flush_delayed_work(&dev_priv->gt.idle_work);
+ 
+ 	/* Assert that we sucessfully flushed all the work and
+ 	 * reset the GPU back to its idle, low power state.
+ 	 */
+-	WARN_ON(dev_priv->mm.busy);
++	WARN_ON(dev_priv->gt.awake);
+ 
+ 	return 0;
+ 
+@@ -5245,9 +5292,9 @@ i915_gem_load_init(struct drm_device *dev)
+ 		init_engine_lists(&dev_priv->engine[i]);
+ 	for (i = 0; i < I915_MAX_NUM_FENCES; i++)
+ 		INIT_LIST_HEAD(&dev_priv->fence_regs[i].lru_list);
+-	INIT_DELAYED_WORK(&dev_priv->mm.retire_work,
++	INIT_DELAYED_WORK(&dev_priv->gt.retire_work,
+ 			  i915_gem_retire_work_handler);
+-	INIT_DELAYED_WORK(&dev_priv->mm.idle_work,
++	INIT_DELAYED_WORK(&dev_priv->gt.idle_work,
+ 			  i915_gem_idle_work_handler);
+ 	init_waitqueue_head(&dev_priv->gpu_error.wait_queue);
+ 	init_waitqueue_head(&dev_priv->gpu_error.reset_queue);
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 00bae68..47e98ce 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1479,6 +1479,12 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 		dispatch_flags |= I915_DISPATCH_RS;
+ 	}
+ 
++	/* Take a local wakeref for preparing to dispatch the execbuf as
++	 * we expect to access the hardware fairly frequently in the
++	 * process. Upon first dispatch, we acquire another prolonged
++	 * wakeref that we hold until the GPU has been idle for at least
++	 * 100ms.
++	 */
+ 	intel_runtime_pm_get(dev_priv);
+ 
+ 	ret = i915_mutex_lock_interruptible(dev);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 6104910..84d0448 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -3115,12 +3115,8 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
+ 	if (!i915.enable_hangcheck)
+ 		return;
+ 
+-	/*
+-	 * The hangcheck work is synced during runtime suspend, we don't
+-	 * require a wakeref. TODO: instead of disabling the asserts make
+-	 * sure that we hold a reference when this work is running.
+-	 */
+-	DISABLE_RPM_WAKEREF_ASSERTS(dev_priv);
++	if (!lockless_dereference(dev_priv->gt.awake))
++		return;
+ 
+ 	/* As enabling the GPU requires fairly extensive mmio access,
+ 	 * periodically arm the mmio checker to see if we are triggering
+@@ -3228,17 +3224,12 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
+ 		}
+ 	}
+ 
+-	if (rings_hung) {
++	if (rings_hung)
+ 		i915_handle_error(dev_priv, rings_hung, "Engine(s) hung");
+-		goto out;
+-	}
+ 
+ 	/* Reset timer in case GPU hangs without another request being added */
+ 	if (busy_count)
+ 		i915_queue_hangcheck(dev_priv);
+-
+-out:
+-	ENABLE_RPM_WAKEREF_ASSERTS(dev_priv);
+ }
+ 
+ static void ibx_irq_reset(struct drm_device *dev)
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 395d390..86c2e9c 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -11008,31 +11008,6 @@ struct drm_display_mode *intel_crtc_mode_get(struct drm_device *dev,
+ 	return mode;
+ }
+ 
+-void intel_mark_busy(struct drm_i915_private *dev_priv)
+-{
+-	if (dev_priv->mm.busy)
+-		return;
+-
+-	intel_runtime_pm_get(dev_priv);
+-	i915_update_gfx_val(dev_priv);
+-	if (INTEL_GEN(dev_priv) >= 6)
+-		gen6_rps_busy(dev_priv);
+-	dev_priv->mm.busy = true;
+-}
+-
+-void intel_mark_idle(struct drm_i915_private *dev_priv)
+-{
+-	if (!dev_priv->mm.busy)
+-		return;
+-
+-	dev_priv->mm.busy = false;
+-
+-	if (INTEL_GEN(dev_priv) >= 6)
+-		gen6_rps_idle(dev_priv);
+-
+-	intel_runtime_pm_put(dev_priv);
+-}
+-
+ static void intel_crtc_destroy(struct drm_crtc *crtc)
+ {
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 93d91dd..8c2fd65 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -4899,7 +4899,7 @@ void gen6_rps_boost(struct drm_i915_private *dev_priv,
+ 	/* This is intentionally racy! We peek at the state here, then
+ 	 * validate inside the RPS worker.
+ 	 */
+-	if (!(dev_priv->mm.busy &&
++	if (!(dev_priv->gt.awake &&
+ 	      dev_priv->rps.enabled &&
+ 	      dev_priv->rps.cur_freq < dev_priv->rps.max_freq_softlimit))
+ 		return;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 41cc9f3..321e1c6 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -360,13 +360,13 @@ struct intel_engine_cs {
+ };
+ 
+ static inline bool
+-intel_engine_initialized(struct intel_engine_cs *engine)
++intel_engine_initialized(const struct intel_engine_cs *engine)
+ {
+ 	return engine->i915 != NULL;
+ }
+ 
+ static inline unsigned
+-intel_engine_flag(struct intel_engine_cs *engine)
++intel_engine_flag(const struct intel_engine_cs *engine)
+ {
+ 	return 1 << engine->id;
+ }
+-- 
+1.7.5.4
+

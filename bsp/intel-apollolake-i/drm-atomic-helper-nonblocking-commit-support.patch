@@ -1,0 +1,405 @@
+From deb28033b21ba90ce6af46ad6cce921fa359a700 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Wed, 8 Jun 2016 14:19:02 +0200
+Subject: [PATCH 3295/4706] drm/atomic-helper: nonblocking commit support
+
+commit 9f2a7950e77abf00a2a87f3b4cbefa36e9b6009b upstream
+
+Design ideas:
+
+- split up the actual commit into different phases, and have
+  completions for each of them. This will be useful for the future
+  when we want to interleave phases much more aggressively, for e.g.
+  queue depth > 1. For not it's just a minimal optimization compared
+  to current common nonblocking implementation patterns from drivers,
+  which all stall for the entire commit to complete, including vblank
+  waits and cleanups.
+
+- Extract a separate atomic_commit_hw hook since that's the part most
+  drivers will need to overwrite, hopefully allowing even more shared
+  code.
+
+- Enforce EBUSY seamntics by attaching one of the completions to the
+  flip_done vblank event. Side benefit of forcing atomic drivers using
+  these helpers to implement event handlign at least semi-correct. I'm
+  evil that way ;-)
+
+- Ridiculously modular, as usual.
+
+- The main tracking unit for a commit stays struct drm_atomic_state,
+  and the ownership rules for that are unchanged. Ownership still
+  gets transferred to the driver (and subsequently to the worker) on
+  successful commits. What is added is a small, per-crtc, refcounted
+  structure to track pending commits called struct drm_crtc_commit.
+  No actual state is attached to that though, it's purely for ordering
+  and waiting.
+
+- Dependencies are implicitly handled by assuming that any CRTC part
+  of &drm_atomic_state is a dependency, and that the current commit
+  must wait for any commits to complete on those CRTC. This way
+  drivers can easily add more depencies using
+  drm_atomic_get_crtc_state(), which is very natural since in most
+  case a dependency exists iff there's some bit of state that needs to
+  be cross checked.
+
+  Removing depencies is not possible, drivers simply need to be
+  careful to not include every CRTC in a commit if that's not
+  necessary. Which is a good idea anyway, since that also avoids
+  ww_mutex lock contention.
+
+- Queue depth > 1 sees some prep work in this patch by adding a stall
+  paramater to drm_atomic_helper_swap_states(). To be able to push
+  commits entirely free-standing and in a deeper queue through the
+  back-end the driver must not access any obj->state pointers. This
+  means we need to track the old state in drm_atomic_state (much
+  easier with the consolidated arrays), and pass them all explicitly
+  to driver backends (this will be serious amounts of churn).
+
+  Once that's done stall can be set to false in swap_states.
+
+v2: Dont ask for flip_done signalling when the CRTC is off and stays
+off: Drivers don't handle events in that case. Instead complete right
+away. This way future commits don't need to have special-case logic,
+but can keep blocking for the flip_done completion.
+
+v3: Tons of fixes:
+- Stall for preceeding commit for real, not the current one by
+  accident.
+- Add WARN_ON in case drivers don't fire the drm event.
+- Don't double-free drm events.
+
+v4: Make legacy cursor not stall.
+
+v5: Extend the helper hook to cover the entire commit tail. Some
+drivers need special code for cleanup and vblank waiting, this makes
+it a bit more useful. Inspired by the rockchip driver.
+
+v6: Add WARN_ON to catch drivers who forget to send out the
+drm event.
+
+v7: Fixup the stalls in swap_state for real!!
+
+v8:
+- Fixup trailing whitespace, spotted by Maarten.
+- Actually wait for flip_done in cleanup_done, like the comment says
+  we should do. Thanks a lot for Tomeu for helping with debugging this
+  on.
+
+v9: Now with awesome kerneldoc!
+
+v10: Split out drm_crtc_commit tracking infrastructure.
+
+v:
+- Add missing static (Gustavo).
+- Split out the sync functions, only do the actual nonblocking
+  logic in this patch (Maarten).
+
+Cc: Gustavo Padovan <gustavo.padovan@collabora.co.uk>
+Tested-by: Tomeu Vizoso <tomeu.vizoso@collabora.com>
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Cc: Tomeu Vizoso <tomeu.vizoso@gmail.com>
+Cc: Daniel Stone <daniels@collabora.com>
+Tested-by: Liviu Dudau <Liviu.Dudau@arm.com>
+Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Testcase: igt/kms_flip/*
+Testcase: igt/kms_cursor*
+Testcase: igt/kms*plane*
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1465388359-8070-10-git-send-email-daniel.vetter@ffwll.ch
+---
+ drivers/gpu/drm/drm_atomic_helper.c      |  144 ++++++++++++++++++++----------
+ include/drm/drm_atomic_helper.h          |    1 +
+ include/drm/drm_crtc.h                   |    3 +
+ include/drm/drm_modeset_helper_vtables.h |   39 ++++++++
+ 4 files changed, 141 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_helper.c
+index 6dee09c..6a13df8 100644
+--- a/drivers/gpu/drm/drm_atomic_helper.c
++++ b/drivers/gpu/drm/drm_atomic_helper.c
+@@ -1120,22 +1120,17 @@ drm_atomic_helper_wait_for_vblanks(struct drm_device *dev,
+ EXPORT_SYMBOL(drm_atomic_helper_wait_for_vblanks);
+ 
+ /**
+- * drm_atomic_helper_commit - commit validated state object
+- * @dev: DRM device
+- * @state: the driver state object
+- * @nonblocking: whether nonblocking behavior is requested.
++ * drm_atomic_helper_commit_tail - commit atomic update to hardware
++ * @state: new modeset state to be committed
+  *
+- * This function commits a with drm_atomic_helper_check() pre-validated state
+- * object. This can still fail when e.g. the framebuffer reservation fails. For
+- * now this doesn't implement nonblocking commits.
++ * This is the default implemenation for the ->atomic_commit_tail() hook of the
++ * &drm_mode_config_helper_funcs vtable.
+  *
+- * Note that right now this function does not support nonblocking commits, hence
+- * driver writers must implement their own version for now. Also note that the
+- * default ordering of how the various stages are called is to match the legacy
+- * modeset helper library closest. One peculiarity of that is that it doesn't
+- * mesh well with runtime PM at all.
++ * Note that the default ordering of how the various stages are called is to
++ * match the legacy modeset helper library closest. One peculiarity of that is
++ * that it doesn't mesh well with runtime PM at all.
+  *
+- * For drivers supporting runtime PM the recommended sequence is
++ * For drivers supporting runtime PM the recommended sequence is instead ::
+  *
+  *     drm_atomic_helper_commit_modeset_disables(dev, state);
+  *
+@@ -1143,7 +1138,73 @@ EXPORT_SYMBOL(drm_atomic_helper_wait_for_vblanks);
+  *
+  *     drm_atomic_helper_commit_planes(dev, state, true);
+  *
+- * See the kerneldoc entries for these three functions for more details.
++ * for committing the atomic update to hardware.  See the kerneldoc entries for
++ * these three functions for more details.
++ */
++void drm_atomic_helper_commit_tail(struct drm_atomic_state *state)
++{
++	struct drm_device *dev = state->dev;
++
++	drm_atomic_helper_commit_modeset_disables(dev, state);
++
++	drm_atomic_helper_commit_planes(dev, state, false);
++
++	drm_atomic_helper_commit_modeset_enables(dev, state);
++
++	drm_atomic_helper_commit_hw_done(state);
++
++	drm_atomic_helper_wait_for_vblanks(dev, state);
++
++	drm_atomic_helper_cleanup_planes(dev, state);
++}
++EXPORT_SYMBOL(drm_atomic_helper_commit_tail);
++
++static void commit_tail(struct drm_atomic_state *state)
++{
++	struct drm_device *dev = state->dev;
++	struct drm_mode_config_helper_funcs *funcs;
++
++	funcs = dev->mode_config.helper_private;
++
++	drm_atomic_helper_wait_for_fences(dev, state);
++
++	drm_atomic_helper_wait_for_dependencies(state);
++
++	if (funcs && funcs->atomic_commit_tail)
++		funcs->atomic_commit_tail(state);
++	else
++		drm_atomic_helper_commit_tail(state);
++
++	drm_atomic_helper_commit_cleanup_done(state);
++
++	drm_atomic_state_free(state);
++}
++
++static void commit_work(struct work_struct *work)
++{
++	struct drm_atomic_state *state = container_of(work,
++						      struct drm_atomic_state,
++						      commit_work);
++	commit_tail(state);
++}
++
++/**
++ * drm_atomic_helper_commit - commit validated state object
++ * @dev: DRM device
++ * @state: the driver state object
++ * @nonblock: whether nonblocking behavior is requested.
++ *
++ * This function commits a with drm_atomic_helper_check() pre-validated state
++ * object. This can still fail when e.g. the framebuffer reservation fails. This
++ * function implements nonblocking commits, using
++ * drm_atomic_helper_setup_commit() and related functions.
++ *
++ * Note that right now this function does not support nonblocking commits, hence
++ * driver writers must implement their own version for now.
++ *
++ * Committing the actual hardware state is done through the
++ * ->atomic_commit_tail() callback of the &drm_mode_config_helper_funcs vtable,
++ * or it's default implementation drm_atomic_helper_commit_tail().
+  *
+  * RETURNS:
+  * Zero for success or -errno.
+@@ -1154,13 +1215,12 @@ int drm_atomic_helper_commit(struct drm_device *dev,
+ {
+ 	int ret;
+ 
+-	if (nonblock)
+-		return -EBUSY;
+-
+ 	ret = drm_atomic_helper_setup_commit(state, nonblock);
+ 	if (ret)
+ 		return ret;
+ 
++	INIT_WORK(&state->commit_work, commit_work);
++
+ 	ret = drm_atomic_helper_prepare_planes(dev, state);
+ 	if (ret)
+ 		return ret;
+@@ -1187,27 +1247,16 @@ int drm_atomic_helper_commit(struct drm_device *dev,
+ 	 * update. Which is important since compositors need to figure out the
+ 	 * composition of the next frame right after having submitted the
+ 	 * current layout.
++	 *
++	 * NOTE: Commit work has multiple phases, first hardware commit, then
++	 * cleanup. We want them to overlap, hence need system_unbound_wq to
++	 * make sure work items don't artifically stall on each another.
+ 	 */
+ 
+-	drm_atomic_helper_wait_for_fences(dev, state);
+-
+-	drm_atomic_helper_wait_for_dependencies(state);
+-
+-	drm_atomic_helper_commit_modeset_disables(dev, state);
+-
+-	drm_atomic_helper_commit_planes(dev, state, false);
+-
+-	drm_atomic_helper_commit_modeset_enables(dev, state);
+-
+-	drm_atomic_helper_commit_hw_done(state);
+-
+-	drm_atomic_helper_wait_for_vblanks(dev, state);
+-
+-	drm_atomic_helper_cleanup_planes(dev, state);
+-
+-	drm_atomic_helper_commit_cleanup_done(state);
+-
+-	drm_atomic_state_free(state);
++	if (nonblock)
++		queue_work(system_unbound_wq, &state->commit_work);
++	else
++		commit_tail(state);
+ 
+ 	return 0;
+ }
+@@ -1216,12 +1265,7 @@ EXPORT_SYMBOL(drm_atomic_helper_commit);
+ /**
+  * DOC: implementing nonblocking commit
+  *
+- * For now the atomic helpers don't support nonblocking commit directly. If
+- * there is real need it could be added though, using the dma-buf fence
+- * infrastructure for generic synchronization with outstanding rendering.
+- *
+- * For now drivers have to implement nonblocking commit themselves, with the
+- * following sequence being the recommended one:
++ * Nonblocking atomic commits have to be implemented in the following sequence:
+  *
+  * 1. Run drm_atomic_helper_prepare_planes() first. This is the only function
+  * which commit needs to call which can fail, so we want to run it first and
+@@ -1233,10 +1277,14 @@ EXPORT_SYMBOL(drm_atomic_helper_commit);
+  * cancelled updates. Note that it is important to ensure that the framebuffer
+  * cleanup is still done when cancelling.
+  *
+- * For sufficient parallelism it is recommended to have a work item per crtc
+- * (for updates which don't touch global state) and a global one. Then we only
+- * need to synchronize with the crtc work items for changed crtcs and the global
+- * work item, which allows nice concurrent updates on disjoint sets of crtcs.
++ * Asynchronous workers need to have sufficient parallelism to be able to run
++ * different atomic commits on different CRTCs in parallel. The simplest way to
++ * achive this is by running them on the &system_unbound_wq work queue. Note
++ * that drivers are not required to split up atomic commits and run an
++ * individual commit in parallel - userspace is supposed to do that if it cares.
++ * But it might be beneficial to do that for modesets, since those necessarily
++ * must be done as one global operation, and enabling or disabling a CRTC can
++ * take a long time. But even that is not required.
+  *
+  * 3. The software state is updated synchronously with
+  * drm_atomic_helper_swap_state(). Doing this under the protection of all modeset
+@@ -1249,6 +1297,10 @@ EXPORT_SYMBOL(drm_atomic_helper_commit);
+  * commit helpers: a) pre-plane commit b) plane commit c) post-plane commit and
+  * then cleaning up the framebuffers after the old framebuffer is no longer
+  * being displayed.
++ *
++ * The above scheme is implemented in the atomic helper libraries in
++ * drm_atomic_helper_commit() using a bunch of helper functions. See
++ * drm_atomic_helper_setup_commit() for a starting point.
+  */
+ 
+ static int stall_checks(struct drm_crtc *crtc, bool nonblock)
+diff --git a/include/drm/drm_atomic_helper.h b/include/drm/drm_atomic_helper.h
+index d90b3a6..e833061 100644
+--- a/include/drm/drm_atomic_helper.h
++++ b/include/drm/drm_atomic_helper.h
+@@ -38,6 +38,7 @@ int drm_atomic_helper_check_planes(struct drm_device *dev,
+ 			       struct drm_atomic_state *state);
+ int drm_atomic_helper_check(struct drm_device *dev,
+ 			    struct drm_atomic_state *state);
++void drm_atomic_helper_commit_tail(struct drm_atomic_state *state);
+ int drm_atomic_helper_commit(struct drm_device *dev,
+ 			     struct drm_atomic_state *state,
+ 			     bool nonblock);
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index b2dc62d..544eeb6 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -2248,6 +2248,7 @@ struct drm_mode_config_funcs {
+  * @async_page_flip: does this device support async flips on the primary plane?
+  * @cursor_width: hint to userspace for max cursor width
+  * @cursor_height: hint to userspace for max cursor height
++ * @helper_private: mid-layer private data
+  *
+  * Core mode resource tracking structure.  All CRTC, encoders, and connectors
+  * enumerated by the driver are added here, as are global properties.  Some
+@@ -2391,6 +2392,8 @@ struct drm_mode_config {
+ 
+ 	/* cursor size */
+ 	uint32_t cursor_width, cursor_height;
++
++	struct drm_mode_config_helper_funcs *helper_private;
+ };
+ 
+ /**
+diff --git a/include/drm/drm_modeset_helper_vtables.h b/include/drm/drm_modeset_helper_vtables.h
+index 4e7a53b..b55f218 100644
+--- a/include/drm/drm_modeset_helper_vtables.h
++++ b/include/drm/drm_modeset_helper_vtables.h
+@@ -931,4 +931,43 @@ static inline void drm_plane_helper_add(struct drm_plane *plane,
+ 	plane->helper_private = funcs;
+ }
+ 
++/**
++ * struct drm_mode_config_helper_funcs - global modeset helper operations
++ *
++ * These helper functions are used by the atomic helpers.
++ */
++struct drm_mode_config_helper_funcs {
++	/**
++	 * @atomic_commit_tail:
++	 *
++	 * This hook is used by the default atomic_commit() hook implemented in
++	 * drm_atomic_helper_commit() together with the nonblocking commit
++	 * helpers (see drm_atomic_helper_setup_commit() for a starting point)
++	 * to implement blocking and nonblocking commits easily. It is not used
++	 * by the atomic helpers
++	 *
++	 * This hook should first commit the given atomic state to the hardware.
++	 * But drivers can add more waiting calls at the start of their
++	 * implementation, e.g. to wait for driver-internal request for implicit
++	 * syncing, before starting to commit the update to the hardware.
++	 *
++	 * After the atomic update is committed to the hardware this hook needs
++	 * to call drm_atomic_helper_commit_hw_done(). Then wait for the upate
++	 * to be executed by the hardware, for example using
++	 * drm_atomic_helper_wait_for_vblanks(), and then clean up the old
++	 * framebuffers using drm_atomic_helper_cleanup_planes().
++	 *
++	 * When disabling a CRTC this hook _must_ stall for the commit to
++	 * complete. Vblank waits don't work on disabled CRTC, hence the core
++	 * can't take care of this. And it also can't rely on the vblank event,
++	 * since that can be signalled already when the screen shows black,
++	 * which can happen much earlier than the last hardware access needed to
++	 * shut off the display pipeline completely.
++	 *
++	 * This hook is optional, the default implementation is
++	 * drm_atomic_helper_commit_tail().
++	 */
++	void (*atomic_commit_tail)(struct drm_atomic_state *state);
++};
++
+ #endif
+-- 
+1.7.5.4
+

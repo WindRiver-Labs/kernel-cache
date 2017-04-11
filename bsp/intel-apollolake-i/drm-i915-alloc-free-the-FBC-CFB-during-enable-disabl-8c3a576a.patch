@@ -1,0 +1,271 @@
+From a60061b143302c7c3809d03d0d0858232ae45879 Mon Sep 17 00:00:00 2001
+From: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Date: Thu, 15 Oct 2015 14:19:21 -0300
+Subject: [PATCH 1935/4706] drm/i915: alloc/free the FBC CFB during
+ enable/disable
+
+commit c5ecd4691c797c098013da2bb6167d6bd93df6ae upstream
+
+One of the problems with the current code is that it frees the CFB and
+releases its drm_mm node as soon as we flip FBC's enable bit. This is
+bad because after we disable FBC the hardware may still use the CFB
+for the rest of the frame, so in theory we should only release the
+drm_mm node one frame after we disable FBC. Otherwise, a stolen memory
+allocation done right after an FBC disable may result in either
+corrupted memory for the new owner of that memory region or corrupted
+screen/underruns in case the new owner changes it while the hardware
+is still reading it. This case is not exactly easy to reproduce since
+we currently don't do a lot of stolen memory allocations, but I see
+patches on the mailing list trying to expose stolen memory to user
+space, so races will be possible.
+
+I thought about three different approaches to solve this, and they all
+have downsides.
+
+The first approach would be to simply use multiple drm_mm nodes and
+freeing the unused ones only after a frame has passed. The problem
+with this approach is that since stolen memory is rather small,
+there's a risk we just won't be able to allocate a new CFB from stolen
+if the previous one was not freed yet. This could happen in case we
+quickly disable FBC from pipe A and decide to enable it on pipe B, or
+just if we change pipe A's fb stride while FBC is enabled.
+
+The second approach would be similar to the first one, but maintaining
+a single drm_mm node and keeping track of when it can be reused. This
+would remove the disadvantage of not having enough space for two
+nodes, but would create the new problem where we may not be able to
+enable FBC at the point intel_fbc_update() is called, so we would have
+to add more code to retry updating FBC after the time has passed. And
+that can quickly get too complex since we can get invalidate, flush,
+disable and other calls in the middle of the wait.
+
+Both solutions above - and also the current code - have the problem
+that we unnecessarily free+realloc FBC during invalidate+flush
+operations even if the CFB size doesn't change.
+
+The third option would be to move the allocation/deallocation to
+enable/disable. This makes sure that the pipe is always disabled when
+we allocate/deallocate the CFB, so there's no risk that the FBC
+hardware may read or write to the memory right after it is freed from
+drm_mm. The downside is that it is possible for user space to change
+the buffer stride without triggering a disable/enable - only
+deactivate/activate -, so we'll have to handle this case somehow - see
+igt's kms_frontbuffer_tracking test, fbc-stridechange subtest. It
+could be possible to implement a way to free+alloc the CFB during said
+stride change, but it would involve a lot of book-keeping - exactly as
+mentioned above - just for on case, so for now I'll keep it simple and
+just deactivate FBC. Besides, we may not even need to disable FBC
+since we do CFB over-allocation.
+
+Note from Chris: "Starting a fullscreen client that covers a single
+monitor in a multi-monitor setup will trigger a change in stride on
+one of the CRTCs (the monitors will be flipped independently).". It
+shouldn't be a huge problem if we lose FBC on multi-monitor setups
+since these setups already have problems reaching deep PC states
+anyway.
+
+v2: Rebase after changing the patch order.
+v3:
+  - Remove references to the stride change case being "uncommon" and
+    paste Chris' example.
+  - Rebase after a change in a previous patch.
+
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/
+---
+ drivers/gpu/drm/i915/intel_fbc.c |  134 +++++++++++++++++++------------------
+ 1 files changed, 69 insertions(+), 65 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_fbc.c b/drivers/gpu/drm/i915/intel_fbc.c
+index 6125c7b..958f973 100644
+--- a/drivers/gpu/drm/i915/intel_fbc.c
++++ b/drivers/gpu/drm/i915/intel_fbc.c
+@@ -64,6 +64,46 @@ static unsigned int get_crtc_fence_y_offset(struct intel_crtc *crtc)
+ 	return crtc->base.y - crtc->adjusted_y;
+ }
+ 
++/*
++ * For SKL+, the plane source size used by the hardware is based on the value we
++ * write to the PLANE_SIZE register. For BDW-, the hardware looks at the value
++ * we wrote to PIPESRC.
++ */
++static void intel_fbc_get_plane_source_size(struct intel_crtc *crtc,
++					    int *width, int *height)
++{
++	struct intel_plane_state *plane_state =
++			to_intel_plane_state(crtc->base.primary->state);
++	int w, h;
++
++	if (intel_rotation_90_or_270(plane_state->base.rotation)) {
++		w = drm_rect_height(&plane_state->src) >> 16;
++		h = drm_rect_width(&plane_state->src) >> 16;
++	} else {
++		w = drm_rect_width(&plane_state->src) >> 16;
++		h = drm_rect_height(&plane_state->src) >> 16;
++	}
++
++	if (width)
++		*width = w;
++	if (height)
++		*height = h;
++}
++
++static int intel_fbc_calculate_cfb_size(struct intel_crtc *crtc,
++					struct drm_framebuffer *fb)
++{
++	struct drm_i915_private *dev_priv = crtc->base.dev->dev_private;
++	int lines;
++
++	intel_fbc_get_plane_source_size(crtc, NULL, &lines);
++	if (INTEL_INFO(dev_priv)->gen >= 7)
++		lines = min(lines, 2048);
++
++	/* Hardware needs the full buffer stride, not just the active area. */
++	return lines * fb->pitches[0];
++}
++
+ static void i8xx_fbc_deactivate(struct drm_i915_private *dev_priv)
+ {
+ 	u32 fbc_ctl;
+@@ -558,11 +598,17 @@ again:
+ 	}
+ }
+ 
+-static int intel_fbc_alloc_cfb(struct drm_i915_private *dev_priv, int size,
+-			       int fb_cpp)
++static int intel_fbc_alloc_cfb(struct intel_crtc *crtc)
+ {
++	struct drm_i915_private *dev_priv = crtc->base.dev->dev_private;
++	struct drm_framebuffer *fb = crtc->base.primary->state->fb;
+ 	struct drm_mm_node *uninitialized_var(compressed_llb);
+-	int ret;
++	int size, fb_cpp, ret;
++
++	WARN_ON(drm_mm_node_allocated(&dev_priv->fbc.compressed_fb));
++
++	size = intel_fbc_calculate_cfb_size(crtc, fb);
++	fb_cpp = drm_format_plane_cpp(fb->pixel_format, 0);
+ 
+ 	ret = find_compression_threshold(dev_priv, &dev_priv->fbc.compressed_fb,
+ 					 size, fb_cpp);
+@@ -639,65 +685,6 @@ void intel_fbc_cleanup_cfb(struct drm_i915_private *dev_priv)
+ 	mutex_unlock(&dev_priv->fbc.lock);
+ }
+ 
+-/*
+- * For SKL+, the plane source size used by the hardware is based on the value we
+- * write to the PLANE_SIZE register. For BDW-, the hardware looks at the value
+- * we wrote to PIPESRC.
+- */
+-static void intel_fbc_get_plane_source_size(struct intel_crtc *crtc,
+-					    int *width, int *height)
+-{
+-	struct intel_plane_state *plane_state =
+-			to_intel_plane_state(crtc->base.primary->state);
+-	int w, h;
+-
+-	if (intel_rotation_90_or_270(plane_state->base.rotation)) {
+-		w = drm_rect_height(&plane_state->src) >> 16;
+-		h = drm_rect_width(&plane_state->src) >> 16;
+-	} else {
+-		w = drm_rect_width(&plane_state->src) >> 16;
+-		h = drm_rect_height(&plane_state->src) >> 16;
+-	}
+-
+-	if (width)
+-		*width = w;
+-	if (height)
+-		*height = h;
+-}
+-
+-static int intel_fbc_calculate_cfb_size(struct intel_crtc *crtc)
+-{
+-	struct drm_i915_private *dev_priv = crtc->base.dev->dev_private;
+-	struct drm_framebuffer *fb = crtc->base.primary->fb;
+-	int lines;
+-
+-	intel_fbc_get_plane_source_size(crtc, NULL, &lines);
+-	if (INTEL_INFO(dev_priv)->gen >= 7)
+-		lines = min(lines, 2048);
+-
+-	/* Hardware needs the full buffer stride, not just the active area. */
+-	return lines * fb->pitches[0];
+-}
+-
+-static int intel_fbc_setup_cfb(struct intel_crtc *crtc)
+-{
+-	struct drm_i915_private *dev_priv = crtc->base.dev->dev_private;
+-	struct drm_framebuffer *fb = crtc->base.primary->fb;
+-	int size, cpp;
+-
+-	size = intel_fbc_calculate_cfb_size(crtc);
+-	cpp = drm_format_plane_cpp(fb->pixel_format, 0);
+-
+-	if (drm_mm_node_allocated(&dev_priv->fbc.compressed_fb) &&
+-	    size <= dev_priv->fbc.compressed_fb.size * dev_priv->fbc.threshold)
+-		return 0;
+-
+-	/* Release any current block */
+-	__intel_fbc_cleanup_cfb(dev_priv);
+-
+-	return intel_fbc_alloc_cfb(dev_priv, size, cpp);
+-}
+-
+ static bool stride_is_valid(struct drm_i915_private *dev_priv,
+ 			    unsigned int stride)
+ {
+@@ -853,8 +840,19 @@ static void __intel_fbc_update(struct intel_crtc *crtc)
+ 		goto out_disable;
+ 	}
+ 
+-	if (intel_fbc_setup_cfb(crtc)) {
+-		set_no_fbc_reason(dev_priv, "not enough stolen memory");
++	/* It is possible for the required CFB size change without a
++	 * crtc->disable + crtc->enable since it is possible to change the
++	 * stride without triggering a full modeset. Since we try to
++	 * over-allocate the CFB, there's a chance we may keep FBC enabled even
++	 * if this happens, but if we exceed the current CFB size we'll have to
++	 * disable FBC. Notice that it would be possible to disable FBC, wait
++	 * for a frame, free the stolen node, then try to reenable FBC in case
++	 * we didn't get any invalidate/deactivate calls, but this would require
++	 * a lot of tracking just for a specific case. If we conclude it's an
++	 * important case, we can implement it later. */
++	if (intel_fbc_calculate_cfb_size(crtc, fb) >
++	    dev_priv->fbc.compressed_fb.size * dev_priv->fbc.threshold) {
++		set_no_fbc_reason(dev_priv, "CFB requirements changed");
+ 		goto out_disable;
+ 	}
+ 
+@@ -907,7 +905,6 @@ out_disable:
+ 		DRM_DEBUG_KMS("unsupported config, deactivating FBC\n");
+ 		__intel_fbc_deactivate(dev_priv);
+ 	}
+-	__intel_fbc_cleanup_cfb(dev_priv);
+ }
+ 
+ /*
+@@ -1020,6 +1017,11 @@ void intel_fbc_enable(struct intel_crtc *crtc)
+ 		goto out;
+ 	}
+ 
++	if (intel_fbc_alloc_cfb(crtc)) {
++		set_no_fbc_reason(dev_priv, "not enough stolen memory");
++		goto out;
++	}
++
+ 	DRM_DEBUG_KMS("Enabling FBC on pipe %c\n", pipe_name(crtc->pipe));
+ 	dev_priv->fbc.no_fbc_reason = "FBC enabled but not active yet\n";
+ 
+@@ -1047,6 +1049,8 @@ static void __intel_fbc_disable(struct drm_i915_private *dev_priv)
+ 
+ 	DRM_DEBUG_KMS("Disabling FBC on pipe %c\n", pipe_name(crtc->pipe));
+ 
++	__intel_fbc_cleanup_cfb(dev_priv);
++
+ 	dev_priv->fbc.enabled = false;
+ 	dev_priv->fbc.crtc = NULL;
+ }
+-- 
+1.7.5.4
+

@@ -1,0 +1,246 @@
+From 626f09b85b56bded380ce7533e15d8a890ae2a29 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 13 Apr 2016 17:35:08 +0100
+Subject: [PATCH 2816/4706] drm/i915: Prevent leaking of -EIO from
+ i915_wait_request()
+
+commit f4457ae71fd6c3bc9ab979839258411a34baa7f6 upstream
+
+Reporting -EIO from i915_wait_request() has proven very troublematic
+over the years, with numerous hard-to-reproduce bugs cropping up in the
+corner case of where a reset occurs and the code wasn't expecting such
+an error.
+
+If the we reset the GPU or have detected a hang and wish to reset the
+GPU, the request is forcibly complete and the wait broken. Currently, we
+report either -EAGAIN or -EIO in order for the caller to retreat and
+restart the wait (if appropriate) after dropping and then reacquiring
+the struct_mutex (essential to allow the GPU reset to proceed). However,
+if we take the view that the request is complete (no further work will
+be done on it by the GPU because it is dead and soon to be reset), then
+we can proceed with the task at hand and then drop the struct_mutex
+allowing the reset to occur. This transfers the burden of checking
+whether it is safe to proceed to the caller, which in all but one
+instance it is safe - completely eliminating the source of all spurious
+-EIO.
+
+Of note, we only have two API entry points where we expect that
+userspace can observe an EIO. First is when submitting an execbuf, if
+the GPU is terminally wedged, then the operation cannot succeed and an
+-EIO is reported. Secondly, existing userspace uses the throttle ioctl
+to detect an already wedged GPU before starting using HW acceleration
+(or to confirm that the GPU is wedged after an error condition). So if
+the GPU is wedged when the user calls throttle, also report -EIO.
+
+v2: Split more carefully the change to i915_wait_request() and assorted
+ABI from the reset handling.
+v3: Add a couple of WARN_ON(EIO) to the interruptible modesetting code
+so that we don't start to leak EIO there in future (and break our hang
+resistant modesetting).
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/1460565315-7748-9-git-send-email-chris@chris-wilson.co.uk
+Link: http://patchwork.freedesktop.org/patch/msgid/1460565315-7748-1-git-send-email-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    2 -
+ drivers/gpu/drm/i915/i915_gem.c         |   44 +++++++++++++++---------------
+ drivers/gpu/drm/i915/i915_gem_userptr.c |    6 +---
+ drivers/gpu/drm/i915/intel_display.c    |   13 ++++-----
+ drivers/gpu/drm/i915/intel_lrc.c        |    2 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    3 +-
+ 6 files changed, 32 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index d854a8d..1b44773 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3087,8 +3087,6 @@ i915_gem_find_active_request(struct intel_engine_cs *engine);
+ 
+ bool i915_gem_retire_requests(struct drm_device *dev);
+ void i915_gem_retire_requests_ring(struct intel_engine_cs *engine);
+-int __must_check i915_gem_check_wedge(struct i915_gpu_error *error,
+-				      bool interruptible);
+ 
+ static inline u32 i915_reset_counter(struct i915_gpu_error *error)
+ {
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 612c823..84e0fe0 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -206,11 +206,10 @@ i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj)
+ 	BUG_ON(obj->madv == __I915_MADV_PURGED);
+ 
+ 	ret = i915_gem_object_set_to_cpu_domain(obj, true);
+-	if (ret) {
++	if (WARN_ON(ret)) {
+ 		/* In the event of a disaster, abandon all caches and
+ 		 * hope for the best.
+ 		 */
+-		WARN_ON(ret != -EIO);
+ 		obj->base.read_domains = obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+ 	}
+ 
+@@ -1105,15 +1104,13 @@ put_rpm:
+ 	return ret;
+ }
+ 
+-int
+-i915_gem_check_wedge(struct i915_gpu_error *error,
+-		     bool interruptible)
++static int
++i915_gem_check_wedge(unsigned reset_counter, bool interruptible)
+ {
+-	if (i915_reset_in_progress_or_wedged(error)) {
+-		/* Recovery complete, but the reset failed ... */
+-		if (i915_terminally_wedged(error))
+-			return -EIO;
++	if (__i915_terminally_wedged(reset_counter))
++		return -EIO;
+ 
++	if (__i915_reset_in_progress(reset_counter)) {
+ 		/* Non-interruptible callers can't handle -EAGAIN, hence return
+ 		 * -EIO unconditionally for these. */
+ 		if (!interruptible)
+@@ -1287,13 +1284,14 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
+ 		prepare_to_wait(&engine->irq_queue, &wait, state);
+ 
+ 		/* We need to check whether any gpu reset happened in between
+-		 * the caller grabbing the seqno and now ... */
++		 * the request being submitted and now. If a reset has occurred,
++		 * the request is effectively complete (we either are in the
++		 * process of or have discarded the rendering and completely
++		 * reset the GPU. The results of the request are lost and we
++		 * are free to continue on with the original operation.
++		 */
+ 		if (req->reset_counter != i915_reset_counter(&dev_priv->gpu_error)) {
+-			/* ... but upgrade the -EAGAIN to an -EIO if the gpu
+-			 * is truely gone. */
+-			ret = i915_gem_check_wedge(&dev_priv->gpu_error, interruptible);
+-			if (ret == 0)
+-				ret = -EAGAIN;
++			ret = 0;
+ 			break;
+ 		}
+ 
+@@ -2151,11 +2149,10 @@ i915_gem_object_put_pages_gtt(struct drm_i915_gem_object *obj)
+ 	BUG_ON(obj->madv == __I915_MADV_PURGED);
+ 
+ 	ret = i915_gem_object_set_to_cpu_domain(obj, true);
+-	if (ret) {
++	if (WARN_ON(ret)) {
+ 		/* In the event of a disaster, abandon all caches and
+ 		 * hope for the best.
+ 		 */
+-		WARN_ON(ret != -EIO);
+ 		i915_gem_clflush_object(obj, true);
+ 		obj->base.read_domains = obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+ 	}
+@@ -2727,8 +2724,11 @@ __i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 
+ 	*req_out = NULL;
+ 
+-	ret = i915_gem_check_wedge(&dev_priv->gpu_error,
+-				   dev_priv->mm.interruptible);
++	/* ABI: Before userspace accesses the GPU (e.g. execbuffer), report
++	 * EIO if the GPU is already wedged, or EAGAIN to drop the struct_mutex
++	 * and restart.
++	 */
++	ret = i915_gem_check_wedge(reset_counter, dev_priv->mm.interruptible);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -4163,9 +4163,9 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = i915_gem_check_wedge(&dev_priv->gpu_error, false);
+-	if (ret)
+-		return ret;
++	/* ABI: return -EIO if already wedged */
++	if (i915_terminally_wedged(&dev_priv->gpu_error))
++		return -EIO;
+ 
+ 	spin_lock(&file_priv->mm.lock);
+ 	list_for_each_entry(request, &file_priv->mm.request_list, client_list) {
+diff --git a/drivers/gpu/drm/i915/i915_gem_userptr.c b/drivers/gpu/drm/i915/i915_gem_userptr.c
+index d557c29..4c3bade 100644
+--- a/drivers/gpu/drm/i915/i915_gem_userptr.c
++++ b/drivers/gpu/drm/i915/i915_gem_userptr.c
+@@ -112,10 +112,8 @@ static void cancel_userptr(struct work_struct *work)
+ 		was_interruptible = dev_priv->mm.interruptible;
+ 		dev_priv->mm.interruptible = false;
+ 
+-		list_for_each_entry_safe(vma, tmp, &obj->vma_list, obj_link) {
+-			int ret = i915_vma_unbind(vma);
+-			WARN_ON(ret && ret != -EIO);
+-		}
++		list_for_each_entry_safe(vma, tmp, &obj->vma_list, obj_link)
++			WARN_ON(i915_vma_unbind(vma));
+ 		WARN_ON(i915_gem_object_put_pages(obj));
+ 
+ 		dev_priv->mm.interruptible = was_interruptible;
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 689f7d3..9b93d35 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -13463,11 +13463,9 @@ static int intel_atomic_prepare_commit(struct drm_device *dev,
+ 
+ 			ret = __i915_wait_request(intel_plane_state->wait_req,
+ 						  true, NULL, NULL);
+-
+-			/* Swallow -EIO errors to allow updates during hw lockup. */
+-			if (ret == -EIO)
+-				ret = 0;
+ 			if (ret) {
++				/* Any hang should be swallowed by the wait */
++				WARN_ON(ret == -EIO);
+ 				mutex_lock(&dev->struct_mutex);
+ 				drm_atomic_helper_cleanup_planes(dev, state);
+ 				mutex_unlock(&dev->struct_mutex);
+@@ -13819,10 +13817,11 @@ intel_prepare_plane_fb(struct drm_plane *plane,
+ 		 */
+ 		if (needs_modeset(crtc_state))
+ 			ret = i915_gem_object_wait_rendering(old_obj, true);
+-
+-		/* Swallow -EIO errors to allow updates during hw lockup. */
+-		if (ret && ret != -EIO)
++		if (ret) {
++			/* GPU hangs should have been swallowed by the wait */
++			WARN_ON(ret == -EIO);
+ 			return ret;
++		}
+ 	}
+ 
+ 	/* For framebuffer backed by dmabuf, wait for fence */
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 6b0915e..c5dba68 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1048,7 +1048,7 @@ void intel_logical_ring_stop(struct intel_engine_cs *engine)
+ 		return;
+ 
+ 	ret = intel_engine_idle(engine);
+-	if (ret && !i915_reset_in_progress_or_wedged(&dev_priv->gpu_error))
++	if (ret)
+ 		DRM_ERROR("failed to quiesce %s whilst cleaning up: %d\n",
+ 			  engine->name, ret);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 127b9ce..0d24494 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -3187,8 +3187,7 @@ intel_stop_engine(struct intel_engine_cs *engine)
+ 		return;
+ 
+ 	ret = intel_engine_idle(engine);
+-	if (ret &&
+-	    !i915_reset_in_progress_or_wedged(&to_i915(engine->dev)->gpu_error))
++	if (ret)
+ 		DRM_ERROR("failed to quiesce %s whilst cleaning up: %d\n",
+ 			  engine->name, ret);
+ 
+-- 
+1.7.5.4
+

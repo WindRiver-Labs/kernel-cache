@@ -1,0 +1,457 @@
+From f744193fd06a835f4561570d6a4af62ede0ac7a1 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 14 Dec 2016 09:45:43 -0800
+Subject: [PATCH 3898/4706] drm/i915: Enable i915_gem_wait_for_idle() without
+ holding struct_mutex
+
+commit 9cd1e6c79cf15e76e0c3b7cc491472a6da0831d2 from
+git://git.yoctoproject.org/linux-yocto-4.1
+
+The principal motivation for this was to try and eliminate the
+struct_mutex from i915_gem_suspend - but we still need to hold the mutex
+current for the i915_gem_context_lost(). (The issue there is that there
+may be an indirect lockdep cycle between cpu_hotplug (i.e. suspend) and
+struct_mutex via the stop_machine().) For the moment, enabling last
+request tracking for the engine, allows us to do busyness checking and
+waiting without requiring the struct_mutex - which is useful in its own
+right.
+
+As a side-effect of having a robust means for tracking engine busyness,
+we can replace our other busyness heuristic, that of comparing against
+the last submitted seqno. For paranoid reasons, we have a semi-ordered
+check of that seqno inside the hangchecker, which we can now improve to
+an ordered check of the engine's busyness (removing a locked xchg in the
+process).
+
+v2: Pass along "bool interruptible" as being unlocked we cannot rely on
+i915->mm.interruptible being stable or even under our control.
+v3: Replace check Ironlake i915_gpu_busy() with the common precalculated value
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1470388464-28458-6-git-send-email-chris@chris-wilson.co.uk
+(cherry picked from commit dcff85c8443e7ad6abda897678d2fd5a950a64ad)
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+[Kevin: Just some minor context mods in order to port to wrlinux]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c     |    2 +-
+ drivers/gpu/drm/i915/i915_drv.h         |    3 +-
+ drivers/gpu/drm/i915/i915_gem.c         |   31 +++++++++++++----------------
+ drivers/gpu/drm/i915/i915_gem_evict.c   |    6 ++--
+ drivers/gpu/drm/i915/i915_gem_gtt.c     |    2 +-
+ drivers/gpu/drm/i915/i915_gem_request.c |    7 +++--
+ drivers/gpu/drm/i915/i915_gem_request.h |   11 ++++++++++
+ drivers/gpu/drm/i915/i915_irq.c         |    9 +-------
+ drivers/gpu/drm/i915/intel_engine_cs.c  |    8 ++++++-
+ drivers/gpu/drm/i915/intel_pm.c         |   12 +---------
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   18 ----------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |   33 +++++++++++++++++++-----------
+ 12 files changed, 67 insertions(+), 75 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index cdb8da0a..1a1cd37 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -4925,7 +4925,7 @@ i915_drop_caches_set(void *data, u64 val)
+ 		return ret;
+ 
+ 	if (val & DROP_ACTIVE) {
+-		ret = i915_gem_wait_for_idle(dev_priv);
++		ret = i915_gem_wait_for_idle(dev_priv, true);
+ 		if (ret)
+ 			goto unlock;
+ 	}
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 07cbd32..4763fc3 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3241,7 +3241,8 @@ int __must_check i915_gem_init(struct drm_device *dev);
+ int __must_check i915_gem_init_hw(struct drm_device *dev);
+ void i915_gem_init_swizzling(struct drm_device *dev);
+ void i915_gem_cleanup_engines(struct drm_device *dev);
+-int __must_check i915_gem_wait_for_idle(struct drm_i915_private *dev_priv);
++int __must_check i915_gem_wait_for_idle(struct drm_i915_private *dev_priv,
++					bool interruptible);
+ int __must_check i915_gem_suspend(struct drm_device *dev);
+ void i915_gem_resume(struct drm_device *dev);
+ int i915_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 565ea2d2..17f221b 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2436,13 +2436,18 @@ static void i915_gem_reset_engine_status(struct intel_engine_cs *engine)
+ 
+ static void i915_gem_reset_engine_cleanup(struct intel_engine_cs *engine)
+ {
++	struct drm_i915_gem_request *request;
+ 	struct intel_ring *ring;
+ 
++	request = i915_gem_active_peek(&engine->last_request,
++				       &engine->i915->drm.struct_mutex);
++
+ 	/* Mark all pending requests as complete so that any concurrent
+ 	 * (lockless) lookup doesn't try and wait upon the request as we
+ 	 * reset it.
+ 	 */
+-	intel_engine_init_seqno(engine, engine->last_submitted_seqno);
++	if (request)
++		intel_engine_init_seqno(engine, request->fence.seqno);
+ 
+ 	/*
+ 	 * Clear the execlists queue up before freeing the requests, as those
+@@ -2464,15 +2469,9 @@ static void i915_gem_reset_engine_cleanup(struct intel_engine_cs *engine)
+ 	 * implicit references on things like e.g. ppgtt address spaces through
+ 	 * the request.
+ 	 */
+-	if (!list_empty(&engine->request_list)) {
+-		struct drm_i915_gem_request *request;
+-
+-		request = list_last_entry(&engine->request_list,
+-					  struct drm_i915_gem_request,
+-					  link);
+-
++	if (request)
+ 		i915_gem_request_retire_upto(request);
+-	}
++	GEM_BUG_ON(intel_engine_is_active(engine));
+ 
+ 	/* Having flushed all requests from all queues, we know that all
+ 	 * ringbuffers must now be empty. However, since we do not reclaim
+@@ -2895,18 +2894,17 @@ destroy:
+ 	return 0;
+ }
+ 
+-int i915_gem_wait_for_idle(struct drm_i915_private *dev_priv)
++int i915_gem_wait_for_idle(struct drm_i915_private *dev_priv,
++			   bool interruptible)
+ {
+ 	struct intel_engine_cs *engine;
+ 	int ret;
+ 
+-	lockdep_assert_held(&dev_priv->drm.struct_mutex);
+-
+ 	for_each_engine(engine, dev_priv) {
+ 		if (engine->last_context == NULL)
+ 			continue;
+ 
+-		ret = intel_engine_idle(engine);
++		ret = intel_engine_idle(engine, interruptible);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -4078,11 +4076,10 @@ struct i915_vma *i915_gem_obj_to_ggtt_view(struct drm_i915_gem_object *obj,
+ 	return NULL;
+ }
+ 
+-int
+-i915_gem_suspend(struct drm_device *dev)
++int i915_gem_suspend(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+-	int ret = 0;
++	int ret;
+ 
+ 	intel_suspend_gt_powersave(dev_priv);
+ 
+@@ -4100,7 +4097,7 @@ i915_gem_suspend(struct drm_device *dev)
+ 	if (ret)
+ 		goto err;
+ 
+-	ret = i915_gem_wait_for_idle(dev_priv);
++	ret = i915_gem_wait_for_idle(dev_priv, true);
+ 	if (ret)
+ 		goto err;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_evict.c b/drivers/gpu/drm/i915/i915_gem_evict.c
+index 7be4258..f76c06e 100644
+--- a/drivers/gpu/drm/i915/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/i915_gem_evict.c
+@@ -39,7 +39,7 @@ gpu_is_idle(struct drm_i915_private *dev_priv)
+ 	struct intel_engine_cs *engine;
+ 
+ 	for_each_engine(engine, dev_priv) {
+-		if (!list_empty(&engine->request_list))
++		if (intel_engine_is_active(engine))
+ 			return false;
+ 	}
+ 
+@@ -167,7 +167,7 @@ search_again:
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = i915_gem_wait_for_idle(dev_priv);
++	ret = i915_gem_wait_for_idle(dev_priv, true);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -272,7 +272,7 @@ int i915_gem_evict_vm(struct i915_address_space *vm, bool do_idle)
+ 				return ret;
+ 		}
+ 
+-		ret = i915_gem_wait_for_idle(dev_priv);
++		ret = i915_gem_wait_for_idle(dev_priv, true);
+ 		if (ret)
+ 			return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 72ac75a..8314b5c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -2251,7 +2251,7 @@ static bool do_idling(struct drm_i915_private *dev_priv)
+ 
+ 	if (unlikely(ggtt->do_idle_maps)) {
+ 		dev_priv->mm.interruptible = false;
+-		if (i915_gem_wait_for_idle(dev_priv)) {
++		if (i915_gem_wait_for_idle(dev_priv, false)) {
+ 			DRM_ERROR("Failed to wait for idle; VT'd may hang.\n");
+ 			/* Wait a bit, in hopes it avoids the hang */
+ 			udelay(10);
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index 3fecb8f..1f91dc8 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -265,7 +265,7 @@ static int i915_gem_init_seqno(struct drm_i915_private *dev_priv, u32 seqno)
+ 
+ 	/* Carefully retire all requests without writing to the rings */
+ 	for_each_engine(engine, dev_priv) {
+-		ret = intel_engine_idle(engine);
++		ret = intel_engine_idle(engine, true);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -486,7 +486,8 @@ void __i915_add_request(struct drm_i915_gem_request *request,
+ 	 */
+ 	request->emitted_jiffies = jiffies;
+ 	request->previous_seqno = engine->last_submitted_seqno;
+-	smp_store_mb(engine->last_submitted_seqno, request->fence.seqno);
++	engine->last_submitted_seqno = request->fence.seqno;
++	i915_gem_active_set(&engine->last_request, request);
+ 	list_add_tail(&request->link, &engine->request_list);
+ 	list_add_tail(&request->ring_link, &ring->request_list);
+ 
+@@ -757,7 +758,7 @@ void i915_gem_retire_requests(struct drm_i915_private *dev_priv)
+ 
+ 	for_each_engine(engine, dev_priv) {
+ 		engine_retire_requests(engine);
+-		if (list_empty(&engine->request_list))
++		if (!intel_engine_is_active(engine))
+ 			dev_priv->gt.active_engines &= ~intel_engine_flag(engine);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.h b/drivers/gpu/drm/i915/i915_gem_request.h
+index 15495d1..3496e28 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.h
++++ b/drivers/gpu/drm/i915/i915_gem_request.h
+@@ -29,6 +29,17 @@
+ 
+ #include "i915_gem.h"
+ 
++struct intel_wait {
++	struct rb_node node;
++	struct task_struct *tsk;
++	u32 seqno;
++};
++
++struct intel_signal_node {
++	struct rb_node node;
++	struct intel_wait wait;
++};
++
+ /**
+  * Request queue structure.
+  *
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 1bdcb7c..812605e 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2805,13 +2805,6 @@ static void gen8_disable_vblank(struct drm_device *dev, unsigned int pipe)
+ }
+ 
+ static bool
+-ring_idle(struct intel_engine_cs *engine, u32 seqno)
+-{
+-	return i915_seqno_passed(seqno,
+-				 READ_ONCE(engine->last_submitted_seqno));
+-}
+-
+-static bool
+ ipehr_is_semaphore_wait(struct intel_engine_cs *engine, u32 ipehr)
+ {
+ 	if (INTEL_GEN(engine->i915) >= 8) {
+@@ -3131,7 +3124,7 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
+ 		user_interrupts = 0;
+ 
+ 		if (engine->hangcheck.seqno == seqno) {
+-			if (ring_idle(engine, seqno)) {
++			if (!intel_engine_is_active(engine)) {
+ 				engine->hangcheck.action = HANGCHECK_IDLE;
+ 				if (busy) {
+ 					/* Safeguard against driver failure */
+diff --git a/drivers/gpu/drm/i915/intel_engine_cs.c b/drivers/gpu/drm/i915/intel_engine_cs.c
+index f495969..e9b301a 100644
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -166,6 +166,12 @@ void intel_engine_init_hangcheck(struct intel_engine_cs *engine)
+ 	memset(&engine->hangcheck, 0, sizeof(engine->hangcheck));
+ }
+ 
++static void intel_engine_init_requests(struct intel_engine_cs *engine)
++{
++	init_request_active(&engine->last_request, NULL);
++	INIT_LIST_HEAD(&engine->request_list);
++}
++
+ /**
+  * intel_engines_setup_common - setup engine state not requiring hw access
+  * @engine: Engine to setup.
+@@ -177,13 +183,13 @@ void intel_engine_init_hangcheck(struct intel_engine_cs *engine)
+  */
+ void intel_engine_setup_common(struct intel_engine_cs *engine)
+ {
+-	INIT_LIST_HEAD(&engine->request_list);
+ 	INIT_LIST_HEAD(&engine->buffers);
+ 	INIT_LIST_HEAD(&engine->execlist_queue);
+ 	spin_lock_init(&engine->execlist_lock);
+ 
+ 	engine->fence_context = fence_context_alloc(1);
+ 
++	intel_engine_init_requests(engine);
+ 	intel_engine_init_hangcheck(engine);
+ 	i915_gem_batch_pool_init(engine, &engine->batch_pool);
+ }
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 2f9aa64..d084368 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -6517,19 +6517,11 @@ EXPORT_SYMBOL_GPL(i915_gpu_lower);
+  */
+ bool i915_gpu_busy(void)
+ {
+-	struct drm_i915_private *dev_priv;
+-	struct intel_engine_cs *engine;
+ 	bool ret = false;
+ 
+ 	spin_lock_irq(&mchdev_lock);
+-	if (!i915_mch_dev)
+-		goto out_unlock;
+-	dev_priv = i915_mch_dev;
+-
+-	for_each_engine(engine, dev_priv)
+-		ret |= !list_empty(&engine->request_list);
+-
+-out_unlock:
++	if (i915_mch_dev)
++		ret = i915_mch_dev->gt.awake;
+ 	spin_unlock_irq(&mchdev_lock);
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 4fbe162..e08a1e1 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2227,24 +2227,6 @@ void intel_engine_cleanup(struct intel_engine_cs *engine)
+ 	engine->i915 = NULL;
+ }
+ 
+-int intel_engine_idle(struct intel_engine_cs *engine)
+-{
+-	struct drm_i915_gem_request *req;
+-
+-	/* Wait upon the last request to be completed */
+-	if (list_empty(&engine->request_list))
+-		return 0;
+-
+-	req = list_entry(engine->request_list.prev,
+-			 struct drm_i915_gem_request,
+-			 link);
+-
+-	/* Make sure we do not trigger any retires */
+-	return i915_wait_request(req,
+-				 req->i915->mm.interruptible,
+-				 NULL, NULL);
+-}
+-
+ int intel_ring_alloc_request_extras(struct drm_i915_gem_request *request)
+ {
+ 	int ret;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 88952bf..43e545e 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -3,6 +3,7 @@
+ 
+ #include <linux/hashtable.h>
+ #include "i915_gem_batch_pool.h"
++#include "i915_gem_request.h"
+ 
+ #define I915_CMD_HASH_ORDER 9
+ 
+@@ -307,6 +308,13 @@ struct intel_engine_cs {
+ 	 */
+ 	u32 last_submitted_seqno;
+ 
++	/* An RCU guarded pointer to the last request. No reference is
++	 * held to the request, users must carefully acquire a reference to
++	 * the request using i915_gem_active_get_request_rcu(), or hold the
++	 * struct_mutex.
++	 */
++	struct i915_gem_active last_request;
++
+ 	struct i915_gem_context *last_context;
+ 
+ 	struct intel_engine_hangcheck hangcheck;
+@@ -465,7 +473,6 @@ static inline u32 intel_ring_offset(struct intel_ring *ring, u32 value)
+ int __intel_ring_space(int head, int tail, int size);
+ void intel_ring_update_space(struct intel_ring *ring);
+ 
+-int __must_check intel_engine_idle(struct intel_engine_cs *engine);
+ void intel_engine_init_seqno(struct intel_engine_cs *engine, u32 seqno);
+ 
+ int intel_init_pipe_control(struct intel_engine_cs *engine, int size);
+@@ -475,6 +482,14 @@ void intel_engine_setup_common(struct intel_engine_cs *engine);
+ int intel_engine_init_common(struct intel_engine_cs *engine);
+ void intel_engine_cleanup_common(struct intel_engine_cs *engine);
+ 
++static inline int intel_engine_idle(struct intel_engine_cs *engine,
++				    bool interruptible)
++{
++	/* Wait upon the last request to be completed */
++	return i915_gem_active_wait_unlocked(&engine->last_request,
++					     interruptible, NULL, NULL);
++}
++
+ int intel_init_render_ring_buffer(struct intel_engine_cs *engine);
+ int intel_init_bsd_ring_buffer(struct intel_engine_cs *engine);
+ int intel_init_bsd2_ring_buffer(struct intel_engine_cs *engine);
+@@ -504,17 +519,6 @@ static inline u32 intel_hws_seqno_address(struct intel_engine_cs *engine)
+ }
+ 
+ /* intel_breadcrumbs.c -- user interrupt bottom-half for waiters */
+-struct intel_wait {
+-	struct rb_node node;
+-	struct task_struct *tsk;
+-	u32 seqno;
+-};
+-
+-struct intel_signal_node {
+-	struct rb_node node;
+-	struct intel_wait wait;
+-};
+-
+ int intel_engine_init_breadcrumbs(struct intel_engine_cs *engine);
+ 
+ static inline void intel_wait_init(struct intel_wait *wait, u32 seqno)
+@@ -561,4 +565,9 @@ void intel_engine_fini_breadcrumbs(struct intel_engine_cs *engine);
+ unsigned int intel_kick_waiters(struct drm_i915_private *i915);
+ unsigned int intel_kick_signalers(struct drm_i915_private *i915);
+ 
++static inline bool intel_engine_is_active(struct intel_engine_cs *engine)
++{
++	return i915_gem_active_isset(&engine->last_request);
++}
++
+ #endif /* _INTEL_RINGBUFFER_H_ */
+-- 
+1.7.5.4
+

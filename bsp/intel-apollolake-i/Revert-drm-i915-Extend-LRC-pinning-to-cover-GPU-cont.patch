@@ -1,0 +1,293 @@
+From a5a4ae6ce92d3d01ad768b06670728fee418b9c4 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Fri, 4 Dec 2015 17:27:15 +0100
+Subject: [PATCH 1950/4706] Revert "drm/i915: Extend LRC pinning to cover GPU
+ context writeback"
+
+commit af3302b90775ca3389c93ab31458d696e8a8fa60 upstream
+
+This reverts commit 6d65ba943a2d1e4292a07ca7ddb6c5138b9efa5d.
+
+Mika Kuoppala traced down a use-after-free crash in module unload to
+this commit, because ring->last_context is leaked beyond when the
+context gets destroyed. Mika submitted a quick fix to patch that up in
+the context destruction code, but that's too much of a hack.
+
+The right fix is instead for the ring to hold a full reference onto
+it's last context, like we do for legacy contexts.
+
+Since this is causing a regression in BAT it gets reverted before we
+can close this.
+
+Cc: Nick Hoath <nicholas.hoath@intel.com>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: David Gordon <david.s.gordon@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Alex Dai <yu.dai@intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=93248
+Acked-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h  |    1 -
+ drivers/gpu/drm/i915/i915_gem.c  |    7 +-
+ drivers/gpu/drm/i915/intel_lrc.c |  136 +++++++-------------------------------
+ drivers/gpu/drm/i915/intel_lrc.h |    1 -
+ 4 files changed, 27 insertions(+), 118 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index dd541d9..ab4f8ec 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -884,7 +884,6 @@ struct intel_context {
+ 	struct {
+ 		struct drm_i915_gem_object *state;
+ 		struct intel_ringbuffer *ringbuf;
+-		bool dirty;
+ 		int pin_count;
+ 	} engine[I915_NUM_RINGS];
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index fd4f760..6d29cbf 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1413,9 +1413,6 @@ static void i915_gem_request_retire(struct drm_i915_gem_request *request)
+ {
+ 	trace_i915_gem_request_retire(request);
+ 
+-	if (i915.enable_execlists)
+-		intel_lr_context_complete_check(request);
+-
+ 	/* We know the GPU must have read the request to have
+ 	 * sent us the seqno + interrupt, so use the position
+ 	 * of tail of the request to update the last known position
+@@ -2828,6 +2825,10 @@ static void i915_gem_reset_ring_cleanup(struct drm_i915_private *dev_priv,
+ 					struct drm_i915_gem_request,
+ 					execlist_link);
+ 			list_del(&submit_req->execlist_link);
++
++			if (submit_req->ctx != ring->default_context)
++				intel_lr_context_unpin(submit_req);
++
+ 			i915_gem_request_unreference(submit_req);
+ 		}
+ 		spin_unlock_irq(&ring->execlist_lock);
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 5d89fbd..ad8b456 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -571,6 +571,9 @@ static int execlists_context_queue(struct drm_i915_gem_request *request)
+ 	struct drm_i915_gem_request *cursor;
+ 	int num_elements = 0;
+ 
++	if (request->ctx != ring->default_context)
++		intel_lr_context_pin(request);
++
+ 	i915_gem_request_reference(request);
+ 
+ 	spin_lock_irq(&ring->execlist_lock);
+@@ -734,13 +737,6 @@ intel_logical_ring_advance_and_submit(struct drm_i915_gem_request *request)
+ 	if (intel_ring_stopped(ring))
+ 		return;
+ 
+-	if (request->ctx != ring->default_context) {
+-		if (!request->ctx->engine[ring->id].dirty) {
+-			intel_lr_context_pin(request);
+-			request->ctx->engine[ring->id].dirty = true;
+-		}
+-	}
+-
+ 	if (dev_priv->guc.execbuf_client)
+ 		i915_guc_submit(dev_priv->guc.execbuf_client, request);
+ 	else
+@@ -967,6 +963,12 @@ void intel_execlists_retire_requests(struct intel_engine_cs *ring)
+ 	spin_unlock_irq(&ring->execlist_lock);
+ 
+ 	list_for_each_entry_safe(req, tmp, &retired_list, execlist_link) {
++		struct intel_context *ctx = req->ctx;
++		struct drm_i915_gem_object *ctx_obj =
++				ctx->engine[ring->id].state;
++
++		if (ctx_obj && (ctx != ring->default_context))
++			intel_lr_context_unpin(req);
+ 		list_del(&req->execlist_link);
+ 		i915_gem_request_unreference(req);
+ 	}
+@@ -1061,39 +1063,21 @@ reset_pin_count:
+ 	return ret;
+ }
+ 
+-static void __intel_lr_context_unpin(struct intel_engine_cs *ring,
+-		struct intel_context *ctx)
++void intel_lr_context_unpin(struct drm_i915_gem_request *rq)
+ {
+-	struct drm_i915_gem_object *ctx_obj = ctx->engine[ring->id].state;
+-	struct intel_ringbuffer *ringbuf = ctx->engine[ring->id].ringbuf;
++	struct intel_engine_cs *ring = rq->ring;
++	struct drm_i915_gem_object *ctx_obj = rq->ctx->engine[ring->id].state;
++	struct intel_ringbuffer *ringbuf = rq->ringbuf;
++
+ 	if (ctx_obj) {
+ 		WARN_ON(!mutex_is_locked(&ring->dev->struct_mutex));
+-		if (--ctx->engine[ring->id].pin_count == 0) {
++		if (--rq->ctx->engine[ring->id].pin_count == 0) {
+ 			intel_unpin_ringbuffer_obj(ringbuf);
+ 			i915_gem_object_ggtt_unpin(ctx_obj);
+ 		}
+ 	}
+ }
+ 
+-void intel_lr_context_unpin(struct drm_i915_gem_request *rq)
+-{
+-	__intel_lr_context_unpin(rq->ring, rq->ctx);
+-}
+-
+-void intel_lr_context_complete_check(struct drm_i915_gem_request *req)
+-{
+-	struct intel_engine_cs *ring = req->ring;
+-
+-	if (ring->last_context && ring->last_context != req->ctx &&
+-			ring->last_context->engine[ring->id].dirty) {
+-		__intel_lr_context_unpin(
+-				ring,
+-				ring->last_context);
+-		ring->last_context->engine[ring->id].dirty = false;
+-	}
+-	ring->last_context = req->ctx;
+-}
+-
+ static int intel_logical_ring_workarounds_emit(struct drm_i915_gem_request *req)
+ {
+ 	int ret, i;
+@@ -2374,76 +2358,6 @@ populate_lr_context(struct intel_context *ctx, struct drm_i915_gem_object *ctx_o
+ }
+ 
+ /**
+- * intel_lr_context_clean_ring() - clean the ring specific parts of an LRC
+- * @ctx: the LR context being freed.
+- * @ring: the engine being cleaned
+- * @ctx_obj: the hw context being unreferenced
+- * @ringbuf: the ringbuf being freed
+- *
+- * Take care of cleaning up the per-engine backing
+- * objects and the logical ringbuffer.
+- */
+-static void
+-intel_lr_context_clean_ring(struct intel_context *ctx,
+-			    struct intel_engine_cs *ring,
+-			    struct drm_i915_gem_object *ctx_obj,
+-			    struct intel_ringbuffer *ringbuf)
+-{
+-	int ret;
+-
+-	WARN_ON(!mutex_is_locked(&ring->dev->struct_mutex));
+-
+-	if (ctx == ring->default_context) {
+-		intel_unpin_ringbuffer_obj(ringbuf);
+-		i915_gem_object_ggtt_unpin(ctx_obj);
+-	}
+-
+-	if (ctx->engine[ring->id].dirty) {
+-		struct drm_i915_gem_request *req = NULL;
+-
+-		/**
+-		 * If there is already a request pending on
+-		 * this ring, wait for that to complete,
+-		 * otherwise create a switch to idle request
+-		 */
+-		if (list_empty(&ring->request_list)) {
+-			int ret;
+-
+-			ret = i915_gem_request_alloc(
+-					ring,
+-					ring->default_context,
+-					&req);
+-			if (!ret)
+-				i915_add_request(req);
+-			else
+-				DRM_DEBUG("Failed to ensure context saved");
+-		} else {
+-			req = list_first_entry(
+-					&ring->request_list,
+-					typeof(*req), list);
+-		}
+-		if (req) {
+-			ret = i915_wait_request(req);
+-			if (ret != 0) {
+-				/**
+-				 * If we get here, there's probably been a ring
+-				 * reset, so we just clean up the dirty flag.&
+-				 * pin count.
+-				 */
+-				ctx->engine[ring->id].dirty = false;
+-				__intel_lr_context_unpin(
+-					ring,
+-					ctx);
+-			}
+-		}
+-	}
+-
+-	WARN_ON(ctx->engine[ring->id].pin_count);
+-	intel_ringbuffer_free(ringbuf);
+-	drm_gem_object_unreference(&ctx_obj->base);
+-}
+-
+-/**
+  * intel_lr_context_free() - free the LRC specific bits of a context
+  * @ctx: the LR context to free.
+  *
+@@ -2455,7 +2369,7 @@ void intel_lr_context_free(struct intel_context *ctx)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < I915_NUM_RINGS; ++i) {
++	for (i = 0; i < I915_NUM_RINGS; i++) {
+ 		struct drm_i915_gem_object *ctx_obj = ctx->engine[i].state;
+ 
+ 		if (ctx_obj) {
+@@ -2463,10 +2377,13 @@ void intel_lr_context_free(struct intel_context *ctx)
+ 					ctx->engine[i].ringbuf;
+ 			struct intel_engine_cs *ring = ringbuf->ring;
+ 
+-			intel_lr_context_clean_ring(ctx,
+-						    ring,
+-						    ctx_obj,
+-						    ringbuf);
++			if (ctx == ring->default_context) {
++				intel_unpin_ringbuffer_obj(ringbuf);
++				i915_gem_object_ggtt_unpin(ctx_obj);
++			}
++			WARN_ON(ctx->engine[ring->id].pin_count);
++			intel_ringbuffer_free(ringbuf);
++			drm_gem_object_unreference(&ctx_obj->base);
+ 		}
+ 	}
+ }
+@@ -2628,12 +2545,5 @@ void intel_lr_context_reset(struct drm_device *dev,
+ 
+ 		ringbuf->head = 0;
+ 		ringbuf->tail = 0;
+-
+-		if (ctx->engine[ring->id].dirty) {
+-			__intel_lr_context_unpin(
+-					ring,
+-					ctx);
+-			ctx->engine[ring->id].dirty = false;
+-		}
+ 	}
+ }
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index fd1b6b4..0b821b9 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -91,7 +91,6 @@ void intel_lr_context_reset(struct drm_device *dev,
+ 			struct intel_context *ctx);
+ uint64_t intel_lr_context_descriptor(struct intel_context *ctx,
+ 				     struct intel_engine_cs *ring);
+-void intel_lr_context_complete_check(struct drm_i915_gem_request *req);
+ 
+ /* Execlists */
+ int intel_sanitize_enable_execlists(struct drm_device *dev, int enable_execlists);
+-- 
+1.7.5.4
+

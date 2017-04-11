@@ -1,0 +1,600 @@
+From d8f7dc696537e5a389eeb72159ef15a53170033c Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Wed, 16 Dec 2015 02:52:19 +0200
+Subject: [PATCH 2025/4706] drm/i915: add support for checking if we hold an
+ RPM reference
+
+commit 1f814daca43a2d99248fd754eacfb8ba12449235 upstream
+
+Atm, we assert that the device is not suspended until the point when the
+device is truly put to a suspended state. This is fine, but we can catch
+more problems if we check that RPM refcount is non-zero. After that one
+drops to zero we shouldn't access the device any more, even if the actual
+device suspend may be delayed. Change assert_rpm_wakelock_held()
+accordingly to check for a non-zero RPM refcount in addition to the
+current device-not-suspended check.
+
+For the new asserts to work we need to annotate every place explicitly in
+the code where we expect that the device is powered. The places where we
+only assume this, but may not hold an RPM reference:
+- driver load
+  We assume the device to be powered until we enable RPM. Make this
+  explicit by taking an RPM reference around the load function.
+- system and runtime sudpend/resume handlers
+  These handlers are called when the RPM reference becomes 0 and know the
+  exact point after which the device can get powered off. Disable the
+  RPM-reference-held check for their duration.
+- the IRQ, hangcheck and RPS work handlers
+  These handlers are flushed in the system/runtime suspend handler
+  before the device is powered off, so it's guaranteed that they won't
+  run while the device is powered off even though they don't hold any
+  RPM reference. Disable the RPM-reference-held check for their duration.
+
+In all these cases we still check that the device is not suspended.
+These explicit annotations also have the positive side effect of
+documenting our assumptions better.
+
+This caught additional WARNs from the atomic modeset path, those should
+be fixed separately.
+
+v2:
+- remove the redundant HAS_RUNTIME_PM check (moved to patch 1) (Ville)
+v3:
+- use a new dedicated RPM wakelock refcount to also catch cases where
+  our own RPM get/put functions were not called (Chris)
+- assert also that the new RPM wakelock refcount is 0 in the RPM
+  suspend handler (Chris)
+- change the assert error message to be more meaningful (Chris)
+- prevent false assert errors and check that the RPM wakelock is 0 in
+  the RPM resume handler too
+- prevent false assert errors in the hangcheck work too
+- add a device not suspended assert check to the hangcheck work
+v4:
+- rename disable/enable_rpm_asserts to disable/enable_rpm_wakeref_asserts
+  and wakelock_count to wakeref_count
+- disable the wakeref asserts in the IRQ handlers and RPS work too
+- update/clarify commit message
+v5:
+- mark places we plan to change to use proper RPM refcounting with
+  separate DISABLE/ENABLE_RPM_WAKEREF_ASSERTS aliases (Chris)
+
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: http://patchwork.freedesktop.org/patch/msgid/1450227139-13471-1-git-send-email-imre.deak@intel.com
+---
+ drivers/gpu/drm/i915/i915_dma.c         |    7 +++
+ drivers/gpu/drm/i915/i915_drv.c         |   39 ++++++++++++++--
+ drivers/gpu/drm/i915/i915_drv.h         |    1 +
+ drivers/gpu/drm/i915/i915_irq.c         |   75 ++++++++++++++++++++++++++++---
+ drivers/gpu/drm/i915/intel_drv.h        |   50 ++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_pm.c         |    1 +
+ drivers/gpu/drm/i915/intel_runtime_pm.c |    6 +++
+ 7 files changed, 169 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index f75988f..988a380 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -896,6 +896,8 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 
+ 	intel_pm_setup(dev);
+ 
++	intel_runtime_pm_get(dev_priv);
++
+ 	intel_display_crc_init(dev);
+ 
+ 	i915_dump_device_info(dev_priv);
+@@ -1085,6 +1087,8 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 
+ 	i915_audio_component_init(dev_priv);
+ 
++	intel_runtime_pm_put(dev_priv);
++
+ 	return 0;
+ 
+ out_power_well:
+@@ -1120,6 +1124,9 @@ free_priv:
+ 	kmem_cache_destroy(dev_priv->requests);
+ 	kmem_cache_destroy(dev_priv->vmas);
+ 	kmem_cache_destroy(dev_priv->objects);
++
++	intel_runtime_pm_put(dev_priv);
++
+ 	kfree(dev_priv);
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 44ad308..3ac616d 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -577,6 +577,8 @@ static int i915_drm_suspend(struct drm_device *dev)
+ 	dev_priv->modeset_restore = MODESET_SUSPENDED;
+ 	mutex_unlock(&dev_priv->modeset_restore_lock);
+ 
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	/* We do a lot of poking in a lot of registers, make sure they work
+ 	 * properly. */
+ 	intel_display_set_init_power(dev_priv, true);
+@@ -589,7 +591,7 @@ static int i915_drm_suspend(struct drm_device *dev)
+ 	if (error) {
+ 		dev_err(&dev->pdev->dev,
+ 			"GEM idle failed, resume might fail\n");
+-		return error;
++		goto out;
+ 	}
+ 
+ 	intel_guc_suspend(dev);
+@@ -632,7 +634,10 @@ static int i915_drm_suspend(struct drm_device *dev)
+ 	if (HAS_CSR(dev_priv))
+ 		flush_work(&dev_priv->csr.work);
+ 
+-	return 0;
++out:
++	enable_rpm_wakeref_asserts(dev_priv);
++
++	return error;
+ }
+ 
+ static int i915_drm_suspend_late(struct drm_device *drm_dev, bool hibernation)
+@@ -641,6 +646,8 @@ static int i915_drm_suspend_late(struct drm_device *drm_dev, bool hibernation)
+ 	bool fw_csr;
+ 	int ret;
+ 
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	fw_csr = suspend_to_idle(dev_priv) && dev_priv->csr.dmc_payload;
+ 	/*
+ 	 * In case of firmware assisted context save/restore don't manually
+@@ -659,7 +666,7 @@ static int i915_drm_suspend_late(struct drm_device *drm_dev, bool hibernation)
+ 		if (!fw_csr)
+ 			intel_power_domains_init_hw(dev_priv, true);
+ 
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	pci_disable_device(drm_dev->pdev);
+@@ -680,7 +687,10 @@ static int i915_drm_suspend_late(struct drm_device *drm_dev, bool hibernation)
+ 
+ 	dev_priv->suspended_to_idle = suspend_to_idle(dev_priv);
+ 
+-	return 0;
++out:
++	enable_rpm_wakeref_asserts(dev_priv);
++
++	return ret;
+ }
+ 
+ int i915_suspend_switcheroo(struct drm_device *dev, pm_message_t state)
+@@ -711,6 +721,8 @@ static int i915_drm_resume(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	mutex_lock(&dev->struct_mutex);
+ 	i915_gem_restore_gtt_mappings(dev);
+ 	mutex_unlock(&dev->struct_mutex);
+@@ -775,6 +787,8 @@ static int i915_drm_resume(struct drm_device *dev)
+ 
+ 	drm_kms_helper_poll_enable(dev);
+ 
++	enable_rpm_wakeref_asserts(dev_priv);
++
+ 	return 0;
+ }
+ 
+@@ -799,6 +813,8 @@ static int i915_drm_resume_early(struct drm_device *dev)
+ 
+ 	pci_set_master(dev->pdev);
+ 
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	if (IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv))
+ 		ret = vlv_resume_prepare(dev_priv, false);
+ 	if (ret)
+@@ -820,6 +836,8 @@ static int i915_drm_resume_early(struct drm_device *dev)
+ out:
+ 	dev_priv->suspended_to_idle = false;
+ 
++	enable_rpm_wakeref_asserts(dev_priv);
++
+ 	return ret;
+ }
+ 
+@@ -1452,6 +1470,9 @@ static int intel_runtime_suspend(struct device *device)
+ 
+ 		return -EAGAIN;
+ 	}
++
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	/*
+ 	 * We are safe here against re-faults, since the fault handler takes
+ 	 * an RPM reference.
+@@ -1471,10 +1492,15 @@ static int intel_runtime_suspend(struct device *device)
+ 		DRM_ERROR("Runtime suspend failed, disabling it (%d)\n", ret);
+ 		intel_runtime_pm_enable_interrupts(dev_priv);
+ 
++		enable_rpm_wakeref_asserts(dev_priv);
++
+ 		return ret;
+ 	}
+ 
+ 	intel_uncore_forcewake_reset(dev, false);
++
++	enable_rpm_wakeref_asserts(dev_priv);
++	WARN_ON_ONCE(atomic_read(&dev_priv->pm.wakeref_count));
+ 	dev_priv->pm.suspended = true;
+ 
+ 	/*
+@@ -1518,6 +1544,9 @@ static int intel_runtime_resume(struct device *device)
+ 
+ 	DRM_DEBUG_KMS("Resuming device\n");
+ 
++	WARN_ON_ONCE(atomic_read(&dev_priv->pm.wakeref_count));
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	intel_opregion_notify_adapter(dev, PCI_D0);
+ 	dev_priv->pm.suspended = false;
+ 
+@@ -1552,6 +1581,8 @@ static int intel_runtime_resume(struct device *device)
+ 
+ 	intel_enable_gt_powersave(dev);
+ 
++	enable_rpm_wakeref_asserts(dev_priv);
++
+ 	if (ret)
+ 		DRM_ERROR("Runtime resume failed, disabling it (%d)\n", ret);
+ 	else
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 340ac4b..5893b46 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1605,6 +1605,7 @@ struct skl_wm_level {
+  * For more, read the Documentation/power/runtime_pm.txt.
+  */
+ struct i915_runtime_pm {
++	atomic_t wakeref_count;
+ 	bool suspended;
+ 	bool irqs_enabled;
+ };
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 86664d1..3f8c753 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1103,6 +1103,14 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ 		spin_unlock_irq(&dev_priv->irq_lock);
+ 		return;
+ 	}
++
++	/*
++	 * The RPS work is synced during runtime suspend, we don't require a
++	 * wakeref. TODO: instead of disabling the asserts make sure that we
++	 * always hold an RPM reference while the work is running.
++	 */
++	DISABLE_RPM_WAKEREF_ASSERTS(dev_priv);
++
+ 	pm_iir = dev_priv->rps.pm_iir;
+ 	dev_priv->rps.pm_iir = 0;
+ 	/* Make sure not to corrupt PMIMR state used by ringbuffer on GEN6 */
+@@ -1115,7 +1123,7 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ 	WARN_ON(pm_iir & ~dev_priv->pm_rps_events);
+ 
+ 	if ((pm_iir & dev_priv->pm_rps_events) == 0 && !client_boost)
+-		return;
++		goto out;
+ 
+ 	mutex_lock(&dev_priv->rps.hw_lock);
+ 
+@@ -1170,6 +1178,8 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ 	intel_set_rps(dev_priv->dev, new_delay);
+ 
+ 	mutex_unlock(&dev_priv->rps.hw_lock);
++out:
++	ENABLE_RPM_WAKEREF_ASSERTS(dev_priv);
+ }
+ 
+ 
+@@ -1758,6 +1768,9 @@ static irqreturn_t valleyview_irq_handler(int irq, void *arg)
+ 	if (!intel_irqs_enabled(dev_priv))
+ 		return IRQ_NONE;
+ 
++	/* IRQs are synced during runtime_suspend, we don't require a wakeref */
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	while (true) {
+ 		/* Find, clear, then process each source of interrupt */
+ 
+@@ -1792,6 +1805,8 @@ static irqreturn_t valleyview_irq_handler(int irq, void *arg)
+ 	}
+ 
+ out:
++	enable_rpm_wakeref_asserts(dev_priv);
++
+ 	return ret;
+ }
+ 
+@@ -1805,6 +1820,9 @@ static irqreturn_t cherryview_irq_handler(int irq, void *arg)
+ 	if (!intel_irqs_enabled(dev_priv))
+ 		return IRQ_NONE;
+ 
++	/* IRQs are synced during runtime_suspend, we don't require a wakeref */
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	for (;;) {
+ 		master_ctl = I915_READ(GEN8_MASTER_IRQ) & ~GEN8_MASTER_IRQ_CONTROL;
+ 		iir = I915_READ(VLV_IIR);
+@@ -1835,6 +1853,8 @@ static irqreturn_t cherryview_irq_handler(int irq, void *arg)
+ 		POSTING_READ(GEN8_MASTER_IRQ);
+ 	}
+ 
++	enable_rpm_wakeref_asserts(dev_priv);
++
+ 	return ret;
+ }
+ 
+@@ -2165,6 +2185,9 @@ static irqreturn_t ironlake_irq_handler(int irq, void *arg)
+ 	if (!intel_irqs_enabled(dev_priv))
+ 		return IRQ_NONE;
+ 
++	/* IRQs are synced during runtime_suspend, we don't require a wakeref */
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	/* We get interrupts on unclaimed registers, so check for this before we
+ 	 * do any I915_{READ,WRITE}. */
+ 	intel_uncore_check_errors(dev);
+@@ -2223,6 +2246,9 @@ static irqreturn_t ironlake_irq_handler(int irq, void *arg)
+ 		POSTING_READ(SDEIER);
+ 	}
+ 
++	/* IRQs are synced during runtime_suspend, we don't require a wakeref */
++	enable_rpm_wakeref_asserts(dev_priv);
++
+ 	return ret;
+ }
+ 
+@@ -2255,6 +2281,9 @@ static irqreturn_t gen8_irq_handler(int irq, void *arg)
+ 	if (!intel_irqs_enabled(dev_priv))
+ 		return IRQ_NONE;
+ 
++	/* IRQs are synced during runtime_suspend, we don't require a wakeref */
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	if (INTEL_INFO(dev_priv)->gen >= 9)
+ 		aux_mask |=  GEN9_AUX_CHANNEL_B | GEN9_AUX_CHANNEL_C |
+ 			GEN9_AUX_CHANNEL_D;
+@@ -2262,7 +2291,7 @@ static irqreturn_t gen8_irq_handler(int irq, void *arg)
+ 	master_ctl = I915_READ_FW(GEN8_MASTER_IRQ);
+ 	master_ctl &= ~GEN8_MASTER_IRQ_CONTROL;
+ 	if (!master_ctl)
+-		return IRQ_NONE;
++		goto out;
+ 
+ 	I915_WRITE_FW(GEN8_MASTER_IRQ, 0);
+ 
+@@ -2393,6 +2422,9 @@ static irqreturn_t gen8_irq_handler(int irq, void *arg)
+ 	I915_WRITE_FW(GEN8_MASTER_IRQ, GEN8_MASTER_IRQ_CONTROL);
+ 	POSTING_READ_FW(GEN8_MASTER_IRQ);
+ 
++out:
++	enable_rpm_wakeref_asserts(dev_priv);
++
+ 	return ret;
+ }
+ 
+@@ -2989,6 +3021,13 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
+ 	if (!i915.enable_hangcheck)
+ 		return;
+ 
++	/*
++	 * The hangcheck work is synced during runtime suspend, we don't
++	 * require a wakeref. TODO: instead of disabling the asserts make
++	 * sure that we hold a reference when this work is running.
++	 */
++	DISABLE_RPM_WAKEREF_ASSERTS(dev_priv);
++
+ 	for_each_ring(ring, dev_priv, i) {
+ 		u64 acthd;
+ 		u32 seqno;
+@@ -3080,13 +3119,18 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
+ 		}
+ 	}
+ 
+-	if (rings_hung)
+-		return i915_handle_error(dev, true, "Ring hung");
++	if (rings_hung) {
++		i915_handle_error(dev, true, "Ring hung");
++		goto out;
++	}
+ 
+ 	if (busy_count)
+ 		/* Reset timer case chip hangs without another request
+ 		 * being added */
+ 		i915_queue_hangcheck(dev);
++
++out:
++	ENABLE_RPM_WAKEREF_ASSERTS(dev_priv);
+ }
+ 
+ void i915_queue_hangcheck(struct drm_device *dev)
+@@ -3878,13 +3922,18 @@ static irqreturn_t i8xx_irq_handler(int irq, void *arg)
+ 	u16 flip_mask =
+ 		I915_DISPLAY_PLANE_A_FLIP_PENDING_INTERRUPT |
+ 		I915_DISPLAY_PLANE_B_FLIP_PENDING_INTERRUPT;
++	irqreturn_t ret;
+ 
+ 	if (!intel_irqs_enabled(dev_priv))
+ 		return IRQ_NONE;
+ 
++	/* IRQs are synced during runtime_suspend, we don't require a wakeref */
++	disable_rpm_wakeref_asserts(dev_priv);
++
++	ret = IRQ_NONE;
+ 	iir = I915_READ16(IIR);
+ 	if (iir == 0)
+-		return IRQ_NONE;
++		goto out;
+ 
+ 	while (iir & ~flip_mask) {
+ 		/* Can't rely on pipestat interrupt bit in iir as it might
+@@ -3933,8 +3982,12 @@ static irqreturn_t i8xx_irq_handler(int irq, void *arg)
+ 
+ 		iir = new_iir;
+ 	}
++	ret = IRQ_HANDLED;
++
++out:
++	enable_rpm_wakeref_asserts(dev_priv);
+ 
+-	return IRQ_HANDLED;
++	return ret;
+ }
+ 
+ static void i8xx_irq_uninstall(struct drm_device * dev)
+@@ -4063,6 +4116,9 @@ static irqreturn_t i915_irq_handler(int irq, void *arg)
+ 	if (!intel_irqs_enabled(dev_priv))
+ 		return IRQ_NONE;
+ 
++	/* IRQs are synced during runtime_suspend, we don't require a wakeref */
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	iir = I915_READ(IIR);
+ 	do {
+ 		bool irq_received = (iir & ~flip_mask) != 0;
+@@ -4145,6 +4201,8 @@ static irqreturn_t i915_irq_handler(int irq, void *arg)
+ 		iir = new_iir;
+ 	} while (iir & ~flip_mask);
+ 
++	enable_rpm_wakeref_asserts(dev_priv);
++
+ 	return ret;
+ }
+ 
+@@ -4284,6 +4342,9 @@ static irqreturn_t i965_irq_handler(int irq, void *arg)
+ 	if (!intel_irqs_enabled(dev_priv))
+ 		return IRQ_NONE;
+ 
++	/* IRQs are synced during runtime_suspend, we don't require a wakeref */
++	disable_rpm_wakeref_asserts(dev_priv);
++
+ 	iir = I915_READ(IIR);
+ 
+ 	for (;;) {
+@@ -4369,6 +4430,8 @@ static irqreturn_t i965_irq_handler(int irq, void *arg)
+ 		iir = new_iir;
+ 	}
+ 
++	enable_rpm_wakeref_asserts(dev_priv);
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 9837a25..eff7d2e 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1442,8 +1442,58 @@ static inline void
+ assert_rpm_wakelock_held(struct drm_i915_private *dev_priv)
+ {
+ 	assert_rpm_device_not_suspended(dev_priv);
++	WARN_ONCE(!atomic_read(&dev_priv->pm.wakeref_count),
++		  "RPM wakelock ref not held during HW access");
+ }
+ 
++/**
++ * disable_rpm_wakeref_asserts - disable the RPM assert checks
++ * @dev_priv: i915 device instance
++ *
++ * This function disable asserts that check if we hold an RPM wakelock
++ * reference, while keeping the device-not-suspended checks still enabled.
++ * It's meant to be used only in special circumstances where our rule about
++ * the wakelock refcount wrt. the device power state doesn't hold. According
++ * to this rule at any point where we access the HW or want to keep the HW in
++ * an active state we must hold an RPM wakelock reference acquired via one of
++ * the intel_runtime_pm_get() helpers. Currently there are a few special spots
++ * where this rule doesn't hold: the IRQ and suspend/resume handlers, the
++ * forcewake release timer, and the GPU RPS and hangcheck works. All other
++ * users should avoid using this function.
++ *
++ * Any calls to this function must have a symmetric call to
++ * enable_rpm_wakeref_asserts().
++ */
++static inline void
++disable_rpm_wakeref_asserts(struct drm_i915_private *dev_priv)
++{
++	atomic_inc(&dev_priv->pm.wakeref_count);
++}
++
++/**
++ * enable_rpm_wakeref_asserts - re-enable the RPM assert checks
++ * @dev_priv: i915 device instance
++ *
++ * This function re-enables the RPM assert checks after disabling them with
++ * disable_rpm_wakeref_asserts. It's meant to be used only in special
++ * circumstances otherwise its use should be avoided.
++ *
++ * Any calls to this function must have a symmetric call to
++ * disable_rpm_wakeref_asserts().
++ */
++static inline void
++enable_rpm_wakeref_asserts(struct drm_i915_private *dev_priv)
++{
++	atomic_dec(&dev_priv->pm.wakeref_count);
++}
++
++/* TODO: convert users of these to rely instead on proper RPM refcounting */
++#define DISABLE_RPM_WAKEREF_ASSERTS(dev_priv)	\
++	disable_rpm_wakeref_asserts(dev_priv)
++
++#define ENABLE_RPM_WAKEREF_ASSERTS(dev_priv)	\
++	enable_rpm_wakeref_asserts(dev_priv)
++
+ void intel_runtime_pm_get(struct drm_i915_private *dev_priv);
+ void intel_runtime_pm_get_noresume(struct drm_i915_private *dev_priv);
+ void intel_runtime_pm_put(struct drm_i915_private *dev_priv);
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 4c914fe..3232305 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -7246,4 +7246,5 @@ void intel_pm_setup(struct drm_device *dev)
+ 	INIT_LIST_HEAD(&dev_priv->rps.mmioflips.link);
+ 
+ 	dev_priv->pm.suspended = false;
++	atomic_set(&dev_priv->pm.wakeref_count, 0);
+ }
+diff --git a/drivers/gpu/drm/i915/intel_runtime_pm.c b/drivers/gpu/drm/i915/intel_runtime_pm.c
+index 2705133..df9a3f1 100644
+--- a/drivers/gpu/drm/i915/intel_runtime_pm.c
++++ b/drivers/gpu/drm/i915/intel_runtime_pm.c
+@@ -2240,6 +2240,8 @@ void intel_runtime_pm_get(struct drm_i915_private *dev_priv)
+ 	struct device *device = &dev->pdev->dev;
+ 
+ 	pm_runtime_get_sync(device);
++
++	atomic_inc(&dev_priv->pm.wakeref_count);
+ 	assert_rpm_wakelock_held(dev_priv);
+ }
+ 
+@@ -2267,6 +2269,8 @@ void intel_runtime_pm_get_noresume(struct drm_i915_private *dev_priv)
+ 
+ 	assert_rpm_wakelock_held(dev_priv);
+ 	pm_runtime_get_noresume(device);
++
++	atomic_inc(&dev_priv->pm.wakeref_count);
+ }
+ 
+ /**
+@@ -2282,6 +2286,8 @@ void intel_runtime_pm_put(struct drm_i915_private *dev_priv)
+ 	struct drm_device *dev = dev_priv->dev;
+ 	struct device *device = &dev->pdev->dev;
+ 
++	atomic_dec(&dev_priv->pm.wakeref_count);
++
+ 	pm_runtime_mark_last_busy(device);
+ 	pm_runtime_put_autosuspend(device);
+ }
+-- 
+1.7.5.4
+

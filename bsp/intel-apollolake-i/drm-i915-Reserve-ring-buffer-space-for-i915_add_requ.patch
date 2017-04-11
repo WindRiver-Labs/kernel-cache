@@ -1,0 +1,337 @@
+From e7f0ea97a7ffd64903a0597ea7e0a3632bbd0af8 Mon Sep 17 00:00:00 2001
+From: John Harrison <John.C.Harrison@Intel.com>
+Date: Thu, 18 Jun 2015 13:10:09 +0100
+Subject: [PATCH 0701/4706] drm/i915: Reserve ring buffer space for
+ i915_add_request() commands
+
+commit 29b1b415fcd95a2266ab58fc7825bccbffa5c142 upstream
+
+It is a bad idea for i915_add_request() to fail. The work will already have been
+send to the ring and will be processed, but there will not be any tracking or
+management of that work.
+
+The only way the add request call can fail is if it can't write its epilogue
+commands to the ring (cache flushing, seqno updates, interrupt signalling). The
+reasons for that are mostly down to running out of ring buffer space and the
+problems associated with trying to get some more. This patch prevents that
+situation from happening in the first place.
+
+When a request is created, it marks sufficient space as reserved for the
+epilogue commands. Thus guaranteeing that by the time the epilogue is written,
+there will be plenty of space for it. Note that a ring_begin() call is required
+to actually reserve the space (and do any potential waiting). However, that is
+not currently done at request creation time. This is because the ring_begin()
+code can allocate a request. Hence calling begin() from the request allocation
+code would lead to infinite recursion! Later patches in this series remove the
+need for begin() to do the allocate. At that point, it becomes safe for the
+allocate to call begin() and really reserve the space.
+
+Until then, there is a potential for insufficient space to be available at the
+point of calling i915_add_request(). However, that would only be in the case
+where the request was created and immediately submitted without ever calling
+ring_begin() and adding any work to that request. Which should never happen. And
+even if it does, and if that request happens to fall down the tiny window of
+opportunity for failing due to being out of ring space then does it really
+matter because the request wasn't doing anything in the first place?
+
+v2: Updated the 'reserved space too small' warning to include the offending
+sizes. Added a 'cancel' operation to clean up when a request is abandoned. Added
+re-initialisation of tracking state after a buffer wrap to keep the sanity
+checks accurate.
+
+v3: Incremented the reserved size to accommodate Ironlake (after finally
+managing to run on an ILK system). Also fixed missing wrap code in LRC mode.
+
+v4: Added extra comment and removed duplicate WARN (feedback from Tomas).
+
+For: VIZ-5115
+CC: Tomas Elf <tomas.elf@intel.com>
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    1 +
+ drivers/gpu/drm/i915/i915_gem.c         |   37 ++++++++++++++++
+ drivers/gpu/drm/i915/intel_lrc.c        |   21 +++++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   71 ++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_ringbuffer.h |   25 +++++++++++
+ 5 files changed, 153 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 9856417..97f8f25 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2200,6 +2200,7 @@ struct drm_i915_gem_request {
+ 
+ int i915_gem_request_alloc(struct intel_engine_cs *ring,
+ 			   struct intel_context *ctx);
++void i915_gem_request_cancel(struct drm_i915_gem_request *req);
+ void i915_gem_request_free(struct kref *req_ref);
+ 
+ static inline uint32_t
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 322485c..84ac575 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2491,6 +2491,13 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 	} else
+ 		ringbuf = ring->buffer;
+ 
++	/*
++	 * To ensure that this call will not fail, space for its emissions
++	 * should already have been reserved in the ring buffer. Let the ring
++	 * know that it is time to use that space up.
++	 */
++	intel_ring_reserved_space_use(ringbuf);
++
+ 	request_start = intel_ring_get_tail(ringbuf);
+ 	/*
+ 	 * Emit any outstanding flushes - execbuf can fail to emit the flush
+@@ -2574,6 +2581,9 @@ int __i915_add_request(struct intel_engine_cs *ring,
+ 			   round_jiffies_up_relative(HZ));
+ 	intel_mark_busy(dev_priv->dev);
+ 
++	/* Sanity check that the reserved size was large enough. */
++	intel_ring_reserved_space_end(ringbuf);
++
+ 	return 0;
+ }
+ 
+@@ -2672,6 +2682,26 @@ int i915_gem_request_alloc(struct intel_engine_cs *ring,
+ 	if (ret)
+ 		goto err;
+ 
++	/*
++	 * Reserve space in the ring buffer for all the commands required to
++	 * eventually emit this request. This is to guarantee that the
++	 * i915_add_request() call can't fail. Note that the reserve may need
++	 * to be redone if the request is not actually submitted straight
++	 * away, e.g. because a GPU scheduler has deferred it.
++	 *
++	 * Note further that this call merely notes the reserve request. A
++	 * subsequent call to *_ring_begin() is required to actually ensure
++	 * that the reservation is available. Without the begin, if the
++	 * request creator immediately submitted the request without adding
++	 * any commands to it then there might not actually be sufficient
++	 * room for the submission commands. Unfortunately, the current
++	 * *_ring_begin() implementations potentially call back here to
++	 * i915_gem_request_alloc(). Thus calling _begin() here would lead to
++	 * infinite recursion! Until that back call path is removed, it is
++	 * necessary to do a manual _begin() outside.
++	 */
++	intel_ring_reserved_space_reserve(req->ringbuf, MIN_SPACE_FOR_ADD_REQUEST);
++
+ 	ring->outstanding_lazy_request = req;
+ 	return 0;
+ 
+@@ -2680,6 +2710,13 @@ err:
+ 	return ret;
+ }
+ 
++void i915_gem_request_cancel(struct drm_i915_gem_request *req)
++{
++	intel_ring_reserved_space_cancel(req->ringbuf);
++
++	i915_gem_request_unreference(req);
++}
++
+ struct drm_i915_gem_request *
+ i915_gem_find_active_request(struct intel_engine_cs *ring)
+ {
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index b456845..8bf36b5 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -686,6 +686,9 @@ static int logical_ring_wait_for_space(struct intel_ringbuffer *ringbuf,
+ 	unsigned space;
+ 	int ret;
+ 
++	/* The whole point of reserving space is to not wait! */
++	WARN_ON(ringbuf->reserved_in_use);
++
+ 	if (intel_ring_space(ringbuf) >= bytes)
+ 		return 0;
+ 
+@@ -746,6 +749,9 @@ static int logical_ring_wrap_buffer(struct intel_ringbuffer *ringbuf,
+ 	uint32_t __iomem *virt;
+ 	int rem = ringbuf->size - ringbuf->tail;
+ 
++	/* Can't wrap if space has already been reserved! */
++	WARN_ON(ringbuf->reserved_in_use);
++
+ 	if (ringbuf->space < rem) {
+ 		int ret = logical_ring_wait_for_space(ringbuf, ctx, rem);
+ 
+@@ -769,10 +775,25 @@ static int logical_ring_prepare(struct intel_ringbuffer *ringbuf,
+ {
+ 	int ret;
+ 
++	/*
++	 * Add on the reserved size to the request to make sure that after
++	 * the intended commands have been emitted, there is guaranteed to
++	 * still be enough free space to send them to the hardware.
++	 */
++	if (!ringbuf->reserved_in_use)
++		bytes += ringbuf->reserved_size;
++
+ 	if (unlikely(ringbuf->tail + bytes > ringbuf->effective_size)) {
+ 		ret = logical_ring_wrap_buffer(ringbuf, ctx);
+ 		if (unlikely(ret))
+ 			return ret;
++
++		if(ringbuf->reserved_size) {
++			uint32_t size = ringbuf->reserved_size;
++
++			intel_ring_reserved_space_cancel(ringbuf);
++			intel_ring_reserved_space_reserve(ringbuf, size);
++		}
+ 	}
+ 
+ 	if (unlikely(ringbuf->space < bytes)) {
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 5321a4e..14ed869 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2120,6 +2120,9 @@ static int ring_wait_for_space(struct intel_engine_cs *ring, int n)
+ 	unsigned space;
+ 	int ret;
+ 
++	/* The whole point of reserving space is to not wait! */
++	WARN_ON(ringbuf->reserved_in_use);
++
+ 	if (intel_ring_space(ringbuf) >= n)
+ 		return 0;
+ 
+@@ -2147,6 +2150,9 @@ static int intel_wrap_ring_buffer(struct intel_engine_cs *ring)
+ 	struct intel_ringbuffer *ringbuf = ring->buffer;
+ 	int rem = ringbuf->size - ringbuf->tail;
+ 
++	/* Can't wrap if space has already been reserved! */
++	WARN_ON(ringbuf->reserved_in_use);
++
+ 	if (ringbuf->space < rem) {
+ 		int ret = ring_wait_for_space(ring, rem);
+ 		if (ret)
+@@ -2197,16 +2203,77 @@ int intel_ring_alloc_request_extras(struct drm_i915_gem_request *request)
+ 	return 0;
+ }
+ 
+-static int __intel_ring_prepare(struct intel_engine_cs *ring,
+-				int bytes)
++void intel_ring_reserved_space_reserve(struct intel_ringbuffer *ringbuf, int size)
++{
++	/* NB: Until request management is fully tidied up and the OLR is
++	 * removed, there are too many ways for get false hits on this
++	 * anti-recursion check! */
++	/*WARN_ON(ringbuf->reserved_size);*/
++	WARN_ON(ringbuf->reserved_in_use);
++
++	ringbuf->reserved_size = size;
++
++	/*
++	 * Really need to call _begin() here but that currently leads to
++	 * recursion problems! This will be fixed later but for now just
++	 * return and hope for the best. Note that there is only a real
++	 * problem if the create of the request never actually calls _begin()
++	 * but if they are not submitting any work then why did they create
++	 * the request in the first place?
++	 */
++}
++
++void intel_ring_reserved_space_cancel(struct intel_ringbuffer *ringbuf)
++{
++	WARN_ON(ringbuf->reserved_in_use);
++
++	ringbuf->reserved_size   = 0;
++	ringbuf->reserved_in_use = false;
++}
++
++void intel_ring_reserved_space_use(struct intel_ringbuffer *ringbuf)
++{
++	WARN_ON(ringbuf->reserved_in_use);
++
++	ringbuf->reserved_in_use = true;
++	ringbuf->reserved_tail   = ringbuf->tail;
++}
++
++void intel_ring_reserved_space_end(struct intel_ringbuffer *ringbuf)
++{
++	WARN_ON(!ringbuf->reserved_in_use);
++	WARN(ringbuf->tail > ringbuf->reserved_tail + ringbuf->reserved_size,
++	     "request reserved size too small: %d vs %d!\n",
++	     ringbuf->tail - ringbuf->reserved_tail, ringbuf->reserved_size);
++
++	ringbuf->reserved_size   = 0;
++	ringbuf->reserved_in_use = false;
++}
++
++static int __intel_ring_prepare(struct intel_engine_cs *ring, int bytes)
+ {
+ 	struct intel_ringbuffer *ringbuf = ring->buffer;
+ 	int ret;
+ 
++	/*
++	 * Add on the reserved size to the request to make sure that after
++	 * the intended commands have been emitted, there is guaranteed to
++	 * still be enough free space to send them to the hardware.
++	 */
++	if (!ringbuf->reserved_in_use)
++		bytes += ringbuf->reserved_size;
++
+ 	if (unlikely(ringbuf->tail + bytes > ringbuf->effective_size)) {
+ 		ret = intel_wrap_ring_buffer(ring);
+ 		if (unlikely(ret))
+ 			return ret;
++
++		if(ringbuf->reserved_size) {
++			uint32_t size = ringbuf->reserved_size;
++
++			intel_ring_reserved_space_cancel(ringbuf);
++			intel_ring_reserved_space_reserve(ringbuf, size);
++		}
+ 	}
+ 
+ 	if (unlikely(ringbuf->space < bytes)) {
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 75b951e..f50151d 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -106,6 +106,9 @@ struct intel_ringbuffer {
+ 	int space;
+ 	int size;
+ 	int effective_size;
++	int reserved_size;
++	int reserved_tail;
++	bool reserved_in_use;
+ 
+ 	/** We track the position of the requests in the ring buffer, and
+ 	 * when each is retired we increment last_retired_head as the GPU
+@@ -479,4 +482,26 @@ intel_ring_get_request(struct intel_engine_cs *ring)
+ 	return ring->outstanding_lazy_request;
+ }
+ 
++/*
++ * Arbitrary size for largest possible 'add request' sequence. The code paths
++ * are complex and variable. Empirical measurement shows that the worst case
++ * is ILK at 136 words. Reserving too much is better than reserving too little
++ * as that allows for corner cases that might have been missed. So the figure
++ * has been rounded up to 160 words.
++ */
++#define MIN_SPACE_FOR_ADD_REQUEST	160
++
++/*
++ * Reserve space in the ring to guarantee that the i915_add_request() call
++ * will always have sufficient room to do its stuff. The request creation
++ * code calls this automatically.
++ */
++void intel_ring_reserved_space_reserve(struct intel_ringbuffer *ringbuf, int size);
++/* Cancel the reservation, e.g. because the request is being discarded. */
++void intel_ring_reserved_space_cancel(struct intel_ringbuffer *ringbuf);
++/* Use the reserved space - for use by i915_add_request() only. */
++void intel_ring_reserved_space_use(struct intel_ringbuffer *ringbuf);
++/* Finish with the reserved space - for use by i915_add_request() only. */
++void intel_ring_reserved_space_end(struct intel_ringbuffer *ringbuf);
++
+ #endif /* _INTEL_RINGBUFFER_H_ */
+-- 
+1.7.5.4
+

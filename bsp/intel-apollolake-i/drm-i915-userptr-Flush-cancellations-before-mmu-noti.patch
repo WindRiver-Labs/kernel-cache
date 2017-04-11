@@ -1,0 +1,153 @@
+From 25d7047d984eceb43f66d25d42793f25bfcfeb88 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 5 Apr 2016 14:59:59 +0100
+Subject: [PATCH 2769/4706] drm/i915/userptr: Flush cancellations before
+ mmu-notifier invalidate returns
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 393afc2c3fda670ff392725ca618e956d625b964 upstream
+
+In order to ensure that all invalidations are completed before the
+operation returns to userspace (i.e. before the munmap() syscall returns)
+we need to wait upon the outstanding operations.
+
+We are allowed to block inside the invalidate_range_start callback, and
+as struct_mutex is the inner lock with mmap_sem we can wait upon the
+struct_mutex without provoking lockdep into warning about a deadlock.
+However, we don't actually want to wait upon outstanding rendering
+whilst holding the struct_mutex if we can help it otherwise we also
+block other processes from submitting work to the GPU. So first we do a
+wait without the lock and then when we reacquire the lock, we double
+check that everything is ready for removing the invalidated pages.
+
+Finally to wait upon the outstanding unpinning tasks, we create a
+private workqueue as a means to conveniently wait upon all at once. The
+drawback is that this workqueue is per-mm, so any threads concurrently
+invalidating objects will wait upon each other. The advantage of using
+the workqueue is that we can wait in parallel for completion of
+rendering and unpinning of several objects (of particular importance if
+the process terminates with a whole mm full of objects).
+
+v2: Apply a cup of tea to the changelog.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=94699
+Testcase: igt/gem_userptr_blits/sync-unmap-cycles
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Michał Winiarski <michal.winiarski@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1459864801-28606-1-git-send-email-chris@chris-wilson.co.uk
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gem_userptr.c |   48 ++++++++++++++++++++++++++++++-
+ 1 files changed, 47 insertions(+), 1 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_userptr.c b/drivers/gpu/drm/i915/i915_gem_userptr.c
+index 9c3bda9..0f7e3a1 100644
+--- a/drivers/gpu/drm/i915/i915_gem_userptr.c
++++ b/drivers/gpu/drm/i915/i915_gem_userptr.c
+@@ -49,6 +49,7 @@ struct i915_mmu_notifier {
+ 	struct hlist_node node;
+ 	struct mmu_notifier mn;
+ 	struct rb_root objects;
++	struct workqueue_struct *wq;
+ };
+ 
+ struct i915_mmu_object {
+@@ -60,6 +61,40 @@ struct i915_mmu_object {
+ 	bool attached;
+ };
+ 
++static void wait_rendering(struct drm_i915_gem_object *obj)
++{
++	struct drm_device *dev = obj->base.dev;
++	struct drm_i915_gem_request *requests[I915_NUM_ENGINES];
++	unsigned reset_counter;
++	int i, n;
++
++	if (!obj->active)
++		return;
++
++	n = 0;
++	for (i = 0; i < I915_NUM_ENGINES; i++) {
++		struct drm_i915_gem_request *req;
++
++		req = obj->last_read_req[i];
++		if (req == NULL)
++			continue;
++
++		requests[n++] = i915_gem_request_reference(req);
++	}
++
++	reset_counter = atomic_read(&to_i915(dev)->gpu_error.reset_counter);
++	mutex_unlock(&dev->struct_mutex);
++
++	for (i = 0; i < n; i++)
++		__i915_wait_request(requests[i], reset_counter, false,
++				    NULL, NULL);
++
++	mutex_lock(&dev->struct_mutex);
++
++	for (i = 0; i < n; i++)
++		i915_gem_request_unreference(requests[i]);
++}
++
+ static void cancel_userptr(struct work_struct *work)
+ {
+ 	struct i915_mmu_object *mo = container_of(work, typeof(*mo), work);
+@@ -75,6 +110,8 @@ static void cancel_userptr(struct work_struct *work)
+ 		struct i915_vma *vma, *tmp;
+ 		bool was_interruptible;
+ 
++		wait_rendering(obj);
++
+ 		was_interruptible = dev_priv->mm.interruptible;
+ 		dev_priv->mm.interruptible = false;
+ 
+@@ -140,7 +177,7 @@ static void i915_gem_userptr_mn_invalidate_range_start(struct mmu_notifier *_mn,
+ 		 */
+ 		mo = container_of(it, struct i915_mmu_object, it);
+ 		if (kref_get_unless_zero(&mo->obj->base.refcount))
+-			schedule_work(&mo->work);
++			queue_work(mn->wq, &mo->work);
+ 
+ 		list_add(&mo->link, &cancelled);
+ 		it = interval_tree_iter_next(it, start, end);
+@@ -148,6 +185,8 @@ static void i915_gem_userptr_mn_invalidate_range_start(struct mmu_notifier *_mn,
+ 	list_for_each_entry(mo, &cancelled, link)
+ 		del_object(mo);
+ 	spin_unlock(&mn->lock);
++
++	flush_workqueue(mn->wq);
+ }
+ 
+ static const struct mmu_notifier_ops i915_gem_userptr_notifier = {
+@@ -167,10 +206,16 @@ i915_mmu_notifier_create(struct mm_struct *mm)
+ 	spin_lock_init(&mn->lock);
+ 	mn->mn.ops = &i915_gem_userptr_notifier;
+ 	mn->objects = RB_ROOT;
++	mn->wq = alloc_workqueue("i915-userptr-release", WQ_UNBOUND, 0);
++	if (mn->wq == NULL) {
++		kfree(mn);
++		return ERR_PTR(-ENOMEM);
++	}
+ 
+ 	 /* Protected by mmap_sem (write-lock) */
+ 	ret = __mmu_notifier_register(&mn->mn, mm);
+ 	if (ret) {
++		destroy_workqueue(mn->wq);
+ 		kfree(mn);
+ 		return ERR_PTR(ret);
+ 	}
+@@ -256,6 +301,7 @@ i915_mmu_notifier_free(struct i915_mmu_notifier *mn,
+ 		return;
+ 
+ 	mmu_notifier_unregister(&mn->mn, mm);
++	destroy_workqueue(mn->wq);
+ 	kfree(mn);
+ }
+ 
+-- 
+1.7.5.4
+

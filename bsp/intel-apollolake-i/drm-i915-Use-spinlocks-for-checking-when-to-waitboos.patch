@@ -1,0 +1,264 @@
+From 702b1b2e473d7dcb5845642fa1acecded9b7cff2 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 21 May 2015 21:01:47 +0100
+Subject: [PATCH 0427/4706] drm/i915: Use spinlocks for checking when to
+ waitboost
+
+commit 8d3afd7d0e666b932e6fa15901e6280fe829a786 upstream
+
+In commit 1854d5ca0dd7a9fc11243ff220a3e93fce2b4d3e
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Tue Apr 7 16:20:32 2015 +0100
+
+    drm/i915: Deminish contribution of wait-boosting from clients
+
+we removed an atomic timer based check for allowing waitboosting and
+moved it below the mutex taken during RPS. However, that mutex can be
+held for long periods of time on Vallyview/Cherryview as communication
+with the PCU is slow. As clients may frequently wait for results (e.g.
+such as tranform feedback) we introduced contention between the client
+and the RPS worker. We can take advantage of the RPS worker, by
+switching the wait boost decision to use spin locks and defer the
+actual reclocking to the worker.
+
+Fixes a regression of up to 45% on Baytrail and Baswell!
+
+v2 (Daniel):
+- Use max_freq_softlimit instead of the not-yet-merged boost
+  frequency.
+- Don't inject a fake irq into the boost work, instead treat
+  client_boost as just another legit waker.
+
+v3: Drop the now unused mask (Chris).
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=90112
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk> (v1)
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   17 +++--------------
+ drivers/gpu/drm/i915/i915_drv.h     |    9 +++++++--
+ drivers/gpu/drm/i915/i915_gem.c     |    4 ++--
+ drivers/gpu/drm/i915/i915_irq.c     |   19 +++++++++++++------
+ drivers/gpu/drm/i915/intel_pm.c     |   31 ++++++++++++++++++++-----------
+ 5 files changed, 45 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 564a6ba..82bbe3f 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -2303,15 +2303,6 @@ static int i915_rps_boost_info(struct seq_file *m, void *data)
+ 	struct drm_device *dev = node->minor->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_file *file;
+-	int ret;
+-
+-	ret = mutex_lock_interruptible(&dev->struct_mutex);
+-	if (ret)
+-		return ret;
+-
+-	ret = mutex_lock_interruptible(&dev_priv->rps.hw_lock);
+-	if (ret)
+-		goto unlock;
+ 
+ 	seq_printf(m, "RPS enabled? %d\n", dev_priv->rps.enabled);
+ 	seq_printf(m, "GPU busy? %d\n", dev_priv->mm.busy);
+@@ -2322,6 +2313,7 @@ static int i915_rps_boost_info(struct seq_file *m, void *data)
+ 		   intel_gpu_freq(dev_priv, dev_priv->rps.min_freq_softlimit),
+ 		   intel_gpu_freq(dev_priv, dev_priv->rps.max_freq_softlimit),
+ 		   intel_gpu_freq(dev_priv, dev_priv->rps.max_freq));
++	spin_lock(&dev_priv->rps.client_lock);
+ 	list_for_each_entry_reverse(file, &dev->filelist, lhead) {
+ 		struct drm_i915_file_private *file_priv = file->driver_priv;
+ 		struct task_struct *task;
+@@ -2342,12 +2334,9 @@ static int i915_rps_boost_info(struct seq_file *m, void *data)
+ 		   dev_priv->rps.mmioflips.boosts,
+ 		   list_empty(&dev_priv->rps.mmioflips.link) ? "" : ", active");
+ 	seq_printf(m, "Kernel boosts: %d\n", dev_priv->rps.boosts);
++	spin_unlock(&dev_priv->rps.client_lock);
+ 
+-	mutex_unlock(&dev_priv->rps.hw_lock);
+-unlock:
+-	mutex_unlock(&dev->struct_mutex);
+-
+-	return ret;
++	return 0;
+ }
+ 
+ static int i915_llc(struct seq_file *m, void *data)
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 9adfd12..3f6cad9 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1089,9 +1089,12 @@ struct intel_gen6_power_mgmt {
+ 	int last_adj;
+ 	enum { LOW_POWER, BETWEEN, HIGH_POWER } power;
+ 
++	spinlock_t client_lock;
++	struct list_head clients;
++	bool client_boost;
++
+ 	bool enabled;
+ 	struct delayed_work delayed_resume_work;
+-	struct list_head clients;
+ 	unsigned boosts;
+ 
+ 	struct intel_rps_client semaphores, mmioflips;
+@@ -1101,7 +1104,9 @@ struct intel_gen6_power_mgmt {
+ 
+ 	/*
+ 	 * Protects RPS/RC6 register access and PCU communication.
+-	 * Must be taken after struct_mutex if nested.
++	 * Must be taken after struct_mutex if nested. Note that
++	 * this lock may be held for long periods of time when
++	 * talking to hw - so only take it when talking to hw!
+ 	 */
+ 	struct mutex hw_lock;
+ };
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index ef68e70..4446cb2 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -5223,9 +5223,9 @@ void i915_gem_release(struct drm_device *dev, struct drm_file *file)
+ 	spin_unlock(&file_priv->mm.lock);
+ 
+ 	if (!list_empty(&file_priv->rps.link)) {
+-		mutex_lock(&to_i915(dev)->rps.hw_lock);
++		spin_lock(&to_i915(dev)->rps.client_lock);
+ 		list_del(&file_priv->rps.link);
+-		mutex_unlock(&to_i915(dev)->rps.hw_lock);
++		spin_unlock(&to_i915(dev)->rps.client_lock);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 707e2ca..e6bb72d 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1086,8 +1086,9 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ {
+ 	struct drm_i915_private *dev_priv =
+ 		container_of(work, struct drm_i915_private, rps.work);
++	bool client_boost;
++	int new_delay, adj, min, max;
+ 	u32 pm_iir;
+-	int new_delay, adj;
+ 
+ 	spin_lock_irq(&dev_priv->irq_lock);
+ 	/* Speed up work cancelation during disabling rps interrupts. */
+@@ -1099,12 +1100,14 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ 	dev_priv->rps.pm_iir = 0;
+ 	/* Make sure not to corrupt PMIMR state used by ringbuffer on GEN6 */
+ 	gen6_enable_pm_irq(dev_priv, dev_priv->pm_rps_events);
++	client_boost = dev_priv->rps.client_boost;
++	dev_priv->rps.client_boost = false;
+ 	spin_unlock_irq(&dev_priv->irq_lock);
+ 
+ 	/* Make sure we didn't queue anything we're not going to process. */
+ 	WARN_ON(pm_iir & ~dev_priv->pm_rps_events);
+ 
+-	if ((pm_iir & dev_priv->pm_rps_events) == 0)
++	if ((pm_iir & dev_priv->pm_rps_events) == 0 && !client_boost)
+ 		return;
+ 
+ 	mutex_lock(&dev_priv->rps.hw_lock);
+@@ -1113,7 +1116,13 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ 
+ 	adj = dev_priv->rps.last_adj;
+ 	new_delay = dev_priv->rps.cur_freq;
+-	if (pm_iir & GEN6_PM_RP_UP_THRESHOLD) {
++	min = dev_priv->rps.min_freq_softlimit;
++	max = dev_priv->rps.max_freq_softlimit;
++
++	if (client_boost) {
++		new_delay = dev_priv->rps.max_freq_softlimit;
++		adj = 0;
++	} else if (pm_iir & GEN6_PM_RP_UP_THRESHOLD) {
+ 		if (adj > 0)
+ 			adj *= 2;
+ 		else /* CHV needs even encode values */
+@@ -1149,9 +1158,7 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ 	 * interrupt
+ 	 */
+ 	new_delay += adj;
+-	new_delay = clamp_t(int, new_delay,
+-			    dev_priv->rps.min_freq_softlimit,
+-			    dev_priv->rps.max_freq_softlimit);
++	new_delay = clamp_t(int, new_delay, min, max);
+ 
+ 	intel_set_rps(dev_priv->dev, new_delay);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 48bb7ec..a0ff4fb 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -4141,17 +4141,25 @@ void gen6_rps_idle(struct drm_i915_private *dev_priv)
+ 		dev_priv->rps.last_adj = 0;
+ 		I915_WRITE(GEN6_PMINTRMSK, 0xffffffff);
+ 	}
++	mutex_unlock(&dev_priv->rps.hw_lock);
+ 
++	spin_lock(&dev_priv->rps.client_lock);
+ 	while (!list_empty(&dev_priv->rps.clients))
+ 		list_del_init(dev_priv->rps.clients.next);
+-	mutex_unlock(&dev_priv->rps.hw_lock);
++	spin_unlock(&dev_priv->rps.client_lock);
+ }
+ 
+ void gen6_rps_boost(struct drm_i915_private *dev_priv,
+ 		    struct intel_rps_client *rps,
+ 		    unsigned long submitted)
+ {
+-	u32 val;
++	/* This is intentionally racy! We peek at the state here, then
++	 * validate inside the RPS worker.
++	 */
++	if (!(dev_priv->mm.busy &&
++	      dev_priv->rps.enabled &&
++	      dev_priv->rps.cur_freq < dev_priv->rps.max_freq_softlimit))
++		return;
+ 
+ 	/* Force a RPS boost (and don't count it against the client) if
+ 	 * the GPU is severely congested.
+@@ -4159,14 +4167,14 @@ void gen6_rps_boost(struct drm_i915_private *dev_priv,
+ 	if (rps && time_after(jiffies, submitted + DRM_I915_THROTTLE_JIFFIES))
+ 		rps = NULL;
+ 
+-	mutex_lock(&dev_priv->rps.hw_lock);
+-	val = dev_priv->rps.max_freq_softlimit;
+-	if (dev_priv->rps.enabled &&
+-	    dev_priv->mm.busy &&
+-	    dev_priv->rps.cur_freq < val &&
+-	    (rps == NULL || list_empty(&rps->link))) {
+-		intel_set_rps(dev_priv->dev, val);
+-		dev_priv->rps.last_adj = 0;
++	spin_lock(&dev_priv->rps.client_lock);
++	if (rps == NULL || list_empty(&rps->link)) {
++		spin_lock_irq(&dev_priv->irq_lock);
++		if (dev_priv->rps.interrupts_enabled) {
++			dev_priv->rps.client_boost = true;
++			queue_work(dev_priv->wq, &dev_priv->rps.work);
++		}
++		spin_unlock_irq(&dev_priv->irq_lock);
+ 
+ 		if (rps != NULL) {
+ 			list_add(&rps->link, &dev_priv->rps.clients);
+@@ -4174,7 +4182,7 @@ void gen6_rps_boost(struct drm_i915_private *dev_priv,
+ 		} else
+ 			dev_priv->rps.boosts++;
+ 	}
+-	mutex_unlock(&dev_priv->rps.hw_lock);
++	spin_unlock(&dev_priv->rps.client_lock);
+ }
+ 
+ void intel_set_rps(struct drm_device *dev, u8 val)
+@@ -6911,6 +6919,7 @@ void intel_pm_setup(struct drm_device *dev)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	mutex_init(&dev_priv->rps.hw_lock);
++	spin_lock_init(&dev_priv->rps.client_lock);
+ 
+ 	INIT_DELAYED_WORK(&dev_priv->rps.delayed_resume_work,
+ 			  intel_gen6_powersave_work);
+-- 
+1.7.5.4
+

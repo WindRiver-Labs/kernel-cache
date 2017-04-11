@@ -1,0 +1,184 @@
+From 2b9b1b884f72a3c7c5be645e437228f2588adece Mon Sep 17 00:00:00 2001
+From: Michel Thierry <michel.thierry@intel.com>
+Date: Wed, 8 Apr 2015 12:13:33 +0100
+Subject: [PATCH 0073/4706] drm/i915/gen8: begin bitmap tracking
+
+commit 33c8819f1b057b555c73886f69f9baabe72527e0 upstream
+
+Like with gen6/7, we can enable bitmap tracking with all the
+preallocations to make sure things actually don't blow up.
+
+v2: Rebased to match changes from previous patches.
+v3: Without teardown logic, rely on used_pdpes and used_pdes when
+freeing page tables.
+v4: Rebased after s/page_tables/page_table/.
+v5: Rebased after page table generalizations.
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com> (v2+)
+Reviewed-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+---
+ drivers/gpu/drm/i915/i915_gem_gtt.c |   59 +++++++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/i915_gem_gtt.h |    7 ++++
+ 2 files changed, 54 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 1e1b42f..1be0a8e 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -437,6 +437,7 @@ static void unmap_and_free_pd(struct i915_page_directory *pd,
+ 	if (pd->page) {
+ 		i915_dma_unmap_single(pd, dev);
+ 		__free_page(pd->page);
++		kfree(pd->used_pdes);
+ 		kfree(pd);
+ 	}
+ }
+@@ -444,26 +445,35 @@ static void unmap_and_free_pd(struct i915_page_directory *pd,
+ static struct i915_page_directory *alloc_pd_single(struct drm_device *dev)
+ {
+ 	struct i915_page_directory *pd;
+-	int ret;
++	int ret = -ENOMEM;
+ 
+ 	pd = kzalloc(sizeof(*pd), GFP_KERNEL);
+ 	if (!pd)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	pd->used_pdes = kcalloc(BITS_TO_LONGS(I915_PDES),
++				sizeof(*pd->used_pdes), GFP_KERNEL);
++	if (!pd->used_pdes)
++		goto free_pd;
++
+ 	pd->page = alloc_page(GFP_KERNEL);
+-	if (!pd->page) {
+-		kfree(pd);
+-		return ERR_PTR(-ENOMEM);
+-	}
++	if (!pd->page)
++		goto free_bitmap;
+ 
+ 	ret = i915_dma_map_single(pd, dev);
+-	if (ret) {
+-		__free_page(pd->page);
+-		kfree(pd);
+-		return ERR_PTR(ret);
+-	}
++	if (ret)
++		goto free_page;
+ 
+ 	return pd;
++
++free_page:
++	__free_page(pd->page);
++free_bitmap:
++	kfree(pd->used_pdes);
++free_pd:
++	kfree(pd);
++
++	return ERR_PTR(ret);
+ }
+ 
+ /* Broadwell Page Directory Pointer Descriptors */
+@@ -675,7 +685,7 @@ static void gen8_free_page_tables(struct i915_page_directory *pd, struct drm_dev
+ 	if (!pd->page)
+ 		return;
+ 
+-	for (i = 0; i < I915_PDES; i++) {
++	for_each_set_bit(i, pd->used_pdes, I915_PDES) {
+ 		if (WARN_ON(!pd->page_table[i]))
+ 			continue;
+ 
+@@ -688,7 +698,7 @@ static void gen8_ppgtt_free(struct i915_hw_ppgtt *ppgtt)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < GEN8_LEGACY_PDPES; i++) {
++	for_each_set_bit(i, ppgtt->pdp.used_pdpes, GEN8_LEGACY_PDPES) {
+ 		if (WARN_ON(!ppgtt->pdp.page_directory[i]))
+ 			continue;
+ 
+@@ -752,6 +762,7 @@ static int gen8_ppgtt_alloc_page_directories(struct i915_hw_ppgtt *ppgtt,
+ 	gen8_for_each_pdpe(unused, pdp, start, length, temp, pdpe) {
+ 		WARN_ON(unused);
+ 		pdp->page_directory[pdpe] = alloc_pd_single(dev);
++
+ 		if (IS_ERR(pdp->page_directory[pdpe]))
+ 			goto unwind_out;
+ 
+@@ -775,10 +786,13 @@ static int gen8_alloc_va_range(struct i915_address_space *vm,
+ 	struct i915_hw_ppgtt *ppgtt =
+ 		container_of(vm, struct i915_hw_ppgtt, base);
+ 	struct i915_page_directory *pd;
++	const uint64_t orig_start = start;
++	const uint64_t orig_length = length;
+ 	uint64_t temp;
+ 	uint32_t pdpe;
+ 	int ret;
+ 
++	/* Do the allocations first so we can easily bail out */
+ 	ret = gen8_ppgtt_alloc_page_directories(ppgtt, &ppgtt->pdp, start, length);
+ 	if (ret)
+ 		return ret;
+@@ -789,6 +803,27 @@ static int gen8_alloc_va_range(struct i915_address_space *vm,
+ 			goto err_out;
+ 	}
+ 
++	/* Now mark everything we've touched as used. This doesn't allow for
++	 * robust error checking, but it makes the code a hell of a lot simpler.
++	 */
++	start = orig_start;
++	length = orig_length;
++
++	gen8_for_each_pdpe(pd, &ppgtt->pdp, start, length, temp, pdpe) {
++		struct i915_page_table *pt;
++		uint64_t pd_len = gen8_clamp_pd(start, length);
++		uint64_t pd_start = start;
++		uint32_t pde;
++
++		gen8_for_each_pde(pt, &ppgtt->pd, pd_start, pd_len, temp, pde) {
++			bitmap_set(pd->page_table[pde]->used_ptes,
++				   gen8_pte_index(start),
++				   gen8_pte_count(start, length));
++			set_bit(pde, pd->used_pdes);
++		}
++		set_bit(pdpe, ppgtt->pdp.used_pdpes);
++	}
++
+ 	return 0;
+ 
+ err_out:
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index c3d5d40..29de64d 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -220,11 +220,13 @@ struct i915_page_directory {
+ 		dma_addr_t daddr;
+ 	};
+ 
++	unsigned long *used_pdes;
+ 	struct i915_page_table *page_table[I915_PDES]; /* PDEs */
+ };
+ 
+ struct i915_page_directory_pointer {
+ 	/* struct page *page; */
++	DECLARE_BITMAP(used_pdpes, GEN8_LEGACY_PDPES);
+ 	struct i915_page_directory *page_directory[GEN8_LEGACY_PDPES];
+ };
+ 
+@@ -453,6 +455,11 @@ static inline uint32_t gen8_pml4e_index(uint64_t address)
+ 	return 0;
+ }
+ 
++static inline size_t gen8_pte_count(uint64_t address, uint64_t length)
++{
++	return i915_pte_count(address, length, GEN8_PDE_SHIFT);
++}
++
+ int i915_gem_gtt_init(struct drm_device *dev);
+ void i915_gem_init_global_gtt(struct drm_device *dev);
+ void i915_global_gtt_cleanup(struct drm_device *dev);
+-- 
+1.7.5.4
+

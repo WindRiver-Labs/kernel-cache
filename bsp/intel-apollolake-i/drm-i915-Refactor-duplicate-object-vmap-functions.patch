@@ -1,0 +1,284 @@
+From 08e9d24fc7ab04508a89c92acc1c934836d48419 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 8 Apr 2016 12:11:11 +0100
+Subject: [PATCH 2749/4706] drm/i915: Refactor duplicate object vmap functions
+
+commit 0a798eb92e6dcc1cba45d13d7b75a523e5d0fc4c upstream
+
+We now have two implementations for vmapping a whole object, one for
+dma-buf and one for the ringbuffer. If we couple the mapping into the
+obj->pages lifetime, then we can reuse an obj->mapping for both and at
+the same time couple it into the shrinker. There is a third vmapping
+routine in the cmdparser that maps only a range within the object, for
+the time being that is left alone, but will eventually use these routines
+in order to cache the mapping between invocations.
+
+v2: Mark the failable kmalloc() as __GFP_NOWARN (vsyrjala)
+v3: Call unpin_vmap from the right dmabuf unmapper
+
+v4: Rename vmap to map as we don't wish to imply the type of mapping
+involved, just that it contiguously maps the object into kernel space.
+Add kerneldoc and lockdep annotations
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Cc: Dave Gordon <david.s.gordon@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1460113874-17366-4-git-send-email-chris@chris-wilson.co.uk
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |   37 +++++++++++++++++++++--
+ drivers/gpu/drm/i915/i915_gem.c         |   44 +++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_gem_dmabuf.c  |   49 +++---------------------------
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   26 +---------------
+ 4 files changed, 84 insertions(+), 72 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 2c3f0b2..45c5f8a 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2168,10 +2168,7 @@ struct drm_i915_gem_object {
+ 		struct scatterlist *sg;
+ 		int last;
+ 	} get_page;
+-
+-	/* prime dma-buf support */
+-	void *dma_buf_vmapping;
+-	int vmapping_count;
++	void *mapping;
+ 
+ 	/** Breadcrumb of last rendering to the buffer.
+ 	 * There can only be one writer, but we allow for multiple readers.
+@@ -2988,12 +2985,44 @@ static inline void i915_gem_object_pin_pages(struct drm_i915_gem_object *obj)
+ 	BUG_ON(obj->pages == NULL);
+ 	obj->pages_pin_count++;
+ }
++
+ static inline void i915_gem_object_unpin_pages(struct drm_i915_gem_object *obj)
+ {
+ 	BUG_ON(obj->pages_pin_count == 0);
+ 	obj->pages_pin_count--;
+ }
+ 
++/**
++ * i915_gem_object_pin_map - return a contiguous mapping of the entire object
++ * @obj - the object to map into kernel address space
++ *
++ * Calls i915_gem_object_pin_pages() to prevent reaping of the object's
++ * pages and then returns a contiguous mapping of the backing storage into
++ * the kernel address space.
++ *
++ * The caller must hold the struct_mutex.
++ *
++ * Returns the pointer through which to access the backing storage.
++ */
++void *__must_check i915_gem_object_pin_map(struct drm_i915_gem_object *obj);
++
++/**
++ * i915_gem_object_unpin_map - releases an earlier mapping
++ * @obj - the object to unmap
++ *
++ * After pinning the object and mapping its pages, once you are finished
++ * with your access, call i915_gem_object_unpin_map() to release the pin
++ * upon the mapping. Once the pin count reaches zero, that mapping may be
++ * removed.
++ *
++ * The caller must hold the struct_mutex.
++ */
++static inline void i915_gem_object_unpin_map(struct drm_i915_gem_object *obj)
++{
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
++	i915_gem_object_unpin_pages(obj);
++}
++
+ int __must_check i915_mutex_lock_interruptible(struct drm_device *dev);
+ int i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 			 struct intel_engine_cs *to,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 5d9010b..fe6288d 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2229,6 +2229,11 @@ i915_gem_object_put_pages(struct drm_i915_gem_object *obj)
+ 	 * lists early. */
+ 	list_del(&obj->global_list);
+ 
++	if (obj->mapping) {
++		vunmap(obj->mapping);
++		obj->mapping = NULL;
++	}
++
+ 	ops->put_pages(obj);
+ 	obj->pages = NULL;
+ 
+@@ -2398,6 +2403,45 @@ i915_gem_object_get_pages(struct drm_i915_gem_object *obj)
+ 	return 0;
+ }
+ 
++void *i915_gem_object_pin_map(struct drm_i915_gem_object *obj)
++{
++	int ret;
++
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
++
++	ret = i915_gem_object_get_pages(obj);
++	if (ret)
++		return ERR_PTR(ret);
++
++	i915_gem_object_pin_pages(obj);
++
++	if (obj->mapping == NULL) {
++		struct sg_page_iter sg_iter;
++		struct page **pages;
++		int n;
++
++		n = obj->base.size >> PAGE_SHIFT;
++		pages = kmalloc(n*sizeof(*pages), GFP_TEMPORARY | __GFP_NOWARN);
++		if (pages == NULL)
++			pages = drm_malloc_ab(n, sizeof(*pages));
++		if (pages != NULL) {
++			n = 0;
++			for_each_sg_page(obj->pages->sgl, &sg_iter,
++					 obj->pages->nents, 0)
++				pages[n++] = sg_page_iter_page(&sg_iter);
++
++			obj->mapping = vmap(pages, n, 0, PAGE_KERNEL);
++			drm_free_large(pages);
++		}
++		if (obj->mapping == NULL) {
++			i915_gem_object_unpin_pages(obj);
++			return ERR_PTR(-ENOMEM);
++		}
++	}
++
++	return obj->mapping;
++}
++
+ void i915_vma_move_to_active(struct i915_vma *vma,
+ 			     struct drm_i915_gem_request *req)
+ {
+diff --git a/drivers/gpu/drm/i915/i915_gem_dmabuf.c b/drivers/gpu/drm/i915/i915_gem_dmabuf.c
+index b7d4680..80bbe43 100644
+--- a/drivers/gpu/drm/i915/i915_gem_dmabuf.c
++++ b/drivers/gpu/drm/i915/i915_gem_dmabuf.c
+@@ -108,51 +108,17 @@ static void *i915_gem_dmabuf_vmap(struct dma_buf *dma_buf)
+ {
+ 	struct drm_i915_gem_object *obj = dma_buf_to_obj(dma_buf);
+ 	struct drm_device *dev = obj->base.dev;
+-	struct sg_page_iter sg_iter;
+-	struct page **pages;
+-	int ret, i;
++	void *addr;
++	int ret;
+ 
+ 	ret = i915_mutex_lock_interruptible(dev);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
+-	if (obj->dma_buf_vmapping) {
+-		obj->vmapping_count++;
+-		goto out_unlock;
+-	}
+-
+-	ret = i915_gem_object_get_pages(obj);
+-	if (ret)
+-		goto err;
+-
+-	i915_gem_object_pin_pages(obj);
+-
+-	ret = -ENOMEM;
+-
+-	pages = drm_malloc_ab(obj->base.size >> PAGE_SHIFT, sizeof(*pages));
+-	if (pages == NULL)
+-		goto err_unpin;
+-
+-	i = 0;
+-	for_each_sg_page(obj->pages->sgl, &sg_iter, obj->pages->nents, 0)
+-		pages[i++] = sg_page_iter_page(&sg_iter);
+-
+-	obj->dma_buf_vmapping = vmap(pages, i, 0, PAGE_KERNEL);
+-	drm_free_large(pages);
+-
+-	if (!obj->dma_buf_vmapping)
+-		goto err_unpin;
+-
+-	obj->vmapping_count = 1;
+-out_unlock:
++	addr = i915_gem_object_pin_map(obj);
+ 	mutex_unlock(&dev->struct_mutex);
+-	return obj->dma_buf_vmapping;
+ 
+-err_unpin:
+-	i915_gem_object_unpin_pages(obj);
+-err:
+-	mutex_unlock(&dev->struct_mutex);
+-	return ERR_PTR(ret);
++	return addr;
+ }
+ 
+ static void i915_gem_dmabuf_vunmap(struct dma_buf *dma_buf, void *vaddr)
+@@ -161,12 +127,7 @@ static void i915_gem_dmabuf_vunmap(struct dma_buf *dma_buf, void *vaddr)
+ 	struct drm_device *dev = obj->base.dev;
+ 
+ 	mutex_lock(&dev->struct_mutex);
+-	if (--obj->vmapping_count == 0) {
+-		vunmap(obj->dma_buf_vmapping);
+-		obj->dma_buf_vmapping = NULL;
+-
+-		i915_gem_object_unpin_pages(obj);
+-	}
++	i915_gem_object_unpin_map(obj);
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 2777ef1..4ebe227 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2084,35 +2084,13 @@ static int init_phys_status_page(struct intel_engine_cs *engine)
+ void intel_unpin_ringbuffer_obj(struct intel_ringbuffer *ringbuf)
+ {
+ 	if (HAS_LLC(ringbuf->obj->base.dev) && !ringbuf->obj->stolen)
+-		vunmap(ringbuf->virtual_start);
++		i915_gem_object_unpin_map(ringbuf->obj);
+ 	else
+ 		iounmap(ringbuf->virtual_start);
+-	ringbuf->virtual_start = NULL;
+ 	ringbuf->vma = NULL;
+ 	i915_gem_object_ggtt_unpin(ringbuf->obj);
+ }
+ 
+-static u32 *vmap_obj(struct drm_i915_gem_object *obj)
+-{
+-	struct sg_page_iter sg_iter;
+-	struct page **pages;
+-	void *addr;
+-	int i;
+-
+-	pages = drm_malloc_ab(obj->base.size >> PAGE_SHIFT, sizeof(*pages));
+-	if (pages == NULL)
+-		return NULL;
+-
+-	i = 0;
+-	for_each_sg_page(obj->pages->sgl, &sg_iter, obj->pages->nents, 0)
+-		pages[i++] = sg_page_iter_page(&sg_iter);
+-
+-	addr = vmap(pages, i, 0, PAGE_KERNEL);
+-	drm_free_large(pages);
+-
+-	return addr;
+-}
+-
+ int intel_pin_and_map_ringbuffer_obj(struct drm_device *dev,
+ 				     struct intel_ringbuffer *ringbuf)
+ {
+@@ -2132,7 +2110,7 @@ int intel_pin_and_map_ringbuffer_obj(struct drm_device *dev,
+ 		if (ret)
+ 			goto err_unpin;
+ 
+-		ringbuf->virtual_start = vmap_obj(obj);
++		ringbuf->virtual_start = i915_gem_object_pin_map(obj);
+ 		if (ringbuf->virtual_start == NULL) {
+ 			ret = -ENOMEM;
+ 			goto err_unpin;
+-- 
+1.7.5.4
+

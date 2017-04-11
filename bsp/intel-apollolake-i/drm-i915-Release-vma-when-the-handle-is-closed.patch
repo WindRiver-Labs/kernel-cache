@@ -1,0 +1,329 @@
+From ca6e38577a1a01b15dc43627c6b8e864df4a4e00 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 4 Aug 2016 07:52:45 +0100
+Subject: [PATCH 3855/4706] drm/i915: Release vma when the handle is closed
+
+commit b1f788c6acb2f34622dd5f4c3d5210c6e3945e78 upstream
+
+In order to prevent a leak of the vma on shared objects, we need to
+hook into the object_close callback to destroy the vma on the object for
+this file. However, if we destroyed that vma immediately we may cause
+unexpected application stalls as we try to unbind a busy vma - hence we
+defer the unbind to when we retire the vma.
+
+v2: Keep vma allocated until closed. This is useful for a later
+optimisation, but it is required now in order to handle potential
+recursion of i915_vma_unbind() by retiring itself.
+v3: Comments are important.
+
+Testcase: igt/gem_ppggtt/flink-and-close-vma-leak
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1470293567-10811-26-git-send-email-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_drv.c       |    1 +
+ drivers/gpu/drm/i915/i915_drv.h       |    4 +-
+ drivers/gpu/drm/i915/i915_gem.c       |   88 +++++++++++++++++----------------
+ drivers/gpu/drm/i915/i915_gem_evict.c |    8 +--
+ drivers/gpu/drm/i915/i915_gem_gtt.c   |   25 +++++++++
+ drivers/gpu/drm/i915/i915_gem_gtt.h   |    1 +
+ 6 files changed, 77 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 2a13641..d225950 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -2583,6 +2583,7 @@ static struct drm_driver driver = {
+ 	.postclose = i915_driver_postclose,
+ 	.set_busid = drm_pci_set_busid,
+ 
++	.gem_close_object = i915_gem_close_object,
+ 	.gem_free_object = i915_gem_free_object,
+ 	.gem_vm_ops = &i915_gem_vm_ops,
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index a39e364..bfe12272 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3022,8 +3022,8 @@ struct drm_i915_gem_object *i915_gem_object_create(struct drm_device *dev,
+ 						  size_t size);
+ struct drm_i915_gem_object *i915_gem_object_create_from_data(
+ 		struct drm_device *dev, const void *data, size_t size);
++void i915_gem_close_object(struct drm_gem_object *gem, struct drm_file *file);
+ void i915_gem_free_object(struct drm_gem_object *obj);
+-void i915_gem_vma_destroy(struct i915_vma *vma);
+ 
+ /* Flags used by pin/bind&friends. */
+ #define PIN_MAPPABLE	(1<<0)
+@@ -3056,6 +3056,8 @@ int __must_check i915_vma_unbind(struct i915_vma *vma);
+  * _guarantee_ VMA in question is _not in use_ anywhere.
+  */
+ int __must_check __i915_vma_unbind_no_wait(struct i915_vma *vma);
++void i915_vma_close(struct i915_vma *vma);
++void i915_vma_destroy(struct i915_vma *vma);
+ 
+ int i915_gem_object_unbind(struct drm_i915_gem_object *obj);
+ int i915_gem_object_put_pages(struct drm_i915_gem_object *obj);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index a7a7bf9..b38f4c0 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2597,6 +2597,19 @@ out_rearm:
+ 	}
+ }
+ 
++void i915_gem_close_object(struct drm_gem_object *gem, struct drm_file *file)
++{
++	struct drm_i915_gem_object *obj = to_intel_bo(gem);
++	struct drm_i915_file_private *fpriv = file->driver_priv;
++	struct i915_vma *vma, *vn;
++
++	mutex_lock(&obj->base.dev->struct_mutex);
++	list_for_each_entry_safe(vma, vn, &obj->vma_list, obj_link)
++		if (vma->vm->file == fpriv)
++			i915_vma_close(vma);
++	mutex_unlock(&obj->base.dev->struct_mutex);
++}
++
+ /**
+  * i915_gem_wait_ioctl - implements DRM_IOCTL_I915_GEM_WAIT
+  * @dev: drm device pointer
+@@ -2804,26 +2817,32 @@ static int __i915_vma_unbind(struct i915_vma *vma, bool wait)
+ 	if (active && wait) {
+ 		int idx;
+ 
++		/* When a closed VMA is retired, it is unbound - eek.
++		 * In order to prevent it from being recursively closed,
++		 * take a pin on the vma so that the second unbind is
++		 * aborted.
++		 */
++		vma->pin_count++;
++
+ 		for_each_active(active, idx) {
+ 			ret = i915_gem_active_retire(&vma->last_read[idx],
+ 						   &vma->vm->dev->struct_mutex);
+ 			if (ret)
+-				return ret;
++				break;
+ 		}
+ 
++		vma->pin_count--;
++		if (ret)
++			return ret;
++
+ 		GEM_BUG_ON(i915_vma_is_active(vma));
+ 	}
+ 
+ 	if (vma->pin_count)
+ 		return -EBUSY;
+ 
+-	if (list_empty(&vma->obj_link))
+-		return 0;
+-
+-	if (!drm_mm_node_allocated(&vma->node)) {
+-		i915_gem_vma_destroy(vma);
+-		return 0;
+-	}
++	if (!drm_mm_node_allocated(&vma->node))
++		goto destroy;
+ 
+ 	GEM_BUG_ON(obj->bind_count == 0);
+ 	GEM_BUG_ON(!obj->pages);
+@@ -2856,7 +2875,6 @@ static int __i915_vma_unbind(struct i915_vma *vma, bool wait)
+ 	}
+ 
+ 	drm_mm_remove_node(&vma->node);
+-	i915_gem_vma_destroy(vma);
+ 
+ 	/* Since the unbound list is global, only move to that list if
+ 	 * no more VMAs exist. */
+@@ -2870,6 +2888,10 @@ static int __i915_vma_unbind(struct i915_vma *vma, bool wait)
+ 	 */
+ 	i915_gem_object_unpin_pages(obj);
+ 
++destroy:
++	if (unlikely(vma->closed))
++		i915_vma_destroy(vma);
++
+ 	return 0;
+ }
+ 
+@@ -3044,7 +3066,7 @@ i915_gem_object_bind_to_vm(struct drm_i915_gem_object *obj,
+ 
+ 		if (offset & (alignment - 1) || offset + size > end) {
+ 			ret = -EINVAL;
+-			goto err_free_vma;
++			goto err_vma;
+ 		}
+ 		vma->node.start = offset;
+ 		vma->node.size = size;
+@@ -3056,7 +3078,7 @@ i915_gem_object_bind_to_vm(struct drm_i915_gem_object *obj,
+ 				ret = drm_mm_reserve_node(&vm->mm, &vma->node);
+ 		}
+ 		if (ret)
+-			goto err_free_vma;
++			goto err_vma;
+ 	} else {
+ 		if (flags & PIN_HIGH) {
+ 			search_flag = DRM_MM_SEARCH_BELOW;
+@@ -3081,7 +3103,7 @@ search_free:
+ 			if (ret == 0)
+ 				goto search_free;
+ 
+-			goto err_free_vma;
++			goto err_vma;
+ 		}
+ 	}
+ 	if (WARN_ON(!i915_gem_valid_gtt_space(vma, obj->cache_level))) {
+@@ -3102,8 +3124,7 @@ search_free:
+ 
+ err_remove_node:
+ 	drm_mm_remove_node(&vma->node);
+-err_free_vma:
+-	i915_gem_vma_destroy(vma);
++err_vma:
+ 	vma = ERR_PTR(ret);
+ err_unpin:
+ 	i915_gem_object_unpin_pages(obj);
+@@ -4052,21 +4073,18 @@ void i915_gem_free_object(struct drm_gem_object *gem_obj)
+ 
+ 	trace_i915_gem_object_destroy(obj);
+ 
++	/* All file-owned VMA should have been released by this point through
++	 * i915_gem_close_object(), or earlier by i915_gem_context_close().
++	 * However, the object may also be bound into the global GTT (e.g.
++	 * older GPUs without per-process support, or for direct access through
++	 * the GTT either for the user or for scanout). Those VMA still need to
++	 * unbound now.
++	 */
+ 	list_for_each_entry_safe(vma, next, &obj->vma_list, obj_link) {
+-		int ret;
+-
++		GEM_BUG_ON(!vma->is_ggtt);
++		GEM_BUG_ON(i915_vma_is_active(vma));
+ 		vma->pin_count = 0;
+-		ret = __i915_vma_unbind_no_wait(vma);
+-		if (WARN_ON(ret == -ERESTARTSYS)) {
+-			bool was_interruptible;
+-
+-			was_interruptible = dev_priv->mm.interruptible;
+-			dev_priv->mm.interruptible = false;
+-
+-			WARN_ON(i915_vma_unbind(vma));
+-
+-			dev_priv->mm.interruptible = was_interruptible;
+-		}
++		i915_vma_close(vma);
+ 	}
+ 	GEM_BUG_ON(obj->bind_count);
+ 
+@@ -4130,22 +4148,6 @@ struct i915_vma *i915_gem_obj_to_ggtt_view(struct drm_i915_gem_object *obj,
+ 	return NULL;
+ }
+ 
+-void i915_gem_vma_destroy(struct i915_vma *vma)
+-{
+-	WARN_ON(vma->node.allocated);
+-
+-	/* Keep the vma as a placeholder in the execbuffer reservation lists */
+-	if (!list_empty(&vma->exec_list))
+-		return;
+-
+-	if (!vma->is_ggtt)
+-		i915_ppgtt_put(i915_vm_to_ppgtt(vma->vm));
+-
+-	list_del(&vma->obj_link);
+-
+-	kmem_cache_free(to_i915(vma->obj->base.dev)->vmas, vma);
+-}
+-
+ static void
+ i915_gem_stop_engines(struct drm_device *dev)
+ {
+diff --git a/drivers/gpu/drm/i915/i915_gem_evict.c b/drivers/gpu/drm/i915/i915_gem_evict.c
+index 81f7b43..3437ced 100644
+--- a/drivers/gpu/drm/i915/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/i915_gem_evict.c
+@@ -182,8 +182,8 @@ found:
+ 				       struct i915_vma,
+ 				       exec_list);
+ 		if (drm_mm_scan_remove_block(&vma->node)) {
++			vma->pin_count++;
+ 			list_move(&vma->exec_list, &eviction_list);
+-			i915_gem_object_get(vma->obj);
+ 			continue;
+ 		}
+ 		list_del_init(&vma->exec_list);
+@@ -191,18 +191,14 @@ found:
+ 
+ 	/* Unbinding will emit any required flushes */
+ 	while (!list_empty(&eviction_list)) {
+-		struct drm_i915_gem_object *obj;
+-
+ 		vma = list_first_entry(&eviction_list,
+ 				       struct i915_vma,
+ 				       exec_list);
+ 
+-		obj =  vma->obj;
+ 		list_del_init(&vma->exec_list);
++		vma->pin_count--;
+ 		if (ret == 0)
+ 			ret = i915_vma_unbind(vma);
+-
+-		i915_gem_object_put(obj);
+ 	}
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 68f0e51..a669cc3 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -3346,6 +3346,31 @@ i915_vma_retire(struct i915_gem_active *active,
+ 		return;
+ 
+ 	list_move_tail(&vma->vm_link, &vma->vm->inactive_list);
++	if (unlikely(vma->closed && !vma->pin_count))
++		WARN_ON(i915_vma_unbind(vma));
++}
++
++void i915_vma_destroy(struct i915_vma *vma)
++{
++	GEM_BUG_ON(vma->node.allocated);
++	GEM_BUG_ON(i915_vma_is_active(vma));
++	GEM_BUG_ON(!vma->closed);
++
++	list_del(&vma->vm_link);
++	if (!vma->is_ggtt)
++		i915_ppgtt_put(i915_vm_to_ppgtt(vma->vm));
++
++	kmem_cache_free(to_i915(vma->obj->base.dev)->vmas, vma);
++}
++
++void i915_vma_close(struct i915_vma *vma)
++{
++	GEM_BUG_ON(vma->closed);
++	vma->closed = true;
++
++	list_del_init(&vma->obj_link);
++	if (!i915_vma_is_active(vma) && !vma->pin_count)
++		WARN_ON(__i915_vma_unbind_no_wait(vma));
+ }
+ 
+ static struct i915_vma *
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index bfd3c11..deb9dbc 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -189,6 +189,7 @@ struct i915_vma {
+ #define LOCAL_BIND	(1<<1)
+ 	unsigned int bound : 4;
+ 	bool is_ggtt : 1;
++	bool closed : 1;
+ 
+ 	/**
+ 	 * Support different GGTT views into the same object.
+-- 
+1.7.5.4
+

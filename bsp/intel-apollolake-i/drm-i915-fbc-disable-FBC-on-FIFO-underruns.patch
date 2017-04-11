@@ -1,0 +1,184 @@
+From 7018f71fa9d5c49fcec5f201b64ed8fe9c6affc7 Mon Sep 17 00:00:00 2001
+From: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Date: Tue, 13 Sep 2016 10:38:57 -0300
+Subject: [PATCH 4371/4706] drm/i915/fbc: disable FBC on FIFO underruns
+
+commit 61a585d664c78274c53fe466ef1dd0408917fd74 upstream
+
+Ever since I started working on FBC I was already aware that FBC can
+really amplify the FIFO underrun symptoms. On systems where FIFO
+underruns were harmless error messages, enabling FBC would cause the
+underruns to give black screens.
+
+We recently tried to enable FBC on Haswell and got reports of a system
+that would hang after some hours of uptime, and the first bad commit
+was the one that enabled FBC. We also observed that this system had
+FIFO underrun error messages on its dmesg. Although we don't have any
+evidence that fixing the underruns would solve the bug and make FBC
+work properly on this machine, IMHO it's better if we minimize the
+amount of possible problems by just giving up FBC whenever we detect
+an underrun.
+
+v2: New version, different implementation and commit message.
+v3: Clarify the fact that we run from an IRQ handler (Chris).
+v4: Also add the underrun_detected check at can_choose() to avoid
+    misleading dmesg messages (DK).
+v5: Fix Engrish, use READ_ONCE on the unlocked read (Chris).
+
+Cc: Stefan Richter <stefanr@s5r6.in-berlin.de>
+Cc: Lyude <cpaul@redhat.com>
+Cc: stevenhoneyman@gmail.com <stevenhoneyman@gmail.com>
+Cc: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1473773937-19758-1-git-send-email-paulo.r.zanoni@intel.com
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    3 +
+ drivers/gpu/drm/i915/intel_drv.h           |    1 +
+ drivers/gpu/drm/i915/intel_fbc.c           |   67 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_fifo_underrun.c |    2 +
+ 4 files changed, 73 insertions(+), 0 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 376c1f9..8334f3f 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -972,6 +972,9 @@ struct intel_fbc {
+ 	bool enabled;
+ 	bool active;
+ 
++	bool underrun_detected;
++	struct work_struct underrun_work;
++
+ 	struct intel_fbc_state_cache {
+ 		struct {
+ 			unsigned int mode_flags;
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index a19ec06..ab4a674 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -1513,6 +1513,7 @@ void intel_fbc_invalidate(struct drm_i915_private *dev_priv,
+ void intel_fbc_flush(struct drm_i915_private *dev_priv,
+ 		     unsigned int frontbuffer_bits, enum fb_op_origin origin);
+ void intel_fbc_cleanup_cfb(struct drm_i915_private *dev_priv);
++void intel_fbc_handle_fifo_underrun_irq(struct drm_i915_private *dev_priv);
+ 
+ /* intel_hdmi.c */
+ void intel_hdmi_init(struct drm_device *dev, i915_reg_t hdmi_reg, enum port port);
+diff --git a/drivers/gpu/drm/i915/intel_fbc.c b/drivers/gpu/drm/i915/intel_fbc.c
+index c43dd9a..6345cb8 100644
+--- a/drivers/gpu/drm/i915/intel_fbc.c
++++ b/drivers/gpu/drm/i915/intel_fbc.c
+@@ -776,6 +776,14 @@ static bool intel_fbc_can_activate(struct intel_crtc *crtc)
+ 	struct intel_fbc *fbc = &dev_priv->fbc;
+ 	struct intel_fbc_state_cache *cache = &fbc->state_cache;
+ 
++	/* We don't need to use a state cache here since this information is
++	 * global for all CRTC.
++	 */
++	if (fbc->underrun_detected) {
++		fbc->no_fbc_reason = "underrun detected";
++		return false;
++	}
++
+ 	if (!cache->plane.visible) {
+ 		fbc->no_fbc_reason = "primary plane not visible";
+ 		return false;
+@@ -861,6 +869,11 @@ static bool intel_fbc_can_choose(struct intel_crtc *crtc)
+ 		return false;
+ 	}
+ 
++	if (fbc->underrun_detected) {
++		fbc->no_fbc_reason = "underrun detected";
++		return false;
++	}
++
+ 	if (fbc_on_pipe_a_only(dev_priv) && crtc->pipe != PIPE_A) {
+ 		fbc->no_fbc_reason = "no enabled pipes can have FBC";
+ 		return false;
+@@ -1223,6 +1236,59 @@ void intel_fbc_global_disable(struct drm_i915_private *dev_priv)
+ 	cancel_work_sync(&fbc->work.work);
+ }
+ 
++static void intel_fbc_underrun_work_fn(struct work_struct *work)
++{
++	struct drm_i915_private *dev_priv =
++		container_of(work, struct drm_i915_private, fbc.underrun_work);
++	struct intel_fbc *fbc = &dev_priv->fbc;
++
++	mutex_lock(&fbc->lock);
++
++	/* Maybe we were scheduled twice. */
++	if (fbc->underrun_detected)
++		goto out;
++
++	DRM_DEBUG_KMS("Disabling FBC due to FIFO underrun.\n");
++	fbc->underrun_detected = true;
++
++	intel_fbc_deactivate(dev_priv);
++out:
++	mutex_unlock(&fbc->lock);
++}
++
++/**
++ * intel_fbc_handle_fifo_underrun_irq - disable FBC when we get a FIFO underrun
++ * @dev_priv: i915 device instance
++ *
++ * Without FBC, most underruns are harmless and don't really cause too many
++ * problems, except for an annoying message on dmesg. With FBC, underruns can
++ * become black screens or even worse, especially when paired with bad
++ * watermarks. So in order for us to be on the safe side, completely disable FBC
++ * in case we ever detect a FIFO underrun on any pipe. An underrun on any pipe
++ * already suggests that watermarks may be bad, so try to be as safe as
++ * possible.
++ *
++ * This function is called from the IRQ handler.
++ */
++void intel_fbc_handle_fifo_underrun_irq(struct drm_i915_private *dev_priv)
++{
++	struct intel_fbc *fbc = &dev_priv->fbc;
++
++	if (!fbc_supported(dev_priv))
++		return;
++
++	/* There's no guarantee that underrun_detected won't be set to true
++	 * right after this check and before the work is scheduled, but that's
++	 * not a problem since we'll check it again under the work function
++	 * while FBC is locked. This check here is just to prevent us from
++	 * unnecessarily scheduling the work, and it relies on the fact that we
++	 * never switch underrun_detect back to false after it's true. */
++	if (READ_ONCE(fbc->underrun_detected))
++		return;
++
++	schedule_work(&fbc->underrun_work);
++}
++
+ /**
+  * intel_fbc_init_pipe_state - initialize FBC's CRTC visibility tracking
+  * @dev_priv: i915 device instance
+@@ -1294,6 +1360,7 @@ void intel_fbc_init(struct drm_i915_private *dev_priv)
+ 	enum pipe pipe;
+ 
+ 	INIT_WORK(&fbc->work.work, intel_fbc_work_fn);
++	INIT_WORK(&fbc->underrun_work, intel_fbc_underrun_work_fn);
+ 	mutex_init(&fbc->lock);
+ 	fbc->enabled = false;
+ 	fbc->active = false;
+diff --git a/drivers/gpu/drm/i915/intel_fifo_underrun.c b/drivers/gpu/drm/i915/intel_fifo_underrun.c
+index 2aa7440..ebb4fed 100644
+--- a/drivers/gpu/drm/i915/intel_fifo_underrun.c
++++ b/drivers/gpu/drm/i915/intel_fifo_underrun.c
+@@ -372,6 +372,8 @@ void intel_cpu_fifo_underrun_irq_handler(struct drm_i915_private *dev_priv,
+ 	if (intel_set_cpu_fifo_underrun_reporting(dev_priv, pipe, false))
+ 		DRM_ERROR("CPU pipe %c FIFO underrun\n",
+ 			  pipe_name(pipe));
++
++	intel_fbc_handle_fifo_underrun_irq(dev_priv);
+ }
+ 
+ /**
+-- 
+1.7.5.4
+

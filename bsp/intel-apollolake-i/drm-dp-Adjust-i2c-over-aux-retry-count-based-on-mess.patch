@@ -1,0 +1,181 @@
+From e84ccffd07da13b4f76d1aba3702b36099d52f66 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Tue, 1 Sep 2015 20:12:54 +0300
+Subject: [PATCH 1076/4706] drm/dp: Adjust i2c-over-aux retry count based on
+ message size and i2c bus speed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 4efa83c8c786ab7ec7982e3dd348cb7e7ecbeb04 upstream
+
+Calculate the number of retries we should do for each i2c-over-aux
+message based on the time it takes to perform the i2c transfer vs. the
+aux transfer. We assume the shortest possible length for the aux
+transfer, and the longest possible (exluding clock stretching) for the
+i2c transfer.
+
+The DP spec has some examples on how to calculate this, but we don't
+calculate things quite the same way. The spec doesn't account for the
+retry interval (assumes immediate retry on defer), and doesn't assume
+the best/worst case behaviour as we do.
+
+Note that currently we assume 10 kHz speed for the i2c bus. Some real
+world devices (eg. some Apple DP->VGA dongle) fails with less than 16
+retries. and that would correspond to something close to 15 kHz (with
+our method of calculating things) But let's just go for 10 kHz to be
+on the safe side. Ideally we should query/set the i2c bus speed via
+DPCD but for now this should at leaast remove the regression from the
+1->16 byte trasnfer size change. And of course if the sink completes
+the transfer quicker this shouldn't slow things down since we don't
+change the interval between retries.
+
+I did a few experiments with a DP->DVI dongle I have that allows you
+to change the i2c bus speed. Here are the results of me changing the
+actual bus speed and the assumed bus speed and seeing when we start
+to fail the operation:
+
+actual i2c khz          assumed i2c khz         max retries
+1                       1 ok -> 2 fail          211 ok -> 106 fail
+5                       8 ok -> 9 fail          27 ok -> 24 fail
+10                      17 ok -> 18 fail        13 ok -> 12 fail
+100                     210 ok -> 211 fail      2 ok -> 1 fail
+
+So based on that we have a fairly decent safety margin baked into
+the formula to calculate the max number of retries.
+
+Fixes a regression with some DP dongles from:
+commit 1d002fa720738bcd0bddb9178e9ea0773288e1dd
+Author: Simon Farnsworth <simon.farnsworth@onelan.co.uk>
+Date:   Tue Feb 10 18:38:08 2015 +0000
+
+    drm/dp: Use large transactions for I2C over AUX
+
+v2: Use best case for AUX and worst case for i2c (Simon Farnsworth)
+    Add a define our AUX retry interval and account for it
+v3: Make everything usecs to avoid confusion about units (Daniel)
+    Add a comment reminding people about the AUX bitrate (Daniel)
+    Use DIV_ROUND_UP() since we're after the "worst" case for i2c
+
+Cc: Simon Farnsworth <simon.farnsworth@onelan.com>
+Cc: moosotc@gmail.com
+Tested-by: moosotc@gmail.com
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=91451
+Reviewed-by: Simon Farnsworth <simon.farnsworth@onelan.com>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+---
+ drivers/gpu/drm/drm_dp_helper.c |   84 ++++++++++++++++++++++++++++++++++++++-
+ 1 files changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_dp_helper.c b/drivers/gpu/drm/drm_dp_helper.c
+index 7069e54..214a4c6 100644
+--- a/drivers/gpu/drm/drm_dp_helper.c
++++ b/drivers/gpu/drm/drm_dp_helper.c
+@@ -424,6 +424,81 @@ static u32 drm_dp_i2c_functionality(struct i2c_adapter *adapter)
+ 	       I2C_FUNC_10BIT_ADDR;
+ }
+ 
++#define AUX_PRECHARGE_LEN 10 /* 10 to 16 */
++#define AUX_SYNC_LEN (16 + 4) /* preamble + AUX_SYNC_END */
++#define AUX_STOP_LEN 4
++#define AUX_CMD_LEN 4
++#define AUX_ADDRESS_LEN 20
++#define AUX_REPLY_PAD_LEN 4
++#define AUX_LENGTH_LEN 8
++
++/*
++ * Calculate the duration of the AUX request/reply in usec. Gives the
++ * "best" case estimate, ie. successful while as short as possible.
++ */
++static int drm_dp_aux_req_duration(const struct drm_dp_aux_msg *msg)
++{
++	int len = AUX_PRECHARGE_LEN + AUX_SYNC_LEN + AUX_STOP_LEN +
++		AUX_CMD_LEN + AUX_ADDRESS_LEN + AUX_LENGTH_LEN;
++
++	if ((msg->request & DP_AUX_I2C_READ) == 0)
++		len += msg->size * 8;
++
++	return len;
++}
++
++static int drm_dp_aux_reply_duration(const struct drm_dp_aux_msg *msg)
++{
++	int len = AUX_PRECHARGE_LEN + AUX_SYNC_LEN + AUX_STOP_LEN +
++		AUX_CMD_LEN + AUX_REPLY_PAD_LEN;
++
++	/*
++	 * For read we expect what was asked. For writes there will
++	 * be 0 or 1 data bytes. Assume 0 for the "best" case.
++	 */
++	if (msg->request & DP_AUX_I2C_READ)
++		len += msg->size * 8;
++
++	return len;
++}
++
++#define I2C_START_LEN 1
++#define I2C_STOP_LEN 1
++#define I2C_ADDR_LEN 9 /* ADDRESS + R/W + ACK/NACK */
++#define I2C_DATA_LEN 9 /* DATA + ACK/NACK */
++
++/*
++ * Calculate the length of the i2c transfer in usec, assuming
++ * the i2c bus speed is as specified. Gives the the "worst"
++ * case estimate, ie. successful while as long as possible.
++ * Doesn't account the the "MOT" bit, and instead assumes each
++ * message includes a START, ADDRESS and STOP. Neither does it
++ * account for additional random variables such as clock stretching.
++ */
++static int drm_dp_i2c_msg_duration(const struct drm_dp_aux_msg *msg,
++				   int i2c_speed_khz)
++{
++	/* AUX bitrate is 1MHz, i2c bitrate as specified */
++	return DIV_ROUND_UP((I2C_START_LEN + I2C_ADDR_LEN +
++			     msg->size * I2C_DATA_LEN +
++			     I2C_STOP_LEN) * 1000, i2c_speed_khz);
++}
++
++/*
++ * Deterine how many retries should be attempted to successfully transfer
++ * the specified message, based on the estimated durations of the
++ * i2c and AUX transfers.
++ */
++static int drm_dp_i2c_retry_count(const struct drm_dp_aux_msg *msg,
++			      int i2c_speed_khz)
++{
++	int aux_time_us = drm_dp_aux_req_duration(msg) +
++		drm_dp_aux_reply_duration(msg);
++	int i2c_time_us = drm_dp_i2c_msg_duration(msg, i2c_speed_khz);
++
++	return DIV_ROUND_UP(i2c_time_us, aux_time_us + AUX_RETRY_INTERVAL);
++}
++
+ /*
+  * Transfer a single I2C-over-AUX message and handle various error conditions,
+  * retrying the transaction as appropriate.  It is assumed that the
+@@ -436,13 +511,18 @@ static int drm_dp_i2c_do_msg(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
+ {
+ 	unsigned int retry, defer_i2c;
+ 	int ret;
+-
+ 	/*
+ 	 * DP1.2 sections 2.7.7.1.5.6.1 and 2.7.7.1.6.6.1: A DP Source device
+ 	 * is required to retry at least seven times upon receiving AUX_DEFER
+ 	 * before giving up the AUX transaction.
++	 *
++	 * We also try to account for the i2c bus speed.
++	 * FIXME currently assumes 10 kHz as some real world devices seem
++	 * to require it. We should query/set the speed via DPCD if supported.
+ 	 */
+-	for (retry = 0, defer_i2c = 0; retry < (7 + defer_i2c); retry++) {
++	int max_retries = max(7, drm_dp_i2c_retry_count(msg, 10));
++
++	for (retry = 0, defer_i2c = 0; retry < (max_retries + defer_i2c); retry++) {
+ 		mutex_lock(&aux->hw_mutex);
+ 		ret = aux->transfer(aux, msg);
+ 		mutex_unlock(&aux->hw_mutex);
+-- 
+1.7.5.4
+
