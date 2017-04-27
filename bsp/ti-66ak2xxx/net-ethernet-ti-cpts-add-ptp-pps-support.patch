@@ -1,0 +1,533 @@
+From fa22018684b7d9e12abab1d285c2b0dc3d274804 Mon Sep 17 00:00:00 2001
+From: Grygorii Strashko <grygorii.strashko@ti.com>
+Date: Fri, 28 Oct 2016 11:41:23 -0500
+Subject: [PATCH 319/347] net: ethernet: ti: cpts: add ptp pps support
+
+This patch comes from:
+  git://git.ti.com/processor-sdk/processor-sdk-linux.git
+
+The TS_COMP output in the CPSW CPTS module is asserted for
+ts_comp_length[15:0] RCLK periods when the time_stamp value compares
+with the ts_comp_val[31:0] and the length value is non-zero. The
+TS_COMP pulse edge occurs three RCLK periods after the values
+compare. A timestamp compare event is pushed into the event FIFO when
+TS_COMP is asserted.
+
+This patch adds support of Pulse-Per-Second (PPS) by using the
+timestamp compare output. The CPTS driver adds one second of counter
+value to the ts_comp_val register after each assertion of the TS_COMP
+output. The TS_COMP pulse polarity and width are configurable in DT.
+
+Signed-off-by: WingMan Kwok <w-kwok2@ti.com>
+Signed-off-by: Grygorii Strashko <grygorii.strashko@ti.com>
+Signed-off-by: Jacob Stiffler <j-stiffler@ti.com>
+(cherry picked from commit f45d8101ba7ae4b73dc9ff897b5cedf1f7a72628)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ .../devicetree/bindings/net/keystone-netcp.txt     |   16 ++-
+ drivers/net/ethernet/ti/cpts.c                     |  245 +++++++++++++++++++-
+ drivers/net/ethernet/ti/cpts.h                     |   14 +-
+ 3 files changed, 262 insertions(+), 13 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/net/keystone-netcp.txt b/Documentation/devicetree/bindings/net/keystone-netcp.txt
+index a22bf25..12d29ca 100644
+--- a/Documentation/devicetree/bindings/net/keystone-netcp.txt
++++ b/Documentation/devicetree/bindings/net/keystone-netcp.txt
+@@ -2,7 +2,7 @@ This document describes the device tree bindings associated with the
+ keystone network coprocessor(NetCP) driver support.
+ 
+ The network coprocessor (NetCP) is a hardware accelerator that processes
+-Ethernet packets. NetCP has a gigabit Ethernet (GbE) subsystem with a ethernet
++Ethernet packets. NetCP has a gigabit Ethernet (GbE) subsytem with a ethernet
+ switch sub-module to send and receive packets. NetCP also includes a packet
+ accelerator (PA) module to perform packet classification operations such as
+ header matching, and packet modification operations such as checksum
+@@ -134,6 +134,20 @@ Optional properties:
+ 
+ 		Defaults: clock_mult, clock_shift = calculated from
+ 		CPTS refclk
++	- cpts-ext-ts-inputs:
++		The number of external time stamp channels.
++		The different CPTS versions might support up 8
++		external time stamp channels. if absent - unsupported.
++	- cpts-ts-comp-length:
++		Enable time stamp comparison event and TS_COMP signal output
++		generation when CPTS counter reaches a value written to
++		the TS_COMP_VAL register.
++		The generated pulse width is 3 refclk cycles if this property
++		has no value (empty) or, otherwise, it should specify desired
++		pulse width in number of refclk periods - max value 2^16.
++		TS_COMP functionality will be disabled if not present.
++	- cpts-ts-comp-polarity-low:
++		Set polarity of TS_COMP signal to low. Default is hight.
+ 
+ NetCP interface properties: Interface specification for NetCP sub-modules.
+ Required properties:
+diff --git a/drivers/net/ethernet/ti/cpts.c b/drivers/net/ethernet/ti/cpts.c
+index 7a72ea5..400ea51 100644
+--- a/drivers/net/ethernet/ti/cpts.c
++++ b/drivers/net/ethernet/ti/cpts.c
+@@ -31,9 +31,13 @@
+ 
+ #include "cpts.h"
+ 
++#define CPTS_TS_COMP_PULSE_LENGTH_DEF	3
++
+ #define cpts_read32(c, r)	readl_relaxed(&c->reg->r)
+ #define cpts_write32(c, v, r)	writel_relaxed(v, &c->reg->r)
+ 
++static int cpts_report_ts_events(struct cpts *cpts, bool pps_reload);
++
+ static int cpts_event_port(struct cpts_event *event)
+ {
+ 	return (event->high >> PORT_NUMBER_SHIFT) & PORT_NUMBER_MASK;
+@@ -108,7 +112,9 @@ static int cpts_fifo_read(struct cpts *cpts, int match)
+ 		type = event_type(event);
+ 		switch (type) {
+ 		case CPTS_EV_HW:
+-			event->tmo = CPTS_EVENT_HWSTAMP_TIMEOUT;
++		case CPTS_EV_COMP:
++			event->tmo +=
++				msecs_to_jiffies(CPTS_EVENT_HWSTAMP_TIMEOUT);
+ 		case CPTS_EV_PUSH:
+ 		case CPTS_EV_RX:
+ 		case CPTS_EV_TX:
+@@ -152,6 +158,60 @@ static cycle_t cpts_systim_read(const struct cyclecounter *cc)
+ 	return val;
+ }
+ 
++static cycle_t cpts_cc_ns2cyc(struct cpts *cpts, u64 nsecs)
++{
++	cycle_t cyc = (nsecs << cpts->cc.shift) + nsecs;
++
++	do_div(cyc, cpts->cc.mult);
++
++	return cyc;
++}
++
++static void cpts_ts_comp_disable(struct cpts *cpts)
++{
++	cpts_write32(cpts, 0, ts_comp_length);
++}
++
++static void cpts_ts_comp_enable(struct cpts *cpts)
++{
++	/* TS_COMP_LENGTH should be 0 while the TS_COMP_VAL value is
++	 * being written
++	 */
++	cpts_write32(cpts, 0, ts_comp_length);
++	cpts_write32(cpts, cpts->ts_comp_next, ts_comp_val);
++	cpts_write32(cpts, cpts->ts_comp_length, ts_comp_length);
++}
++
++static void cpts_ts_comp_add_ns(struct cpts *cpts, s64 add_ns)
++{
++	cycle_t cyc_next;
++
++	if (add_ns == NSEC_PER_SEC)
++		/* avoid calculation */
++		cyc_next = cpts->ts_comp_one_sec_cycs;
++	else
++		cyc_next = cpts_cc_ns2cyc(cpts, add_ns);
++
++	cyc_next += cpts->ts_comp_next;
++	cpts->ts_comp_next = cyc_next & cpts->cc.mask;
++	pr_debug("cpts comp ts_comp_next: %u\n", cpts->ts_comp_next);
++}
++
++static void cpts_ts_comp_settime(struct cpts *cpts, s64 now_ns)
++{
++	struct timespec64 ts;
++
++	if (cpts->ts_comp_enabled) {
++		ts = ns_to_timespec64(now_ns);
++
++		/* align pulse to next sec boundary and add one sec */
++		cpts_ts_comp_add_ns(cpts, NSEC_PER_SEC - ts.tv_nsec);
++
++		/* enable ts_comp pulse */
++		cpts_ts_comp_enable(cpts);
++	}
++}
++
+ /* PTP clock operations */
+ 
+ static int cpts_ptp_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
+@@ -161,6 +221,7 @@ static int cpts_ptp_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
+ 	int neg_adj = 0;
+ 	unsigned long flags;
+ 	struct cpts *cpts = container_of(ptp, struct cpts, info);
++	u64 ns;
+ 
+ 	if (ppb < 0) {
+ 		neg_adj = 1;
+@@ -171,14 +232,31 @@ static int cpts_ptp_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
+ 	adj *= ppb;
+ 	diff = div_u64(adj, 1000000000ULL);
+ 
++	mutex_lock(&cpts->ptp_clk_mutex);
++
+ 	spin_lock_irqsave(&cpts->lock, flags);
++	if (cpts->ts_comp_enabled) {
++		cpts_ts_comp_disable(cpts);
++		/* if any, report existing pulse before adj */
++		cpts_fifo_read(cpts, CPTS_EV_COMP);
++		/* if any, report existing pulse before adj */
++		cpts_report_ts_events(cpts, false);
++	}
+ 
+ 	timecounter_read(&cpts->tc);
+ 
+ 	cpts->cc.mult = neg_adj ? mult - diff : mult + diff;
+-
++	/* get updated time with adj */
++	ns = timecounter_read(&cpts->tc);
++	cpts->ts_comp_next = cpts->tc.cycle_last;
+ 	spin_unlock_irqrestore(&cpts->lock, flags);
+ 
++	if (cpts->ts_comp_enabled)
++		cpts->ts_comp_one_sec_cycs = cpts_cc_ns2cyc(cpts, NSEC_PER_SEC);
++	cpts_ts_comp_settime(cpts, ns);
++
++	mutex_unlock(&cpts->ptp_clk_mutex);
++
+ 	return 0;
+ }
+ 
+@@ -186,11 +264,28 @@ static int cpts_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
+ {
+ 	unsigned long flags;
+ 	struct cpts *cpts = container_of(ptp, struct cpts, info);
++	u64 ns;
++
++	mutex_lock(&cpts->ptp_clk_mutex);
+ 
+ 	spin_lock_irqsave(&cpts->lock, flags);
++	if (cpts->ts_comp_enabled) {
++		cpts_ts_comp_disable(cpts);
++		/* if any, report existing pulse before adj */
++		cpts_fifo_read(cpts, CPTS_EV_COMP);
++		/* if any, report existing pulse before adj */
++		cpts_report_ts_events(cpts, false);
++	}
++
+ 	timecounter_adjtime(&cpts->tc, delta);
++	ns = timecounter_read(&cpts->tc);
++	cpts->ts_comp_next = cpts->tc.cycle_last;
+ 	spin_unlock_irqrestore(&cpts->lock, flags);
+ 
++	cpts_ts_comp_settime(cpts, ns);
++
++	mutex_unlock(&cpts->ptp_clk_mutex);
++
+ 	return 0;
+ }
+ 
+@@ -212,25 +307,91 @@ static int cpts_ptp_gettime(struct ptp_clock_info *ptp, struct timespec64 *ts)
+ static int cpts_ptp_settime(struct ptp_clock_info *ptp,
+ 			    const struct timespec64 *ts)
+ {
+-	u64 ns;
+-	unsigned long flags;
+ 	struct cpts *cpts = container_of(ptp, struct cpts, info);
++	unsigned long flags;
++	u64 ns;
+ 
+ 	ns = timespec64_to_ns(ts);
+ 
++	mutex_lock(&cpts->ptp_clk_mutex);
++
+ 	spin_lock_irqsave(&cpts->lock, flags);
++	if (cpts->ts_comp_enabled) {
++		cpts_ts_comp_disable(cpts);
++		/* if any, get existing pulse event before adj */
++		cpts_fifo_read(cpts, CPTS_EV_COMP);
++		/* if any, report existing pulse before adj */
++		cpts_report_ts_events(cpts, false);
++	}
++
+ 	timecounter_init(&cpts->tc, &cpts->cc, ns);
++	cpts->ts_comp_next = cpts->tc.cycle_last;
+ 	spin_unlock_irqrestore(&cpts->lock, flags);
+ 
++	cpts_ts_comp_settime(cpts, ns);
++
++	mutex_unlock(&cpts->ptp_clk_mutex);
++
+ 	return 0;
+ }
+ 
+-static int cpts_report_ts_events(struct cpts *cpts)
++static int cpts_pps_enable(struct cpts *cpts, int on)
++{
++	struct timespec64 ts;
++	unsigned long flags;
++	u64 ns;
++
++	if (cpts->ts_comp_enabled == on)
++		return 0;
++
++	mutex_lock(&cpts->ptp_clk_mutex);
++	cpts->ts_comp_enabled = on;
++
++	if (!on) {
++		cpts_ts_comp_disable(cpts);
++		mutex_unlock(&cpts->ptp_clk_mutex);
++		return 0;
++	}
++
++	/* get current counter value */
++	spin_lock_irqsave(&cpts->lock, flags);
++	ns = timecounter_read(&cpts->tc);
++	cpts->ts_comp_next = cpts->tc.cycle_last;
++	spin_unlock_irqrestore(&cpts->lock, flags);
++
++	ts = ns_to_timespec64(ns);
++	/* align to next sec boundary and add one sec to avoid the situation
++	 * when the current time is very close to the next second point and
++	 * it might be possible that ts_comp_val will be configured to
++	 * the time in the past.
++	 */
++	cpts_ts_comp_add_ns(cpts, 2 * NSEC_PER_SEC - ts.tv_nsec);
++
++	/* enable ts_comp pulse */
++	cpts_ts_comp_enable(cpts);
++
++	if (cpts->ts_comp_enabled)
++		/* poll for events faster - evry 200 ms */
++		cpts->ov_check_period =
++			msecs_to_jiffies(CPTS_EVENT_HWSTAMP_TIMEOUT);
++	else if (!cpts->hw_ts_enable)
++		cpts->ov_check_period = cpts->ov_check_period_slow;
++
++	mod_delayed_work(system_wq, &cpts->overflow_work,
++			 cpts->ov_check_period);
++
++	mutex_unlock(&cpts->ptp_clk_mutex);
++
++	return 0;
++}
++
++static int cpts_report_ts_events(struct cpts *cpts, bool pps_reload)
+ {
+ 	struct list_head *this, *next;
+ 	struct ptp_clock_event pevent;
+ 	struct cpts_event *event;
+ 	int reported = 0, ev;
++	u64 ns;
+ 
+ 	list_for_each_safe(this, next, &cpts->events) {
+ 		event = list_entry(this, struct cpts_event, list);
+@@ -247,6 +408,33 @@ static int cpts_report_ts_events(struct cpts *cpts)
+ 			++reported;
+ 			continue;
+ 		}
++
++		if (event_type(event) == CPTS_EV_COMP) {
++			list_del_init(&event->list);
++			list_add(&event->list, &cpts->pool);
++			if (cpts->ts_comp_next != event->low) {
++				pr_err("cpts ts_comp mismatch: %08x %08x\n",
++				       cpts->ts_comp_next, event->low);
++				continue;
++			} else
++				pr_debug("cpts comp ev tstamp: %u\n",
++					 event->low);
++
++			/* report the event */
++			ns = timecounter_cyc2time(&cpts->tc, event->low);
++			pevent.type = PTP_CLOCK_PPSUSR;
++			pevent.pps_times.ts_real = ns_to_timespec64(ns);
++			ptp_clock_event(cpts->clock, &pevent);
++
++			if (pps_reload) {
++				/* reload: add ns to ts_comp */
++				cpts_ts_comp_add_ns(cpts, NSEC_PER_SEC);
++				/* enable ts_comp pulse with new val */
++				cpts_ts_comp_enable(cpts);
++			}
++			++reported;
++			continue;
++		}
+ 	}
+ 	return reported;
+ }
+@@ -263,6 +451,8 @@ static int cpts_extts_enable(struct cpts *cpts, u32 index, int on)
+ 	if (((cpts->hw_ts_enable & BIT(index)) >> index) == on)
+ 		return 0;
+ 
++	mutex_lock(&cpts->ptp_clk_mutex);
++
+ 	spin_lock_irqsave(&cpts->lock, flags);
+ 
+ 	v = cpts_read32(cpts, control);
+@@ -280,13 +470,13 @@ static int cpts_extts_enable(struct cpts *cpts, u32 index, int on)
+ 	if (cpts->hw_ts_enable)
+ 		/* poll for events faster - evry 200 ms */
+ 		cpts->ov_check_period =
+-			msecs_to_jiffies(CPTS_EVENT_RX_TX_TIMEOUT);
+-	else
++ 			msecs_to_jiffies(CPTS_EVENT_HWSTAMP_TIMEOUT);
++	else if (!cpts->ts_comp_enabled)
+ 		cpts->ov_check_period = cpts->ov_check_period_slow;
+ 
+ 	mod_delayed_work(system_wq, &cpts->overflow_work,
+ 			 cpts->ov_check_period);
+-
++	mutex_unlock(&cpts->ptp_clk_mutex);
+ 	return 0;
+ }
+ 
+@@ -298,6 +488,8 @@ static int cpts_ptp_enable(struct ptp_clock_info *ptp,
+ 	switch (rq->type) {
+ 	case PTP_CLK_REQ_EXTTS:
+ 		return cpts_extts_enable(cpts, rq->extts.index, on);
++	case PTP_CLK_REQ_PPS:
++		return cpts_pps_enable(cpts, on);
+ 	default:
+ 		break;
+ 	}
+@@ -325,12 +517,15 @@ static void cpts_overflow_check(struct work_struct *work)
+ 	struct timespec64 ts;
+ 	unsigned long flags;
+ 
++	mutex_lock(&cpts->ptp_clk_mutex);
+ 	spin_lock_irqsave(&cpts->lock, flags);
+ 	ts = ns_to_timespec64(timecounter_read(&cpts->tc));
+ 	spin_unlock_irqrestore(&cpts->lock, flags);
+ 
+-	if (cpts->hw_ts_enable)
+-		cpts_report_ts_events(cpts);
++	if (cpts->hw_ts_enable || cpts->ts_comp_enabled)
++		cpts_report_ts_events(cpts, true);
++	mutex_unlock(&cpts->ptp_clk_mutex);
++
+ 	pr_debug("cpts overflow check at %lld.%09lu\n", ts.tv_sec, ts.tv_nsec);
+ 	schedule_delayed_work(&cpts->overflow_work, cpts->ov_check_period);
+ }
+@@ -448,6 +643,7 @@ EXPORT_SYMBOL_GPL(cpts_tx_timestamp);
+ int cpts_register(struct cpts *cpts)
+ {
+ 	int err, i;
++	u32 control;
+ 
+ 	INIT_LIST_HEAD(&cpts->events);
+ 	INIT_LIST_HEAD(&cpts->pool);
+@@ -456,7 +652,14 @@ int cpts_register(struct cpts *cpts)
+ 
+ 	clk_enable(cpts->refclk);
+ 
+-	cpts_write32(cpts, CPTS_EN, control);
++	control = CPTS_EN;
++	if (cpts->caps & CPTS_CAP_TS_COMP_EN) {
++		if (cpts->caps & CPTS_CAP_TS_COMP_POL_LOW_SEL)
++			control &= ~TS_COMP_POL;
++		else
++			control |= TS_COMP_POL;
++	}
++	cpts_write32(cpts, control, control);
+ 	cpts_write32(cpts, TS_PEND_EN, int_enable);
+ 
+ 	cpts->cc.mult = cpts->cc_mult;
+@@ -560,6 +763,20 @@ static int cpts_of_parse(struct cpts *cpts, struct device_node *node)
+ 		cpts->rftclk_sel = prop & CPTS_RFTCLK_SEL_MASK;
+ 	}
+ 
++	if (of_property_read_bool(node, "cpts-ts-comp-length")) {
++		cpts->caps |= CPTS_CAP_TS_COMP_EN;
++		cpts->ts_comp_length = CPTS_TS_COMP_PULSE_LENGTH_DEF;
++	}
++
++	if (cpts->caps & CPTS_CAP_TS_COMP_EN) {
++		ret = of_property_read_u32(node, "cpts-ts-comp-length", &prop);
++		if (!ret)
++			cpts->ts_comp_length = prop;
++
++		if (of_property_read_bool(node, "cpts-ts-comp-polarity-low"))
++			cpts->caps |= CPTS_CAP_TS_COMP_POL_LOW_SEL;
++	}
++
+ 	if (!of_property_read_u32(node, "cpts-ext-ts-inputs", &prop))
+ 		cpts->ext_ts_inputs = prop;
+ 
+@@ -586,6 +803,7 @@ struct cpts *cpts_create(struct device *dev, void __iomem *regs,
+ 	cpts->dev = dev;
+ 	cpts->reg = (struct cpsw_cpts __iomem *)regs;
+ 	spin_lock_init(&cpts->lock);
++	mutex_init(&cpts->ptp_clk_mutex);
+ 	INIT_DELAYED_WORK(&cpts->overflow_work, cpts_overflow_check);
+ 
+ 	ret = cpts_of_parse(cpts, node);
+@@ -612,6 +830,11 @@ struct cpts *cpts_create(struct device *dev, void __iomem *regs,
+ 
+ 	cpts_calc_mult_shift(cpts);
+ 
++	if (cpts->caps & CPTS_CAP_TS_COMP_EN) {
++		cpts->info.pps = 1;
++		cpts->ts_comp_one_sec_cycs = clk_get_rate(cpts->refclk);
++	}
++
+ 	return cpts;
+ }
+ 
+diff --git a/drivers/net/ethernet/ti/cpts.h b/drivers/net/ethernet/ti/cpts.h
+index 13bbb66..744fb11 100644
+--- a/drivers/net/ethernet/ti/cpts.h
++++ b/drivers/net/ethernet/ti/cpts.h
+@@ -39,7 +39,8 @@ struct cpsw_cpts {
+ 	u32 ts_push;              /* Time stamp event push */
+ 	u32 ts_load_val;          /* Time stamp load value */
+ 	u32 ts_load_en;           /* Time stamp load enable */
+-	u32 res2[2];
++	u32 ts_comp_val;          /* Time stamp comparison value, v1.5 & up */
++	u32 ts_comp_length;       /* Time stamp comp assert len, v1.5 & up */
+ 	u32 intstat_raw;          /* Time sync interrupt status raw */
+ 	u32 intstat_masked;       /* Time sync interrupt status masked */
+ 	u32 int_enable;           /* Time sync interrupt enable */
+@@ -64,11 +65,14 @@ struct cpsw_cpts {
+ #define HW3_TS_PUSH_EN       (1<<10) /* Hardware push 3 enable */
+ #define HW2_TS_PUSH_EN       (1<<9)  /* Hardware push 2 enable */
+ #define HW1_TS_PUSH_EN       (1<<8)  /* Hardware push 1 enable */
++#define TS_COMP_POL	     BIT(2)  /* TS_COMP Polarity */
+ #define INT_TEST             (1<<1)  /* Interrupt Test */
+ #define CPTS_EN              (1<<0)  /* Time Sync Enable */
+ 
+ #define CPTS_RFTCLK_SEL_MASK 0x1f
+ 
++#define CPTS_TS_COMP_LENGTH_MASK 0xffff
++
+ /*
+  * Definitions for the single bit resisters:
+  * TS_PUSH TS_LOAD_EN  INTSTAT_RAW INTSTAT_MASKED INT_ENABLE EVENT_POP
+@@ -97,6 +101,7 @@ enum {
+ 	CPTS_EV_HW,   /* Hardware Time Stamp Push Event */
+ 	CPTS_EV_RX,   /* Ethernet Receive Event */
+ 	CPTS_EV_TX,   /* Ethernet Transmit Event */
++	CPTS_EV_COMP, /* Time Stamp Compare Event */
+ };
+ 
+ #define CPTS_FIFO_DEPTH 16
+@@ -113,6 +118,8 @@ struct cpts_event {
+ };
+ 
+ #define CPTS_CAP_RFTCLK_SEL BIT(0)
++#define CPTS_CAP_TS_COMP_EN BIT(1)
++#define CPTS_CAP_TS_COMP_POL_LOW_SEL BIT(2)
+ 
+ struct cpts {
+ 	struct device *dev;
+@@ -137,6 +144,11 @@ struct cpts {
+ 	u32 ext_ts_inputs;
+ 	u32 hw_ts_enable;
+ 	u32 caps;
++	u32 ts_comp_next;	/* next time_stamp value to compare with */
++	u32 ts_comp_length;	/* TS_COMP Output pulse width */
++	u32 ts_comp_one_sec_cycs; /* number of counter cycles in one sec */
++	int ts_comp_enabled;
++	struct mutex ptp_clk_mutex; /* sync PTP interface with overflow_work */
+ };
+ 
+ int cpts_rx_timestamp(struct cpts *cpts, struct sk_buff *skb);
+-- 
+1.7.5.4
+
