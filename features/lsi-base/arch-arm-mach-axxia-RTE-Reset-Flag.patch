@@ -1,0 +1,416 @@
+From 7a4a6d026d2ed428a02629033c17ce951f1428e1 Mon Sep 17 00:00:00 2001
+From: Li Wang <li.wang@windriver.com>
+Date: Thu, 18 May 2017 10:48:53 +0800
+Subject: [PATCH 2/6] arch/arm/mach-axxia: RTE Reset Flag
+
+the patch comes from:
+http://git.yoctoproject.org/cgit/cgit.cgi/linux-yocto-3.14/commit/?h=standard/axxia/base&id=59cc9b844a7f1fe558487a904119aae52abb3fe0
+
+Add a flag that the RTE and kernel can share to indicate that the
+RTE is initiating a reset.
+
+Signed-off-by: John Jacques <john.jacques@intel.com>
+Signed-off-by: Li Wang <li.wang@windriver.com>
+---
+ arch/arm/mach-axxia/axxia.c         |    9 ++
+ arch/arm/mach-axxia/axxia.h         |    9 ++
+ arch/arm/mach-axxia/ddr_retention.c |   20 ++++-
+ drivers/misc/lsi-ncr.c              |  164 +++++++++++++++++++++-------------
+ 4 files changed, 137 insertions(+), 65 deletions(-)
+
+diff --git a/arch/arm/mach-axxia/axxia.c b/arch/arm/mach-axxia/axxia.c
+index 446ab13..b807ed8 100644
+--- a/arch/arm/mach-axxia/axxia.c
++++ b/arch/arm/mach-axxia/axxia.c
+@@ -66,6 +66,11 @@ static void __iomem *base;
+ 
+ #ifdef CONFIG_KEXEC
+ 
++#ifdef AXXIA_NCR_RESET_CHECK
++int ncr_reset_active;
++EXPORT_SYMBOL(ncr_reset_active);
++#endif
++
+ static void set_l3_pstate(u32 newstate)
+ {
+ 	static const u8 hnf[] = {
+@@ -208,6 +213,10 @@ void __init axxia_dt_init(void)
+ 	}
+ #endif
+ 
++#ifdef AXXIA_NCR_RESET_CHECK
++	ncr_reset_active = 0;
++#endif
++
+ 	bus_register_notifier(&platform_bus_type, &axxia_platform_nb);
+ 	bus_register_notifier(&amba_bustype, &axxia_amba_nb);
+ 
+diff --git a/arch/arm/mach-axxia/axxia.h b/arch/arm/mach-axxia/axxia.h
+index 3b8fb0c..6fd9474 100644
+--- a/arch/arm/mach-axxia/axxia.h
++++ b/arch/arm/mach-axxia/axxia.h
+@@ -11,6 +11,15 @@ extern void axxia_secondary_startup(void);
+ 
+ extern struct smp_operations axxia_smp_ops;
+ 
++/*
++ * when defined, the RTE driver module will set/clear
++ * the ncr_reset_active flag to indicate when Axxia device
++ * reset is in progress. This flag will be checked by the
++ * kernel lsi-ncr driver and ddr_retention code.
++ */
++#define AXXIA_NCR_RESET_CHECK
++extern int ncr_reset_active;
++
+ extern void __iomem *syscon;
+ extern void __iomem *dickens;
+ 
+diff --git a/arch/arm/mach-axxia/ddr_retention.c b/arch/arm/mach-axxia/ddr_retention.c
+index 5a9b0e2..b1645b9 100644
+--- a/arch/arm/mach-axxia/ddr_retention.c
++++ b/arch/arm/mach-axxia/ddr_retention.c
+@@ -253,7 +253,16 @@ initiate_retention_reset(void)
+ 	unsigned long ctl_244 = 0;
+ 	unsigned long value;
+ 	unsigned cpu_id;
+-	long tmp;
++    /*
++     * in order to preload the DDR shutdown function into cache
++     * we use these variables to do a word-by-word copy of the
++     * memory where the function resides. The 'tmp' variable
++     * must be declared as volatile to ensure the compiler
++     * doesn't optimize this out.
++     * Removal of this volatile to resolve the checkpatch warning
++     * will break the operation!
++     */
++	volatile long tmp;
+ 	long *ptmp;
+ 
+ 	if (0 == ddr_retention_enabled) {
+@@ -264,6 +273,13 @@ initiate_retention_reset(void)
+ 	if (NULL == nca || NULL == apb || NULL == dickens)
+ 		BUG();
+ 
++	/*
++	 * If the axxia device is in reset then DDR retention is not
++	 * possible. Just do an emergency_restart instead.
++	 */
++	if (ncr_reset_active)
++		emergency_restart();
++
+ 	preempt_disable();
+ 	cpu_id = smp_processor_id();
+ 
+@@ -303,7 +319,7 @@ initiate_retention_reset(void)
+ 		tmp += *ptmp++;
+ 	} while (ptmp < (long *) (ncp_ddr_shutdown + 0x1000));
+ 
+-	asm volatile ("isb" : : : "memory");
++	isb();
+ 
+ 	/* disable L2 prefetching */
+ 	cpu_disable_l2_prefetch();
+diff --git a/drivers/misc/lsi-ncr.c b/drivers/misc/lsi-ncr.c
+index 45e6741..bfcb32d 100644
+--- a/drivers/misc/lsi-ncr.c
++++ b/drivers/misc/lsi-ncr.c
+@@ -22,8 +22,10 @@
+ 
+ #include <linux/module.h>
+ #include <linux/io.h>
+-
+ #include "lsi-ncr.h"
++#ifdef CONFIG_ARM
++#include <../../arch/arm/mach-axxia/axxia.h>
++#endif
+ 
+ #ifdef CONFIG_ARCH_AXXIA
+ #define NCA_PHYS_ADDRESS 0x002020100000ULL
+@@ -47,9 +49,28 @@ static DEFINE_RAW_SPINLOCK(ncr_spin_lock);
+  * is subjected to simultaneous requests from multiple masters
+  */
+ DEFINE_RAW_SPINLOCK(nca_access_lock);
++EXPORT_SYMBOL(nca_access_lock);
+ 
+ static unsigned long ncr_spin_flags;
+ 
++#ifdef AXXIA_NCR_RESET_CHECK
++/*
++ * define behavior if NCA register read/write is called while
++ * the axxia device is being reset. Any attempt to access NCA
++ * AXI registers while the NCA is in reset will hang the system.
++ *
++ * Due to higher level locking (ncr_spin_lock) this should not
++ * occur as part of normal config ring access (ncr_read/write),
++ * so we handle this condition as a BUG(). If it turns out there
++ * is some valid case where this may occur we can re-implement
++ * this as a wait loop.
++ */
++#define AXXIA_NCR_RESET_ACTIVE_CHECK()				\
++	do { if (ncr_reset_active) BUG(); } while (0)
++#else
++#define AXXIA_NCR_RESET_ACTIVE_CHECK()
++#endif
++
+ #define LOCK_DOMAIN 0
+ 
+ union command_data_register_0 {
+@@ -102,7 +123,10 @@ union command_data_register_2 {
+ unsigned long
+ ncr_register_read(unsigned *address)
+ {
+-	unsigned long value = __raw_readl(address);
++	unsigned long value;
++
++	AXXIA_NCR_RESET_ACTIVE_CHECK();
++	value = __raw_readl(address);
+ 
+ 	return be32_to_cpu(value);
+ }
+@@ -110,6 +134,7 @@ ncr_register_read(unsigned *address)
+ void
+ ncr_register_write(const unsigned value, unsigned *address)
+ {
++	AXXIA_NCR_RESET_ACTIVE_CHECK();
+ 	__raw_writel(cpu_to_be32(value), address);
+ }
+ 
+@@ -215,9 +240,9 @@ ncr_pio_error_dump(char *str)
+ 	stat1 = nca_register_read((unsigned *)(nca_address + 0xe8));
+ 
+ 	pr_err("lsi-ncr: %8s failed, error status : 0x%08lx 0x%08lx\n",
+-			str, stat0, stat1);
++	       str, stat0, stat1);
+ 	pr_err("lsi-ncr:  CDR0-2: 0x%08lx 0x%08lx 0x%08lx\n",
+-			cdr0, cdr1, cdr2);
++	       cdr0, cdr1, cdr2);
+ 
+ }
+ /*
+@@ -250,11 +275,23 @@ ncr_check_pio_status(char *str)
+ 		return -1;
+ 	}
+ 
+-	if (0x3 != cdr0.bits.status) {
++	if (cdr0.raw && (0x3 != cdr0.bits.status)) {
+ 		/* completed with non-success status */
+ 		ncr_pio_error_dump(str);
+ 		/* clear CDR0 to allow subsequent commands to complete */
+ 		nca_register_write(0, (unsigned *) (nca_address + 0xf0));
++
++		/*
++		 * we now treat any config ring error as a BUG().
++		 * this should never occur during normal operation with
++		 * 'good' system software.
++		 *
++		 * In the debug/lab environment the config ring errors
++		 * can occur more often. If this BUG() becomes too onerous
++		 * we may provide a way for the RTE to suppress this BUG()
++		 */
++		BUG();
++		return -1;
+ 	}
+ 
+ 	return 0;
+@@ -275,7 +312,7 @@ ncr_check_pio_status(char *str)
+ 
+ int
+ ncr_read_nolock(unsigned long region, unsigned long address, int number,
+-	void *buffer)
++		void *buffer)
+ {
+ 	union command_data_register_0 cdr0;
+ 	union command_data_register_1 cdr1;
+@@ -287,7 +324,7 @@ ncr_read_nolock(unsigned long region, unsigned long address, int number,
+ 			return -1;
+ 
+ 		/*
+-		Set up the read command.
++		  Set up the read command.
+ 		*/
+ 
+ 		cdr2.raw = 0;
+@@ -313,14 +350,14 @@ ncr_read_nolock(unsigned long region, unsigned long address, int number,
+ 		mb();
+ 
+ 		/*
+-		Wait for completion.
++		  Wait for completion.
+ 		*/
+ 
+ 		if (0 != ncr_check_pio_status("read"))
+ 			return -1;
+ 
+ 		/*
+-		Copy data words to the buffer.
++		  Copy data words to the buffer.
+ 		*/
+ 
+ 		address = (unsigned long)(nca_address + 0x1000);
+@@ -345,8 +382,8 @@ ncr_read_nolock(unsigned long region, unsigned long address, int number,
+ 			void __iomem *targ_address = apb2ser0_address +
+ 				(address & (~0x3));
+ 			/*
+-			* Copy data words to the buffer.
+-			*/
++			 * Copy data words to the buffer.
++			 */
+ 
+ 			while (4 <= number) {
+ 				*((unsigned long *) buffer) =
+@@ -382,7 +419,7 @@ ncr_read_nolock(unsigned long region, unsigned long address, int number,
+ 				return -1;
+ 			}
+ 			if ((NCP_TARGET_ID(region) == 0x1) ||
+-				(NCP_TARGET_ID(region) == 0x4)) {
++			    (NCP_TARGET_ID(region) == 0x4)) {
+ 				writel((0x84c00000 + address), (base + 4));
+ 			} else {
+ 				writel((0x85400000 + address), (base + 4));
+@@ -392,13 +429,13 @@ ncr_read_nolock(unsigned long region, unsigned long address, int number,
+ 				*((unsigned long *) buffer) =
+ 					readl(base + 4);
+ 			} while (0 != (*((unsigned long *) buffer) & 0x80000000)
+-					&& 0 < wfc_timeout);
++				 && 0 < wfc_timeout);
+ 
+ 			if (0 == wfc_timeout)
+ 				return -1;
+ 
+ 			if ((NCP_TARGET_ID(region) == 0x1) ||
+-				(NCP_TARGET_ID(region) == 0x4)) {
++			    (NCP_TARGET_ID(region) == 0x4)) {
+ 				*((unsigned short *) buffer) =
+ 					readl(base + 8);
+ 			} else {
+@@ -483,7 +520,7 @@ ncr_write_nolock(unsigned long region, unsigned long address, int number,
+ 
+ 		while (4 <= number) {
+ 			nca_register_write(*((unsigned long *) buffer),
+-					(unsigned *) data_word_base);
++					   (unsigned *) data_word_base);
+ 			data_word_base += 4;
+ 			buffer += 4;
+ 			number -= 4;
+@@ -513,69 +550,70 @@ ncr_write_nolock(unsigned long region, unsigned long address, int number,
+ 		mb();
+ 
+ 		/*
+-		Wait for completion.
++		  Wait for completion.
+ 		*/
+ 
+ 		if (0 != ncr_check_pio_status("write"))
+ 			return -1;
++
+ 	} else {
+ #ifdef APB2SER_PHY_PHYS_ADDRESS
+ 		int wfc_timeout = WFC_TIMEOUT;
+ 
+-	if (NCP_NODE_ID(region) != 0x115) {
+-		void __iomem *targ_address = apb2ser0_address +
+-					     (address & (~0x3));
+-		/*
+-		  Copy from buffer to the data words.
+-		*/
+-
+-		while (4 <= number) {
+-			*((unsigned long *) targ_address) =
+-				*((unsigned long *) buffer);
+-			targ_address += 4;
+-			number -= 4;
+-		}
+-	} else {
+-		void __iomem *base;
+-		if (0xffff < address)
+-			return -1;
++		if (NCP_NODE_ID(region) != 0x115) {
++			void __iomem *targ_address = apb2ser0_address +
++				(address & (~0x3));
++			/*
++			  Copy from buffer to the data words.
++			*/
+ 
+-		switch (NCP_TARGET_ID(region)) {
+-		case 0:
+-			base = (apb2ser0_address + 0x1e0);
+-			break;
+-		case 1:
+-			base = (apb2ser0_address + 0x1f0);
+-			break;
+-		case 2:
+-			base = (apb2ser0_address + 0x200);
+-			break;
+-		case 3:
+-			base = (apb2ser0_address + 0x210);
+-			break;
+-		case 4:
+-			base = (apb2ser0_address + 0x220);
+-			break;
+-		case 5:
+-			base = (apb2ser0_address + 0x230);
+-			break;
+-		default:
+-			return -1;
+-		}
+-		if ((NCP_TARGET_ID(region) == 0x1) ||
+-				(NCP_TARGET_ID(region) == 0x4)) {
+-			writel(*((unsigned short *) buffer), base);
+-			writel((0xc4c00000 + address), (base + 4));
++			while (4 <= number) {
++				*((unsigned long *) targ_address) =
++					*((unsigned long *) buffer);
++				targ_address += 4;
++				number -= 4;
++			}
+ 		} else {
+-			writel(*((unsigned long *) buffer), base);
+-			writel((0xc5400000 + address), (base + 4));
+-		}
++			void __iomem *base;
++			if (0xffff < address)
++				return -1;
++
++			switch (NCP_TARGET_ID(region)) {
++			case 0:
++				base = (apb2ser0_address + 0x1e0);
++				break;
++			case 1:
++				base = (apb2ser0_address + 0x1f0);
++				break;
++			case 2:
++				base = (apb2ser0_address + 0x200);
++				break;
++			case 3:
++				base = (apb2ser0_address + 0x210);
++				break;
++			case 4:
++				base = (apb2ser0_address + 0x220);
++				break;
++			case 5:
++				base = (apb2ser0_address + 0x230);
++				break;
++			default:
++				return -1;
++			}
++			if ((NCP_TARGET_ID(region) == 0x1) ||
++			    (NCP_TARGET_ID(region) == 0x4)) {
++				writel(*((unsigned short *) buffer), base);
++				writel((0xc4c00000 + address), (base + 4));
++			} else {
++				writel(*((unsigned long *) buffer), base);
++				writel((0xc5400000 + address), (base + 4));
++			}
+ 			do {
+ 				--wfc_timeout;
+ 				*((unsigned long *) buffer) =
+ 					readl(base + 4);
+ 			} while (0 != (*((unsigned long *) buffer) & 0x80000000)
+-				&& 0 < wfc_timeout);
++				 && 0 < wfc_timeout);
+ 
+ 			if (0 == wfc_timeout)
+ 				return -1;
+-- 
+1.7.5.4
+
