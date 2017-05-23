@@ -13,6 +13,9 @@
 git checkout		standard/arm-versatile-926ejs
 git merge --no-edit	standard/base		|| bash
 
+git checkout 		standard/axxiaarm
+git merge --no-edit	standard/base		|| bash
+
 git checkout		standard/bcm-587xx
 git merge --no-edit	standard/base		|| bash
 
@@ -31,6 +34,9 @@ git merge --no-edit	standard/base		|| bash
 git checkout		standard/intel
 git merge --no-edit	standard/base		|| bash
 
+git checkout		standard/intel-socfpga
+git merge --no-edit	standard/base		|| bash
+
 git checkout		standard/intel-x86-32
 git merge --no-edit	standard/base		|| bash
 
@@ -41,6 +47,9 @@ git checkout		standard/mti-malta32
 git merge --no-edit	standard/base		|| bash
 
 git checkout		standard/mti-malta64
+git merge --no-edit	standard/base		|| bash
+
+git checkout		standard/ti-66ak2xxx
 git merge --no-edit	standard/base		|| bash
 
 git checkout		standard/qemuarm64
@@ -89,9 +98,14 @@ git merge --no-edit	standard/tiny/base		|| bash
 git checkout		standard/cgl/base
 git merge --no-edit	standard/base		|| bash
 
+git checkout		standard/cgl/axxiaarm
+git merge --no-edit	standard/cgl/base	|| bash
+
 git checkout		standard/cgl/cav-octeontx
 git merge --no-edit	standard/cgl/base	|| bash
 
+git checkout		standard/cgl/intel-socfpga
+git merge --no-edit	standard/cgl/base	|| bash
 git checkout		standard/cgl/intel-x86-32
 git merge --no-edit	standard/cgl/base	|| bash
 git checkout		standard/cgl/intel-x86-64
@@ -110,6 +124,9 @@ git merge --no-edit	standard/cgl/nxp/base	|| bash
 git checkout		standard/preempt-rt/base
 git merge --no-edit	standard/base		|| bash
 
+git checkout		standard/preempt-rt/axxiaarm
+git merge --no-edit	standard/preempt-rt/base		|| bash
+
 git checkout		standard/preempt-rt/bcm-587xx
 git merge --no-edit	standard/preempt-rt/base		|| bash
 
@@ -118,6 +135,8 @@ git merge --no-edit	standard/preempt-rt/base		|| bash
 
 git checkout		standard/preempt-rt/intel
 git merge --no-edit	standard/preempt-rt/base		|| bash
+git checkout		standard/preempt-rt/intel-socfpga
+git merge --no-edit	standard/preempt-rt/intel		|| bash
 git checkout		standard/preempt-rt/intel-x86-32
 git merge --no-edit	standard/preempt-rt/intel		|| bash
 git checkout		standard/preempt-rt/intel-x86-64
@@ -138,6 +157,9 @@ git checkout		standard/preempt-rt/nxp-imx/sdk-4.1.15/base
 git merge --no-edit	standard/preempt-rt/nxp-imx/base	|| bash
 git checkout		standard/preempt-rt/nxp-imx/sdk-4.1.15/nxp-imx6
 git merge --no-edit	standard/preempt-rt/nxp-imx/base	|| bash
+
+git checkout		standard/preempt-rt/ti-66ak2xxx
+git merge --no-edit	standard/preempt-rt/base		|| bash
 
 git checkout		standard/preempt-rt/xilinx-zynq
 git merge --no-edit	standard/preempt-rt/base		|| bash
