@@ -1,0 +1,253 @@
+From b4e54b57abdff29f0ff339ec8f5ff2318f5070d2 Mon Sep 17 00:00:00 2001
+From: Bogdan Purcareata <bogdan.purcareata@nxp.com>
+Date: Tue, 10 Jan 2017 13:18:51 +0000
+Subject: [PATCH 338/388] staging: fsl-dpaa2: Add busy poll support
+
+Implement low latency poll routine for the DPAA2 Ethernet driver. This
+routine does a single volatile dequeue and consumes all found frames.
+
+Add synchronization between low latency and napi poll.
+
+Signed-off-by: Bogdan Purcareata <bogdan.purcareata@nxp.com>
+[Original patch taken from SDK-V2.0-1703]
+Signed-off-by: Yanjiang Jin <yanjiang.jin@windriver.com>
+---
+ drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c | 54 ++++++++++++++++-
+ drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.h | 80 ++++++++++++++++++++++++++
+ 2 files changed, 133 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c b/drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c
+index 74b238b..adf60d8 100644
+--- a/drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c
++++ b/drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.c
+@@ -37,6 +37,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/kthread.h>
+ #include <linux/net_tstamp.h>
++#include <net/busy_poll.h>
+ 
+ #include "../../fsl-mc/include/mc.h"
+ #include "../../fsl-mc/include/mc-sys.h"
+@@ -293,6 +294,8 @@ static void dpaa2_eth_rx(struct dpaa2_eth_priv *priv,
+ 	percpu_stats->rx_packets++;
+ 	percpu_stats->rx_bytes += dpaa2_fd_get_len(fd);
+ 
++	skb_mark_napi_id(skb, napi);
++
+ 	napi_gro_receive(napi, skb);
+ 
+ 	return;
+@@ -1062,6 +1065,9 @@ static int dpaa2_eth_poll(struct napi_struct *napi, int budget)
+ 	ch = container_of(napi, struct dpaa2_eth_channel, napi);
+ 	priv = ch->priv;
+ 
++	if (!dpaa2_ch_lock_napi(ch))
++		return budget;
++
+ 	do {
+ 		err = pull_channel(ch);
+ 		if (unlikely(err))
+@@ -1077,10 +1083,14 @@ static int dpaa2_eth_poll(struct napi_struct *napi, int budget)
+ 		 * or reached the Tx conf threshold, we're done.
+ 		 */
+ 		if (rx_cleaned >= budget ||
+-		    tx_conf_cleaned >= TX_CONF_PER_NAPI_POLL)
++		    tx_conf_cleaned >= TX_CONF_PER_NAPI_POLL) {
++			dpaa2_ch_unlock_napi(ch);
+ 			return budget;
++		}
+ 	} while (store_cleaned);
+ 
++	dpaa2_ch_unlock_napi(ch);
++
+ 	/* We didn't consume the entire budget, finish napi and
+ 	 * re-enable data availability notifications */
+ 	napi_complete(napi);
+@@ -1099,6 +1109,7 @@ static void enable_ch_napi(struct dpaa2_eth_priv *priv)
+ 
+ 	for (i = 0; i < priv->num_channels; i++) {
+ 		ch = priv->channel[i];
++		dpaa2_ch_init_lock(ch);
+ 		napi_enable(&ch->napi);
+ 	}
+ }
+@@ -1111,6 +1122,11 @@ static void disable_ch_napi(struct dpaa2_eth_priv *priv)
+ 	for (i = 0; i < priv->num_channels; i++) {
+ 		ch = priv->channel[i];
+ 		napi_disable(&ch->napi);
++		while (!dpaa2_ch_disable(ch)) {
++			dev_info_once(priv->net_dev->dev.parent,
++				      "Channel %d locked\n", ch->ch_id);
++			usleep_range(1000, 20000);
++		}
+ 	}
+ }
+ 
+@@ -1572,6 +1588,37 @@ static int dpaa2_eth_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
+ 	return -EINVAL;
+ }
+ 
++#ifdef CONFIG_NET_RX_BUSY_POLL
++static int dpaa2_eth_busy_poll(struct napi_struct *napi)
++{
++	struct dpaa2_eth_channel *ch;
++	int cleaned = 0;
++	struct dpaa2_eth_priv *priv;
++
++	ch = container_of(napi, struct dpaa2_eth_channel, napi);
++	priv = ch->priv;
++
++	if (!netif_running(priv->net_dev))
++		return LL_FLUSH_FAILED;
++
++	if (!dpaa2_ch_lock_poll(ch))
++		return LL_FLUSH_BUSY;
++
++	if (likely(pull_channel(ch) == 0)) {
++		/* Refill pool if appropriate */
++		refill_pool(priv, ch, priv->bpid);
++		/* All frames in VDQ will be from the same queue
++		 * (either Rx or Tx conf)
++		 */
++		consume_frames(ch, &cleaned, &cleaned);
++	}
++
++	dpaa2_ch_unlock_poll(ch);
++
++	return cleaned;
++}
++#endif
++
+ static const struct net_device_ops dpaa2_eth_ops = {
+ 	.ndo_open = dpaa2_eth_open,
+ 	.ndo_start_xmit = dpaa2_eth_tx,
+@@ -1584,6 +1631,9 @@ static const struct net_device_ops dpaa2_eth_ops = {
+ 	.ndo_set_rx_mode = dpaa2_eth_set_rx_mode,
+ 	.ndo_set_features = dpaa2_eth_set_features,
+ 	.ndo_do_ioctl = dpaa2_eth_ioctl,
++#ifdef CONFIG_NET_RX_BUSY_POLL
++	.ndo_busy_poll = dpaa2_eth_busy_poll,
++#endif
+ };
+ 
+ static void cdan_cb(struct dpaa2_io_notification_ctx *ctx)
+@@ -2710,6 +2760,7 @@ static void add_ch_napi(struct dpaa2_eth_priv *priv)
+ 		/* NAPI weight *MUST* be a multiple of DPAA2_ETH_STORE_SIZE */
+ 		netif_napi_add(priv->net_dev, &ch->napi, dpaa2_eth_poll,
+ 			       NAPI_POLL_WEIGHT);
++		napi_hash_add(&ch->napi);
+ 	}
+ }
+ 
+@@ -2720,6 +2771,7 @@ static void del_ch_napi(struct dpaa2_eth_priv *priv)
+ 
+ 	for (i = 0; i < priv->num_channels; i++) {
+ 		ch = priv->channel[i];
++		napi_hash_del(&ch->napi);
+ 		netif_napi_del(&ch->napi);
+ 	}
+ }
+diff --git a/drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.h b/drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.h
+index fde6a01..0021e2c 100644
+--- a/drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.h
++++ b/drivers/staging/fsl-dpaa2/ethernet/dpaa2-eth.h
+@@ -32,6 +32,7 @@
+ #ifndef __DPAA2_ETH_H
+ #define __DPAA2_ETH_H
+ 
++#include <linux/atomic.h>
+ #include <linux/netdevice.h>
+ #include <linux/if_vlan.h>
+ #include "../../fsl-mc/include/fsl_dpaa2_io.h"
+@@ -346,9 +347,88 @@ struct dpaa2_eth_channel {
+ 	struct dpaa2_io_store *store;
+ 	struct dpaa2_eth_priv *priv;
+ 	int buf_count;
++#ifdef CONFIG_NET_RX_BUSY_POLL
++	atomic_t state;
++#endif
+ 	struct dpaa2_eth_ch_stats stats;
+ };
+ 
++#ifdef CONFIG_NET_RX_BUSY_POLL
++enum dpaa2_eth_channel_state {
++	DPAA2_CH_DISABLED = 0,
++	DPAA2_CH_NAPI,
++	DPAA2_CH_POLL,
++	DPAA2_CH_IDLE
++};
++
++static inline void dpaa2_ch_init_lock(struct dpaa2_eth_channel *ch)
++{
++	atomic_set(&ch->state, DPAA2_CH_IDLE);
++}
++
++static inline bool dpaa2_ch_lock_napi(struct dpaa2_eth_channel *ch)
++{
++	int ret = atomic_cmpxchg(&ch->state, DPAA2_CH_IDLE, DPAA2_CH_NAPI);
++
++	return ret == DPAA2_CH_IDLE;
++}
++
++static inline void dpaa2_ch_unlock_napi(struct dpaa2_eth_channel *ch)
++{
++	WARN_ON(atomic_read(&ch->state) != DPAA2_CH_NAPI);
++
++	atomic_set(&ch->state, DPAA2_CH_IDLE);
++}
++
++static inline bool dpaa2_ch_lock_poll(struct dpaa2_eth_channel *ch)
++{
++	int ret = atomic_cmpxchg(&ch->state, DPAA2_CH_IDLE, DPAA2_CH_POLL);
++
++	return ret == DPAA2_CH_IDLE;
++}
++
++static inline void dpaa2_ch_unlock_poll(struct dpaa2_eth_channel *ch)
++{
++	WARN_ON(atomic_read(&ch->state) != DPAA2_CH_POLL);
++
++	atomic_set(&ch->state, DPAA2_CH_IDLE);
++}
++
++static inline bool dpaa2_ch_disable(struct dpaa2_eth_channel *ch)
++{
++	int ret = atomic_cmpxchg(&ch->state, DPAA2_CH_IDLE, DPAA2_CH_DISABLED);
++
++	return ret == DPAA2_CH_IDLE;
++}
++#else
++static inline void dpaa2_ch_init_lock(struct dpaa2_eth_channel *ch)
++{
++}
++
++static inline bool dpaa2_ch_lock_napi(struct dpaa2_eth_channel *ch)
++{
++	return true;
++}
++
++static inline void dpaa2_ch_unlock_napi(struct dpaa2_eth_channel *ch)
++{
++}
++
++static inline bool dpaa2_ch_lock_poll(struct dpaa2_eth_channel *ch)
++{
++	return false;
++}
++
++static inline void dpaa2_ch_unlock_poll(struct dpaa2_eth_channel *ch)
++{
++}
++
++static inline bool dpaa2_ch_disable(struct dpaa2_eth_channel *ch)
++{
++	return true;
++}
++#endif
++
+ struct dpaa2_eth_cls_rule {
+ 	struct ethtool_rx_flow_spec fs;
+ 	bool in_use;
+-- 
+2.9.3
+
