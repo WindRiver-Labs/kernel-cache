@@ -1,0 +1,333 @@
+From af38b2ef010b744a200c3e3a91a436613c2989a7 Mon Sep 17 00:00:00 2001
+From: Masaharu Hayakawa <masaharu.hayakawa.ry@renesas.com>
+Date: Thu, 19 Jan 2017 09:46:55 +0900
+Subject: [PATCH 1386/2066] mmc: tmio: Add transfer completion interrupt
+ processing internal DMA
+
+Although the completion of the data transfer processing was judged only
+by the Access End interrupt of SDHI, the Transfer End interruption of
+DMAC was also added to the condition.
+
+If any error occurs when issuing the command, the DMAC does not operate and
+therefore ends the command sequence.
+
+note: For Gen2, data transfer may be necessary even if -EILSEQ occurs.
+
+Signed-off-by: Masaharu Hayakawa <masaharu.hayakawa.ry@renesas.com>
+[zou:Original patch taken from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+ v4.9/rcar-3.5.1]
+Signed-off-by: zou cao <cao.zou@windriver.com>
+---
+ drivers/mmc/host/tmio_mmc.h          |   23 ++++++++++++++-
+ drivers/mmc/host/tmio_mmc_dma_gen3.c |   53 ++++++++++++++++++++++++++++++++--
+ drivers/mmc/host/tmio_mmc_pio.c      |   45 ++++++++++++++++++++++++++--
+ include/linux/mfd/tmio.h             |    3 --
+ 4 files changed, 113 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/mmc/host/tmio_mmc.h b/drivers/mmc/host/tmio_mmc.h
+index add32ef..616cfc8 100644
+--- a/drivers/mmc/host/tmio_mmc.h
++++ b/drivers/mmc/host/tmio_mmc.h
+@@ -2,7 +2,7 @@
+  * linux/drivers/mmc/host/tmio_mmc.h
+  *
+  * Copyright (C) 2016 Sang Engineering, Wolfram Sang
+- * Copyright (C) 2015-16 Renesas Electronics Corporation
++ * Copyright (C) 2015-2017 Renesas Electronics Corporation
+  * Copyright (C) 2007 Ian Molton
+  * Copyright (C) 2004 Ian Molton
+  *
+@@ -101,6 +101,9 @@
+ 		TMIO_STAT_CARD_REMOVE | TMIO_STAT_CARD_INSERT)
+ #define TMIO_MASK_IRQ     (TMIO_MASK_READOP | TMIO_MASK_WRITEOP | TMIO_MASK_CMD)
+ 
++#define TMIO_TRANSTATE_DEND	0x00000001
++#define TMIO_TRANSTATE_AEND	0x00000002
++
+ struct tmio_mmc_data;
+ struct tmio_mmc_host;
+ 
+@@ -141,6 +144,7 @@ struct tmio_mmc_host {
+ 	struct tasklet_struct	dma_issue;
+ 	struct scatterlist	bounce_sg;
+ 	u8			*bounce_buf;
++	u32			dma_tranend1;
+ 
+ 	/* Track lost interrupts */
+ 	struct delayed_work	delayed_reset_work;
+@@ -149,6 +153,7 @@ struct tmio_mmc_host {
+ 	/* Cache */
+ 	u32			sdcard_irq_mask;
+ 	u32			sdio_irq_mask;
++	u32			dma_irq_mask;
+ 	unsigned int		clk_cache;
+ 
+ 	spinlock_t		lock;		/* protect host private data */
+@@ -159,6 +164,9 @@ struct tmio_mmc_host {
+ 	u32			scc_tappos;
+ 	struct completion	completion;
+ 
++	spinlock_t		trans_lock;
++	unsigned int		trans_state;
++
+ 	int (*clk_enable)(struct tmio_mmc_host *host);
+ 
+ 	/* Optional callbacks */
+@@ -196,6 +204,9 @@ int tmio_mmc_host_probe(struct tmio_mmc_host *host,
+ void tmio_mmc_host_remove(struct tmio_mmc_host *host);
+ void tmio_mmc_do_data_irq(struct tmio_mmc_host *host);
+ 
++void tmio_set_transtate(struct tmio_mmc_host *host, unsigned int state);
++void tmio_clear_transtate(struct tmio_mmc_host *host);
++
+ void tmio_mmc_enable_mmc_irqs(struct tmio_mmc_host *host, u32 i);
+ void tmio_mmc_disable_mmc_irqs(struct tmio_mmc_host *host, u32 i);
+ irqreturn_t tmio_mmc_irq(int irq, void *devid);
+@@ -246,6 +257,16 @@ static inline void tmio_mmc_abort_dma(struct tmio_mmc_host *host)
+ }
+ #endif
+ 
++#if (defined(CONFIG_MMC_SDHI) || defined(CONFIG_MMC_SDHI_MODULE)) \
++	&& defined(CONFIG_ARM64)
++bool __tmio_mmc_dma_irq(struct tmio_mmc_host *host);
++#else
++static inline bool __tmio_mmc_dma_irq(struct tmio_mmc_host *host)
++{
++	return false;
++}
++#endif
++
+ #ifdef CONFIG_PM
+ int tmio_mmc_host_runtime_suspend(struct device *dev);
+ int tmio_mmc_host_runtime_resume(struct device *dev);
+diff --git a/drivers/mmc/host/tmio_mmc_dma_gen3.c b/drivers/mmc/host/tmio_mmc_dma_gen3.c
+index d75e07b..61c0daf 100644
+--- a/drivers/mmc/host/tmio_mmc_dma_gen3.c
++++ b/drivers/mmc/host/tmio_mmc_dma_gen3.c
+@@ -1,7 +1,7 @@
+ /*
+  * linux/drivers/mmc/tmio_mmc_dma_gen3.c
+  *
+- * Copyright (C) 2015 Renesas Electronics Corporation
++ * Copyright (C) 2015-2017 Renesas Electronics Corporation
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License version 2 as
+@@ -18,6 +18,7 @@
+ #include <linux/mmc/host.h>
+ #include <linux/pagemap.h>
+ #include <linux/scatterlist.h>
++#include <linux/sys_soc.h>
+ 
+ #include "tmio_mmc.h"
+ 
+@@ -46,13 +47,24 @@
+ 
+ /* DM_CM_INFO1 and DM_CM_INFO1_MASK */
+ #define INFO1_CLEAR		0
+-#define INFO1_DTRANEND1		BIT(17)
++#define INFO1_DTRANEND1_BIT20	BIT(20)
++#define INFO1_DTRANEND1_BIT17	BIT(17)
+ #define INFO1_DTRANEND0		BIT(16)
+ 
+ /* DM_CM_INFO2 and DM_CM_INFO2_MASK */
+ #define INFO2_DTRANERR1		BIT(17)
+ #define INFO2_DTRANERR0		BIT(16)
+ 
++static const struct soc_device_attribute r8a7795es1x[] = {
++	{ .soc_id = "r8a7795", .revision = "ES1.*" },
++	{ },
++};
++
++static const struct soc_device_attribute r8a7796es10[] = {
++	{ .soc_id = "r8a7796", .revision = "ES1.0" },
++	{ },
++};
++
+ /*
+  * Specification of this driver:
+  * - host->chan_{rx,tx} will be used as a flag of enabling/disabling the dma
+@@ -65,6 +77,11 @@ static void tmio_dm_write(struct tmio_mmc_host *host, int addr, u64 val)
+ 	writeq(val, host->ctl + addr);
+ }
+ 
++static u32 tmio_dm_read(struct tmio_mmc_host *host, int addr)
++{
++	return readl(host->ctl + addr);
++}
++
+ void tmio_mmc_enable_dma(struct tmio_mmc_host *host, bool enable)
+ {
+ 	if (!host->chan_tx || !host->chan_rx)
+@@ -73,8 +90,11 @@ void tmio_mmc_enable_dma(struct tmio_mmc_host *host, bool enable)
+ 	if (!enable)
+ 		tmio_dm_write(host, DM_CM_INFO1, INFO1_CLEAR);
+ 
+-	if (host->dma->enable)
++	if (host->dma->enable) {
++		host->dma_irq_mask = ~(host->dma_tranend1 | INFO1_DTRANEND0);
+ 		host->dma->enable(host, enable);
++		tmio_dm_write(host, DM_CM_INFO1_MASK, host->dma_irq_mask);
++	}
+ }
+ 
+ void tmio_mmc_abort_dma(struct tmio_mmc_host *host)
+@@ -128,6 +148,7 @@ void tmio_mmc_start_dma(struct tmio_mmc_host *host, struct mmc_data *data)
+ 		return;
+ 	}
+ 
++	tmio_clear_transtate(host);
+ 	tmio_mmc_enable_dma(host, true);
+ 
+ 	/* disable PIO irqs to avoid "PIO IRQ in DMA mode!" */
+@@ -170,12 +191,38 @@ static void tmio_mmc_complete_tasklet_fn(unsigned long arg)
+ 	tmio_mmc_do_data_irq(host);
+ }
+ 
++bool __tmio_mmc_dma_irq(struct tmio_mmc_host *host)
++{
++	unsigned int ireg, status;
++
++	status = tmio_dm_read(host, DM_CM_INFO1);
++	ireg = status & ~host->dma_irq_mask;
++
++	if (ireg & INFO1_DTRANEND0) {
++		tmio_dm_write(host, DM_CM_INFO1, ireg & ~INFO1_DTRANEND0);
++		tmio_set_transtate(host, TMIO_TRANSTATE_DEND);
++		return true;
++	}
++
++	if (ireg & host->dma_tranend1) {
++		tmio_dm_write(host, DM_CM_INFO1, ireg & ~host->dma_tranend1);
++		tmio_set_transtate(host, TMIO_TRANSTATE_DEND);
++		return true;
++	}
++	return false;
++}
++
+ void tmio_mmc_request_dma(struct tmio_mmc_host *host,
+ 			  struct tmio_mmc_data *pdata)
+ {
+ 	/* Each value is set to non-zero to assume "enabling" each DMA */
+ 	host->chan_rx = host->chan_tx = (void *)0xdeadbeaf;
+ 
++	if (soc_device_match(r8a7795es1x) || soc_device_match(r8a7796es10))
++		host->dma_tranend1 = INFO1_DTRANEND1_BIT17;
++	else /* ES 2.0 */
++		host->dma_tranend1 = INFO1_DTRANEND1_BIT20;
++
+ 	tasklet_init(&host->dma_complete, tmio_mmc_complete_tasklet_fn,
+ 		     (unsigned long)host);
+ 	tasklet_init(&host->dma_issue, tmio_mmc_issue_tasklet_fn,
+diff --git a/drivers/mmc/host/tmio_mmc_pio.c b/drivers/mmc/host/tmio_mmc_pio.c
+index 18706f3..33ac12c 100644
+--- a/drivers/mmc/host/tmio_mmc_pio.c
++++ b/drivers/mmc/host/tmio_mmc_pio.c
+@@ -2,7 +2,7 @@
+  * linux/drivers/mmc/host/tmio_mmc_pio.c
+  *
+  * Copyright (C) 2016 Renesas Electronics Corporation
+- * Copyright (C) 2016 Sang Engineering, Wolfram Sang
++ * Copyright (C) 2015-2017 Renesas Electronics Corporation
+  * Copyright (C) 2011 Guennadi Liakhovetski
+  * Copyright (C) 2007 Ian Molton
+  * Copyright (C) 2004 Ian Molton
+@@ -65,6 +65,32 @@ void tmio_mmc_disable_mmc_irqs(struct tmio_mmc_host *host, u32 i)
+ 	sd_ctrl_write32_as_16_and_16(host, CTL_IRQ_MASK, host->sdcard_irq_mask);
+ }
+ 
++void tmio_set_transtate(struct tmio_mmc_host *host, unsigned int state)
++{
++	unsigned long flags = 0;
++
++	spin_lock_irqsave(&host->trans_lock, flags);
++	host->trans_state |= state;
++
++	if (host->trans_state == (TMIO_TRANSTATE_DEND | TMIO_TRANSTATE_AEND)) {
++		spin_unlock_irqrestore(&host->trans_lock, flags);
++		tasklet_schedule(&host->dma_complete);
++	} else {
++		spin_unlock_irqrestore(&host->trans_lock, flags);
++	}
++}
++
++void tmio_clear_transtate(struct tmio_mmc_host *host)
++{
++	unsigned long flags = 0;
++
++	spin_lock_irqsave(&host->trans_lock, flags);
++
++	host->trans_state = 0;
++
++	spin_unlock_irqrestore(&host->trans_lock, flags);
++}
++
+ static void tmio_mmc_ack_mmc_irqs(struct tmio_mmc_host *host, u32 i)
+ {
+ 	sd_ctrl_write32_as_16_and_16(host, CTL_STATUS, ~i);
+@@ -596,11 +622,17 @@ static void tmio_mmc_data_irq(struct tmio_mmc_host *host, unsigned int stat)
+ 
+ 		if (done) {
+ 			tmio_mmc_disable_mmc_irqs(host, TMIO_STAT_DATAEND);
+-			tasklet_schedule(&host->dma_complete);
++			if (!data->error)
++				tmio_set_transtate(host, TMIO_TRANSTATE_AEND);
++			else
++				tasklet_schedule(&host->dma_complete);
+ 		}
+ 	} else if (host->chan_rx && (data->flags & MMC_DATA_READ) && !host->force_pio) {
+ 		tmio_mmc_disable_mmc_irqs(host, TMIO_STAT_DATAEND);
+-		tasklet_schedule(&host->dma_complete);
++		if (!data->error)
++			tmio_set_transtate(host, TMIO_TRANSTATE_AEND);
++		else
++			tasklet_schedule(&host->dma_complete);
+ 	} else {
+ 		tmio_mmc_do_data_irq(host);
+ 		tmio_mmc_disable_mmc_irqs(host, TMIO_MASK_READOP | TMIO_MASK_WRITEOP);
+@@ -650,7 +682,7 @@ static void tmio_mmc_cmd_irq(struct tmio_mmc_host *host,
+ 	 * we will ultimatley finish the request in the data_end handler.
+ 	 * If theres no data or we encountered an error, finish now.
+ 	 */
+-	if (host->data && (!cmd->error || cmd->error == -EILSEQ)) {
++	if (host->data && !cmd->error) {
+ 		if (host->data->flags & MMC_DATA_READ) {
+ 			if (host->force_pio || !host->chan_rx)
+ 				tmio_mmc_enable_mmc_irqs(host, TMIO_MASK_READOP);
+@@ -760,6 +792,8 @@ irqreturn_t tmio_mmc_irq(int irq, void *devid)
+ 		return IRQ_HANDLED;
+ 	if (__tmio_mmc_sdcard_irq(host, ireg, status))
+ 		return IRQ_HANDLED;
++	if (__tmio_mmc_dma_irq(host))
++		return IRQ_HANDLED;
+ 
+ 	tmio_mmc_sdio_irq(irq, devid);
+ 
+@@ -1291,6 +1325,9 @@ int tmio_mmc_host_probe(struct tmio_mmc_host *_host,
+ 	spin_lock_init(&_host->lock);
+ 	mutex_init(&_host->ios_lock);
+ 
++	spin_lock_init(&_host->trans_lock);
++	_host->trans_state = 0;
++
+ 	/* Init delayed work for request timeouts */
+ 	INIT_DELAYED_WORK(&_host->delayed_reset_work, tmio_mmc_reset_work);
+ 	INIT_WORK(&_host->done, tmio_mmc_done_work);
+diff --git a/include/linux/mfd/tmio.h b/include/linux/mfd/tmio.h
+index 2f2cc7b..3b95dc7 100644
+--- a/include/linux/mfd/tmio.h
++++ b/include/linux/mfd/tmio.h
+@@ -99,9 +99,6 @@
+  */
+ #define TMIO_MMC_SDIO_STATUS_QUIRK	(1 << 8)
+ 
+-/* The start or stop of SD clock don't wait 10msec. */
+-#define TMIO_MMC_CLK_NO_SLEEP		(1 << 9)
+-
+ /*
+  * Some controllers allows to set SDx actual clock
+  */
+-- 
+1.7.5.4
+
