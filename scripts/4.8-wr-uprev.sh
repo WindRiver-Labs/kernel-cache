@@ -166,3 +166,21 @@ git merge --no-edit	standard/preempt-rt/base		|| bash
 
 git checkout		standard/preempt-rt/xilinx-zynqmp
 git merge --no-edit	standard/preempt-rt/base		|| bash
+
+git checkout		standard/ovp/base
+git merge --no-edit	standard/preempt-rt/base		|| bash
+
+# OVP
+
+git checkout		standard/ovp/intel-x86-32
+git merge --no-edit	standard/ovp/base			|| bash
+git checkout		standard/ovp/intel-x86-64
+git merge --no-edit	standard/ovp/base			|| bash
+git checkout		standard/ovp/qemux86
+git merge --no-edit	standard/ovp/base			|| bash
+git checkout		standard/ovp/qemux86-64
+git merge --no-edit	standard/ovp/base			|| bash
+git checkout		standard/ovp/x86-64-kvm-guest
+git merge --no-edit	standard/ovp/base			|| bash
+git checkout		standard/ovp/x86-kvm-guest
+git merge --no-edit	standard/ovp/base			|| bash
