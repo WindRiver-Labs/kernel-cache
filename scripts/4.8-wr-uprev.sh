@@ -9,11 +9,13 @@
 # if the merges have been done properly then you should be able to run
 # this script and see nothing but a bunch of "already up to date" messages.
 
-
 git checkout		standard/arm-versatile-926ejs
 git merge --no-edit	standard/base		|| bash
 
 git checkout 		standard/axxiaarm
+git merge --no-edit	standard/base		|| bash
+
+git			checkout standard/bcm-2xxx-rpi
 git merge --no-edit	standard/base		|| bash
 
 git checkout		standard/bcm-587xx
@@ -119,12 +121,18 @@ git merge --no-edit	standard/cgl/base	|| bash
 git checkout		standard/cgl/nxp/sdk-2-0/nxp-t4xxx
 git merge --no-edit	standard/cgl/nxp/base	|| bash
 
+git checkout		standard/cgl/xilinx-zynq
+git merge --no-edit	standard/cgl/base	|| bash
+
 # -rt
 
 git checkout		standard/preempt-rt/base
 git merge --no-edit	standard/base		|| bash
 
 git checkout		standard/preempt-rt/axxiaarm
+git merge --no-edit	standard/preempt-rt/base		|| bash
+
+git checkout		standard/preempt-rt/bcm-2xxx-rpi
 git merge --no-edit	standard/preempt-rt/base		|| bash
 
 git checkout		standard/preempt-rt/bcm-587xx
