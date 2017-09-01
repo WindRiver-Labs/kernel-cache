@@ -1,0 +1,414 @@
+From ef854f64503292f8660ae6d6cb4ce2a8fb4fc738 Mon Sep 17 00:00:00 2001
+From: Radu Alexe <radu.alexe@nxp.com>
+Date: Thu, 9 Mar 2017 17:49:33 +0200
+Subject: [PATCH 488/508] crypto: dpaa2-caam: add congestion management
+
+Configure the hardware to write notifications to memory
+when DPAA2 CAAM enqueue/dequeue bufferes enter or exit
+congestion.
+
+On enqueue in case we detect congestion we drop the
+packet.
+
+The congestion entrance threshold was chosen so that
+on a LS2088 we support the maximum throughput for the
+available memory.
+
+Signed-off-by: Radu Alexe <radu.alexe@nxp.com>
+[Original patch taken from SDK-V2.0-1703]
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/crypto/dpaa2-caam/dpaa2-caam.c     |   85 +++++++++++++++++++++++++++-
+ drivers/crypto/dpaa2-caam/dpaa2-caam.h     |   17 ++++++
+ drivers/crypto/dpaa2-caam/dpseci.c         |   48 +++++++++++++++-
+ drivers/crypto/dpaa2-caam/fsl_dpseci.h     |   73 ++++++++++++++++++++++++
+ drivers/crypto/dpaa2-caam/fsl_dpseci_cmd.h |   31 ++++++++++-
+ 5 files changed, 248 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/crypto/dpaa2-caam/dpaa2-caam.c b/drivers/crypto/dpaa2-caam/dpaa2-caam.c
+index 91e69ed..adaa049 100644
+--- a/drivers/crypto/dpaa2-caam/dpaa2-caam.c
++++ b/drivers/crypto/dpaa2-caam/dpaa2-caam.c
+@@ -4896,11 +4896,24 @@ static int dpaa2_dpseci_bind(struct dpaa2_caam_priv *priv)
+ 	return err;
+ }
+ 
++static void dpaa2_dpseci_congestion_free(struct dpaa2_caam_priv *priv)
++{
++	struct device *dev = priv->dev;
++
++	if (!priv->cscn_mem)
++		return;
++
++	dma_unmap_single(dev, priv->cscn_dma, DPAA2_CSCN_SIZE,
++			DMA_FROM_DEVICE);
++	kfree(priv->cscn_mem);
++}
++
+ static void dpaa2_dpseci_free(struct dpaa2_caam_priv *priv)
+ {
+ 	struct device *dev = priv->dev;
+ 	struct fsl_mc_device *ls_dev = to_fsl_mc_device(dev);
+ 
++	dpaa2_dpseci_congestion_free(priv);
+ 	dpseci_close(priv->mc_io, 0, ls_dev->mc_handle);
+ }
+ 
+@@ -5015,6 +5028,56 @@ static int dpaa2_dpseci_poll(struct napi_struct *napi, int budget)
+ 	return cleaned;
+ }
+ 
++static int dpaa2_dpseci_congestion_setup(struct dpaa2_caam_priv *priv,
++					u16 token)
++{
++	struct dpseci_congestion_notification_cfg cong_notif_cfg = { 0 };
++	struct device *dev = priv->dev;
++	int err;
++
++	if (priv->major_ver <= 5 && priv->minor_ver < 1)
++		return 0;
++
++	priv->cscn_mem = kzalloc(DPAA2_CSCN_SIZE + DPAA2_CSCN_ALIGN,
++					GFP_KERNEL | GFP_DMA);
++	if (!priv->cscn_mem)
++		return -ENOMEM;
++
++	priv->cscn_mem_aligned = PTR_ALIGN(priv->cscn_mem, DPAA2_CSCN_ALIGN);
++	priv->cscn_dma = dma_map_single(dev, priv->cscn_mem_aligned,
++					DPAA2_CSCN_SIZE, DMA_FROM_DEVICE);
++	if (dma_mapping_error(dev, priv->cscn_dma)) {
++		dev_err(dev, "Error mapping CSCN memory area\n");
++		err = -ENOMEM;
++		goto err_dma_map;
++	}
++
++	cong_notif_cfg.units = DPSECI_CONGESTION_UNIT_BYTES;
++	cong_notif_cfg.threshold_entry = DPAA2_SEC_CONG_ENTRY_THRESH;
++	cong_notif_cfg.threshold_exit = DPAA2_SEC_CONG_EXIT_THRESH;
++	cong_notif_cfg.message_ctx = (u64)priv;
++	cong_notif_cfg.message_iova = priv->cscn_dma;
++	cong_notif_cfg.notification_mode = DPSECI_CGN_MODE_WRITE_MEM_ON_ENTER |
++					DPSECI_CGN_MODE_WRITE_MEM_ON_EXIT |
++					DPSECI_CGN_MODE_COHERENT_WRITE;
++
++	err = dpseci_set_congestion_notification(priv->mc_io, 0, token,
++						&cong_notif_cfg);
++	if (err) {
++		dev_err(dev, "dpseci_set_congestion_notification failed\n");
++		goto err_set_cong;
++	}
++
++	return 0;
++
++err_set_cong:
++	dma_unmap_single(dev, priv->cscn_dma, DPAA2_CSCN_SIZE, DMA_FROM_DEVICE);
++err_dma_map:
++	kfree(priv->cscn_mem);
++
++	return err;
++}
++
+ static int __cold dpaa2_dpseci_setup(struct fsl_mc_device *ls_dev)
+ {
+ 	struct device *dev = &ls_dev->dev;
+@@ -5051,6 +5114,12 @@ static int __cold dpaa2_dpseci_setup(struct fsl_mc_device *ls_dev)
+ 		goto err_get_vers;
+ 	}
+ 
++	err = dpaa2_dpseci_congestion_setup(priv, ls_dev->mc_handle);
++	if (err) {
++		dev_err(dev, "setup_congestion() failed\n");
++		goto err_get_vers;
++	}
++
+ 	priv->num_pairs = min(priv->dpseci_attr.num_rx_queues,
+ 			      priv->dpseci_attr.num_tx_queues);
+ 
+@@ -5059,7 +5128,7 @@ static int __cold dpaa2_dpseci_setup(struct fsl_mc_device *ls_dev)
+ 					  &priv->rx_queue_attr[i]);
+ 		if (err) {
+ 			dev_err(dev, "dpseci_get_rx_queue() failed\n");
+-			goto err_get_vers;
++			goto err_get_rx_queue;
+ 		}
+ 	}
+ 
+@@ -5068,7 +5137,7 @@ static int __cold dpaa2_dpseci_setup(struct fsl_mc_device *ls_dev)
+ 					  &priv->tx_queue_attr[i]);
+ 		if (err) {
+ 			dev_err(dev, "dpseci_get_tx_queue() failed\n");
+-			goto err_get_vers;
++			goto err_get_rx_queue;
+ 		}
+ 	}
+ 
+@@ -5091,6 +5160,8 @@ static int __cold dpaa2_dpseci_setup(struct fsl_mc_device *ls_dev)
+ 
+ 	return 0;
+ 
++err_get_rx_queue:
++	dpaa2_dpseci_congestion_free(priv);
+ err_get_vers:
+ 	dpseci_close(priv->mc_io, 0, ls_dev->mc_handle);
+ err_open:
+@@ -5361,6 +5432,16 @@ int dpaa2_caam_enqueue(struct device *dev, struct caam_request *req)
+ 	if (IS_ERR(req))
+ 		return PTR_ERR(req);
+ 
++	if (priv->cscn_mem) {
++		dma_sync_single_for_cpu(priv->dev, priv->cscn_dma,
++					DPAA2_CSCN_SIZE,
++					DMA_FROM_DEVICE);
++		if (unlikely(dpaa2_cscn_state_congested(priv->cscn_mem_aligned))) {
++			dev_dbg_ratelimited(dev, "Dropping request\n");
++			return -EBUSY;
++		}
++	}
++
+ 	dpaa2_fl_set_flc(&req->fd_flt[1], req->flc_dma);
+ 
+ 	req->fd_flt_dma = dma_map_single(dev, req->fd_flt, sizeof(req->fd_flt),
+diff --git a/drivers/crypto/dpaa2-caam/dpaa2-caam.h b/drivers/crypto/dpaa2-caam/dpaa2-caam.h
+index 5eaac12..961b38b 100644
+--- a/drivers/crypto/dpaa2-caam/dpaa2-caam.h
++++ b/drivers/crypto/dpaa2-caam/dpaa2-caam.h
+@@ -49,6 +49,12 @@
+ /* NAPI weight *must* be a multiple of the store size. */
+ #define DPAA2_CAAM_NAPI_WEIGHT	64
+ 
++/* The congestion entrance threshold was chosen so that on LS2088
++ * we support the maximum throughput for the available memory
++ */
++#define DPAA2_SEC_CONG_ENTRY_THRESH	(128 * 1024 * 1024)
++#define DPAA2_SEC_CONG_EXIT_THRESH	(DPAA2_SEC_CONG_ENTRY_THRESH * 9/10)
++
+ /**
+  * dpaa2_caam_priv - driver private data
+  * @dpseci_id: DPSECI object unique ID
+@@ -57,6 +63,12 @@
+  * @dpseci_attr: DPSECI attributes
+  * @rx_queue_attr: array of Rx queue attributes
+  * @tx_queue_attr: array of Tx queue attributes
++ * @cscn_mem: pointer to memory region containing the
++ *	dpaa2_cscn struct; it's size is larger than
++ *	sizeof(struct dpaa2_cscn) to accommodate alignment
++ * @cscn_mem_aligned: pointer to struct dpaa2_cscn; it is computed
++ *	as PTR_ALIGN(cscn_mem, DPAA2_CSCN_ALIGN)
++ * @cscn_dma: dma address used by the QMAN to write CSCN messages
+  * @dev: device associated with the DPSECI object
+  * @mc_io: pointer to MC portal's I/O object
+  * @ppriv: per CPU pointers to privata data
+@@ -72,6 +84,11 @@ struct dpaa2_caam_priv {
+ 	struct dpseci_tx_queue_attr tx_queue_attr[DPSECI_PRIO_NUM];
+ 	int num_pairs;
+ 
++	/* congestion */
++	void *cscn_mem;
++	void *cscn_mem_aligned;
++	dma_addr_t cscn_dma;
++
+ 	struct device *dev;
+ 	struct fsl_mc_io *mc_io;
+ 
+diff --git a/drivers/crypto/dpaa2-caam/dpseci.c b/drivers/crypto/dpaa2-caam/dpseci.c
+index 33d7ded..b4ef37a 100644
+--- a/drivers/crypto/dpaa2-caam/dpseci.c
++++ b/drivers/crypto/dpaa2-caam/dpseci.c
+@@ -437,9 +437,9 @@ int dpseci_get_sec_attr(struct fsl_mc_io		*mc_io,
+ 	return 0;
+ }
+ 
+-int dpseci_get_sec_counters(struct fsl_mc_io		*mc_io,
+-			    uint32_t			cmd_flags,
+-		uint16_t			token,
++int dpseci_get_sec_counters(struct fsl_mc_io *mc_io,
++		uint32_t cmd_flags,
++		uint16_t token,
+ 		struct dpseci_sec_counters *counters)
+ {
+ 	struct mc_command cmd = { 0 };
+@@ -528,3 +528,45 @@ int dpseci_get_opr(struct fsl_mc_io *mc_io,
+ 
+ 	return 0;
+ }
++
++int dpseci_set_congestion_notification(struct fsl_mc_io *mc_io,
++			uint32_t cmd_flags,
++			uint16_t token,
++			const struct dpseci_congestion_notification_cfg *cfg)
++{
++	struct mc_command cmd = { 0 };
++
++	/* prepare command */
++	cmd.header = mc_encode_cmd_header(
++			DPSECI_CMDID_SET_CONGESTION_NOTIFICATION,
++			cmd_flags,
++			token);
++	DPSECI_CMD_SET_CONGESTION_NOTIFICATION(cmd, cfg);
++
++	/* send command to mc */
++	return mc_send_command(mc_io, &cmd);
++}
++
++int dpseci_get_congestion_notification(struct fsl_mc_io *mc_io,
++			uint32_t cmd_flags,
++			uint16_t token,
++			struct dpseci_congestion_notification_cfg *cfg)
++{
++	struct mc_command cmd = { 0 };
++	int err;
++
++	/* prepare command */
++	cmd.header = mc_encode_cmd_header(
++			DPSECI_CMDID_GET_CONGESTION_NOTIFICATION,
++			cmd_flags,
++			token);
++
++	/* send command to mc */
++	err = mc_send_command(mc_io, &cmd);
++	if (err)
++		return err;
++
++	DPSECI_RSP_GET_CONGESTION_NOTIFICATION(cmd, cfg);
++
++	return 0;
++}
+diff --git a/drivers/crypto/dpaa2-caam/fsl_dpseci.h b/drivers/crypto/dpaa2-caam/fsl_dpseci.h
+index c782dc5..a99c7b5 100644
+--- a/drivers/crypto/dpaa2-caam/fsl_dpseci.h
++++ b/drivers/crypto/dpaa2-caam/fsl_dpseci.h
+@@ -662,4 +662,77 @@ int dpseci_get_opr(struct fsl_mc_io *mc_io,
+ 			 struct opr_cfg *cfg,
+ 			 struct opr_qry *qry);
+ 
++/**
++ * enum dpseci_congestion_unit - DPSECI congestion units
++ * @DPSECI_CONGESTION_UNIT_BYTES: bytes units
++ * @DPSECI_CONGESTION_UNIT_FRAMES: frames units
++ */
++enum dpseci_congestion_unit {
++	DPSECI_CONGESTION_UNIT_BYTES = 0,
++	DPSECI_CONGESTION_UNIT_FRAMES
++};
++
++#define DPSECI_CGN_MODE_WRITE_MEM_ON_ENTER		0x00000001
++#define DPSECI_CGN_MODE_WRITE_MEM_ON_EXIT		0x00000002
++#define DPSECI_CGN_MODE_COHERENT_WRITE			0x00000004
++#define DPSECI_CGN_MODE_NOTIFY_DEST_ON_ENTER		0x00000008
++#define DPSECI_CGN_MODE_NOTIFY_DEST_ON_EXIT		0x00000010
++#define DPSECI_CGN_MODE_INTR_COALESCING_DISABLED	0x00000020
++
++/**
++ * struct dpseci_congestion_notification_cfg - congestion notification
++ *	configuration
++ * @units: units type
++ * @threshold_entry: above this threshold we enter a congestion state.
++ *	set it to '0' to disable it
++ * @threshold_exit: below this threshold we exit the congestion state.
++ * @message_ctx: The context that will be part of the CSCN message
++ * @message_iova: I/O virtual address (must be in DMA-able memory),
++ *	must be 16B aligned;
++ * @dest_cfg: CSCN can be send to either DPIO or DPCON WQ channel
++ * @notification_mode: Mask of available options; use 'DPSECI_CGN_MODE_<X>'
++ *  values
++ */
++struct dpseci_congestion_notification_cfg {
++	enum dpseci_congestion_unit units;
++	uint32_t threshold_entry;
++	uint32_t threshold_exit;
++	uint64_t message_ctx;
++	uint64_t message_iova;
++	struct dpseci_dest_cfg dest_cfg;
++	uint16_t notification_mode;
++};
++
++/**
++ * dpseci_set_congestion_notification() - Set congestion group
++ *	notification configuration
++ * @mc_io:	Pointer to MC portal's I/O object
++ * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
++ * @token:	Token of DPSECI object
++ * @cfg:	congestion notification configuration
++ *
++ * Return:	'0' on Success; error code otherwise.
++ */
++int dpseci_set_congestion_notification(struct fsl_mc_io	*mc_io,
++			uint32_t cmd_flags,
++			uint16_t token,
++			const struct dpseci_congestion_notification_cfg *cfg);
++
++/**
++ * dpseci_get_congestion_notification() - Get congestion group
++ *	notification configuration
++ * @mc_io:	Pointer to MC portal's I/O object
++ * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
++ * @token:	Token of DPSECI object
++ * @cfg:	congestion notification configuration
++ *
++ * Return:	'0' on Success; error code otherwise.
++ */
++int dpseci_get_congestion_notification(struct fsl_mc_io	*mc_io,
++			uint32_t cmd_flags,
++			uint16_t token,
++			struct dpseci_congestion_notification_cfg *cfg);
++
++
++
+ #endif /* __FSL_DPSECI_H */
+diff --git a/drivers/crypto/dpaa2-caam/fsl_dpseci_cmd.h b/drivers/crypto/dpaa2-caam/fsl_dpseci_cmd.h
+index 10b22d4..e34e044 100644
+--- a/drivers/crypto/dpaa2-caam/fsl_dpseci_cmd.h
++++ b/drivers/crypto/dpaa2-caam/fsl_dpseci_cmd.h
+@@ -34,7 +34,7 @@
+ 
+ /* DPSECI Version */
+ #define DPSECI_VER_MAJOR				5
+-#define DPSECI_VER_MINOR				0
++#define DPSECI_VER_MINOR				1
+ 
+ /* Command IDs */
+ 
+@@ -65,6 +65,9 @@
+ #define DPSECI_CMDID_SET_OPR				0x19A1
+ #define DPSECI_CMDID_GET_OPR				0x19B1
+ 
++#define DPSECI_CMDID_SET_CONGESTION_NOTIFICATION	0x1701
++#define DPSECI_CMDID_GET_CONGESTION_NOTIFICATION	0x1711
++
+ /*                cmd, param, offset, width, type, arg_name */
+ #define DPSECI_CMD_OPEN(cmd, dpseci_id) \
+ 	MC_CMD_OP(cmd, 0, 0,  32, int,      dpseci_id)
+@@ -262,4 +265,30 @@ do { \
+ 	MC_RSP_OP(cmd, 5, 32, 16, uint16_t, (qry)->opr_id); \
+ } while (0)
+ 
++#define DPSECI_CMD_SET_CONGESTION_NOTIFICATION(cmd, cfg) \
++do { \
++	MC_CMD_OP(cmd, 0,  0, 32, uint32_t, (cfg)->dest_cfg.dest_id); \
++	MC_CMD_OP(cmd, 0,  0, 16, uint16_t, (cfg)->notification_mode); \
++	MC_CMD_OP(cmd, 0, 48,  8, uint8_t, (cfg)->dest_cfg.priority); \
++	MC_CMD_OP(cmd, 0, 56,  4, enum dpseci_dest, (cfg)->dest_cfg.dest_type);\
++	MC_CMD_OP(cmd, 0, 60,  2, enum dpseci_congestion_unit, (cfg)->units); \
++	MC_CMD_OP(cmd, 1,  0, 64, uint64_t, (cfg)->message_iova); \
++	MC_CMD_OP(cmd, 2,  0, 64, uint64_t, (cfg)->message_ctx); \
++	MC_CMD_OP(cmd, 3,  0, 32, uint32_t, (cfg)->threshold_entry); \
++	MC_CMD_OP(cmd, 3, 32, 32, uint32_t, (cfg)->threshold_exit); \
++} while (0)
++
++#define DPSECI_RSP_GET_CONGESTION_NOTIFICATION(cmd, cfg) \
++do { \
++	MC_RSP_OP(cmd, 1,  0, 32, uint32_t, (cfg)->dest_cfg.dest_id); \
++	MC_RSP_OP(cmd, 1,  0, 16, uint16_t, (cfg)->notification_mode); \
++	MC_RSP_OP(cmd, 1, 48,  8, uint8_t, (cfg)->dest_cfg.priority); \
++	MC_RSP_OP(cmd, 1, 56,  4, enum dpseci_dest, (cfg)->dest_cfg.dest_type);\
++	MC_RSP_OP(cmd, 1, 60,  2, enum dpseci_congestion_unit, (cfg)->units); \
++	MC_RSP_OP(cmd, 2,  0, 64, uint64_t, (cfg)->message_iova); \
++	MC_RSP_OP(cmd, 3,  0, 64, uint64_t, (cfg)->message_ctx); \
++	MC_RSP_OP(cmd, 4,  0, 32, uint32_t, (cfg)->threshold_entry); \
++	MC_RSP_OP(cmd, 4, 32, 32, uint32_t, (cfg)->threshold_exit); \
++} while (0)
++
+ #endif /* _FSL_DPSECI_CMD_H */
+-- 
+1.7.5.4
+
