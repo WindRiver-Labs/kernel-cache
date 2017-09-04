@@ -1,0 +1,192 @@
+From 0a932602078327bd65acf12da4ea3276c86e1b4c Mon Sep 17 00:00:00 2001
+From: "Eric W. Biederman" <ebiederm@xmission.com>
+Date: Thu, 13 Oct 2016 21:23:16 -0500
+Subject: [PATCH] mm: Add a user_ns owner to mm_struct and fix ptrace
+ permission checks
+
+commit bfedb589252c01fa505ac9f6f2a3d5d68d707ef4 upstream
+
+During exec dumpable is cleared if the file that is being executed is
+not readable by the user executing the file.  A bug in
+ptrace_may_access allows reading the file if the executable happens to
+enter into a subordinate user namespace (aka clone(CLONE_NEWUSER),
+unshare(CLONE_NEWUSER), or setns(fd, CLONE_NEWUSER).
+
+This problem is fixed with only necessary userspace breakage by adding
+a user namespace owner to mm_struct, captured at the time of exec, so
+it is clear in which user namespace CAP_SYS_PTRACE must be present in
+to be able to safely give read permission to the executable.
+
+The function ptrace_may_access is modified to verify that the ptracer
+has CAP_SYS_ADMIN in task->mm->user_ns instead of task->cred->user_ns.
+This ensures that if the task changes it's cred into a subordinate
+user namespace it does not become ptraceable.
+
+The function ptrace_attach is modified to only set PT_PTRACE_CAP when
+CAP_SYS_PTRACE is held over task->mm->user_ns.  The intent of
+PT_PTRACE_CAP is to be a flag to note that whatever permission changes
+the task might go through the tracer has sufficient permissions for
+it not to be an issue.  task->cred->user_ns is always the same
+as or descendent of mm->user_ns.  Which guarantees that having
+CAP_SYS_PTRACE over mm->user_ns is the worst case for the tasks
+credentials.
+
+To prevent regressions mm->dumpable and mm->user_ns are not considered
+when a task has no mm.  As simply failing ptrace_may_attach causes
+regressions in privileged applications attempting to read things
+such as /proc/<pid>/stat
+
+Cc: stable@vger.kernel.org
+Acked-by: Kees Cook <keescook@chromium.org>
+Tested-by: Cyrill Gorcunov <gorcunov@openvz.org>
+Fixes: 8409cca70561 ("userns: allow ptrace from non-init user namespaces")
+Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+[zx: adjusted patch for context, no logical changes]
+Signed-off-by: Zhang Xiao <xiao.zhang@windriver.com>
+---
+ include/linux/mm_types.h |    1 +
+ kernel/fork.c            |    9 ++++++---
+ kernel/ptrace.c          |   26 +++++++++++---------------
+ mm/init-mm.c             |    2 ++
+ 4 files changed, 20 insertions(+), 18 deletions(-)
+
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 948cb92..5b151d4 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -425,6 +425,7 @@ struct mm_struct {
+ #ifdef CONFIG_CGROUP_VM
+ 	struct vm_cgroup *vmcg;		/* vm_cgroup this mm is accounted to */
+ #endif
++	struct user_namespace *user_ns;
+ 
+ 	/* store ref to file /proc/<pid>/exe symlink points to */
+ 	struct file *exe_file;
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 0018a39..66fc516 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -628,7 +628,8 @@ static void mm_init_aio(struct mm_struct *mm)
+ #endif
+ }
+ 
+-static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p)
++static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
++	struct user_namespace *user_ns)
+ {
+ 	atomic_set(&mm->mm_users, 1);
+ 	atomic_set(&mm->mm_count, 1);
+@@ -648,6 +649,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p)
+ 		mm->def_flags = 0;
+ 		mmu_notifier_mm_init(mm);
+ 		mm_init_vm_cgroup(mm, current);
++		mm->user_ns = get_user_ns(user_ns);
+ 		return mm;
+ 	}
+ 
+@@ -685,7 +687,7 @@ struct mm_struct *mm_alloc(void)
+ 
+ 	memset(mm, 0, sizeof(*mm));
+ 	mm_init_cpumask(mm);
+-	return mm_init(mm, current);
++	return mm_init(mm, current, current_user_ns());
+ }
+ 
+ /*
+@@ -701,6 +703,7 @@ void __mmdrop(struct mm_struct *mm)
+ 	destroy_context(mm);
+ 	mmu_notifier_mm_destroy(mm);
+ 	check_mm(mm);
++	put_user_ns(mm->user_ns);
+ 	free_mm(mm);
+ }
+ EXPORT_SYMBOL_GPL(__mmdrop);
+@@ -922,7 +925,7 @@ static struct mm_struct *dup_mm(struct task_struct *tsk)
+ #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
+ 	mm->pmd_huge_pte = NULL;
+ #endif
+-	if (!mm_init(mm, tsk))
++	if (!mm_init(mm, tsk, mm->user_ns))
+ 		goto fail_nomem;
+ 
+ 	if (init_new_context(tsk, mm))
+diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+index 99cf7ab..3c9558b 100644
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -234,7 +234,7 @@ static int __ptrace_may_access(struct task_struct *task, unsigned int mode)
+ 	 * because setting up the necessary parent/child relationship
+ 	 * or halting the specified task is impossible.
+ 	 */
+-	int dumpable = 0;
++	struct mm_struct *mm;
+ 	/* Don't let security modules deny introspection */
+ 	if (same_thread_group(task, current))
+ 		return 0;
+@@ -253,16 +253,11 @@ static int __ptrace_may_access(struct task_struct *task, unsigned int mode)
+ 	return -EPERM;
+ ok:
+ 	rcu_read_unlock();
+-	smp_rmb();
+-	if (task->mm)
+-		dumpable = get_dumpable(task->mm);
+-	rcu_read_lock();
+-	if (dumpable != SUID_DUMP_USER &&
+-	    !ptrace_has_cap(__task_cred(task)->user_ns, mode)) {
+-		rcu_read_unlock();
+-		return -EPERM;
+-	}
+-	rcu_read_unlock();
++	mm = task->mm;
++	if (mm &&
++	    ((get_dumpable(mm) != SUID_DUMP_USER) &&
++	     !ptrace_has_cap(mm->user_ns, mode)))
++	    return -EPERM;
+ 
+ 	return security_ptrace_access_check(task, mode);
+ }
+@@ -313,6 +308,11 @@ static int ptrace_attach(struct task_struct *task, long request,
+ 
+ 	task_lock(task);
+ 	retval = __ptrace_may_access(task, PTRACE_MODE_ATTACH);
++	if (!retval) {
++		struct mm_struct *mm = task->mm;
++		if (mm && ns_capable(mm->user_ns, CAP_SYS_PTRACE))
++			flags |= PT_PTRACE_CAP;
++	}
+ 	task_unlock(task);
+ 	if (retval)
+ 		goto unlock_creds;
+@@ -326,10 +326,6 @@ static int ptrace_attach(struct task_struct *task, long request,
+ 
+ 	if (seize)
+ 		flags |= PT_SEIZED;
+-	rcu_read_lock();
+-	if (ns_capable_nolog(__task_cred(task)->user_ns, CAP_SYS_PTRACE))
+-		flags |= PT_PTRACE_CAP;
+-	rcu_read_unlock();
+ 	task->ptrace = flags;
+ 
+ 	__ptrace_link(task, current);
+diff --git a/mm/init-mm.c b/mm/init-mm.c
+index a56a851..975e49f 100644
+--- a/mm/init-mm.c
++++ b/mm/init-mm.c
+@@ -6,6 +6,7 @@
+ #include <linux/cpumask.h>
+ 
+ #include <linux/atomic.h>
++#include <linux/user_namespace.h>
+ #include <asm/pgtable.h>
+ #include <asm/mmu.h>
+ 
+@@ -21,5 +22,6 @@ struct mm_struct init_mm = {
+ 	.mmap_sem	= __RWSEM_INITIALIZER(init_mm.mmap_sem),
+ 	.page_table_lock =  __SPIN_LOCK_UNLOCKED(init_mm.page_table_lock),
+ 	.mmlist		= LIST_HEAD_INIT(init_mm.mmlist),
++	.user_ns	= &init_user_ns,
+ 	INIT_MM_CONTEXT(init_mm)
+ };
+-- 
+1.7.5.4
+
