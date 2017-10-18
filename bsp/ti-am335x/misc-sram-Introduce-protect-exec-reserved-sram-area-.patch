@@ -1,0 +1,210 @@
+From 4d22144d697c06592e97f4526520a86a05971b8b Mon Sep 17 00:00:00 2001
+From: Dave Gerlach <d-gerlach@ti.com>
+Date: Tue, 13 Dec 2016 12:02:16 -0600
+Subject: [PATCH 759/895] misc: sram: Introduce 'protect-exec' reserved sram
+ area type
+
+Introduce a new 'protect-exec' reserved sram area type which is
+functionally the same as the existing 'pool' sram region type with the
+added requirement that it be maintained as read-only and executable
+while allowing for an arbitrary number of drivers to share the space.
+
+Some platforms, like many ARM SoCs, require to be able to run code from
+on-chip memory like SRAM for tasks like reconfiguring the SDRAM
+controller or entering low-power sleep modes. This introduces a common
+way to maintain a region of sram as read-only and executable and also
+introduces a helper function, sram_exec_copy, which allows for copying
+data to this protected region while maintaining locking to avoid conflicts
+between multiple users of the same space.
+
+Signed-off-by: Dave Gerlach <d-gerlach@ti.com>
+(cherry picked from commit 656c860c6c8a8851becde1818aa4130858efaac3)
+---
+ Documentation/devicetree/bindings/sram/sram.txt |    6 ++
+ drivers/misc/sram.c                             |   85 +++++++++++++++++++++++
+ include/linux/sram.h                            |   20 +++++
+ 3 files changed, 111 insertions(+), 0 deletions(-)
+ create mode 100644 include/linux/sram.h
+
+diff --git a/Documentation/devicetree/bindings/sram/sram.txt b/Documentation/devicetree/bindings/sram/sram.txt
+index add48f0..2aa8396 100644
+--- a/Documentation/devicetree/bindings/sram/sram.txt
++++ b/Documentation/devicetree/bindings/sram/sram.txt
+@@ -42,6 +42,12 @@ Optional properties in the area nodes:
+          and in use by another device or devices
+ - export : indicates that the reserved SRAM area may be accessed outside
+            of the kernel, e.g. by bootloader or userspace
++- protect-exec : Same as 'pool' above but with the additional
++		 constraint that code wil be run from the region and
++		 that the memory is maintained as read-only, executable
++		 during code execution. NOTE: This region must be page
++		 aligned on start and end in order to properly allow
++		 manipulation of the page attributes.
+ - label : the name for the reserved partition, if omitted, the label
+           is taken from the node name excluding the unit address.
+ 
+diff --git a/drivers/misc/sram.c b/drivers/misc/sram.c
+index f84b53d..ca00335 100644
+--- a/drivers/misc/sram.c
++++ b/drivers/misc/sram.c
+@@ -25,15 +25,22 @@
+ #include <linux/of_address.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <linux/sram.h>
++
++#include <asm/cacheflush.h>
+ 
+ #define SRAM_GRANULARITY	32
+ 
++static DEFINE_MUTEX(exec_pool_list_mutex);
++static LIST_HEAD(exec_pool_list);
++
+ struct sram_partition {
+ 	void __iomem *base;
+ 
+ 	struct gen_pool *pool;
+ 	struct bin_attribute battr;
+ 	struct mutex lock;
++	struct list_head list;
+ };
+ 
+ struct sram_dev {
+@@ -53,9 +60,65 @@ struct sram_reserve {
+ 	u32 size;
+ 	bool export;
+ 	bool pool;
++	bool protect_exec;
+ 	const char *label;
+ };
+ 
++/**
++ * sram_exec_copy - copy data to a protected executable region of sram
++ *
++ * @pool: struct gen_pool retrieved that is part of this sram
++ * @dst: Destination address for the copy, that must be inside pool
++ * @src: Source address for the data to copy
++ * @size: Size of copy to perform, which starting from dst, must reside in pool
++ *
++ * This helper function allows sram driver to act as central control location
++ * of 'protect-exec' pools which are normal sram pools but are always set
++ * read-only and executable except when copying data to them, at which point
++ * they are set to read-write non-executable, to make sure no memory is
++ * writeable and executable at the same time. This region must be page-aligned
++ * and is checked during probe, otherwise page attribute manipulation would
++ * not be possible.
++ */
++int sram_exec_copy(struct gen_pool *pool, void *dst, void *src,
++		   size_t size)
++{
++	struct sram_partition *part = NULL, *p;
++	unsigned long base;
++	int pages;
++
++	mutex_lock(&exec_pool_list_mutex);
++	list_for_each_entry(p, &exec_pool_list, list) {
++		if (p->pool == pool)
++			part = p;
++	}
++	mutex_unlock(&exec_pool_list_mutex);
++
++	if (!part)
++		return -EINVAL;
++
++	if (!addr_in_gen_pool(pool, (unsigned long)dst, size))
++		return -EINVAL;
++
++	base = (unsigned long)part->base;
++	pages = PAGE_ALIGN(size) / PAGE_SIZE;
++
++	mutex_lock(&part->lock);
++
++	set_memory_nx((unsigned long)base, pages);
++	set_memory_rw((unsigned long)base, pages);
++
++	memcpy(dst, src, size);
++
++	set_memory_ro((unsigned long)base, pages);
++	set_memory_x((unsigned long)base, pages);
++
++	mutex_unlock(&part->lock);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(sram_exec_copy);
++
+ static ssize_t sram_read(struct file *filp, struct kobject *kobj,
+ 			 struct bin_attribute *attr,
+ 			 char *buf, loff_t pos, size_t count)
+@@ -133,6 +196,16 @@ static int sram_add_partition(struct sram_dev *sram, struct sram_reserve *block,
+ 	mutex_init(&part->lock);
+ 	part->base = sram->virt_base + block->start;
+ 
++	if (block->protect_exec) {
++		unsigned long base = (unsigned long)part->base;
++		unsigned long end = base + block->size;
++
++		if (!PAGE_ALIGNED(base) || !PAGE_ALIGNED(end)) {
++			dev_err(sram->dev,
++				"SRAM pool marked with 'protect-exec' is not page aligned and will not be created.\n");
++			return -ENOMEM;
++		}
++	}
+ 	if (block->pool) {
+ 		ret = sram_add_pool(sram, block, start, part);
+ 		if (ret)
+@@ -143,6 +216,13 @@ static int sram_add_partition(struct sram_dev *sram, struct sram_reserve *block,
+ 		if (ret)
+ 			return ret;
+ 	}
++	if (block->protect_exec) {
++		/* Add to the list after successful call to sram_add_pool */
++		mutex_lock(&exec_pool_list_mutex);
++		list_add_tail(&part->list, &exec_pool_list);
++		mutex_unlock(&exec_pool_list_mutex);
++	}
++
+ 	sram->partitions++;
+ 
+ 	return 0;
+@@ -228,6 +308,11 @@ static int sram_reserve_regions(struct sram_dev *sram, struct resource *res)
+ 		if (of_find_property(child, "pool", NULL))
+ 			block->pool = true;
+ 
++		if (of_find_property(child, "protect-exec", NULL)) {
++			block->protect_exec = true;
++			block->pool = true;
++		}
++
+ 		if ((block->export || block->pool) && block->size) {
+ 			exports++;
+ 
+diff --git a/include/linux/sram.h b/include/linux/sram.h
+new file mode 100644
+index 0000000..f60fc6e
+--- /dev/null
++++ b/include/linux/sram.h
+@@ -0,0 +1,20 @@
++/*
++ * Generic SRAM Driver Interface
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation version 2.
++ *
++ * This program is distributed "as is" WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++#ifndef __LINUX_SRAM_H__
++#define __LINUX_SRAM_H__
++
++struct gen_pool;
++
++int sram_exec_copy(struct gen_pool *pool, void *dst, void *src, size_t size);
++
++#endif /* __LINUX_SRAM_H__ */
+-- 
+1.7.5.4
+
