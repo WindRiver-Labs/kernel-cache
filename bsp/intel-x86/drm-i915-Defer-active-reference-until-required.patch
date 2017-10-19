@@ -1,0 +1,236 @@
+From 45a15d2b0d2164480311bc6c698878f3eb41d20d Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 28 Oct 2016 13:58:29 +0100
+Subject: [PATCH 1634/4301] drm/i915: Defer active reference until required
+
+commit f8a7fde4561067a8ebc956b27afeb530ac97cb9d upstream
+
+We only need the active reference to keep the object alive after the
+handle has been deleted (so as to prevent a synchronous gem_close). Why
+then pay the price of a kref on every execbuf when we can insert that
+final active ref just in time for the handle deletion?
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161028125858.23563-6-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_drv.h              |   28 ++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_gem.c              |   22 +++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_gem_batch_pool.c   |    2 +-
+ drivers/gpu/drm/i915/i915_gem_context.c      |    2 +-
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c   |    2 -
+ drivers/gpu/drm/i915/i915_gem_gtt.c          |    7 +++++-
+ drivers/gpu/drm/i915/i915_gem_render_state.c |    3 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.c      |   15 +++++++++++--
+ 8 files changed, 71 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 2a9d8cc..d34c87c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2274,6 +2274,12 @@ struct drm_i915_gem_object {
+ 	((READ_ONCE((bo)->flags) >> I915_BO_ACTIVE_SHIFT) & I915_BO_ACTIVE_MASK)
+ 
+ 	/**
++	 * Have we taken a reference for the object for incomplete GPU
++	 * activity?
++	 */
++#define I915_BO_ACTIVE_REF (I915_BO_ACTIVE_SHIFT + I915_NUM_ENGINES)
++
++	/**
+ 	 * This is set if the object has been written to since last bound
+ 	 * to the GTT
+ 	 */
+@@ -2434,6 +2440,28 @@ i915_gem_object_has_active_engine(const struct drm_i915_gem_object *obj,
+ 	return obj->flags & BIT(engine + I915_BO_ACTIVE_SHIFT);
+ }
+ 
++static inline bool
++i915_gem_object_has_active_reference(const struct drm_i915_gem_object *obj)
++{
++	return test_bit(I915_BO_ACTIVE_REF, &obj->flags);
++}
++
++static inline void
++i915_gem_object_set_active_reference(struct drm_i915_gem_object *obj)
++{
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
++	__set_bit(I915_BO_ACTIVE_REF, &obj->flags);
++}
++
++static inline void
++i915_gem_object_clear_active_reference(struct drm_i915_gem_object *obj)
++{
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
++	__clear_bit(I915_BO_ACTIVE_REF, &obj->flags);
++}
++
++void __i915_gem_object_release_unless_active(struct drm_i915_gem_object *obj);
++
+ static inline unsigned int
+ i915_gem_object_get_tiling(struct drm_i915_gem_object *obj)
+ {
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index d8261f7..8ea2fc2 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2662,7 +2662,10 @@ i915_gem_object_retire__read(struct i915_gem_active *active,
+ 		list_move_tail(&obj->global_list,
+ 			       &request->i915->mm.bound_list);
+ 
+-	i915_gem_object_put(obj);
++	if (i915_gem_object_has_active_reference(obj)) {
++		i915_gem_object_clear_active_reference(obj);
++		i915_gem_object_put(obj);
++	}
+ }
+ 
+ static bool i915_context_is_banned(const struct i915_gem_context *ctx)
+@@ -2936,6 +2939,12 @@ void i915_gem_close_object(struct drm_gem_object *gem, struct drm_file *file)
+ 	list_for_each_entry_safe(vma, vn, &obj->vma_list, obj_link)
+ 		if (vma->vm->file == fpriv)
+ 			i915_vma_close(vma);
++
++	if (i915_gem_object_is_active(obj) &&
++	    !i915_gem_object_has_active_reference(obj)) {
++		i915_gem_object_set_active_reference(obj);
++		i915_gem_object_get(obj);
++	}
+ 	mutex_unlock(&obj->base.dev->struct_mutex);
+ }
+ 
+@@ -4490,6 +4499,17 @@ void i915_gem_free_object(struct drm_gem_object *gem_obj)
+ 	intel_runtime_pm_put(dev_priv);
+ }
+ 
++void __i915_gem_object_release_unless_active(struct drm_i915_gem_object *obj)
++{
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
++
++	GEM_BUG_ON(i915_gem_object_has_active_reference(obj));
++	if (i915_gem_object_is_active(obj))
++		i915_gem_object_set_active_reference(obj);
++	else
++		i915_gem_object_put(obj);
++}
++
+ int i915_gem_suspend(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+diff --git a/drivers/gpu/drm/i915/i915_gem_batch_pool.c b/drivers/gpu/drm/i915/i915_gem_batch_pool.c
+index ed98959..cb25cad 100644
+--- a/drivers/gpu/drm/i915/i915_gem_batch_pool.c
++++ b/drivers/gpu/drm/i915/i915_gem_batch_pool.c
+@@ -73,7 +73,7 @@ void i915_gem_batch_pool_fini(struct i915_gem_batch_pool *pool)
+ 		list_for_each_entry_safe(obj, next,
+ 					 &pool->cache_list[n],
+ 					 batch_pool_link)
+-			i915_gem_object_put(obj);
++			__i915_gem_object_release_unless_active(obj);
+ 
+ 		INIT_LIST_HEAD(&pool->cache_list[n]);
+ 	}
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 5dca32a..47e888c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -155,7 +155,7 @@ void i915_gem_context_free(struct kref *ctx_ref)
+ 		if (ce->ring)
+ 			intel_ring_free(ce->ring);
+ 
+-		i915_vma_put(ce->state);
++		__i915_gem_object_release_unless_active(ce->state->obj);
+ 	}
+ 
+ 	put_pid(ctx->pid);
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 48e23de..7a6786b 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1296,8 +1296,6 @@ void i915_vma_move_to_active(struct i915_vma *vma,
+ 	 * add the active reference first and queue for it to be dropped
+ 	 * *last*.
+ 	 */
+-	if (!i915_gem_object_is_active(obj))
+-		i915_gem_object_get(obj);
+ 	i915_gem_object_set_active(obj, idx);
+ 	i915_gem_active_set(&obj->last_read[idx], req);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 947d5ad..a3a3644 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -3734,11 +3734,16 @@ void __iomem *i915_vma_pin_iomap(struct i915_vma *vma)
+ void i915_vma_unpin_and_release(struct i915_vma **p_vma)
+ {
+ 	struct i915_vma *vma;
++	struct drm_i915_gem_object *obj;
+ 
+ 	vma = fetch_and_zero(p_vma);
+ 	if (!vma)
+ 		return;
+ 
++	obj = vma->obj;
++
+ 	i915_vma_unpin(vma);
+-	i915_vma_put(vma);
++	i915_vma_close(vma);
++
++	__i915_gem_object_release_unless_active(obj);
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem_render_state.c b/drivers/gpu/drm/i915/i915_gem_render_state.c
+index a98c0f4..e7c3dbc 100644
+--- a/drivers/gpu/drm/i915/i915_gem_render_state.c
++++ b/drivers/gpu/drm/i915/i915_gem_render_state.c
+@@ -224,7 +224,8 @@ int i915_gem_render_state_init(struct drm_i915_gem_request *req)
+ 	i915_vma_move_to_active(so.vma, req, 0);
+ err_unpin:
+ 	i915_vma_unpin(so.vma);
++	i915_vma_close(so.vma);
+ err_obj:
+-	i915_gem_object_put(obj);
++	__i915_gem_object_release_unless_active(obj);
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 7bacd5f..562f66d 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1754,14 +1754,19 @@ static void cleanup_phys_status_page(struct intel_engine_cs *engine)
+ static void cleanup_status_page(struct intel_engine_cs *engine)
+ {
+ 	struct i915_vma *vma;
++	struct drm_i915_gem_object *obj;
+ 
+ 	vma = fetch_and_zero(&engine->status_page.vma);
+ 	if (!vma)
+ 		return;
+ 
++	obj = vma->obj;
++
+ 	i915_vma_unpin(vma);
+-	i915_gem_object_unpin_map(vma->obj);
+-	i915_vma_put(vma);
++	i915_vma_close(vma);
++
++	i915_gem_object_unpin_map(obj);
++	__i915_gem_object_release_unless_active(obj);
+ }
+ 
+ static int init_status_page(struct intel_engine_cs *engine)
+@@ -1959,7 +1964,11 @@ intel_engine_create_ring(struct intel_engine_cs *engine, int size)
+ void
+ intel_ring_free(struct intel_ring *ring)
+ {
+-	i915_vma_put(ring->vma);
++	struct drm_i915_gem_object *obj = ring->vma->obj;
++
++	i915_vma_close(ring->vma);
++	__i915_gem_object_release_unless_active(obj);
++
+ 	kfree(ring);
+ }
+ 
+-- 
+1.7.5.4
+

@@ -1,0 +1,573 @@
+From ae2aef53db2c391011a5c119d5e4bdb820849c1d Mon Sep 17 00:00:00 2001
+From: Jordan Crouse <jcrouse@codeaurora.org>
+Date: Mon, 28 Nov 2016 12:28:34 -0700
+Subject: [PATCH 2183/4301] drm/msm: gpu: Add support for the GPMU
+
+commit 2401a008461481387741bacf7318d13af2c2055f upstream
+
+Most 5XX targets have GPMU (Graphics Power Management Unit) that
+handles a lot of the heavy lifting for power management including
+thermal and limits management and dynamic power collapse. While
+the GPMU itself is optional, it is usually nessesary to hit
+aggressive power targets.
+
+The GPMU firmware needs to be loaded into the GPMU at init time via a
+shared hardware block of registers. Using the GPU to write the microcode
+is more efficient than using the CPU so at first load create an indirect
+buffer that can be executed during subsequent initalization sequences.
+
+After loading the GPMU gets initalized through a shared register
+interface and then we mostly get out of its way and let it do
+its thing.
+
+Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+---
+ drivers/gpu/drm/msm/Makefile               |    1 +
+ drivers/gpu/drm/msm/adreno/a5xx_gpu.c      |   64 +++++-
+ drivers/gpu/drm/msm/adreno/a5xx_gpu.h      |   23 ++
+ drivers/gpu/drm/msm/adreno/a5xx_power.c    |  344 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/msm/adreno/adreno_device.c |    1 +
+ drivers/gpu/drm/msm/adreno/adreno_gpu.h    |    1 +
+ 6 files changed, 431 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/gpu/drm/msm/adreno/a5xx_power.c
+
+diff --git a/drivers/gpu/drm/msm/Makefile b/drivers/gpu/drm/msm/Makefile
+index 3c9f0cc..028c24d 100644
+--- a/drivers/gpu/drm/msm/Makefile
++++ b/drivers/gpu/drm/msm/Makefile
+@@ -7,6 +7,7 @@ msm-y := \
+ 	adreno/a3xx_gpu.o \
+ 	adreno/a4xx_gpu.o \
+ 	adreno/a5xx_gpu.o \
++	adreno/a5xx_power.o \
+ 	hdmi/hdmi.o \
+ 	hdmi/hdmi_audio.o \
+ 	hdmi/hdmi_bridge.o \
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+index bf0a930..b864719 100644
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -450,6 +450,9 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
+ 		REG_A5XX_RBBM_SECVID_TSB_TRUSTED_BASE_HI, 0x00000000);
+ 	gpu_write(gpu, REG_A5XX_RBBM_SECVID_TSB_TRUSTED_SIZE, 0x00000000);
+ 
++	/* Load the GPMU firmware before starting the HW init */
++	a5xx_gpmu_ucode_init(gpu);
++
+ 	ret = adreno_hw_init(gpu);
+ 	if (ret)
+ 		return ret;
+@@ -467,8 +470,9 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Put the GPU into insecure mode */
+-	gpu_write(gpu, REG_A5XX_RBBM_SECVID_TRUST_CNTL, 0x0);
++	ret = a5xx_power_init(gpu);
++	if (ret)
++		return ret;
+ 
+ 	/*
+ 	 * Send a pipeline event stat to get misbehaving counters to start
+@@ -483,6 +487,9 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
+ 			return -EINVAL;
+ 	}
+ 
++	/* Put the GPU into unsecure mode */
++	gpu_write(gpu, REG_A5XX_RBBM_SECVID_TRUST_CNTL, 0x0);
++
+ 	return 0;
+ }
+ 
+@@ -525,6 +532,12 @@ static void a5xx_destroy(struct msm_gpu *gpu)
+ 		drm_gem_object_unreference_unlocked(a5xx_gpu->pfp_bo);
+ 	}
+ 
++	if (a5xx_gpu->gpmu_bo) {
++		if (a5xx_gpu->gpmu_bo)
++			msm_gem_put_iova(a5xx_gpu->gpmu_bo, gpu->id);
++		drm_gem_object_unreference_unlocked(a5xx_gpu->gpmu_bo);
++	}
++
+ 	adreno_gpu_cleanup(adreno_gpu);
+ 	kfree(a5xx_gpu);
+ }
+@@ -748,11 +761,54 @@ static void a5xx_dump(struct msm_gpu *gpu)
+ 
+ static int a5xx_pm_resume(struct msm_gpu *gpu)
+ {
+-	return msm_gpu_pm_resume(gpu);
++	int ret;
++
++	/* Turn on the core power */
++	ret = msm_gpu_pm_resume(gpu);
++	if (ret)
++		return ret;
++
++	/* Turn the RBCCU domain first to limit the chances of voltage droop */
++	gpu_write(gpu, REG_A5XX_GPMU_RBCCU_POWER_CNTL, 0x778000);
++
++	/* Wait 3 usecs before polling */
++	udelay(3);
++
++	ret = spin_usecs(gpu, 20, REG_A5XX_GPMU_RBCCU_PWR_CLK_STATUS,
++		(1 << 20), (1 << 20));
++	if (ret) {
++		DRM_ERROR("%s: timeout waiting for RBCCU GDSC enable: %X\n",
++			gpu->name,
++			gpu_read(gpu, REG_A5XX_GPMU_RBCCU_PWR_CLK_STATUS));
++		return ret;
++	}
++
++	/* Turn on the SP domain */
++	gpu_write(gpu, REG_A5XX_GPMU_SP_POWER_CNTL, 0x778000);
++	ret = spin_usecs(gpu, 20, REG_A5XX_GPMU_SP_PWR_CLK_STATUS,
++		(1 << 20), (1 << 20));
++	if (ret)
++		DRM_ERROR("%s: timeout waiting for SP GDSC enable\n",
++			gpu->name);
++
++	return ret;
+ }
+ 
+ static int a5xx_pm_suspend(struct msm_gpu *gpu)
+ {
++	/* Clear the VBIF pipe before shutting down */
++	gpu_write(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL0, 0xF);
++	spin_until((gpu_read(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL1) & 0xF) == 0xF);
++
++	gpu_write(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL0, 0);
++
++	/*
++	 * Reset the VBIF before power collapse to avoid issue with FIFO
++	 * entries
++	 */
++	gpu_write(gpu, REG_A5XX_RBBM_BLOCK_SW_RESET_CMD, 0x003C0000);
++	gpu_write(gpu, REG_A5XX_RBBM_BLOCK_SW_RESET_CMD, 0x00000000);
++
+ 	return msm_gpu_pm_suspend(gpu);
+ }
+ 
+@@ -820,6 +876,8 @@ struct msm_gpu *a5xx_gpu_init(struct drm_device *dev)
+ 	adreno_gpu->registers = a5xx_registers;
+ 	adreno_gpu->reg_offsets = a5xx_register_offsets;
+ 
++	a5xx_gpu->lm_leakage = 0x4E001A;
++
+ 	ret = adreno_gpu_init(dev, pdev, adreno_gpu, &funcs);
+ 	if (ret) {
+ 		a5xx_destroy(&(a5xx_gpu->base.base));
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_gpu.h b/drivers/gpu/drm/msm/adreno/a5xx_gpu.h
+index 39a07f4..1590f84 100644
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.h
+@@ -30,8 +30,31 @@ struct a5xx_gpu {
+ 
+ 	struct drm_gem_object *pfp_bo;
+ 	uint64_t pfp_iova;
++
++	struct drm_gem_object *gpmu_bo;
++	uint64_t gpmu_iova;
++	uint32_t gpmu_dwords;
++
++	uint32_t lm_leakage;
+ };
+ 
+ #define to_a5xx_gpu(x) container_of(x, struct a5xx_gpu, base)
+ 
++int a5xx_power_init(struct msm_gpu *gpu);
++void a5xx_gpmu_ucode_init(struct msm_gpu *gpu);
++
++static inline int spin_usecs(struct msm_gpu *gpu, uint32_t usecs,
++		uint32_t reg, uint32_t mask, uint32_t value)
++{
++	while (usecs--) {
++		udelay(1);
++		if ((gpu_read(gpu, reg) & mask) == value)
++			return 0;
++		cpu_relax();
++	}
++
++	return -ETIMEDOUT;
++}
++
++
+ #endif /* __A5XX_GPU_H__ */
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_power.c b/drivers/gpu/drm/msm/adreno/a5xx_power.c
+new file mode 100644
+index 0000000..72d52c7
+--- /dev/null
++++ b/drivers/gpu/drm/msm/adreno/a5xx_power.c
+@@ -0,0 +1,344 @@
++/* Copyright (c) 2016 The Linux Foundation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 and
++ * only version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/pm_opp.h>
++#include "a5xx_gpu.h"
++
++/*
++ * The GPMU data block is a block of shared registers that can be used to
++ * communicate back and forth. These "registers" are by convention with the GPMU
++ * firwmare and not bound to any specific hardware design
++ */
++
++#define AGC_INIT_BASE REG_A5XX_GPMU_DATA_RAM_BASE
++#define AGC_INIT_MSG_MAGIC (AGC_INIT_BASE + 5)
++#define AGC_MSG_BASE (AGC_INIT_BASE + 7)
++
++#define AGC_MSG_STATE (AGC_MSG_BASE + 0)
++#define AGC_MSG_COMMAND (AGC_MSG_BASE + 1)
++#define AGC_MSG_PAYLOAD_SIZE (AGC_MSG_BASE + 3)
++#define AGC_MSG_PAYLOAD(_o) ((AGC_MSG_BASE + 5) + (_o))
++
++#define AGC_POWER_CONFIG_PRODUCTION_ID 1
++#define AGC_INIT_MSG_VALUE 0xBABEFACE
++
++static struct {
++	uint32_t reg;
++	uint32_t value;
++} a5xx_sequence_regs[] = {
++	{ 0xB9A1, 0x00010303 },
++	{ 0xB9A2, 0x13000000 },
++	{ 0xB9A3, 0x00460020 },
++	{ 0xB9A4, 0x10000000 },
++	{ 0xB9A5, 0x040A1707 },
++	{ 0xB9A6, 0x00010000 },
++	{ 0xB9A7, 0x0E000904 },
++	{ 0xB9A8, 0x10000000 },
++	{ 0xB9A9, 0x01165000 },
++	{ 0xB9AA, 0x000E0002 },
++	{ 0xB9AB, 0x03884141 },
++	{ 0xB9AC, 0x10000840 },
++	{ 0xB9AD, 0x572A5000 },
++	{ 0xB9AE, 0x00000003 },
++	{ 0xB9AF, 0x00000000 },
++	{ 0xB9B0, 0x10000000 },
++	{ 0xB828, 0x6C204010 },
++	{ 0xB829, 0x6C204011 },
++	{ 0xB82A, 0x6C204012 },
++	{ 0xB82B, 0x6C204013 },
++	{ 0xB82C, 0x6C204014 },
++	{ 0xB90F, 0x00000004 },
++	{ 0xB910, 0x00000002 },
++	{ 0xB911, 0x00000002 },
++	{ 0xB912, 0x00000002 },
++	{ 0xB913, 0x00000002 },
++	{ 0xB92F, 0x00000004 },
++	{ 0xB930, 0x00000005 },
++	{ 0xB931, 0x00000005 },
++	{ 0xB932, 0x00000005 },
++	{ 0xB933, 0x00000005 },
++	{ 0xB96F, 0x00000001 },
++	{ 0xB970, 0x00000003 },
++	{ 0xB94F, 0x00000004 },
++	{ 0xB950, 0x0000000B },
++	{ 0xB951, 0x0000000B },
++	{ 0xB952, 0x0000000B },
++	{ 0xB953, 0x0000000B },
++	{ 0xB907, 0x00000019 },
++	{ 0xB927, 0x00000019 },
++	{ 0xB947, 0x00000019 },
++	{ 0xB967, 0x00000019 },
++	{ 0xB987, 0x00000019 },
++	{ 0xB906, 0x00220001 },
++	{ 0xB926, 0x00220001 },
++	{ 0xB946, 0x00220001 },
++	{ 0xB966, 0x00220001 },
++	{ 0xB986, 0x00300000 },
++	{ 0xAC40, 0x0340FF41 },
++	{ 0xAC41, 0x03BEFED0 },
++	{ 0xAC42, 0x00331FED },
++	{ 0xAC43, 0x021FFDD3 },
++	{ 0xAC44, 0x5555AAAA },
++	{ 0xAC45, 0x5555AAAA },
++	{ 0xB9BA, 0x00000008 },
++};
++
++/*
++ * Get the actual voltage value for the operating point at the specified
++ * frequency
++ */
++static inline uint32_t _get_mvolts(struct msm_gpu *gpu, uint32_t freq)
++{
++	struct drm_device *dev = gpu->dev;
++	struct msm_drm_private *priv = dev->dev_private;
++	struct platform_device *pdev = priv->gpu_pdev;
++	struct dev_pm_opp *opp;
++
++	opp = dev_pm_opp_find_freq_exact(&pdev->dev, freq, true);
++
++	return (!IS_ERR(opp)) ? dev_pm_opp_get_voltage(opp) / 1000 : 0;
++}
++
++/* Setup thermal limit management */
++static void a5xx_lm_setup(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
++	unsigned int i;
++
++	/* Write the block of sequence registers */
++	for (i = 0; i < ARRAY_SIZE(a5xx_sequence_regs); i++)
++		gpu_write(gpu, a5xx_sequence_regs[i].reg,
++			a5xx_sequence_regs[i].value);
++
++	/* Hard code the A530 GPU thermal sensor ID for the GPMU */
++	gpu_write(gpu, REG_A5XX_GPMU_TEMP_SENSOR_ID, 0x60007);
++	gpu_write(gpu, REG_A5XX_GPMU_DELTA_TEMP_THRESHOLD, 0x01);
++	gpu_write(gpu, REG_A5XX_GPMU_TEMP_SENSOR_CONFIG, 0x01);
++
++	/* Until we get clock scaling 0 is always the active power level */
++	gpu_write(gpu, REG_A5XX_GPMU_GPMU_VOLTAGE, 0x80000000 | 0);
++
++	gpu_write(gpu, REG_A5XX_GPMU_BASE_LEAKAGE, a5xx_gpu->lm_leakage);
++
++	/* The threshold is fixed at 6000 for A530 */
++	gpu_write(gpu, REG_A5XX_GPMU_GPMU_PWR_THRESHOLD, 0x80000000 | 6000);
++
++	gpu_write(gpu, REG_A5XX_GPMU_BEC_ENABLE, 0x10001FFF);
++	gpu_write(gpu, REG_A5XX_GDPM_CONFIG1, 0x00201FF1);
++
++	/* Write the voltage table */
++	gpu_write(gpu, REG_A5XX_GPMU_BEC_ENABLE, 0x10001FFF);
++	gpu_write(gpu, REG_A5XX_GDPM_CONFIG1, 0x201FF1);
++
++	gpu_write(gpu, AGC_MSG_STATE, 1);
++	gpu_write(gpu, AGC_MSG_COMMAND, AGC_POWER_CONFIG_PRODUCTION_ID);
++
++	/* Write the max power - hard coded to 5448 for A530 */
++	gpu_write(gpu, AGC_MSG_PAYLOAD(0), 5448);
++	gpu_write(gpu, AGC_MSG_PAYLOAD(1), 1);
++
++	/*
++	 * For now just write the one voltage level - we will do more when we
++	 * can do scaling
++	 */
++	gpu_write(gpu, AGC_MSG_PAYLOAD(2), _get_mvolts(gpu, gpu->fast_rate));
++	gpu_write(gpu, AGC_MSG_PAYLOAD(3), gpu->fast_rate / 1000000);
++
++	gpu_write(gpu, AGC_MSG_PAYLOAD_SIZE, 4 * sizeof(uint32_t));
++	gpu_write(gpu, AGC_INIT_MSG_MAGIC, AGC_INIT_MSG_VALUE);
++}
++
++/* Enable SP/TP cpower collapse */
++static void a5xx_pc_init(struct msm_gpu *gpu)
++{
++	gpu_write(gpu, REG_A5XX_GPMU_PWR_COL_INTER_FRAME_CTRL, 0x7F);
++	gpu_write(gpu, REG_A5XX_GPMU_PWR_COL_BINNING_CTRL, 0);
++	gpu_write(gpu, REG_A5XX_GPMU_PWR_COL_INTER_FRAME_HYST, 0xA0080);
++	gpu_write(gpu, REG_A5XX_GPMU_PWR_COL_STAGGER_DELAY, 0x600040);
++}
++
++/* Enable the GPMU microcontroller */
++static int a5xx_gpmu_init(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
++	struct msm_ringbuffer *ring = gpu->rb;
++
++	if (!a5xx_gpu->gpmu_dwords)
++		return 0;
++
++	/* Turn off protected mode for this operation */
++	OUT_PKT7(ring, CP_SET_PROTECTED_MODE, 1);
++	OUT_RING(ring, 0);
++
++	/* Kick off the IB to load the GPMU microcode */
++	OUT_PKT7(ring, CP_INDIRECT_BUFFER_PFE, 3);
++	OUT_RING(ring, lower_32_bits(a5xx_gpu->gpmu_iova));
++	OUT_RING(ring, upper_32_bits(a5xx_gpu->gpmu_iova));
++	OUT_RING(ring, a5xx_gpu->gpmu_dwords);
++
++	/* Turn back on protected mode */
++	OUT_PKT7(ring, CP_SET_PROTECTED_MODE, 1);
++	OUT_RING(ring, 1);
++
++	gpu->funcs->flush(gpu);
++
++	if (!gpu->funcs->idle(gpu)) {
++		DRM_ERROR("%s: Unable to load GPMU firmware. GPMU will not be active\n",
++			gpu->name);
++		return -EINVAL;
++	}
++
++	gpu_write(gpu, REG_A5XX_GPMU_WFI_CONFIG, 0x4014);
++
++	/* Kick off the GPMU */
++	gpu_write(gpu, REG_A5XX_GPMU_CM3_SYSRESET, 0x0);
++
++	/*
++	 * Wait for the GPMU to respond. It isn't fatal if it doesn't, we just
++	 * won't have advanced power collapse.
++	 */
++	if (spin_usecs(gpu, 25, REG_A5XX_GPMU_GENERAL_0, 0xFFFFFFFF,
++		0xBABEFACE))
++		DRM_ERROR("%s: GPMU firmware initialization timed out\n",
++			gpu->name);
++
++	return 0;
++}
++
++/* Enable limits management */
++static void a5xx_lm_enable(struct msm_gpu *gpu)
++{
++	gpu_write(gpu, REG_A5XX_GDPM_INT_MASK, 0x0);
++	gpu_write(gpu, REG_A5XX_GDPM_INT_EN, 0x0A);
++	gpu_write(gpu, REG_A5XX_GPMU_GPMU_VOLTAGE_INTR_EN_MASK, 0x01);
++	gpu_write(gpu, REG_A5XX_GPMU_TEMP_THRESHOLD_INTR_EN_MASK, 0x50000);
++	gpu_write(gpu, REG_A5XX_GPMU_THROTTLE_UNMASK_FORCE_CTRL, 0x30000);
++
++	gpu_write(gpu, REG_A5XX_GPMU_CLOCK_THROTTLE_CTRL, 0x011);
++}
++
++int a5xx_power_init(struct msm_gpu *gpu)
++{
++	int ret;
++
++	/* Set up the limits management */
++	a5xx_lm_setup(gpu);
++
++	/* Set up SP/TP power collpase */
++	a5xx_pc_init(gpu);
++
++	/* Start the GPMU */
++	ret = a5xx_gpmu_init(gpu);
++	if (ret)
++		return ret;
++
++	/* Start the limits management */
++	a5xx_lm_enable(gpu);
++
++	return 0;
++}
++
++void a5xx_gpmu_ucode_init(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
++	struct drm_device *drm = gpu->dev;
++	const struct firmware *fw;
++	uint32_t dwords = 0, offset = 0, bosize;
++	unsigned int *data, *ptr, *cmds;
++	unsigned int cmds_size;
++
++	if (a5xx_gpu->gpmu_bo)
++		return;
++
++	/* Get the firmware */
++	if (request_firmware(&fw, adreno_gpu->info->gpmufw, drm->dev)) {
++		DRM_ERROR("%s: Could not get GPMU firmware. GPMU will not be active\n",
++			gpu->name);
++		return;
++	}
++
++	data = (unsigned int *) fw->data;
++
++	/*
++	 * The first dword is the size of the remaining data in dwords. Use it
++	 * as a checksum of sorts and make sure it matches the actual size of
++	 * the firmware that we read
++	 */
++
++	if (fw->size < 8 || (data[0] < 2) || (data[0] >= (fw->size >> 2)))
++		goto out;
++
++	/* The second dword is an ID - look for 2 (GPMU_FIRMWARE_ID) */
++	if (data[1] != 2)
++		goto out;
++
++	cmds = data + data[2] + 3;
++	cmds_size = data[0] - data[2] - 2;
++
++	/*
++	 * A single type4 opcode can only have so many values attached so
++	 * add enough opcodes to load the all the commands
++	 */
++	bosize = (cmds_size + (cmds_size / TYPE4_MAX_PAYLOAD) + 1) << 2;
++
++	mutex_lock(&drm->struct_mutex);
++	a5xx_gpu->gpmu_bo = msm_gem_new(drm, bosize, MSM_BO_UNCACHED);
++	mutex_unlock(&drm->struct_mutex);
++
++	if (IS_ERR(a5xx_gpu->gpmu_bo))
++		goto err;
++
++	if (msm_gem_get_iova(a5xx_gpu->gpmu_bo, gpu->id, &a5xx_gpu->gpmu_iova))
++		goto err;
++
++	ptr = msm_gem_get_vaddr(a5xx_gpu->gpmu_bo);
++	if (!ptr)
++		goto err;
++
++	while (cmds_size > 0) {
++		int i;
++		uint32_t _size = cmds_size > TYPE4_MAX_PAYLOAD ?
++			TYPE4_MAX_PAYLOAD : cmds_size;
++
++		ptr[dwords++] = PKT4(REG_A5XX_GPMU_INST_RAM_BASE + offset,
++			_size);
++
++		for (i = 0; i < _size; i++)
++			ptr[dwords++] = *cmds++;
++
++		offset += _size;
++		cmds_size -= _size;
++	}
++
++	msm_gem_put_vaddr(a5xx_gpu->gpmu_bo);
++	a5xx_gpu->gpmu_dwords = dwords;
++
++	goto out;
++
++err:
++	if (a5xx_gpu->gpmu_iova)
++		msm_gem_put_iova(a5xx_gpu->gpmu_bo, gpu->id);
++	if (a5xx_gpu->gpmu_bo)
++		drm_gem_object_unreference_unlocked(a5xx_gpu->gpmu_bo);
++
++	a5xx_gpu->gpmu_bo = NULL;
++	a5xx_gpu->gpmu_iova = 0;
++	a5xx_gpu->gpmu_dwords = 0;
++
++out:
++	/* No need to keep that firmware laying around anymore */
++	release_firmware(fw);
++}
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_device.c b/drivers/gpu/drm/msm/adreno/adreno_device.c
+index 985d95f..893eb2b 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c
+@@ -82,6 +82,7 @@ static const struct adreno_info gpulist[] = {
+ 		.pfpfw = "a530_pfp.fw",
+ 		.gmem = SZ_1M,
+ 		.init = a5xx_gpu_init,
++		.gpmufw = "a530v3_gpmu.fw2",
+ 	},
+ };
+ 
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_gpu.h b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+index 0d1f4e7..e8d55b0 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+@@ -73,6 +73,7 @@ struct adreno_info {
+ 	uint32_t revn;
+ 	const char *name;
+ 	const char *pm4fw, *pfpfw;
++	const char *gpmufw;
+ 	uint32_t gmem;
+ 	struct msm_gpu *(*init)(struct drm_device *dev);
+ };
+-- 
+1.7.5.4
+

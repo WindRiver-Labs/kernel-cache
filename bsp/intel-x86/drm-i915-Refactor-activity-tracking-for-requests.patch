@@ -1,0 +1,805 @@
+From 4fb014601606ca4f7f46c03b6bc4308a0b413bfa Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 4 Aug 2016 07:52:35 +0100
+Subject: [PATCH 0120/4301] drm/i915: Refactor activity tracking for requests
+
+commit fa545cbf9765914da302beb74d68cfd8f21b3843 upstream
+
+With the introduction of requests, we amplified the number of atomic
+refcounted objects we use and update every execbuffer; from none to
+several references, and a set of references that need to be changed. We
+also introduced interesting side-effects in the order of retiring
+requests and objects.
+
+Instead of independently tracking the last request for an object, track
+the active objects for each request. The object will reside in the
+buffer list of its most recent active request and so we reduce the kref
+interchange to a list_move. Now retirements are entirely driven by the
+request, dramatically simplifying activity tracking on the object
+themselves, and removing the ambiguity between retiring objects and
+retiring requests.
+
+Furthermore with the consolidation of managing the activity tracking
+centrally, we can look forward to using RCU to enable lockless lookup of
+the current active requests for an object. In the future, we will be
+able to query the status or wait upon rendering to an object without
+even touching the struct_mutex BKL.
+
+All told, less code, simpler and faster, and more extensible.
+
+v2: Add a typedef for the function pointer for convenience later.
+v3: Make the noop retirement callback explicit. Allow passing NULL to
+the init_request_active() which is expanded to a common noop function.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1470293567-10811-16-git-send-email-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/Makefile           |    1 -
+ drivers/gpu/drm/i915/i915_drv.h         |   10 ---
+ drivers/gpu/drm/i915/i915_gem.c         |  129 +++++--------------------------
+ drivers/gpu/drm/i915/i915_gem_debug.c   |   70 -----------------
+ drivers/gpu/drm/i915/i915_gem_fence.c   |   11 +--
+ drivers/gpu/drm/i915/i915_gem_request.c |   50 ++++++++++--
+ drivers/gpu/drm/i915/i915_gem_request.h |   97 +++++++++++++++++------
+ drivers/gpu/drm/i915/intel_engine_cs.c  |    1 -
+ drivers/gpu/drm/i915/intel_ringbuffer.h |   12 ---
+ 9 files changed, 138 insertions(+), 243 deletions(-)
+ delete mode 100644 drivers/gpu/drm/i915/i915_gem_debug.c
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index 24a09f1..afaf7dd 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -26,7 +26,6 @@ i915-$(CONFIG_DEBUG_FS) += i915_debugfs.o
+ i915-y += i915_cmd_parser.o \
+ 	  i915_gem_batch_pool.o \
+ 	  i915_gem_context.o \
+-	  i915_gem_debug.o \
+ 	  i915_gem_dmabuf.o \
+ 	  i915_gem_evict.o \
+ 	  i915_gem_execbuffer.o \
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 16d3bbc7..7bdf67c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -434,8 +434,6 @@ void intel_link_compute_m_n(int bpp, int nlanes,
+ #define DRIVER_MINOR		6
+ #define DRIVER_PATCHLEVEL	0
+ 
+-#define WATCH_LISTS	0
+-
+ struct opregion_header;
+ struct opregion_acpi;
+ struct opregion_swsci;
+@@ -2191,7 +2189,6 @@ struct drm_i915_gem_object {
+ 	struct drm_mm_node *stolen;
+ 	struct list_head global_list;
+ 
+-	struct list_head engine_list[I915_NUM_ENGINES];
+ 	/** Used in execbuf to temporarily hold a ref */
+ 	struct list_head obj_exec_link;
+ 
+@@ -3500,13 +3497,6 @@ static inline bool i915_gem_object_needs_bit17_swizzle(struct drm_i915_gem_objec
+ 		obj->tiling_mode != I915_TILING_NONE;
+ }
+ 
+-/* i915_gem_debug.c */
+-#if WATCH_LISTS
+-int i915_verify_lists(struct drm_device *dev);
+-#else
+-#define i915_verify_lists(dev) 0
+-#endif
+-
+ /* i915_debugfs.c */
+ #ifdef CONFIG_DEBUG_FS
+ int i915_debugfs_register(struct drm_i915_private *dev_priv);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index b8d22c3..0ac4dcd 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -43,10 +43,6 @@
+ 
+ static void i915_gem_object_flush_gtt_write_domain(struct drm_i915_gem_object *obj);
+ static void i915_gem_object_flush_cpu_write_domain(struct drm_i915_gem_object *obj);
+-static void
+-i915_gem_object_retire__write(struct drm_i915_gem_object *obj);
+-static void
+-i915_gem_object_retire__read(struct drm_i915_gem_object *obj, int engine);
+ 
+ static bool cpu_cache_is_coherent(struct drm_device *dev,
+ 				  enum i915_cache_level level)
+@@ -141,7 +137,6 @@ int i915_mutex_lock_interruptible(struct drm_device *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	WARN_ON(i915_verify_lists(dev));
+ 	return 0;
+ }
+ 
+@@ -1342,23 +1337,6 @@ put_rpm:
+ 	return ret;
+ }
+ 
+-static void
+-i915_gem_object_retire_request(struct drm_i915_gem_object *obj,
+-			       struct drm_i915_gem_request *req)
+-{
+-	int idx = req->engine->id;
+-
+-	if (i915_gem_active_peek(&obj->last_read[idx],
+-				 &obj->base.dev->struct_mutex) == req)
+-		i915_gem_object_retire__read(obj, idx);
+-	else if (i915_gem_active_peek(&obj->last_write,
+-				      &obj->base.dev->struct_mutex) == req)
+-		i915_gem_object_retire__write(obj);
+-
+-	if (!i915_reset_in_progress(&req->i915->gpu_error))
+-		i915_gem_request_retire_upto(req);
+-}
+-
+ /**
+  * Ensures that all rendering to the object has completed and the object is
+  * safe to unbind from the GTT or access from the CPU.
+@@ -1385,18 +1363,10 @@ i915_gem_object_wait_rendering(struct drm_i915_gem_object *obj,
+ 	}
+ 
+ 	for_each_active(active_mask, idx) {
+-		struct drm_i915_gem_request *request;
+-
+-		request = i915_gem_active_peek(&active[idx],
+-					       &obj->base.dev->struct_mutex);
+-		if (!request)
+-			continue;
+-
+-		ret = i915_wait_request(request);
++		ret = i915_gem_active_wait(&active[idx],
++					   &obj->base.dev->struct_mutex);
+ 		if (ret)
+ 			return ret;
+-
+-		i915_gem_object_retire_request(obj, request);
+ 	}
+ 
+ 	resv = i915_gem_object_get_dmabuf_resv(obj);
+@@ -1456,11 +1426,8 @@ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
+ 		ret = __i915_wait_request(requests[i], true, NULL, rps);
+ 	mutex_lock(&dev->struct_mutex);
+ 
+-	for (i = 0; i < n; i++) {
+-		if (ret == 0)
+-			i915_gem_object_retire_request(obj, requests[i]);
++	for (i = 0; i < n; i++)
+ 		i915_gem_request_put(requests[i]);
+-	}
+ 
+ 	return ret;
+ }
+@@ -2380,40 +2347,31 @@ void i915_vma_move_to_active(struct i915_vma *vma,
+ 		i915_gem_object_get(obj);
+ 	obj->active |= intel_engine_flag(engine);
+ 
+-	list_move_tail(&obj->engine_list[engine->id], &engine->active_list);
+ 	i915_gem_active_set(&obj->last_read[engine->id], req);
+ 
+ 	list_move_tail(&vma->vm_link, &vma->vm->active_list);
+ }
+ 
+ static void
+-i915_gem_object_retire__write(struct drm_i915_gem_object *obj)
++i915_gem_object_retire__write(struct i915_gem_active *active,
++			      struct drm_i915_gem_request *request)
+ {
+-	GEM_BUG_ON(!i915_gem_active_isset(&obj->last_write));
+-	GEM_BUG_ON(!(obj->active &
+-		     intel_engine_flag(i915_gem_active_get_engine(&obj->last_write,
+-								  &obj->base.dev->struct_mutex))));
++	struct drm_i915_gem_object *obj =
++		container_of(active, struct drm_i915_gem_object, last_write);
+ 
+-	i915_gem_active_set(&obj->last_write, NULL);
+ 	intel_fb_obj_flush(obj, true, ORIGIN_CS);
+ }
+ 
+ static void
+-i915_gem_object_retire__read(struct drm_i915_gem_object *obj, int idx)
++i915_gem_object_retire__read(struct i915_gem_active *active,
++			     struct drm_i915_gem_request *request)
+ {
+-	struct intel_engine_cs *engine;
++	int idx = request->engine->id;
++	struct drm_i915_gem_object *obj =
++		container_of(active, struct drm_i915_gem_object, last_read[idx]);
+ 	struct i915_vma *vma;
+ 
+-	GEM_BUG_ON(!i915_gem_active_isset(&obj->last_read[idx]));
+-	GEM_BUG_ON(!(obj->active & (1 << idx)));
+-
+-	list_del_init(&obj->engine_list[idx]);
+-	i915_gem_active_set(&obj->last_read[idx], NULL);
+-
+-	engine = i915_gem_active_get_engine(&obj->last_write,
+-					    &obj->base.dev->struct_mutex);
+-	if (engine && engine->id == idx)
+-		i915_gem_object_retire__write(obj);
++	GEM_BUG_ON((obj->active & (1 << idx)) == 0);
+ 
+ 	obj->active &= ~(1 << idx);
+ 	if (obj->active)
+@@ -2423,15 +2381,13 @@ i915_gem_object_retire__read(struct drm_i915_gem_object *obj, int idx)
+ 	 * so that we don't steal from recently used but inactive objects
+ 	 * (unless we are forced to ofc!)
+ 	 */
+-	list_move_tail(&obj->global_list,
+-		       &to_i915(obj->base.dev)->mm.bound_list);
++	list_move_tail(&obj->global_list, &request->i915->mm.bound_list);
+ 
+ 	list_for_each_entry(vma, &obj->vma_list, obj_link) {
+ 		if (!list_empty(&vma->vm_link))
+ 			list_move_tail(&vma->vm_link, &vma->vm->inactive_list);
+ 	}
+ 
+-	i915_gem_active_set(&obj->last_fence, NULL);
+ 	i915_gem_object_put(obj);
+ }
+ 
+@@ -2509,16 +2465,6 @@ static void i915_gem_reset_engine_cleanup(struct intel_engine_cs *engine)
+ {
+ 	struct intel_ring *ring;
+ 
+-	while (!list_empty(&engine->active_list)) {
+-		struct drm_i915_gem_object *obj;
+-
+-		obj = list_first_entry(&engine->active_list,
+-				       struct drm_i915_gem_object,
+-				       engine_list[engine->id]);
+-
+-		i915_gem_object_retire__read(obj, engine->id);
+-	}
+-
+ 	/* Mark all pending requests as complete so that any concurrent
+ 	 * (lockless) lookup doesn't try and wait upon the request as we
+ 	 * reset it.
+@@ -2590,8 +2536,6 @@ void i915_gem_reset(struct drm_device *dev)
+ 	i915_gem_context_reset(dev);
+ 
+ 	i915_gem_restore_fences(dev);
+-
+-	WARN_ON(i915_verify_lists(dev));
+ }
+ 
+ /**
+@@ -2601,13 +2545,6 @@ void i915_gem_reset(struct drm_device *dev)
+ void
+ i915_gem_retire_requests_ring(struct intel_engine_cs *engine)
+ {
+-	WARN_ON(i915_verify_lists(engine->dev));
+-
+-	/* Retire requests first as we use it above for the early return.
+-	 * If we retire requests last, we may use a later seqno and so clear
+-	 * the requests lists without clearing the active list, leading to
+-	 * confusion.
+-	 */
+ 	while (!list_empty(&engine->request_list)) {
+ 		struct drm_i915_gem_request *request;
+ 
+@@ -2620,26 +2557,6 @@ i915_gem_retire_requests_ring(struct intel_engine_cs *engine)
+ 
+ 		i915_gem_request_retire_upto(request);
+ 	}
+-
+-	/* Move any buffers on the active list that are no longer referenced
+-	 * by the ringbuffer to the flushing/inactive lists as appropriate,
+-	 * before we free the context associated with the requests.
+-	 */
+-	while (!list_empty(&engine->active_list)) {
+-		struct drm_i915_gem_object *obj;
+-
+-		obj = list_first_entry(&engine->active_list,
+-				       struct drm_i915_gem_object,
+-				       engine_list[engine->id]);
+-
+-		if (!list_empty(&i915_gem_active_peek(&obj->last_read[engine->id],
+-						      &obj->base.dev->struct_mutex)->link))
+-			break;
+-
+-		i915_gem_object_retire__read(obj, engine->id);
+-	}
+-
+-	WARN_ON(i915_verify_lists(engine->dev));
+ }
+ 
+ void i915_gem_retire_requests(struct drm_i915_private *dev_priv)
+@@ -2822,8 +2739,7 @@ out:
+ }
+ 
+ static int
+-__i915_gem_object_sync(struct drm_i915_gem_object *obj,
+-		       struct drm_i915_gem_request *to,
++__i915_gem_object_sync(struct drm_i915_gem_request *to,
+ 		       struct drm_i915_gem_request *from)
+ {
+ 	int ret;
+@@ -2831,9 +2747,6 @@ __i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 	if (to->engine == from->engine)
+ 		return 0;
+ 
+-	if (i915_gem_request_completed(from))
+-		return 0;
+-
+ 	if (!i915.semaphores) {
+ 		ret = __i915_wait_request(from,
+ 					  from->i915->mm.interruptible,
+@@ -2841,8 +2754,6 @@ __i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 					  NO_WAITBOOST);
+ 		if (ret)
+ 			return ret;
+-
+-		i915_gem_object_retire_request(obj, from);
+ 	} else {
+ 		int idx = intel_engine_sync_index(from->engine, to->engine);
+ 		if (from->fence.seqno <= from->engine->semaphore.sync_seqno[idx])
+@@ -2909,7 +2820,7 @@ i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 		if (!request)
+ 			continue;
+ 
+-		ret = __i915_gem_object_sync(obj, to, request);
++		ret = __i915_gem_object_sync(to, request);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -3045,7 +2956,6 @@ int i915_gem_wait_for_idle(struct drm_i915_private *dev_priv)
+ 			return ret;
+ 	}
+ 
+-	WARN_ON(i915_verify_lists(dev));
+ 	return 0;
+ }
+ 
+@@ -4085,7 +3995,11 @@ void i915_gem_object_init(struct drm_i915_gem_object *obj,
+ 
+ 	INIT_LIST_HEAD(&obj->global_list);
+ 	for (i = 0; i < I915_NUM_ENGINES; i++)
+-		INIT_LIST_HEAD(&obj->engine_list[i]);
++		init_request_active(&obj->last_read[i],
++				    i915_gem_object_retire__read);
++	init_request_active(&obj->last_write,
++			    i915_gem_object_retire__write);
++	init_request_active(&obj->last_fence, NULL);
+ 	INIT_LIST_HEAD(&obj->obj_exec_link);
+ 	INIT_LIST_HEAD(&obj->vma_list);
+ 	INIT_LIST_HEAD(&obj->batch_pool_link);
+@@ -4578,7 +4492,6 @@ i915_gem_cleanup_engines(struct drm_device *dev)
+ static void
+ init_engine_lists(struct intel_engine_cs *engine)
+ {
+-	INIT_LIST_HEAD(&engine->active_list);
+ 	INIT_LIST_HEAD(&engine->request_list);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_debug.c b/drivers/gpu/drm/i915/i915_gem_debug.c
+deleted file mode 100644
+index a565164..0000000
+--- a/drivers/gpu/drm/i915/i915_gem_debug.c
++++ /dev/null
+@@ -1,70 +0,0 @@
+-/*
+- * Copyright © 2008 Intel Corporation
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice (including the next
+- * paragraph) shall be included in all copies or substantial portions of the
+- * Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+- * IN THE SOFTWARE.
+- *
+- * Authors:
+- *    Keith Packard <keithp@keithp.com>
+- *
+- */
+-
+-#include <drm/drmP.h>
+-#include <drm/i915_drm.h>
+-#include "i915_drv.h"
+-
+-#if WATCH_LISTS
+-int
+-i915_verify_lists(struct drm_device *dev)
+-{
+-	static int warned;
+-	struct drm_i915_private *dev_priv = to_i915(dev);
+-	struct drm_i915_gem_object *obj;
+-	struct intel_engine_cs *engine;
+-	int err = 0;
+-
+-	if (warned)
+-		return 0;
+-
+-	for_each_engine(engine, dev_priv) {
+-		list_for_each_entry(obj, &engine->active_list,
+-				    engine_list[engine->id]) {
+-			if (obj->base.dev != dev ||
+-			    !atomic_read(&obj->base.refcount.refcount)) {
+-				DRM_ERROR("%s: freed active obj %p\n",
+-					  engine->name, obj);
+-				err++;
+-				break;
+-			} else if (!obj->active ||
+-				   obj->last_read_req[engine->id] == NULL) {
+-				DRM_ERROR("%s: invalid active obj %p\n",
+-					  engine->name, obj);
+-				err++;
+-			} else if (obj->base.write_domain) {
+-				DRM_ERROR("%s: invalid write obj %p (w %x)\n",
+-					  engine->name,
+-					  obj, obj->base.write_domain);
+-				err++;
+-			}
+-		}
+-	}
+-
+-	return warned = err;
+-}
+-#endif /* WATCH_LIST */
+diff --git a/drivers/gpu/drm/i915/i915_gem_fence.c b/drivers/gpu/drm/i915/i915_gem_fence.c
+index a4ec4fe..dbaab9c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_fence.c
++++ b/drivers/gpu/drm/i915/i915_gem_fence.c
+@@ -261,15 +261,8 @@ static inline void i915_gem_object_fence_lost(struct drm_i915_gem_object *obj)
+ static int
+ i915_gem_object_wait_fence(struct drm_i915_gem_object *obj)
+ {
+-	int ret;
+-
+-	ret = i915_gem_active_wait(&obj->last_fence,
+-				   &obj->base.dev->struct_mutex);
+-	if (ret)
+-		return ret;
+-
+-	i915_gem_active_set(&obj->last_fence, NULL);
+-	return 0;
++	return i915_gem_active_retire(&obj->last_fence,
++				      &obj->base.dev->struct_mutex);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index 7802156..cdaaeb6 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -22,6 +22,8 @@
+  *
+  */
+ 
++#include <linux/prefetch.h>
++
+ #include "i915_drv.h"
+ 
+ static const char *i915_fence_get_driver_name(struct fence *fence)
+@@ -157,8 +159,16 @@ i915_gem_request_remove_from_client(struct drm_i915_gem_request *request)
+ 	request->pid = NULL;
+ }
+ 
++void i915_gem_retire_noop(struct i915_gem_active *active,
++			  struct drm_i915_gem_request *request)
++{
++	/* Space left intentionally blank */
++}
++
+ static void i915_gem_request_retire(struct drm_i915_gem_request *request)
+ {
++	struct i915_gem_active *active, *next;
++
+ 	trace_i915_gem_request_retire(request);
+ 	list_del_init(&request->link);
+ 
+@@ -172,6 +182,33 @@ static void i915_gem_request_retire(struct drm_i915_gem_request *request)
+ 	 */
+ 	request->ring->last_retired_head = request->postfix;
+ 
++	/* Walk through the active list, calling retire on each. This allows
++	 * objects to track their GPU activity and mark themselves as idle
++	 * when their *last* active request is completed (updating state
++	 * tracking lists for eviction, active references for GEM, etc).
++	 *
++	 * As the ->retire() may free the node, we decouple it first and
++	 * pass along the auxiliary information (to avoid dereferencing
++	 * the node after the callback).
++	 */
++	list_for_each_entry_safe(active, next, &request->active_list, link) {
++		/* In microbenchmarks or focusing upon time inside the kernel,
++		 * we may spend an inordinate amount of time simply handling
++		 * the retirement of requests and processing their callbacks.
++		 * Of which, this loop itself is particularly hot due to the
++		 * cache misses when jumping around the list of i915_gem_active.
++		 * So we try to keep this loop as streamlined as possible and
++		 * also prefetch the next i915_gem_active to try and hide
++		 * the likely cache miss.
++		 */
++		prefetchw(next);
++
++		INIT_LIST_HEAD(&active->link);
++		active->request = NULL;
++
++		active->retire(active, request);
++	}
++
+ 	i915_gem_request_remove_from_client(request);
+ 
+ 	if (request->previous_context) {
+@@ -200,8 +237,6 @@ void i915_gem_request_retire_upto(struct drm_i915_gem_request *req)
+ 
+ 		i915_gem_request_retire(tmp);
+ 	} while (tmp != req);
+-
+-	WARN_ON(i915_verify_lists(engine->dev));
+ }
+ 
+ static int i915_gem_check_wedge(unsigned int reset_counter, bool interruptible)
+@@ -336,6 +371,7 @@ i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 		   engine->fence_context,
+ 		   seqno);
+ 
++	INIT_LIST_HEAD(&req->active_list);
+ 	req->i915 = dev_priv;
+ 	req->engine = engine;
+ 	req->ctx = i915_gem_context_get(ctx);
+@@ -570,9 +606,6 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
+ 
+ 	might_sleep();
+ 
+-	if (list_empty(&req->link))
+-		return 0;
+-
+ 	if (i915_gem_request_completed(req))
+ 		return 0;
+ 
+@@ -705,10 +738,13 @@ int i915_wait_request(struct drm_i915_gem_request *req)
+ {
+ 	int ret;
+ 
+-	GEM_BUG_ON(!req);
+ 	lockdep_assert_held(&req->i915->drm.struct_mutex);
++	GEM_BUG_ON(list_empty(&req->link));
+ 
+-	ret = __i915_wait_request(req, req->i915->mm.interruptible, NULL, NULL);
++	ret = __i915_wait_request(req,
++				  req->i915->mm.interruptible,
++				  NULL,
++				  NULL);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.h b/drivers/gpu/drm/i915/i915_gem_request.h
+index 3e40661..6cfae20 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.h
++++ b/drivers/gpu/drm/i915/i915_gem_request.h
+@@ -101,6 +101,7 @@ struct drm_i915_gem_request {
+ 	 * error state dump only).
+ 	 */
+ 	struct drm_i915_gem_object *batch_obj;
++	struct list_head active_list;
+ 
+ 	/** Time at which this request was emitted, in jiffies. */
+ 	unsigned long emitted_jiffies;
+@@ -213,8 +214,12 @@ struct intel_rps_client;
+ int __i915_wait_request(struct drm_i915_gem_request *req,
+ 			bool interruptible,
+ 			s64 *timeout,
+-			struct intel_rps_client *rps);
+-int __must_check i915_wait_request(struct drm_i915_gem_request *req);
++			struct intel_rps_client *rps)
++	__attribute__((nonnull(1)));
++
++int __must_check
++i915_wait_request(struct drm_i915_gem_request *req)
++	__attribute__((nonnull));
+ 
+ static inline u32 intel_engine_get_seqno(struct intel_engine_cs *engine);
+ 
+@@ -276,10 +281,39 @@ static inline bool i915_spin_request(const struct drm_i915_gem_request *request,
+  * can then perform any action, such as delayed freeing of an active
+  * resource including itself.
+  */
++struct i915_gem_active;
++
++typedef void (*i915_gem_retire_fn)(struct i915_gem_active *,
++				   struct drm_i915_gem_request *);
++
+ struct i915_gem_active {
+ 	struct drm_i915_gem_request *request;
++	struct list_head link;
++	i915_gem_retire_fn retire;
+ };
+ 
++void i915_gem_retire_noop(struct i915_gem_active *,
++			  struct drm_i915_gem_request *request);
++
++/**
++ * init_request_active - prepares the activity tracker for use
++ * @active - the active tracker
++ * @func - a callback when then the tracker is retired (becomes idle),
++ *         can be NULL
++ *
++ * init_request_active() prepares the embedded @active struct for use as
++ * an activity tracker, that is for tracking the last known active request
++ * associated with it. When the last request becomes idle, when it is retired
++ * after completion, the optional callback @func is invoked.
++ */
++static inline void
++init_request_active(struct i915_gem_active *active,
++		    i915_gem_retire_fn retire)
++{
++	INIT_LIST_HEAD(&active->link);
++	active->retire = retire ?: i915_gem_retire_noop;
++}
++
+ /**
+  * i915_gem_active_set - updates the tracker to watch the current request
+  * @active - the active tracker
+@@ -293,7 +327,8 @@ static inline void
+ i915_gem_active_set(struct i915_gem_active *active,
+ 		    struct drm_i915_gem_request *request)
+ {
+-	i915_gem_request_assign(&active->request, request);
++	list_move(&active->link, &request->active_list);
++	active->request = request;
+ }
+ 
+ static inline struct drm_i915_gem_request *
+@@ -303,17 +338,23 @@ __i915_gem_active_peek(const struct i915_gem_active *active)
+ }
+ 
+ /**
+- * i915_gem_active_peek - report the request being monitored
++ * i915_gem_active_peek - report the active request being monitored
+  * @active - the active tracker
+  *
+- * i915_gem_active_peek() returns the current request being tracked, or NULL.
+- * It does not obtain a reference on the request for the caller, so the
+- * caller must hold struct_mutex.
++ * i915_gem_active_peek() returns the current request being tracked if
++ * still active, or NULL. It does not obtain a reference on the request
++ * for the caller, so the caller must hold struct_mutex.
+  */
+ static inline struct drm_i915_gem_request *
+ i915_gem_active_peek(const struct i915_gem_active *active, struct mutex *mutex)
+ {
+-	return active->request;
++	struct drm_i915_gem_request *request;
++
++	request = active->request;
++	if (!request || i915_gem_request_completed(request))
++		return NULL;
++
++	return request;
+ }
+ 
+ /**
+@@ -326,13 +367,7 @@ i915_gem_active_peek(const struct i915_gem_active *active, struct mutex *mutex)
+ static inline struct drm_i915_gem_request *
+ i915_gem_active_get(const struct i915_gem_active *active, struct mutex *mutex)
+ {
+-	struct drm_i915_gem_request *request;
+-
+-	request = i915_gem_active_peek(active, mutex);
+-	if (!request || i915_gem_request_completed(request))
+-		return NULL;
+-
+-	return i915_gem_request_get(request);
++	return i915_gem_request_get(i915_gem_active_peek(active, mutex));
+ }
+ 
+ /**
+@@ -361,13 +396,7 @@ static inline bool
+ i915_gem_active_is_idle(const struct i915_gem_active *active,
+ 			struct mutex *mutex)
+ {
+-	struct drm_i915_gem_request *request;
+-
+-	request = i915_gem_active_peek(active, mutex);
+-	if (!request || i915_gem_request_completed(request))
+-		return true;
+-
+-	return false;
++	return !i915_gem_active_peek(active, mutex);
+ }
+ 
+ /**
+@@ -377,6 +406,9 @@ i915_gem_active_is_idle(const struct i915_gem_active *active,
+  * i915_gem_active_wait() waits until the request is completed before
+  * returning. Note that it does not guarantee that the request is
+  * retired first, see i915_gem_active_retire().
++ *
++ * i915_gem_active_wait() returns immediately if the active
++ * request is already complete.
+  */
+ static inline int __must_check
+ i915_gem_active_wait(const struct i915_gem_active *active, struct mutex *mutex)
+@@ -387,7 +419,7 @@ i915_gem_active_wait(const struct i915_gem_active *active, struct mutex *mutex)
+ 	if (!request)
+ 		return 0;
+ 
+-	return i915_wait_request(request);
++	return __i915_wait_request(request, true, NULL, NULL);
+ }
+ 
+ /**
+@@ -400,10 +432,25 @@ i915_gem_active_wait(const struct i915_gem_active *active, struct mutex *mutex)
+  * tracker is idle, the function returns immediately.
+  */
+ static inline int __must_check
+-i915_gem_active_retire(const struct i915_gem_active *active,
++i915_gem_active_retire(struct i915_gem_active *active,
+ 		       struct mutex *mutex)
+ {
+-	return i915_gem_active_wait(active, mutex);
++	struct drm_i915_gem_request *request;
++	int ret;
++
++	request = active->request;
++	if (!request)
++		return 0;
++
++	ret = __i915_wait_request(request, true, NULL, NULL);
++	if (ret)
++		return ret;
++
++	list_del_init(&active->link);
++	active->request = NULL;
++	active->retire(active, request);
++
++	return 0;
+ }
+ 
+ /* Convenience functions for peeking at state inside active's request whilst
+diff --git a/drivers/gpu/drm/i915/intel_engine_cs.c b/drivers/gpu/drm/i915/intel_engine_cs.c
+index 4ec914e..202ad83 100644
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -177,7 +177,6 @@ void intel_engine_init_hangcheck(struct intel_engine_cs *engine)
+  */
+ void intel_engine_setup_common(struct intel_engine_cs *engine)
+ {
+-	INIT_LIST_HEAD(&engine->active_list);
+ 	INIT_LIST_HEAD(&engine->request_list);
+ 	INIT_LIST_HEAD(&engine->buffers);
+ 	INIT_LIST_HEAD(&engine->execlist_queue);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 1706241..236e7a2 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -293,18 +293,6 @@ struct intel_engine_cs {
+ 	u32 ctx_desc_template;
+ 
+ 	/**
+-	 * List of objects currently involved in rendering from the
+-	 * ringbuffer.
+-	 *
+-	 * Includes buffers having the contents of their GPU caches
+-	 * flushed, not necessarily primitives.  last_read_req
+-	 * represents when the rendering involved will be completed.
+-	 *
+-	 * A reference is held on the buffer while on this list.
+-	 */
+-	struct list_head active_list;
+-
+-	/**
+ 	 * List of breadcrumbs associated with GPU requests currently
+ 	 * outstanding.
+ 	 */
+-- 
+1.7.5.4
+

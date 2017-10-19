@@ -1,0 +1,155 @@
+From eed3ce09be891338055c2d868b23d7f8eeb5a3d1 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 18 Oct 2016 13:02:51 +0100
+Subject: [PATCH 1325/4301] drm/i915: Restrict pagefault disabling to just
+ around copy_from_user()
+
+commit ebc0808fa2da0548a78e715858024cb81cd732bc upstream
+
+When handling execbuf relocations, we play a delicate dance with
+pagefault. We first try to access the user pages underneath our
+struct_mutex. However, if those pages were inside a GEM object, we may
+trigger a pagefault and deadlock as i915_gem_fault() tries to
+recursively acquire struct_mutex. Instead, we choose to disable
+pagefaulting around the copy_from_user whilst inside the struct_mutex
+and handle the EFAULT by falling back to a copy outside the
+struct_mutex.
+
+We however presumed that disabling pagefaults would be expensive. It is
+just an operation on the local current task. Cheap enough that we can
+restrict the disable/enable to the critical section around the copy, and
+so avoid having to handle the atomic sections within the relocation
+handling itself.
+
+v2: Just illustrate the broken error handling rather than argue why it
+is safer to ignore it, for now.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161018120251.25043-4-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   71 ++++++++++++++--------------
+ 1 files changed, 35 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 8fd706c..a00479e 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -551,20 +551,6 @@ repeat:
+ 	return 0;
+ }
+ 
+-static bool object_is_idle(struct drm_i915_gem_object *obj)
+-{
+-	unsigned long active = i915_gem_object_get_active(obj);
+-	int idx;
+-
+-	for_each_active(active, idx) {
+-		if (!i915_gem_active_is_idle(&obj->last_read[idx],
+-					     &obj->base.dev->struct_mutex))
+-			return false;
+-	}
+-
+-	return true;
+-}
+-
+ static int
+ i915_gem_execbuffer_relocate_entry(struct drm_i915_gem_object *obj,
+ 				   struct eb_vmas *eb,
+@@ -648,10 +634,6 @@ i915_gem_execbuffer_relocate_entry(struct drm_i915_gem_object *obj,
+ 		return -EINVAL;
+ 	}
+ 
+-	/* We can't wait for rendering with pagefaults disabled */
+-	if (pagefault_disabled() && !object_is_idle(obj))
+-		return -EFAULT;
+-
+ 	ret = relocate_entry(obj, reloc, cache, target_offset);
+ 	if (ret)
+ 		return ret;
+@@ -678,12 +660,23 @@ i915_gem_execbuffer_relocate_vma(struct i915_vma *vma,
+ 	remain = entry->relocation_count;
+ 	while (remain) {
+ 		struct drm_i915_gem_relocation_entry *r = stack_reloc;
+-		int count = remain;
+-		if (count > ARRAY_SIZE(stack_reloc))
+-			count = ARRAY_SIZE(stack_reloc);
++		unsigned long unwritten;
++		unsigned int count;
++
++		count = min_t(unsigned int, remain, ARRAY_SIZE(stack_reloc));
+ 		remain -= count;
+ 
+-		if (__copy_from_user_inatomic(r, user_relocs, count*sizeof(r[0]))) {
++		/* This is the fast path and we cannot handle a pagefault
++		 * whilst holding the struct mutex lest the user pass in the
++		 * relocations contained within a mmaped bo. For in such a case
++		 * we, the page fault handler would call i915_gem_fault() and
++		 * we would try to acquire the struct mutex again. Obviously
++		 * this is bad and so lockdep complains vehemently.
++		 */
++		pagefault_disable();
++		unwritten = __copy_from_user_inatomic(r, user_relocs, count*sizeof(r[0]));
++		pagefault_enable();
++		if (unlikely(unwritten)) {
+ 			ret = -EFAULT;
+ 			goto out;
+ 		}
+@@ -695,11 +688,26 @@ i915_gem_execbuffer_relocate_vma(struct i915_vma *vma,
+ 			if (ret)
+ 				goto out;
+ 
+-			if (r->presumed_offset != offset &&
+-			    __put_user(r->presumed_offset,
+-				       &user_relocs->presumed_offset)) {
+-				ret = -EFAULT;
+-				goto out;
++			if (r->presumed_offset != offset) {
++				pagefault_disable();
++				unwritten = __put_user(r->presumed_offset,
++						       &user_relocs->presumed_offset);
++				pagefault_enable();
++				if (unlikely(unwritten)) {
++					/* Note that reporting an error now
++					 * leaves everything in an inconsistent
++					 * state as we have *already* changed
++					 * the relocation value inside the
++					 * object. As we have not changed the
++					 * reloc.presumed_offset or will not
++					 * change the execobject.offset, on the
++					 * call we may not rewrite the value
++					 * inside the object, leaving it
++					 * dangling and causing a GPU hang.
++					 */
++					ret = -EFAULT;
++					goto out;
++				}
+ 			}
+ 
+ 			user_relocs++;
+@@ -739,20 +747,11 @@ i915_gem_execbuffer_relocate(struct eb_vmas *eb)
+ 	struct i915_vma *vma;
+ 	int ret = 0;
+ 
+-	/* This is the fast path and we cannot handle a pagefault whilst
+-	 * holding the struct mutex lest the user pass in the relocations
+-	 * contained within a mmaped bo. For in such a case we, the page
+-	 * fault handler would call i915_gem_fault() and we would try to
+-	 * acquire the struct mutex again. Obviously this is bad and so
+-	 * lockdep complains vehemently.
+-	 */
+-	pagefault_disable();
+ 	list_for_each_entry(vma, &eb->vmas, exec_list) {
+ 		ret = i915_gem_execbuffer_relocate_vma(vma, eb);
+ 		if (ret)
+ 			break;
+ 	}
+-	pagefault_enable();
+ 
+ 	return ret;
+ }
+-- 
+1.7.5.4
+

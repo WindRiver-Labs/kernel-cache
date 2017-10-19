@@ -1,0 +1,418 @@
+From 0d3305820130f5d641d38fa8e38a380e38999db4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Fri, 9 Sep 2016 16:32:33 +0200
+Subject: [PATCH 0992/4301] drm/amdgpu: add a custom GTT memory manager v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit bb990bb09235a3cc38fd4600d48c7bfb7a0a167c upstream
+
+Only allocate address space when we really need it.
+
+v2: fix a typo, add correct function description,
+    stop leaking the node in the error case.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/Makefile         |    3 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c      |    4 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c |  238 +++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c  |    2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c     |   20 ++-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h     |    9 +-
+ 6 files changed, 265 insertions(+), 11 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/Makefile b/drivers/gpu/drm/amd/amdgpu/Makefile
+index d15e9b0..9ec262d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -23,7 +23,8 @@ amdgpu-y += amdgpu_device.o amdgpu_kms.o \
+ 	amdgpu_pm.o atombios_dp.o amdgpu_afmt.o amdgpu_trace_points.o \
+ 	atombios_encoders.o amdgpu_sa.o atombios_i2c.o \
+ 	amdgpu_prime.o amdgpu_vm.o amdgpu_ib.o amdgpu_pll.o \
+-	amdgpu_ucode.o amdgpu_bo_list.o amdgpu_ctx.o amdgpu_sync.o
++	amdgpu_ucode.o amdgpu_bo_list.o amdgpu_ctx.o amdgpu_sync.o \
++	amdgpu_gtt_mgr.o
+ 
+ # add asic specific block
+ amdgpu-$(CONFIG_DRM_AMDGPU_CIK)+= cik.o cik_ih.o kv_smc.o kv_dpm.o \
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index b8412bc..b0f6e69 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -648,7 +648,7 @@ static int amdgpu_cs_parser_bos(struct amdgpu_cs_parser *p,
+ 	if (!r && p->uf_entry.robj) {
+ 		struct amdgpu_bo *uf = p->uf_entry.robj;
+ 
+-		r = amdgpu_ttm_bind(uf->tbo.ttm, &uf->tbo.mem);
++		r = amdgpu_ttm_bind(&uf->tbo, &uf->tbo.mem);
+ 		p->job->uf_addr += amdgpu_bo_gpu_offset(uf);
+ 	}
+ 
+@@ -1192,7 +1192,7 @@ int amdgpu_cs_sysvm_access_required(struct amdgpu_cs_parser *parser)
+ 	for (i = 0; i < parser->bo_list->num_entries; i++) {
+ 		struct amdgpu_bo *bo = parser->bo_list->array[i].robj;
+ 
+-		r = amdgpu_ttm_bind(bo->tbo.ttm, &bo->tbo.mem);
++		r = amdgpu_ttm_bind(&bo->tbo, &bo->tbo.mem);
+ 		if (unlikely(r))
+ 			return r;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
+new file mode 100644
+index 0000000..262e872
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c
+@@ -0,0 +1,238 @@
++/*
++ * Copyright 2016 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: Christian König
++ */
++
++#include <drm/drmP.h>
++#include "amdgpu.h"
++
++struct amdgpu_gtt_mgr {
++	struct drm_mm mm;
++	spinlock_t lock;
++	uint64_t available;
++};
++
++/**
++ * amdgpu_gtt_mgr_init - init GTT manager and DRM MM
++ *
++ * @man: TTM memory type manager
++ * @p_size: maximum size of GTT
++ *
++ * Allocate and initialize the GTT manager.
++ */
++static int amdgpu_gtt_mgr_init(struct ttm_mem_type_manager *man,
++			       unsigned long p_size)
++{
++	struct amdgpu_gtt_mgr *mgr;
++
++	mgr = kzalloc(sizeof(*mgr), GFP_KERNEL);
++	if (!mgr)
++		return -ENOMEM;
++
++	drm_mm_init(&mgr->mm, 0, p_size);
++	spin_lock_init(&mgr->lock);
++	mgr->available = p_size;
++	man->priv = mgr;
++	return 0;
++}
++
++/**
++ * amdgpu_gtt_mgr_fini - free and destroy GTT manager
++ *
++ * @man: TTM memory type manager
++ *
++ * Destroy and free the GTT manager, returns -EBUSY if ranges are still
++ * allocated inside it.
++ */
++static int amdgpu_gtt_mgr_fini(struct ttm_mem_type_manager *man)
++{
++	struct amdgpu_gtt_mgr *mgr = man->priv;
++
++	spin_lock(&mgr->lock);
++	if (!drm_mm_clean(&mgr->mm)) {
++		spin_unlock(&mgr->lock);
++		return -EBUSY;
++	}
++
++	drm_mm_takedown(&mgr->mm);
++	spin_unlock(&mgr->lock);
++	kfree(mgr);
++	man->priv = NULL;
++	return 0;
++}
++
++/**
++ * amdgpu_gtt_mgr_alloc - allocate new ranges
++ *
++ * @man: TTM memory type manager
++ * @tbo: TTM BO we need this range for
++ * @place: placement flags and restrictions
++ * @mem: the resulting mem object
++ *
++ * Allocate the address space for a node.
++ */
++int amdgpu_gtt_mgr_alloc(struct ttm_mem_type_manager *man,
++			 struct ttm_buffer_object *tbo,
++			 const struct ttm_place *place,
++			 struct ttm_mem_reg *mem)
++{
++	struct amdgpu_gtt_mgr *mgr = man->priv;
++	struct drm_mm_node *node = mem->mm_node;
++	enum drm_mm_search_flags sflags = DRM_MM_SEARCH_BEST;
++	enum drm_mm_allocator_flags aflags = DRM_MM_CREATE_DEFAULT;
++	unsigned long fpfn, lpfn;
++	int r;
++
++	if (node->start != AMDGPU_BO_INVALID_OFFSET)
++		return 0;
++
++	if (place)
++		fpfn = place->fpfn;
++	else
++		fpfn = 0;
++
++	if (place && place->lpfn)
++		lpfn = place->lpfn;
++	else
++		lpfn = man->size;
++
++	if (place && place->flags & TTM_PL_FLAG_TOPDOWN) {
++		sflags = DRM_MM_SEARCH_BELOW;
++		aflags = DRM_MM_CREATE_TOP;
++	}
++
++	spin_lock(&mgr->lock);
++	r = drm_mm_insert_node_in_range_generic(&mgr->mm, node, mem->num_pages,
++						mem->page_alignment, 0,
++						fpfn, lpfn, sflags, aflags);
++	spin_unlock(&mgr->lock);
++
++	if (!r) {
++		mem->start = node->start;
++		tbo->offset = (tbo->mem.start << PAGE_SHIFT) +
++		    tbo->bdev->man[tbo->mem.mem_type].gpu_offset;
++	}
++
++	return r;
++}
++
++/**
++ * amdgpu_gtt_mgr_new - allocate a new node
++ *
++ * @man: TTM memory type manager
++ * @tbo: TTM BO we need this range for
++ * @place: placement flags and restrictions
++ * @mem: the resulting mem object
++ *
++ * Dummy, allocate the node but no space for it yet.
++ */
++static int amdgpu_gtt_mgr_new(struct ttm_mem_type_manager *man,
++			      struct ttm_buffer_object *tbo,
++			      const struct ttm_place *place,
++			      struct ttm_mem_reg *mem)
++{
++	struct amdgpu_gtt_mgr *mgr = man->priv;
++	struct drm_mm_node *node;
++	int r;
++
++	spin_lock(&mgr->lock);
++	if (mgr->available < mem->num_pages) {
++		spin_unlock(&mgr->lock);
++		return 0;
++	}
++	mgr->available -= mem->num_pages;
++	spin_unlock(&mgr->lock);
++
++	node = kzalloc(sizeof(*node), GFP_KERNEL);
++	if (!node)
++		return -ENOMEM;
++
++	node->start = AMDGPU_BO_INVALID_OFFSET;
++	mem->mm_node = node;
++
++	if (place->fpfn || place->lpfn || place->flags & TTM_PL_FLAG_TOPDOWN) {
++		r = amdgpu_gtt_mgr_alloc(man, tbo, place, mem);
++		if (unlikely(r)) {
++			kfree(node);
++			mem->mm_node = NULL;
++		}
++	} else {
++		mem->start = node->start;
++	}
++
++	return 0;
++}
++
++/**
++ * amdgpu_gtt_mgr_del - free ranges
++ *
++ * @man: TTM memory type manager
++ * @tbo: TTM BO we need this range for
++ * @place: placement flags and restrictions
++ * @mem: TTM memory object
++ *
++ * Free the allocated GTT again.
++ */
++static void amdgpu_gtt_mgr_del(struct ttm_mem_type_manager *man,
++			       struct ttm_mem_reg *mem)
++{
++	struct amdgpu_gtt_mgr *mgr = man->priv;
++	struct drm_mm_node *node = mem->mm_node;
++
++	if (!node)
++		return;
++
++	spin_lock(&mgr->lock);
++	if (node->start != AMDGPU_BO_INVALID_OFFSET)
++		drm_mm_remove_node(node);
++	mgr->available += mem->num_pages;
++	spin_unlock(&mgr->lock);
++
++	kfree(node);
++	mem->mm_node = NULL;
++}
++
++/**
++ * amdgpu_gtt_mgr_debug - dump VRAM table
++ *
++ * @man: TTM memory type manager
++ * @prefix: text prefix
++ *
++ * Dump the table content using printk.
++ */
++static void amdgpu_gtt_mgr_debug(struct ttm_mem_type_manager *man,
++				  const char *prefix)
++{
++	struct amdgpu_gtt_mgr *mgr = man->priv;
++
++	spin_lock(&mgr->lock);
++	drm_mm_debug_table(&mgr->mm, prefix);
++	spin_unlock(&mgr->lock);
++}
++
++const struct ttm_mem_type_manager_func amdgpu_gtt_mgr_func = {
++	amdgpu_gtt_mgr_init,
++	amdgpu_gtt_mgr_fini,
++	amdgpu_gtt_mgr_new,
++	amdgpu_gtt_mgr_del,
++	amdgpu_gtt_mgr_debug
++};
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 428aa00..9b80dfed 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -673,7 +673,7 @@ int amdgpu_bo_pin_restricted(struct amdgpu_bo *bo, u32 domain,
+ 		dev_err(bo->adev->dev, "%p pin failed\n", bo);
+ 		goto error;
+ 	}
+-	r = amdgpu_ttm_bind(bo->tbo.ttm, &bo->tbo.mem);
++	r = amdgpu_ttm_bind(&bo->tbo, &bo->tbo.mem);
+ 	if (unlikely(r)) {
+ 		dev_err(bo->adev->dev, "%p bind failed\n", bo);
+ 		goto error;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 82c14e1..8f4e3cf 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -159,7 +159,7 @@ static int amdgpu_init_mem_type(struct ttm_bo_device *bdev, uint32_t type,
+ 		man->default_caching = TTM_PL_FLAG_CACHED;
+ 		break;
+ 	case TTM_PL_TT:
+-		man->func = &ttm_bo_manager_func;
++		man->func = &amdgpu_gtt_mgr_func;
+ 		man->gpu_offset = adev->mc.gtt_start;
+ 		man->available_caching = TTM_PL_MASK_CACHING;
+ 		man->default_caching = TTM_PL_FLAG_CACHED;
+@@ -277,7 +277,7 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
+ 
+ 	switch (old_mem->mem_type) {
+ 	case TTM_PL_TT:
+-		r = amdgpu_ttm_bind(bo->ttm, old_mem);
++		r = amdgpu_ttm_bind(bo, old_mem);
+ 		if (r)
+ 			return r;
+ 
+@@ -290,7 +290,7 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
+ 	}
+ 	switch (new_mem->mem_type) {
+ 	case TTM_PL_TT:
+-		r = amdgpu_ttm_bind(bo->ttm, new_mem);
++		r = amdgpu_ttm_bind(bo, new_mem);
+ 		if (r)
+ 			return r;
+ 
+@@ -675,7 +675,6 @@ static int amdgpu_ttm_backend_bind(struct ttm_tt *ttm,
+ 			return r;
+ 		}
+ 	}
+-	gtt->offset = (u64)bo_mem->start << PAGE_SHIFT;
+ 	if (!ttm->num_pages) {
+ 		WARN(1, "nothing to bind %lu pages for mreg %p back %p!\n",
+ 		     ttm->num_pages, bo_mem, ttm);
+@@ -696,16 +695,25 @@ bool amdgpu_ttm_is_bound(struct ttm_tt *ttm)
+ 	return gtt && !list_empty(&gtt->list);
+ }
+ 
+-int amdgpu_ttm_bind(struct ttm_tt *ttm, struct ttm_mem_reg *bo_mem)
++int amdgpu_ttm_bind(struct ttm_buffer_object *bo, struct ttm_mem_reg *bo_mem)
+ {
+-	struct amdgpu_ttm_tt *gtt = (void *)ttm;
++	struct ttm_tt *ttm = bo->ttm;
++	struct amdgpu_ttm_tt *gtt = (void *)bo->ttm;
+ 	uint32_t flags;
+ 	int r;
+ 
+ 	if (!ttm || amdgpu_ttm_is_bound(ttm))
+ 		return 0;
+ 
++	r = amdgpu_gtt_mgr_alloc(&bo->bdev->man[TTM_PL_TT], bo,
++				 NULL, bo_mem);
++	if (r) {
++		DRM_ERROR("Failed to allocate GTT address space (%d)\n", r);
++		return r;
++	}
++
+ 	flags = amdgpu_ttm_tt_pte_flags(gtt->adev, ttm, bo_mem);
++	gtt->offset = (u64)bo_mem->start << PAGE_SHIFT;
+ 	r = amdgpu_gart_bind(gtt->adev, gtt->offset, ttm->num_pages,
+ 		ttm->pages, gtt->ttm.dma_address, flags);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 3ee825f..9812c80 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -65,6 +65,13 @@ struct amdgpu_mman {
+ 	struct amdgpu_mman_lru			guard;
+ };
+ 
++extern const struct ttm_mem_type_manager_func amdgpu_gtt_mgr_func;
++
++int amdgpu_gtt_mgr_alloc(struct ttm_mem_type_manager *man,
++			 struct ttm_buffer_object *tbo,
++			 const struct ttm_place *place,
++			 struct ttm_mem_reg *mem);
++
+ int amdgpu_copy_buffer(struct amdgpu_ring *ring,
+ 		       uint64_t src_offset,
+ 		       uint64_t dst_offset,
+@@ -78,6 +85,6 @@ int amdgpu_fill_buffer(struct amdgpu_bo *bo,
+ 
+ int amdgpu_mmap(struct file *filp, struct vm_area_struct *vma);
+ bool amdgpu_ttm_is_bound(struct ttm_tt *ttm);
+-int amdgpu_ttm_bind(struct ttm_tt *ttm, struct ttm_mem_reg *bo_mem);
++int amdgpu_ttm_bind(struct ttm_buffer_object *bo, struct ttm_mem_reg *bo_mem);
+ 
+ #endif
+-- 
+1.7.5.4
+

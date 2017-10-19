@@ -1,0 +1,128 @@
+From c20f7da09a99bf1c377c14949b7493ff29a74f4c Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 9 Aug 2016 09:23:34 +0100
+Subject: [PATCH 0191/4301] drm/i915: Do not overwrite the request with zero
+ on reallocation
+
+commit 5a198b8c53e68b6e4737b6890995e676d856c9ed upstream
+
+When using RCU lookup for the request, commit 0eafec6d3244 ("drm/i915:
+Enable lockless lookup of request tracking via RCU"), we acknowledge that
+we may race with another thread that could have reallocated the request.
+In order for the first thread not to blow up, the second thread must not
+clear the request completed before overwriting it. In the RCU lookup, we
+allow for the engine/seqno to be replaced but we do not allow for it to
+be zeroed.
+
+The choice we make is to either add extra checking to the RCU lookup, or
+embrace the inherent races (as intended). It is more complicated as we
+need to manually clear everything we depend upon being zero initialised,
+but we benefit from not emiting the memset() to clear the entire
+frequently allocated structure (that memset turns up in throughput
+profiles). And at the same time, the lookup remains flexible for future
+adjustments.
+
+v2: Old style LRC requires another variable to be initialize. (The
+danger inherent in not zeroing everything.)
+v3: request->batch also needs to be cleared
+v4: signaling.tsk is no long used unset, but pid still exists
+
+Fixes: 0eafec6d3244 ("drm/i915: Enable lockless lookup of request...")
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: "Goel, Akash" <akash.goel@intel.com>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/1470731014-6894-2-git-send-email-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_gem_request.c |   37 ++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_gem_request.h |   11 +++++++++
+ 2 files changed, 47 insertions(+), 1 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index b317a67..4655185 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -355,7 +355,35 @@ i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 	if (req && i915_gem_request_completed(req))
+ 		i915_gem_request_retire(req);
+ 
+-	req = kmem_cache_zalloc(dev_priv->requests, GFP_KERNEL);
++	/* Beware: Dragons be flying overhead.
++	 *
++	 * We use RCU to look up requests in flight. The lookups may
++	 * race with the request being allocated from the slab freelist.
++	 * That is the request we are writing to here, may be in the process
++	 * of being read by __i915_gem_active_get_request_rcu(). As such,
++	 * we have to be very careful when overwriting the contents. During
++	 * the RCU lookup, we change chase the request->engine pointer,
++	 * read the request->fence.seqno and increment the reference count.
++	 *
++	 * The reference count is incremented atomically. If it is zero,
++	 * the lookup knows the request is unallocated and complete. Otherwise,
++	 * it is either still in use, or has been reallocated and reset
++	 * with fence_init(). This increment is safe for release as we check
++	 * that the request we have a reference to and matches the active
++	 * request.
++	 *
++	 * Before we increment the refcount, we chase the request->engine
++	 * pointer. We must not call kmem_cache_zalloc() or else we set
++	 * that pointer to NULL and cause a crash during the lookup. If
++	 * we see the request is completed (based on the value of the
++	 * old engine and seqno), the lookup is complete and reports NULL.
++	 * If we decide the request is not completed (new engine or seqno),
++	 * then we grab a reference and double check that it is still the
++	 * active request - which it won't be and restart the lookup.
++	 *
++	 * Do not use kmem_cache_zalloc() here!
++	 */
++	req = kmem_cache_alloc(dev_priv->requests, GFP_KERNEL);
+ 	if (!req)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -375,6 +403,13 @@ i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 	req->engine = engine;
+ 	req->ctx = i915_gem_context_get(ctx);
+ 
++	/* No zalloc, must clear what we need by hand */
++	req->previous_context = NULL;
++	req->file_priv = NULL;
++	req->batch_obj = NULL;
++	req->pid = NULL;
++	req->elsp_submitted = 0;
++
+ 	/*
+ 	 * Reserve space in the ring buffer for all the commands required to
+ 	 * eventually emit this request. This is to guarantee that the
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.h b/drivers/gpu/drm/i915/i915_gem_request.h
+index 6dd83b1..4e91d49 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.h
++++ b/drivers/gpu/drm/i915/i915_gem_request.h
+@@ -51,6 +51,13 @@ struct intel_signal_node {
+  * emission time to be associated with the request for tracking how far ahead
+  * of the GPU the submission is.
+  *
++ * When modifying this structure be very aware that we perform a lockless
++ * RCU lookup of it that may race against reallocation of the struct
++ * from the slab freelist. We intentionally do not zero the structure on
++ * allocation so that the lookup can use the dangling pointers (and is
++ * cogniscent that those pointers may be wrong). Instead, everything that
++ * needs to be initialised must be done so explicitly.
++ *
+  * The requests are reference counted.
+  */
+ struct drm_i915_gem_request {
+@@ -458,6 +465,10 @@ __i915_gem_active_get_rcu(const struct i915_gem_active *active)
+ 	 * just report the active tracker is idle. If the new request is
+ 	 * incomplete, then we acquire a reference on it and check that
+ 	 * it remained the active request.
++	 *
++	 * It is then imperative that we do not zero the request on
++	 * reallocation, so that we can chase the dangling pointers!
++	 * See i915_gem_request_alloc().
+ 	 */
+ 	do {
+ 		struct drm_i915_gem_request *request;
+-- 
+1.7.5.4
+

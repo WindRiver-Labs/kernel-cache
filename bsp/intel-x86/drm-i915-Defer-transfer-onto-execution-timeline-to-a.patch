@@ -1,0 +1,223 @@
+From 2da6b9a2f3f251e3f782a0cb20a4514480775a96 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 14 Nov 2016 20:40:59 +0000
+Subject: [PATCH 1784/4301] drm/i915: Defer transfer onto execution timeline
+ to actual hw submission
+
+commit d55ac5bf97c6b00539526e2aad8c938376681786 upstream
+
+Defer the transfer from the client's timeline onto the execution
+timeline from the point of readiness to the point of actual submission.
+For example, in execlists, a request is finally submitted to hardware
+when the hardware is ready, and only put onto the hardware queue when
+the request is ready. By deferring the transfer, we ensure that the
+timeline is maintained in retirement order if we decide to queue the
+requests onto the hardware in a different order than fifo.
+
+v2: Rebased onto distinct global/user timeline lock classes.
+v3: Play with the position of the spin_lock().
+v4: Nesting finally resolved with distinct sw_fence lock classes.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161114204105.29171-4-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_gem_request.c    |   38 ++++++++++++++++++---------
+ drivers/gpu/drm/i915/i915_gem_request.h    |    3 ++
+ drivers/gpu/drm/i915/i915_guc_submission.c |   14 +++++++++-
+ drivers/gpu/drm/i915/intel_lrc.c           |   23 ++++++++++------
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |    2 +
+ 5 files changed, 57 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index d0f6b9f..952d2ae 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -306,25 +306,16 @@ static u32 timeline_get_seqno(struct i915_gem_timeline *tl)
+ 	return atomic_inc_return(&tl->next_seqno);
+ }
+ 
+-static int __i915_sw_fence_call
+-submit_notify(struct i915_sw_fence *fence, enum i915_sw_fence_notify state)
++void __i915_gem_request_submit(struct drm_i915_gem_request *request)
+ {
+-	struct drm_i915_gem_request *request =
+-		container_of(fence, typeof(*request), submit);
+ 	struct intel_engine_cs *engine = request->engine;
+ 	struct intel_timeline *timeline;
+-	unsigned long flags;
+ 	u32 seqno;
+ 
+-	if (state != FENCE_COMPLETE)
+-		return NOTIFY_DONE;
+-
+ 	/* Transfer from per-context onto the global per-engine timeline */
+ 	timeline = engine->timeline;
+ 	GEM_BUG_ON(timeline == request->timeline);
+-
+-	/* Will be called from irq-context when using foreign DMA fences */
+-	spin_lock_irqsave(&timeline->lock, flags);
++	assert_spin_locked(&timeline->lock);
+ 
+ 	seqno = timeline_get_seqno(timeline->common);
+ 	GEM_BUG_ON(!seqno);
+@@ -344,15 +335,36 @@ submit_notify(struct i915_sw_fence *fence, enum i915_sw_fence_notify state)
+ 	GEM_BUG_ON(!request->global_seqno);
+ 	engine->emit_breadcrumb(request,
+ 				request->ring->vaddr + request->postfix);
+-	engine->submit_request(request);
+ 
+ 	spin_lock(&request->timeline->lock);
+ 	list_move_tail(&request->link, &timeline->requests);
+ 	spin_unlock(&request->timeline->lock);
+ 
+ 	i915_sw_fence_commit(&request->execute);
++}
++
++void i915_gem_request_submit(struct drm_i915_gem_request *request)
++{
++	struct intel_engine_cs *engine = request->engine;
++	unsigned long flags;
+ 
+-	spin_unlock_irqrestore(&timeline->lock, flags);
++	/* Will be called from irq-context when using foreign fences. */
++	spin_lock_irqsave(&engine->timeline->lock, flags);
++
++	__i915_gem_request_submit(request);
++
++	spin_unlock_irqrestore(&engine->timeline->lock, flags);
++}
++
++static int __i915_sw_fence_call
++submit_notify(struct i915_sw_fence *fence, enum i915_sw_fence_notify state)
++{
++	if (state == FENCE_COMPLETE) {
++		struct drm_i915_gem_request *request =
++			container_of(fence, typeof(*request), submit);
++
++		request->engine->submit_request(request);
++	}
+ 
+ 	return NOTIFY_DONE;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.h b/drivers/gpu/drm/i915/i915_gem_request.h
+index 4976039..4d27846 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.h
++++ b/drivers/gpu/drm/i915/i915_gem_request.h
+@@ -232,6 +232,9 @@ void __i915_add_request(struct drm_i915_gem_request *req, bool flush_caches);
+ #define i915_add_request_no_flush(req) \
+ 	__i915_add_request(req, false)
+ 
++void __i915_gem_request_submit(struct drm_i915_gem_request *request);
++void i915_gem_request_submit(struct drm_i915_gem_request *request);
++
+ struct intel_rps_client;
+ #define NO_WAITBOOST ERR_PTR(-1)
+ #define IS_RPS_CLIENT(p) (!IS_ERR(p))
+diff --git a/drivers/gpu/drm/i915/i915_guc_submission.c b/drivers/gpu/drm/i915/i915_guc_submission.c
+index 666dab7..942f500 100644
+--- a/drivers/gpu/drm/i915/i915_guc_submission.c
++++ b/drivers/gpu/drm/i915/i915_guc_submission.c
+@@ -629,11 +629,23 @@ static int guc_ring_doorbell(struct i915_guc_client *gc)
+ static void i915_guc_submit(struct drm_i915_gem_request *rq)
+ {
+ 	struct drm_i915_private *dev_priv = rq->i915;
+-	unsigned int engine_id = rq->engine->id;
++	struct intel_engine_cs *engine = rq->engine;
++	unsigned int engine_id = engine->id;
+ 	struct intel_guc *guc = &rq->i915->guc;
+ 	struct i915_guc_client *client = guc->execbuf_client;
+ 	int b_ret;
+ 
++	/* We keep the previous context alive until we retire the following
++	 * request. This ensures that any the context object is still pinned
++	 * for any residual writes the HW makes into it on the context switch
++	 * into the next object following the breadcrumb. Otherwise, we may
++	 * retire the context too early.
++	 */
++	rq->previous_context = engine->last_context;
++	engine->last_context = rq->ctx;
++
++	i915_gem_request_submit(rq);
++
+ 	spin_lock(&client->wq_lock);
+ 	guc_wq_item_append(client, rq);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index ff754d1..8cabc4c 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -434,6 +434,7 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ {
+ 	struct drm_i915_gem_request *cursor, *last;
+ 	struct execlist_port *port = engine->execlist_port;
++	unsigned long flags;
+ 	bool submit = false;
+ 
+ 	last = port->request;
+@@ -469,6 +470,7 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 	 * and context switches) submission.
+ 	 */
+ 
++	spin_lock_irqsave(&engine->timeline->lock, flags);
+ 	spin_lock(&engine->execlist_lock);
+ 	list_for_each_entry(cursor, &engine->execlist_queue, execlist_link) {
+ 		/* Can we combine this request with the current port? It has to
+@@ -501,6 +503,17 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 			i915_gem_request_assign(&port->request, last);
+ 			port++;
+ 		}
++
++		/* We keep the previous context alive until we retire the
++		 * following request. This ensures that any the context object
++		 * is still pinned for any residual writes the HW makes into it
++		 * on the context switch into the next object following the
++		 * breadcrumb. Otherwise, we may retire the context too early.
++		 */
++		cursor->previous_context = engine->last_context;
++		engine->last_context = cursor->ctx;
++
++		__i915_gem_request_submit(cursor);
+ 		last = cursor;
+ 		submit = true;
+ 	}
+@@ -512,6 +525,7 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 		i915_gem_request_assign(&port->request, last);
+ 	}
+ 	spin_unlock(&engine->execlist_lock);
++	spin_unlock_irqrestore(&engine->timeline->lock, flags);
+ 
+ 	if (submit)
+ 		execlists_submit_ports(engine);
+@@ -621,15 +635,6 @@ static void execlists_submit_request(struct drm_i915_gem_request *request)
+ 
+ 	spin_lock_irqsave(&engine->execlist_lock, flags);
+ 
+-	/* We keep the previous context alive until we retire the following
+-	 * request. This ensures that any the context object is still pinned
+-	 * for any residual writes the HW makes into it on the context switch
+-	 * into the next object following the breadcrumb. Otherwise, we may
+-	 * retire the context too early.
+-	 */
+-	request->previous_context = engine->last_context;
+-	engine->last_context = request->ctx;
+-
+ 	list_add_tail(&request->execlist_link, &engine->execlist_queue);
+ 	if (execlists_elsp_idle(engine))
+ 		tasklet_hi_schedule(&engine->irq_tasklet);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index e9bfc8f..91cb4c4 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1286,6 +1286,8 @@ static void i9xx_submit_request(struct drm_i915_gem_request *request)
+ {
+ 	struct drm_i915_private *dev_priv = request->i915;
+ 
++	i915_gem_request_submit(request);
++
+ 	I915_WRITE_TAIL(request->engine, request->tail);
+ }
+ 
+-- 
+1.7.5.4
+

@@ -1,0 +1,145 @@
+From df2f57df0fc165d85a48a72d59f898902066da63 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 14 Nov 2016 20:40:58 +0000
+Subject: [PATCH 1783/4301] drm/i915: Split request submit/execute phase into
+ two
+
+commit 23902e49c999353f75f15b7d8483bff70746b97d upstream
+
+In order to support deferred scheduling, we need to differentiate
+between when the request is ready to run (i.e. the submit fence is
+signaled) and when the request is actually run (a new execute fence).
+This is typically split between the request itself wanting to wait upon
+others (for which we use the submit fence) and the CPU wanting to wait
+upon the request, for which we use the execute fence to be sure the
+hardware is ready to signal completion.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161114204105.29171-3-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_gem_request.c |   33 ++++++++++++++++++++++--------
+ drivers/gpu/drm/i915/i915_gem_request.h |   15 ++++++++++++++
+ 2 files changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index f25b537..d0f6b9f 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -350,11 +350,19 @@ submit_notify(struct i915_sw_fence *fence, enum i915_sw_fence_notify state)
+ 	list_move_tail(&request->link, &timeline->requests);
+ 	spin_unlock(&request->timeline->lock);
+ 
++	i915_sw_fence_commit(&request->execute);
++
+ 	spin_unlock_irqrestore(&timeline->lock, flags);
+ 
+ 	return NOTIFY_DONE;
+ }
+ 
++static int __i915_sw_fence_call
++execute_notify(struct i915_sw_fence *fence, enum i915_sw_fence_notify state)
++{
++	return NOTIFY_DONE;
++}
++
+ /**
+  * i915_gem_request_alloc - allocate a request structure
+  *
+@@ -440,6 +448,12 @@ i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 		       __timeline_get_seqno(req->timeline->common));
+ 
+ 	i915_sw_fence_init(&req->submit, submit_notify);
++	i915_sw_fence_init(&req->execute, execute_notify);
++	/* Ensure that the execute fence completes after the submit fence -
++	 * as we complete the execute fence from within the submit fence
++	 * callback, its completion would otherwise be visible first.
++	 */
++	i915_sw_fence_await_sw_fence(&req->execute, &req->submit, &req->execq);
+ 
+ 	INIT_LIST_HEAD(&req->active_list);
+ 	req->i915 = dev_priv;
+@@ -816,9 +830,9 @@ bool __i915_spin_request(const struct drm_i915_gem_request *req,
+ }
+ 
+ static long
+-__i915_request_wait_for_submit(struct drm_i915_gem_request *request,
+-			       unsigned int flags,
+-			       long timeout)
++__i915_request_wait_for_execute(struct drm_i915_gem_request *request,
++				unsigned int flags,
++				long timeout)
+ {
+ 	const int state = flags & I915_WAIT_INTERRUPTIBLE ?
+ 		TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE;
+@@ -830,9 +844,9 @@ __i915_request_wait_for_submit(struct drm_i915_gem_request *request,
+ 		add_wait_queue(q, &reset);
+ 
+ 	do {
+-		prepare_to_wait(&request->submit.wait, &wait, state);
++		prepare_to_wait(&request->execute.wait, &wait, state);
+ 
+-		if (i915_sw_fence_done(&request->submit))
++		if (i915_sw_fence_done(&request->execute))
+ 			break;
+ 
+ 		if (flags & I915_WAIT_LOCKED &&
+@@ -850,7 +864,7 @@ __i915_request_wait_for_submit(struct drm_i915_gem_request *request,
+ 
+ 		timeout = io_schedule_timeout(timeout);
+ 	} while (timeout);
+-	finish_wait(&request->submit.wait, &wait);
++	finish_wait(&request->execute.wait, &wait);
+ 
+ 	if (flags & I915_WAIT_LOCKED)
+ 		remove_wait_queue(q, &reset);
+@@ -902,13 +916,14 @@ long i915_wait_request(struct drm_i915_gem_request *req,
+ 
+ 	trace_i915_gem_request_wait_begin(req);
+ 
+-	if (!i915_sw_fence_done(&req->submit)) {
+-		timeout = __i915_request_wait_for_submit(req, flags, timeout);
++	if (!i915_sw_fence_done(&req->execute)) {
++		timeout = __i915_request_wait_for_execute(req, flags, timeout);
+ 		if (timeout < 0)
+ 			goto complete;
+ 
+-		GEM_BUG_ON(!i915_sw_fence_done(&req->submit));
++		GEM_BUG_ON(!i915_sw_fence_done(&req->execute));
+ 	}
++	GEM_BUG_ON(!i915_sw_fence_done(&req->submit));
+ 	GEM_BUG_ON(!req->global_seqno);
+ 
+ 	/* Optimistic short spin before touching IRQs */
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.h b/drivers/gpu/drm/i915/i915_gem_request.h
+index a56559e..4976039 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.h
++++ b/drivers/gpu/drm/i915/i915_gem_request.h
+@@ -87,8 +87,23 @@ struct drm_i915_gem_request {
+ 	struct intel_timeline *timeline;
+ 	struct intel_signal_node signaling;
+ 
++	/* Fences for the various phases in the request's lifetime.
++	 *
++	 * The submit fence is used to await upon all of the request's
++	 * dependencies. When it is signaled, the request is ready to run.
++	 * It is used by the driver to then queue the request for execution.
++	 *
++	 * The execute fence is used to signal when the request has been
++	 * sent to hardware.
++	 *
++	 * It is illegal for the submit fence of one request to wait upon the
++	 * execute fence of an earlier request. It should be sufficient to
++	 * wait upon the submit fence of the earlier request.
++	 */
+ 	struct i915_sw_fence submit;
++	struct i915_sw_fence execute;
+ 	wait_queue_t submitq;
++	wait_queue_t execq;
+ 
+ 	u32 global_seqno;
+ 
+-- 
+1.7.5.4
+

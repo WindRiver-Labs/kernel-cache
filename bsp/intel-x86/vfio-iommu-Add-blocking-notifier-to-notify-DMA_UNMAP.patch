@@ -1,0 +1,278 @@
+From 1cb6d36929058510eb4b13935318dd548f67efbd Mon Sep 17 00:00:00 2001
+From: Kirti Wankhede <kwankhede@nvidia.com>
+Date: Thu, 17 Nov 2016 10:28:26 +0530
+Subject: [PATCH 2462/4301] vfio iommu: Add blocking notifier to notify
+ DMA_UNMAP
+
+commit c086de818dd81c3c2f7cecff23de6585b74340c0 upstream
+
+Added blocking notifier to IOMMU TYPE1 driver to notify vendor drivers
+about DMA_UNMAP.
+Exported two APIs vfio_register_notifier() and vfio_unregister_notifier().
+Notifier should be registered, if external user wants to use
+vfio_pin_pages()/vfio_unpin_pages() APIs to pin/unpin pages.
+Vendor driver should use VFIO_IOMMU_NOTIFY_DMA_UNMAP action to invalidate
+mappings.
+
+Signed-off-by: Kirti Wankhede <kwankhede@nvidia.com>
+Signed-off-by: Neo Jia <cjia@nvidia.com>
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+---
+ drivers/vfio/vfio.c             |   73 ++++++++++++++++++++++++++++++++++++++
+ drivers/vfio/vfio_iommu_type1.c |   74 ++++++++++++++++++++++++++++++++-------
+ include/linux/vfio.h            |   12 ++++++
+ 3 files changed, 146 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/vfio/vfio.c b/drivers/vfio/vfio.c
+index b162df1..9a9a22b 100644
+--- a/drivers/vfio/vfio.c
++++ b/drivers/vfio/vfio.c
+@@ -1884,6 +1884,79 @@ err_unpin_pages:
+ }
+ EXPORT_SYMBOL(vfio_unpin_pages);
+ 
++int vfio_register_notifier(struct device *dev, struct notifier_block *nb)
++{
++	struct vfio_container *container;
++	struct vfio_group *group;
++	struct vfio_iommu_driver *driver;
++	int ret;
++
++	if (!dev || !nb)
++		return -EINVAL;
++
++	group = vfio_group_get_from_dev(dev);
++	if (IS_ERR(group))
++		return PTR_ERR(group);
++
++	ret = vfio_group_add_container_user(group);
++	if (ret)
++		goto err_register_nb;
++
++	container = group->container;
++	down_read(&container->group_lock);
++
++	driver = container->iommu_driver;
++	if (likely(driver && driver->ops->register_notifier))
++		ret = driver->ops->register_notifier(container->iommu_data, nb);
++	else
++		ret = -ENOTTY;
++
++	up_read(&container->group_lock);
++	vfio_group_try_dissolve_container(group);
++
++err_register_nb:
++	vfio_group_put(group);
++	return ret;
++}
++EXPORT_SYMBOL(vfio_register_notifier);
++
++int vfio_unregister_notifier(struct device *dev, struct notifier_block *nb)
++{
++	struct vfio_container *container;
++	struct vfio_group *group;
++	struct vfio_iommu_driver *driver;
++	int ret;
++
++	if (!dev || !nb)
++		return -EINVAL;
++
++	group = vfio_group_get_from_dev(dev);
++	if (IS_ERR(group))
++		return PTR_ERR(group);
++
++	ret = vfio_group_add_container_user(group);
++	if (ret)
++		goto err_unregister_nb;
++
++	container = group->container;
++	down_read(&container->group_lock);
++
++	driver = container->iommu_driver;
++	if (likely(driver && driver->ops->unregister_notifier))
++		ret = driver->ops->unregister_notifier(container->iommu_data,
++						       nb);
++	else
++		ret = -ENOTTY;
++
++	up_read(&container->group_lock);
++	vfio_group_try_dissolve_container(group);
++
++err_unregister_nb:
++	vfio_group_put(group);
++	return ret;
++}
++EXPORT_SYMBOL(vfio_unregister_notifier);
++
+ /**
+  * Module/class support
+  */
+diff --git a/drivers/vfio/vfio_iommu_type1.c b/drivers/vfio/vfio_iommu_type1.c
+index db0901f..51810a9 100644
+--- a/drivers/vfio/vfio_iommu_type1.c
++++ b/drivers/vfio/vfio_iommu_type1.c
+@@ -38,6 +38,7 @@
+ #include <linux/workqueue.h>
+ #include <linux/pid_namespace.h>
+ #include <linux/mdev.h>
++#include <linux/notifier.h>
+ 
+ #define DRIVER_VERSION  "0.2"
+ #define DRIVER_AUTHOR   "Alex Williamson <alex.williamson@redhat.com>"
+@@ -60,6 +61,7 @@ struct vfio_iommu {
+ 	struct vfio_domain	*external_domain; /* domain for external user */
+ 	struct mutex		lock;
+ 	struct rb_root		dma_list;
++	struct blocking_notifier_head notifier;
+ 	bool			v2;
+ 	bool			nesting;
+ };
+@@ -561,7 +563,8 @@ static int vfio_iommu_type1_pin_pages(void *iommu_data,
+ 
+ 	mutex_lock(&iommu->lock);
+ 
+-	if (!iommu->external_domain) {
++	/* Fail if notifier list is empty */
++	if ((!iommu->external_domain) || (!iommu->notifier.head)) {
+ 		ret = -EINVAL;
+ 		goto pin_done;
+ 	}
+@@ -776,9 +779,9 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
+ 			     struct vfio_iommu_type1_dma_unmap *unmap)
+ {
+ 	uint64_t mask;
+-	struct vfio_dma *dma;
++	struct vfio_dma *dma, *dma_last = NULL;
+ 	size_t unmapped = 0;
+-	int ret = 0;
++	int ret = 0, retries = 0;
+ 
+ 	mask = ((uint64_t)1 << __ffs(vfio_pgsize_bitmap(iommu))) - 1;
+ 
+@@ -788,7 +791,7 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
+ 		return -EINVAL;
+ 
+ 	WARN_ON(mask & PAGE_MASK);
+-
++again:
+ 	mutex_lock(&iommu->lock);
+ 
+ 	/*
+@@ -844,6 +847,32 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
+ 		 */
+ 		if (dma->task->mm != current->mm)
+ 			break;
++
++		if (!RB_EMPTY_ROOT(&dma->pfn_list)) {
++			struct vfio_iommu_type1_dma_unmap nb_unmap;
++
++			if (dma_last == dma) {
++				BUG_ON(++retries > 10);
++			} else {
++				dma_last = dma;
++				retries = 0;
++			}
++
++			nb_unmap.iova = dma->iova;
++			nb_unmap.size = dma->size;
++
++			/*
++			 * Notify anyone (mdev vendor drivers) to invalidate and
++			 * unmap iovas within the range we're about to unmap.
++			 * Vendor drivers MUST unpin pages in response to an
++			 * invalidation.
++			 */
++			mutex_unlock(&iommu->lock);
++			blocking_notifier_call_chain(&iommu->notifier,
++						    VFIO_IOMMU_NOTIFY_DMA_UNMAP,
++						    &nb_unmap);
++			goto again;
++		}
+ 		unmapped += dma->size;
+ 		vfio_remove_dma(iommu, dma);
+ 	}
+@@ -1419,6 +1448,7 @@ static void *vfio_iommu_type1_open(unsigned long arg)
+ 	INIT_LIST_HEAD(&iommu->domain_list);
+ 	iommu->dma_list = RB_ROOT;
+ 	mutex_init(&iommu->lock);
++	BLOCKING_INIT_NOTIFIER_HEAD(&iommu->notifier);
+ 
+ 	return iommu;
+ }
+@@ -1553,16 +1583,34 @@ static long vfio_iommu_type1_ioctl(void *iommu_data,
+ 	return -ENOTTY;
+ }
+ 
++static int vfio_iommu_type1_register_notifier(void *iommu_data,
++					      struct notifier_block *nb)
++{
++	struct vfio_iommu *iommu = iommu_data;
++
++	return blocking_notifier_chain_register(&iommu->notifier, nb);
++}
++
++static int vfio_iommu_type1_unregister_notifier(void *iommu_data,
++						struct notifier_block *nb)
++{
++	struct vfio_iommu *iommu = iommu_data;
++
++	return blocking_notifier_chain_unregister(&iommu->notifier, nb);
++}
++
+ static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1 = {
+-	.name		= "vfio-iommu-type1",
+-	.owner		= THIS_MODULE,
+-	.open		= vfio_iommu_type1_open,
+-	.release	= vfio_iommu_type1_release,
+-	.ioctl		= vfio_iommu_type1_ioctl,
+-	.attach_group	= vfio_iommu_type1_attach_group,
+-	.detach_group	= vfio_iommu_type1_detach_group,
+-	.pin_pages	= vfio_iommu_type1_pin_pages,
+-	.unpin_pages	= vfio_iommu_type1_unpin_pages,
++	.name			= "vfio-iommu-type1",
++	.owner			= THIS_MODULE,
++	.open			= vfio_iommu_type1_open,
++	.release		= vfio_iommu_type1_release,
++	.ioctl			= vfio_iommu_type1_ioctl,
++	.attach_group		= vfio_iommu_type1_attach_group,
++	.detach_group		= vfio_iommu_type1_detach_group,
++	.pin_pages		= vfio_iommu_type1_pin_pages,
++	.unpin_pages		= vfio_iommu_type1_unpin_pages,
++	.register_notifier	= vfio_iommu_type1_register_notifier,
++	.unregister_notifier	= vfio_iommu_type1_unregister_notifier,
+ };
+ 
+ static int __init vfio_iommu_type1_init(void)
+diff --git a/include/linux/vfio.h b/include/linux/vfio.h
+index 3c862a0..6ab13f7 100644
+--- a/include/linux/vfio.h
++++ b/include/linux/vfio.h
+@@ -80,6 +80,10 @@ struct vfio_iommu_driver_ops {
+ 				     unsigned long *phys_pfn);
+ 	int		(*unpin_pages)(void *iommu_data,
+ 				       unsigned long *user_pfn, int npage);
++	int		(*register_notifier)(void *iommu_data,
++					     struct notifier_block *nb);
++	int		(*unregister_notifier)(void *iommu_data,
++					       struct notifier_block *nb);
+ };
+ 
+ extern int vfio_register_iommu_driver(const struct vfio_iommu_driver_ops *ops);
+@@ -103,6 +107,14 @@ extern int vfio_pin_pages(struct device *dev, unsigned long *user_pfn,
+ extern int vfio_unpin_pages(struct device *dev, unsigned long *user_pfn,
+ 			    int npage);
+ 
++#define VFIO_IOMMU_NOTIFY_DMA_UNMAP	(1)
++
++extern int vfio_register_notifier(struct device *dev,
++				  struct notifier_block *nb);
++
++extern int vfio_unregister_notifier(struct device *dev,
++				    struct notifier_block *nb);
++
+ /*
+  * Sub-module helpers
+  */
+-- 
+1.7.5.4
+

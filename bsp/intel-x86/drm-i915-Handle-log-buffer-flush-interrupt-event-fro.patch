@@ -1,0 +1,358 @@
+From 224cc855e98f9b4234b3283527c4dd96442561d9 Mon Sep 17 00:00:00 2001
+From: Sagar Arun Kamble <sagar.a.kamble@intel.com>
+Date: Wed, 12 Oct 2016 21:54:32 +0530
+Subject: [PATCH 1410/4301] drm/i915: Handle log buffer flush interrupt event
+ from GuC
+
+commit 4100b2ab3e8b2932554295ba79371d10687f1bb4 upstream
+
+GuC ukernel sends an interrupt to Host to flush the log buffer
+and expects Host to correspondingly update the read pointer
+information in the state structure, once it has consumed the
+log buffer contents by copying them to a file or buffer.
+Even if Host couldn't copy the contents, it can still update the
+read pointer so that logging state is not disturbed on GuC side.
+
+v2:
+- Use a dedicated workqueue for handling flush interrupt. (Tvrtko)
+- Reduce the overall log buffer copying time by skipping the copy of
+  crash buffer area for regular cases and copying only the state
+  structure data in first page.
+
+v3:
+ - Create a vmalloc mapping of log buffer. (Chris)
+ - Cover the flush acknowledgment under rpm get & put.(Chris)
+ - Revert the change of skipping the copy of crash dump area, as
+   not really needed, will be covered by subsequent patch.
+
+v4:
+ - Destroy the wq under the same condition in which it was created,
+   pass dev_piv pointer instead of dev to newly added GuC function,
+   add more comments & rename variable for clarity. (Tvrtko)
+
+v5:
+- Allocate & destroy the dedicated wq, for handling flush interrupt,
+  from the setup/teardown routines of GuC logging. (Chris)
+- Validate the log buffer size value retrieved from state structure
+  and do some minor cleanup. (Tvrtko)
+- Fix error/warnings reported by checkpatch. (Tvrtko)
+- Rebase.
+
+v6:
+ - Remove the interrupts_enabled check from guc_capture_logs_work, need
+   to process that last work item also, queued just before disabling the
+   interrupt as log buffer flush interrupt handling is a bit different
+   case where GuC is actually expecting an ACK from host, which should be
+   provided to keep the logging going.
+   Sync against the work will be done by caller disabling the interrupt.
+ - Don't sample the log buffer size value from state structure, directly
+   use the expected value to move the pointer & do the copy and that cannot
+   go wrong (out of bounds) as Driver only allocated the log buffer and the
+   relay buffers. Driver should refrain from interpreting the log packet,
+   as much possible and let Userspace parser detect the anomaly. (Chris)
+
+v7:
+- Use switch statement instead of 'if else' for retrieving the GuC log
+  buffer size. (Tvrtko)
+- Refactored the log buffer copying function and shortended the name of
+  couple of variables for better readability. (Tvrtko)
+
+v8:
+- Make the dedicated wq as a high priority one to further reduce the
+  turnaround time of handing log buffer flush event from GuC.
+
+Signed-off-by: Sagar Arun Kamble <sagar.a.kamble@intel.com>
+Signed-off-by: Akash Goel <akash.goel@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+---
+ drivers/gpu/drm/i915/i915_guc_submission.c |  186 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_irq.c            |   28 ++++-
+ drivers/gpu/drm/i915/intel_guc.h           |    4 +
+ 3 files changed, 217 insertions(+), 1 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_guc_submission.c b/drivers/gpu/drm/i915/i915_guc_submission.c
+index 6b77af2..1f27de2 100644
+--- a/drivers/gpu/drm/i915/i915_guc_submission.c
++++ b/drivers/gpu/drm/i915/i915_guc_submission.c
+@@ -170,6 +170,15 @@ static int host2guc_sample_forcewake(struct intel_guc *guc,
+ 	return host2guc_action(guc, data, ARRAY_SIZE(data));
+ }
+ 
++static int host2guc_logbuffer_flush_complete(struct intel_guc *guc)
++{
++	u32 data[1];
++
++	data[0] = HOST2GUC_ACTION_LOG_BUFFER_FILE_FLUSH_COMPLETE;
++
++	return host2guc_action(guc, data, 1);
++}
++
+ /*
+  * Initialise, update, or clear doorbell data shared with the GuC
+  *
+@@ -847,6 +856,163 @@ err:
+ 	return NULL;
+ }
+ 
++static void guc_move_to_next_buf(struct intel_guc *guc)
++{
++}
++
++static void *guc_get_write_buffer(struct intel_guc *guc)
++{
++	return NULL;
++}
++
++static unsigned int guc_get_log_buffer_size(enum guc_log_buffer_type type)
++{
++	switch (type) {
++	case GUC_ISR_LOG_BUFFER:
++		return (GUC_LOG_ISR_PAGES + 1) * PAGE_SIZE;
++	case GUC_DPC_LOG_BUFFER:
++		return (GUC_LOG_DPC_PAGES + 1) * PAGE_SIZE;
++	case GUC_CRASH_DUMP_LOG_BUFFER:
++		return (GUC_LOG_CRASH_PAGES + 1) * PAGE_SIZE;
++	default:
++		MISSING_CASE(type);
++	}
++
++	return 0;
++}
++
++static void guc_read_update_log_buffer(struct intel_guc *guc)
++{
++	struct guc_log_buffer_state *log_buf_state, *log_buf_snapshot_state;
++	struct guc_log_buffer_state log_buf_state_local;
++	unsigned int buffer_size, write_offset;
++	enum guc_log_buffer_type type;
++	void *src_data, *dst_data;
++
++	if (WARN_ON(!guc->log.buf_addr))
++		return;
++
++	/* Get the pointer to shared GuC log buffer */
++	log_buf_state = src_data = guc->log.buf_addr;
++
++	/* Get the pointer to local buffer to store the logs */
++	log_buf_snapshot_state = dst_data = guc_get_write_buffer(guc);
++
++	/* Actual logs are present from the 2nd page */
++	src_data += PAGE_SIZE;
++	dst_data += PAGE_SIZE;
++
++	for (type = GUC_ISR_LOG_BUFFER; type < GUC_MAX_LOG_BUFFER; type++) {
++		/* Make a copy of the state structure, inside GuC log buffer
++		 * (which is uncached mapped), on the stack to avoid reading
++		 * from it multiple times.
++		 */
++		memcpy(&log_buf_state_local, log_buf_state,
++		       sizeof(struct guc_log_buffer_state));
++		buffer_size = guc_get_log_buffer_size(type);
++		write_offset = log_buf_state_local.sampled_write_ptr;
++
++		/* Update the state of shared log buffer */
++		log_buf_state->read_ptr = write_offset;
++		log_buf_state->flush_to_file = 0;
++		log_buf_state++;
++
++		if (unlikely(!log_buf_snapshot_state))
++			continue;
++
++		/* First copy the state structure in snapshot buffer */
++		memcpy(log_buf_snapshot_state, &log_buf_state_local,
++		       sizeof(struct guc_log_buffer_state));
++
++		/* The write pointer could have been updated by GuC firmware,
++		 * after sending the flush interrupt to Host, for consistency
++		 * set write pointer value to same value of sampled_write_ptr
++		 * in the snapshot buffer.
++		 */
++		log_buf_snapshot_state->write_ptr = write_offset;
++		log_buf_snapshot_state++;
++
++		/* Now copy the actual logs. */
++		memcpy(dst_data, src_data, buffer_size);
++
++		src_data += buffer_size;
++		dst_data += buffer_size;
++
++		/* FIXME: invalidate/flush for log buffer needed */
++	}
++
++	if (log_buf_snapshot_state)
++		guc_move_to_next_buf(guc);
++}
++
++static void guc_capture_logs_work(struct work_struct *work)
++{
++	struct drm_i915_private *dev_priv =
++		container_of(work, struct drm_i915_private, guc.log.flush_work);
++
++	i915_guc_capture_logs(dev_priv);
++}
++
++static void guc_log_cleanup(struct intel_guc *guc)
++{
++	struct drm_i915_private *dev_priv = guc_to_i915(guc);
++
++	lockdep_assert_held(&dev_priv->drm.struct_mutex);
++
++	/* First disable the flush interrupt */
++	gen9_disable_guc_interrupts(dev_priv);
++
++	if (guc->log.flush_wq)
++		destroy_workqueue(guc->log.flush_wq);
++
++	guc->log.flush_wq = NULL;
++
++	if (guc->log.buf_addr)
++		i915_gem_object_unpin_map(guc->log.vma->obj);
++
++	guc->log.buf_addr = NULL;
++}
++
++static int guc_log_create_extras(struct intel_guc *guc)
++{
++	struct drm_i915_private *dev_priv = guc_to_i915(guc);
++	void *vaddr;
++	int ret;
++
++	lockdep_assert_held(&dev_priv->drm.struct_mutex);
++
++	/* Nothing to do */
++	if (i915.guc_log_level < 0)
++		return 0;
++
++	if (!guc->log.buf_addr) {
++		/* Create a vmalloc mapping of log buffer pages */
++		vaddr = i915_gem_object_pin_map(guc->log.vma->obj, I915_MAP_WB);
++		if (IS_ERR(vaddr)) {
++			ret = PTR_ERR(vaddr);
++			DRM_ERROR("Couldn't map log buffer pages %d\n", ret);
++			return ret;
++		}
++
++		guc->log.buf_addr = vaddr;
++	}
++
++	if (!guc->log.flush_wq) {
++		INIT_WORK(&guc->log.flush_work, guc_capture_logs_work);
++
++		/* Need a dedicated wq to process log buffer flush interrupts
++		 * from GuC without much delay so as to avoid any loss of logs.
++		 */
++		guc->log.flush_wq = alloc_ordered_workqueue("i915-guc_log", WQ_HIGHPRI);
++		if (guc->log.flush_wq == NULL) {
++			DRM_ERROR("Couldn't allocate the wq for GuC logging\n");
++			return -ENOMEM;
++		}
++	}
++
++	return 0;
++}
++
+ static void guc_log_create(struct intel_guc *guc)
+ {
+ 	struct i915_vma *vma;
+@@ -872,6 +1038,13 @@ static void guc_log_create(struct intel_guc *guc)
+ 		}
+ 
+ 		guc->log.vma = vma;
++
++		if (guc_log_create_extras(guc)) {
++			guc_log_cleanup(guc);
++			i915_vma_unpin_and_release(&guc->log.vma);
++			i915.guc_log_level = -1;
++			return;
++		}
+ 	}
+ 
+ 	/* each allocated unit is a page */
+@@ -1065,6 +1238,7 @@ void i915_guc_submission_fini(struct drm_i915_private *dev_priv)
+ 	struct intel_guc *guc = &dev_priv->guc;
+ 
+ 	i915_vma_unpin_and_release(&guc->ads_vma);
++	guc_log_cleanup(guc);
+ 	i915_vma_unpin_and_release(&guc->log.vma);
+ 
+ 	if (guc->ctx_pool_vma)
+@@ -1126,3 +1300,15 @@ int intel_guc_resume(struct drm_device *dev)
+ 
+ 	return host2guc_action(guc, data, ARRAY_SIZE(data));
+ }
++
++void i915_guc_capture_logs(struct drm_i915_private *dev_priv)
++{
++	guc_read_update_log_buffer(&dev_priv->guc);
++
++	/* Generally device is expected to be active only at this
++	 * time, so get/put should be really quick.
++	 */
++	intel_runtime_pm_get(dev_priv);
++	host2guc_logbuffer_flush_complete(&dev_priv->guc);
++	intel_runtime_pm_put(dev_priv);
++}
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 0f7810d..7972a72 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1705,7 +1705,33 @@ static void gen6_rps_irq_handler(struct drm_i915_private *dev_priv, u32 pm_iir)
+ static void gen9_guc_irq_handler(struct drm_i915_private *dev_priv, u32 gt_iir)
+ {
+ 	if (gt_iir & GEN9_GUC_TO_HOST_INT_EVENT) {
+-		/* TODO: Handle events for which GuC interrupted host */
++		/* Sample the log buffer flush related bits & clear them out now
++		 * itself from the message identity register to minimize the
++		 * probability of losing a flush interrupt, when there are back
++		 * to back flush interrupts.
++		 * There can be a new flush interrupt, for different log buffer
++		 * type (like for ISR), whilst Host is handling one (for DPC).
++		 * Since same bit is used in message register for ISR & DPC, it
++		 * could happen that GuC sets the bit for 2nd interrupt but Host
++		 * clears out the bit on handling the 1st interrupt.
++		 */
++		u32 msg, flush;
++
++		msg = I915_READ(SOFT_SCRATCH(15));
++		flush = msg & (GUC2HOST_MSG_CRASH_DUMP_POSTED |
++			       GUC2HOST_MSG_FLUSH_LOG_BUFFER);
++		if (flush) {
++			/* Clear the message bits that are handled */
++			I915_WRITE(SOFT_SCRATCH(15), msg & ~flush);
++
++			/* Handle flush interrupt in bottom half */
++			queue_work(dev_priv->guc.log.flush_wq,
++				   &dev_priv->guc.log.flush_work);
++		} else {
++			/* Not clearing of unhandled event bits won't result in
++			 * re-triggering of the interrupt.
++			 */
++		}
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_guc.h b/drivers/gpu/drm/i915/intel_guc.h
+index 81bd345..fb72313 100644
+--- a/drivers/gpu/drm/i915/intel_guc.h
++++ b/drivers/gpu/drm/i915/intel_guc.h
+@@ -126,6 +126,9 @@ struct intel_guc_fw {
+ struct intel_guc_log {
+ 	uint32_t flags;
+ 	struct i915_vma *vma;
++	void *buf_addr;
++	struct workqueue_struct *flush_wq;
++	struct work_struct flush_work;
+ };
+ 
+ struct intel_guc {
+@@ -170,5 +173,6 @@ int i915_guc_wq_reserve(struct drm_i915_gem_request *rq);
+ void i915_guc_wq_unreserve(struct drm_i915_gem_request *request);
+ void i915_guc_submission_disable(struct drm_i915_private *dev_priv);
+ void i915_guc_submission_fini(struct drm_i915_private *dev_priv);
++void i915_guc_capture_logs(struct drm_i915_private *dev_priv);
+ 
+ #endif
+-- 
+1.7.5.4
+

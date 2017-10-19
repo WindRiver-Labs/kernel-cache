@@ -1,0 +1,544 @@
+From b8fae023a27bb882145dd335367624b4c9f64a55 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Wed, 14 Dec 2016 00:08:06 +0100
+Subject: [PATCH 2553/4301] drm: locking&new iterators for connector_list
+
+commit 613051dac40da1751ab269572766d3348d45a197 upstream
+
+The requirements for connector_list locking are a bit tricky:
+- We need to be able to jump over zombie conectors (i.e. with refcount
+  == 0, but not yet removed from the list). If instead we require that
+  there's no zombies on the list then the final kref_put must happen
+  under the list protection lock, which means that locking context
+  leaks all over the place. Not pretty - better to deal with zombies
+  and wrap the locking just around the list_del in the destructor.
+
+- When we walk the list we must _not_ hold the connector list lock. We
+  walk the connector list at an absolutely massive amounts of places,
+  if all those places can't ever call drm_connector_unreference the
+  code would get unecessarily complicated.
+
+- connector_list needs it own lock, again too many places that walk it
+  that we could reuse e.g. mode_config.mutex without resulting in
+  inversions.
+
+- Lots of code uses these loops to look-up a connector, i.e. they want
+  to be able to call drm_connector_reference. But on the other hand we
+  want connectors to stay on that list until they're dead (i.e.
+  connector_list can't hold a full reference), which means despite the
+  "can't hold lock for the loop body" rule we need to make sure a
+  connector doesn't suddenly become a zombie.
+
+At first Dave&I discussed various horror-show approaches using srcu,
+but turns out it's fairly easy:
+
+- For the loop body we always hold an additional reference to the
+  current connector. That means it can't zombify, and it also means
+  it'll stay on the list, which means we can use it as our iterator to
+  find the next connector.
+
+- When we try to find the next connector we only have to jump over
+  zombies. To make sure we don't chase bad pointers that entire loop
+  is protected with the new connect_list_lock spinlock. And because we
+  know that we're starting out with a non-zombie (need to drop our
+  reference for the old connector only after we have our new one),
+  we're guranteed to still be on the connector_list and either find
+  the next non-zombie or complete the iteration.
+
+- Only downside is that we need to make sure that the temporary
+  reference for the loop body doesn't leak. iter_get/put() functions +
+  lockdep make sure that's the case.
+
+- To avoid a flag day the new iterator macro has an _iter postfix. We
+  can rename it back once all the users of the unsafe version are gone
+  (there's about 100 list walkers for the connector_list).
+
+For now this patch only converts all the list walking in the core,
+leaving helpers and drivers for later patches. The nice thing is that
+we can now finally remove 2 FIXME comments from the
+register/unregister functions.
+
+v2:
+- use irqsafe spinlocks, so that we can use this in drm_state_dump
+  too.
+- nuke drm_modeset_lock_all from drm_connector_init, now entirely
+  cargo-culted nonsense.
+
+v3:
+- do {} while (!kref_get_unless_zero), makes for a tidier loop (Dave).
+- pretty kerneldoc
+- add EXPORT_SYMBOL, helpers&drivers are supposed to use this.
+
+v4: Change lockdep annotations to only check whether we release the
+iter fake lock again (i.e. make sure that iter_put is called), but
+not check any locking dependecies itself. That seams to require a
+recursive read lock in trylock mode.
+
+Cc: Dave Airlie <airlied@gmail.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Sean Paul <seanpaul@chromium.org>
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161213230814.19598-6-daniel.vetter@ffwll.ch
+---
+ drivers/gpu/drm/drm_atomic.c      |   14 ++++-
+ drivers/gpu/drm/drm_connector.c   |  116 +++++++++++++++++++++++++++++++------
+ drivers/gpu/drm/drm_encoder.c     |    6 ++-
+ drivers/gpu/drm/drm_mode_config.c |   34 +++++------
+ include/drm/drm_connector.h       |   38 ++++++++++++
+ include/drm/drm_mode_config.h     |   12 +++-
+ 6 files changed, 177 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_atomic.c b/drivers/gpu/drm/drm_atomic.c
+index ff38592..b1b5401 100644
+--- a/drivers/gpu/drm/drm_atomic.c
++++ b/drivers/gpu/drm/drm_atomic.c
+@@ -1417,6 +1417,7 @@ drm_atomic_add_affected_connectors(struct drm_atomic_state *state,
+ 	struct drm_mode_config *config = &state->dev->mode_config;
+ 	struct drm_connector *connector;
+ 	struct drm_connector_state *conn_state;
++	struct drm_connector_list_iter conn_iter;
+ 	int ret;
+ 
+ 	ret = drm_modeset_lock(&config->connection_mutex, state->acquire_ctx);
+@@ -1430,14 +1431,18 @@ drm_atomic_add_affected_connectors(struct drm_atomic_state *state,
+ 	 * Changed connectors are already in @state, so only need to look at the
+ 	 * current configuration.
+ 	 */
+-	drm_for_each_connector(connector, state->dev) {
++	drm_connector_list_iter_get(state->dev, &conn_iter);
++	drm_for_each_connector_iter(connector, &conn_iter) {
+ 		if (connector->state->crtc != crtc)
+ 			continue;
+ 
+ 		conn_state = drm_atomic_get_connector_state(state, connector);
+-		if (IS_ERR(conn_state))
++		if (IS_ERR(conn_state)) {
++			drm_connector_list_iter_put(&conn_iter);
+ 			return PTR_ERR(conn_state);
++		}
+ 	}
++	drm_connector_list_iter_put(&conn_iter);
+ 
+ 	return 0;
+ }
+@@ -1692,6 +1697,7 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p)
+ 	struct drm_plane *plane;
+ 	struct drm_crtc *crtc;
+ 	struct drm_connector *connector;
++	struct drm_connector_list_iter conn_iter;
+ 
+ 	if (!drm_core_check_feature(dev, DRIVER_ATOMIC))
+ 		return;
+@@ -1702,8 +1708,10 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p)
+ 	list_for_each_entry(crtc, &config->crtc_list, head)
+ 		drm_atomic_crtc_print_state(p, crtc->state);
+ 
+-	list_for_each_entry(connector, &config->connector_list, head)
++	drm_connector_list_iter_get(dev, &conn_iter);
++	drm_for_each_connector_iter(connector, &conn_iter)
+ 		drm_atomic_connector_print_state(p, connector->state);
++	drm_connector_list_iter_put(&conn_iter);
+ }
+ EXPORT_SYMBOL(drm_state_dump);
+ 
+diff --git a/drivers/gpu/drm/drm_connector.c b/drivers/gpu/drm/drm_connector.c
+index 40f8126..0202258 100644
+--- a/drivers/gpu/drm/drm_connector.c
++++ b/drivers/gpu/drm/drm_connector.c
+@@ -190,13 +190,11 @@ int drm_connector_init(struct drm_device *dev,
+ 	struct ida *connector_ida =
+ 		&drm_connector_enum_list[connector_type].ida;
+ 
+-	drm_modeset_lock_all(dev);
+-
+ 	ret = drm_mode_object_get_reg(dev, &connector->base,
+ 				      DRM_MODE_OBJECT_CONNECTOR,
+ 				      false, drm_connector_free);
+ 	if (ret)
+-		goto out_unlock;
++		return ret;
+ 
+ 	connector->base.properties = &connector->properties;
+ 	connector->dev = dev;
+@@ -233,8 +231,10 @@ int drm_connector_init(struct drm_device *dev,
+ 
+ 	/* We should add connectors at the end to avoid upsetting the connector
+ 	 * index too much. */
++	spin_lock_irq(&config->connector_list_lock);
+ 	list_add_tail(&connector->head, &config->connector_list);
+ 	config->num_connector++;
++	spin_unlock_irq(&config->connector_list_lock);
+ 
+ 	if (connector_type != DRM_MODE_CONNECTOR_VIRTUAL)
+ 		drm_object_attach_property(&connector->base,
+@@ -259,9 +259,6 @@ out_put:
+ 	if (ret)
+ 		drm_mode_object_unregister(dev, &connector->base);
+ 
+-out_unlock:
+-	drm_modeset_unlock_all(dev);
+-
+ 	return ret;
+ }
+ EXPORT_SYMBOL(drm_connector_init);
+@@ -352,8 +349,10 @@ void drm_connector_cleanup(struct drm_connector *connector)
+ 	drm_mode_object_unregister(dev, &connector->base);
+ 	kfree(connector->name);
+ 	connector->name = NULL;
++	spin_lock_irq(&dev->mode_config.connector_list_lock);
+ 	list_del(&connector->head);
+ 	dev->mode_config.num_connector--;
++	spin_unlock_irq(&dev->mode_config.connector_list_lock);
+ 
+ 	WARN_ON(connector->state && !connector->funcs->atomic_destroy_state);
+ 	if (connector->state && connector->funcs->atomic_destroy_state)
+@@ -432,30 +431,30 @@ EXPORT_SYMBOL(drm_connector_unregister);
+ void drm_connector_unregister_all(struct drm_device *dev)
+ {
+ 	struct drm_connector *connector;
++	struct drm_connector_list_iter conn_iter;
+ 
+-	/* FIXME: taking the mode config mutex ends up in a clash with sysfs */
+-	list_for_each_entry(connector, &dev->mode_config.connector_list, head)
++	drm_connector_list_iter_get(dev, &conn_iter);
++	drm_for_each_connector_iter(connector, &conn_iter)
+ 		drm_connector_unregister(connector);
++	drm_connector_list_iter_put(&conn_iter);
+ }
+ 
+ int drm_connector_register_all(struct drm_device *dev)
+ {
+ 	struct drm_connector *connector;
+-	int ret;
++	struct drm_connector_list_iter conn_iter;
++	int ret = 0;
+ 
+-	/* FIXME: taking the mode config mutex ends up in a clash with
+-	 * fbcon/backlight registration */
+-	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
++	drm_connector_list_iter_get(dev, &conn_iter);
++	drm_for_each_connector_iter(connector, &conn_iter) {
+ 		ret = drm_connector_register(connector);
+ 		if (ret)
+-			goto err;
++			break;
+ 	}
++	drm_connector_list_iter_put(&conn_iter);
+ 
+-	return 0;
+-
+-err:
+-	mutex_unlock(&dev->mode_config.mutex);
+-	drm_connector_unregister_all(dev);
++	if (ret)
++		drm_connector_unregister_all(dev);
+ 	return ret;
+ }
+ 
+@@ -477,6 +476,87 @@ const char *drm_get_connector_status_name(enum drm_connector_status status)
+ }
+ EXPORT_SYMBOL(drm_get_connector_status_name);
+ 
++#ifdef CONFIG_LOCKDEP
++static struct lockdep_map connector_list_iter_dep_map = {
++	.name = "drm_connector_list_iter"
++};
++#endif
++
++/**
++ * drm_connector_list_iter_get - initialize a connector_list iterator
++ * @dev: DRM device
++ * @iter: connector_list iterator
++ *
++ * Sets @iter up to walk the connector list in &drm_mode_config of @dev. @iter
++ * must always be cleaned up again by calling drm_connector_list_iter_put().
++ * Iteration itself happens using drm_connector_list_iter_next() or
++ * drm_for_each_connector_iter().
++ */
++void drm_connector_list_iter_get(struct drm_device *dev,
++				 struct drm_connector_list_iter *iter)
++{
++	iter->dev = dev;
++	iter->conn = NULL;
++	lock_acquire_shared_recursive(&connector_list_iter_dep_map, 0, 1, NULL, _RET_IP_);
++}
++EXPORT_SYMBOL(drm_connector_list_iter_get);
++
++/**
++ * drm_connector_list_iter_next - return next connector
++ * @iter: connectr_list iterator
++ *
++ * Returns the next connector for @iter, or NULL when the list walk has
++ * completed.
++ */
++struct drm_connector *
++drm_connector_list_iter_next(struct drm_connector_list_iter *iter)
++{
++	struct drm_connector *old_conn = iter->conn;
++	struct drm_mode_config *config = &iter->dev->mode_config;
++	struct list_head *lhead;
++	unsigned long flags;
++
++	spin_lock_irqsave(&config->connector_list_lock, flags);
++	lhead = old_conn ? &old_conn->head : &config->connector_list;
++
++	do {
++		if (lhead->next == &config->connector_list) {
++			iter->conn = NULL;
++			break;
++		}
++
++		lhead = lhead->next;
++		iter->conn = list_entry(lhead, struct drm_connector, head);
++
++		/* loop until it's not a zombie connector */
++	} while (!kref_get_unless_zero(&iter->conn->base.refcount));
++	spin_unlock_irqrestore(&config->connector_list_lock, flags);
++
++	if (old_conn)
++		drm_connector_unreference(old_conn);
++
++	return iter->conn;
++}
++EXPORT_SYMBOL(drm_connector_list_iter_next);
++
++/**
++ * drm_connector_list_iter_put - tear down a connector_list iterator
++ * @iter: connector_list iterator
++ *
++ * Tears down @iter and releases any resources (like &drm_connector references)
++ * acquired while walking the list. This must always be called, both when the
++ * iteration completes fully or when it was aborted without walking the entire
++ * list.
++ */
++void drm_connector_list_iter_put(struct drm_connector_list_iter *iter)
++{
++	iter->dev = NULL;
++	if (iter->conn)
++		drm_connector_unreference(iter->conn);
++	lock_release(&connector_list_iter_dep_map, 0, _RET_IP_);
++}
++EXPORT_SYMBOL(drm_connector_list_iter_put);
++
+ static const struct drm_prop_enum_list drm_subpixel_enum_list[] = {
+ 	{ SubPixelUnknown, "Unknown" },
+ 	{ SubPixelHorizontalRGB, "Horizontal RGB" },
+diff --git a/drivers/gpu/drm/drm_encoder.c b/drivers/gpu/drm/drm_encoder.c
+index 5dde3c6..5f0598e 100644
+--- a/drivers/gpu/drm/drm_encoder.c
++++ b/drivers/gpu/drm/drm_encoder.c
+@@ -184,10 +184,12 @@ static struct drm_crtc *drm_encoder_get_crtc(struct drm_encoder *encoder)
+ 	struct drm_connector *connector;
+ 	struct drm_device *dev = encoder->dev;
+ 	bool uses_atomic = false;
++	struct drm_connector_list_iter conn_iter;
+ 
+ 	/* For atomic drivers only state objects are synchronously updated and
+ 	 * protected by modeset locks, so check those first. */
+-	drm_for_each_connector(connector, dev) {
++	drm_connector_list_iter_get(dev, &conn_iter);
++	drm_for_each_connector_iter(connector, &conn_iter) {
+ 		if (!connector->state)
+ 			continue;
+ 
+@@ -196,8 +198,10 @@ static struct drm_crtc *drm_encoder_get_crtc(struct drm_encoder *encoder)
+ 		if (connector->state->best_encoder != encoder)
+ 			continue;
+ 
++		drm_connector_list_iter_put(&conn_iter);
+ 		return connector->state->crtc;
+ 	}
++	drm_connector_list_iter_put(&conn_iter);
+ 
+ 	/* Don't return stale data (e.g. pending async disable). */
+ 	if (uses_atomic)
+diff --git a/drivers/gpu/drm/drm_mode_config.c b/drivers/gpu/drm/drm_mode_config.c
+index a9a40dc..649f1da 100644
+--- a/drivers/gpu/drm/drm_mode_config.c
++++ b/drivers/gpu/drm/drm_mode_config.c
+@@ -94,6 +94,7 @@ int drm_mode_getresources(struct drm_device *dev, void *data,
+ 	uint32_t __user *crtc_id;
+ 	uint32_t __user *connector_id;
+ 	uint32_t __user *encoder_id;
++	struct drm_connector_list_iter conn_iter;
+ 
+ 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
+ 		return -EINVAL;
+@@ -113,9 +114,6 @@ int drm_mode_getresources(struct drm_device *dev, void *data,
+ 	card_res->count_fbs = count;
+ 	mutex_unlock(&file_priv->fbs_lock);
+ 
+-	/* mode_config.mutex protects the connector list against e.g. DP MST
+-	 * connector hot-adding. CRTC/Plane lists are invariant. */
+-	mutex_lock(&dev->mode_config.mutex);
+ 	card_res->max_height = dev->mode_config.max_height;
+ 	card_res->min_height = dev->mode_config.min_height;
+ 	card_res->max_width = dev->mode_config.max_width;
+@@ -125,10 +123,8 @@ int drm_mode_getresources(struct drm_device *dev, void *data,
+ 	crtc_id = u64_to_user_ptr(card_res->crtc_id_ptr);
+ 	drm_for_each_crtc(crtc, dev) {
+ 		if (count < card_res->count_crtcs &&
+-		    put_user(crtc->base.id, crtc_id + count)) {
+-			ret = -EFAULT;
+-			goto out;
+-		}
++		    put_user(crtc->base.id, crtc_id + count))
++			return -EFAULT;
+ 		count++;
+ 	}
+ 	card_res->count_crtcs = count;
+@@ -137,28 +133,26 @@ int drm_mode_getresources(struct drm_device *dev, void *data,
+ 	encoder_id = u64_to_user_ptr(card_res->encoder_id_ptr);
+ 	drm_for_each_encoder(encoder, dev) {
+ 		if (count < card_res->count_encoders &&
+-		    put_user(encoder->base.id, encoder_id + count)) {
+-			ret = -EFAULT;
+-			goto out;
+-		}
++		    put_user(encoder->base.id, encoder_id + count))
++			return -EFAULT;
+ 		count++;
+ 	}
+ 	card_res->count_encoders = count;
+ 
++	drm_connector_list_iter_get(dev, &conn_iter);
+ 	count = 0;
+ 	connector_id = u64_to_user_ptr(card_res->connector_id_ptr);
+-	drm_for_each_connector(connector, dev) {
++	drm_for_each_connector_iter(connector, &conn_iter) {
+ 		if (count < card_res->count_connectors &&
+ 		    put_user(connector->base.id, connector_id + count)) {
+-			ret = -EFAULT;
+-			goto out;
++			drm_connector_list_iter_put(&conn_iter);
++			return -EFAULT;
+ 		}
+ 		count++;
+ 	}
+ 	card_res->count_connectors = count;
++	drm_connector_list_iter_put(&conn_iter);
+ 
+-out:
+-	mutex_unlock(&dev->mode_config.mutex);
+ 	return ret;
+ }
+ 
+@@ -176,6 +170,7 @@ void drm_mode_config_reset(struct drm_device *dev)
+ 	struct drm_plane *plane;
+ 	struct drm_encoder *encoder;
+ 	struct drm_connector *connector;
++	struct drm_connector_list_iter conn_iter;
+ 
+ 	drm_for_each_plane(plane, dev)
+ 		if (plane->funcs->reset)
+@@ -189,11 +184,11 @@ void drm_mode_config_reset(struct drm_device *dev)
+ 		if (encoder->funcs->reset)
+ 			encoder->funcs->reset(encoder);
+ 
+-	mutex_lock(&dev->mode_config.mutex);
+-	drm_for_each_connector(connector, dev)
++	drm_connector_list_iter_get(dev, &conn_iter);
++	drm_for_each_connector_iter(connector, &conn_iter)
+ 		if (connector->funcs->reset)
+ 			connector->funcs->reset(connector);
+-	mutex_unlock(&dev->mode_config.mutex);
++	drm_connector_list_iter_put(&conn_iter);
+ }
+ EXPORT_SYMBOL(drm_mode_config_reset);
+ 
+@@ -374,6 +369,7 @@ void drm_mode_config_init(struct drm_device *dev)
+ 	idr_init(&dev->mode_config.crtc_idr);
+ 	idr_init(&dev->mode_config.tile_idr);
+ 	ida_init(&dev->mode_config.connector_ida);
++	spin_lock_init(&dev->mode_config.connector_list_lock);
+ 
+ 	drm_mode_create_standard_properties(dev);
+ 
+diff --git a/include/drm/drm_connector.h b/include/drm/drm_connector.h
+index a9b9524..0e41a2e 100644
+--- a/include/drm/drm_connector.h
++++ b/include/drm/drm_connector.h
+@@ -839,6 +839,11 @@ void drm_mode_put_tile_group(struct drm_device *dev,
+  * @dev: the DRM device
+  *
+  * Iterate over all connectors of @dev.
++ *
++ * WARNING:
++ *
++ * This iterator is not safe against hotadd/removal of connectors and is
++ * deprecated. Use drm_for_each_connector_iter() instead.
+  */
+ #define drm_for_each_connector(connector, dev) \
+ 	for (assert_drm_connector_list_read_locked(&(dev)->mode_config),	\
+@@ -847,4 +852,37 @@ void drm_mode_put_tile_group(struct drm_device *dev,
+ 	     &connector->head != (&(dev)->mode_config.connector_list);		\
+ 	     connector = list_next_entry(connector, head))
+ 
++/**
++ * struct drm_connector_list_iter - connector_list iterator
++ *
++ * This iterator tracks state needed to be able to walk the connector_list
++ * within struct drm_mode_config. Only use together with
++ * drm_connector_list_iter_get(), drm_connector_list_iter_put() and
++ * drm_connector_list_iter_next() respectively the convenience macro
++ * drm_for_each_connector_iter().
++ */
++struct drm_connector_list_iter {
++/* private: */
++	struct drm_device *dev;
++	struct drm_connector *conn;
++};
++
++void drm_connector_list_iter_get(struct drm_device *dev,
++				 struct drm_connector_list_iter *iter);
++struct drm_connector *
++drm_connector_list_iter_next(struct drm_connector_list_iter *iter);
++void drm_connector_list_iter_put(struct drm_connector_list_iter *iter);
++
++/**
++ * drm_for_each_connector_iter - connector_list iterator macro
++ * @connector: struct &drm_connector pointer used as cursor
++ * @iter: struct &drm_connector_list_iter
++ *
++ * Note that @connector is only valid within the list body, if you want to use
++ * @connector after calling drm_connector_list_iter_put() then you need to grab
++ * your own reference first using drm_connector_reference().
++ */
++#define drm_for_each_connector_iter(connector, iter) \
++	while ((connector = drm_connector_list_iter_next(iter)))
++
+ #endif
+diff --git a/include/drm/drm_mode_config.h b/include/drm/drm_mode_config.h
+index bf9991b..5b73554 100644
+--- a/include/drm/drm_mode_config.h
++++ b/include/drm/drm_mode_config.h
+@@ -365,7 +365,13 @@ struct drm_mode_config {
+ 	struct list_head fb_list;
+ 
+ 	/**
+-	 * @num_connector: Number of connectors on this device.
++	 * @connector_list_lock: Protects @num_connector and
++	 * @connector_list.
++	 */
++	spinlock_t connector_list_lock;
++	/**
++	 * @num_connector: Number of connectors on this device. Protected by
++	 * @connector_list_lock.
+ 	 */
+ 	int num_connector;
+ 	/**
+@@ -373,7 +379,9 @@ struct drm_mode_config {
+ 	 */
+ 	struct ida connector_ida;
+ 	/**
+-	 * @connector_list: List of connector objects.
++	 * @connector_list: List of connector objects. Protected by
++	 * @connector_list_lock. Only use drm_for_each_connector_iter() and
++	 * struct &drm_connector_list_iter to walk this list.
+ 	 */
+ 	struct list_head connector_list;
+ 	int num_encoder;
+-- 
+1.7.5.4
+

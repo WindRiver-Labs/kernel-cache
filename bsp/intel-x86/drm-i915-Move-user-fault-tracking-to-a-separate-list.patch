@@ -1,0 +1,225 @@
+From 65fe52bd133b452ba13f9265c1b5cd2591a06044 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 24 Oct 2016 13:42:14 +0100
+Subject: [PATCH 1365/4301] drm/i915: Move user fault tracking to a separate
+ list
+
+commit 275f039db56f998aaf6e2fc74acd1f653cdcb480 upstream
+
+We want to decouple RPM and struct_mutex, but currently RPM has to walk
+the list of bound objects and remove userspace mmapping before we
+suspend (otherwise userspace may continue to access the GTT whilst it is
+powered down). This currently requires the struct_mutex to walk the
+bound_list, but if we move that to a separate list and lock we can take
+the first step towards removing the struct_mutex.
+
+v2: Split runtime suspend unmapping vs regular unmapping, to make the
+locking (and barriers) clearer. Add the object to the userfault_list
+prior to inserting the first PTE, the race between add/revoke depends
+upon struct_mutex for regular unmappings and rpm for runtime-suspend.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch> #v1
+Link: http://patchwork.freedesktop.org/patch/msgid/20161024124218.18252-1-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_debugfs.c   |    2 +-
+ drivers/gpu/drm/i915/i915_drv.h       |   20 ++++++++++-----
+ drivers/gpu/drm/i915/i915_gem.c       |   42 +++++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/i915_gem_evict.c |    2 +-
+ drivers/gpu/drm/i915/i915_gem_fence.c |    2 +-
+ 5 files changed, 49 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index dc057c7..2d9617a 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -107,7 +107,7 @@ static char get_tiling_flag(struct drm_i915_gem_object *obj)
+ 
+ static char get_global_flag(struct drm_i915_gem_object *obj)
+ {
+-	return obj->fault_mappable ? 'g' : ' ';
++	return !list_empty(&obj->userfault_link) ? 'g' : ' ';
+ }
+ 
+ static char get_pin_mapped_flag(struct drm_i915_gem_object *obj)
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 3a7c0e1..6164d4a 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1375,6 +1375,14 @@ struct i915_gem_mm {
+ 	 */
+ 	struct list_head unbound_list;
+ 
++	/** Protects access to the userfault_list */
++	spinlock_t userfault_lock;
++
++	/** List of all objects in gtt_space, currently mmaped by userspace.
++	 * All objects within this list must also be on bound_list.
++	 */
++	struct list_head userfault_list;
++
+ 	/** Usable portion of the GTT for GEM */
+ 	unsigned long stolen_base; /* limited to low memory (32-bit) */
+ 
+@@ -2232,6 +2240,11 @@ struct drm_i915_gem_object {
+ 	struct drm_mm_node *stolen;
+ 	struct list_head global_list;
+ 
++	/**
++	 * Whether the object is currently in the GGTT mmap.
++	 */
++	struct list_head userfault_link;
++
+ 	/** Used in execbuf to temporarily hold a ref */
+ 	struct list_head obj_exec_link;
+ 
+@@ -2259,13 +2272,6 @@ struct drm_i915_gem_object {
+ 	 */
+ 	unsigned int madv:2;
+ 
+-	/**
+-	 * Whether the current gtt mapping needs to be mappable (and isn't just
+-	 * mappable by accident). Track pin and fault separate for a more
+-	 * accurate mappable working set.
+-	 */
+-	unsigned int fault_mappable:1;
+-
+ 	/*
+ 	 * Is the object to be mapped as read-only to the GPU
+ 	 * Only honoured if hardware has relevant pte bit
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 0fed9ce..34e5f4b 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1839,16 +1839,19 @@ int i915_gem_fault(struct vm_area_struct *area, struct vm_fault *vmf)
+ 	if (ret)
+ 		goto err_unpin;
+ 
++	/* Mark as being mmapped into userspace for later revocation */
++	spin_lock(&dev_priv->mm.userfault_lock);
++	if (list_empty(&obj->userfault_link))
++		list_add(&obj->userfault_link, &dev_priv->mm.userfault_list);
++	spin_unlock(&dev_priv->mm.userfault_lock);
++
+ 	/* Finally, remap it using the new GTT offset */
+ 	ret = remap_io_mapping(area,
+ 			       area->vm_start + (vma->ggtt_view.params.partial.offset << PAGE_SHIFT),
+ 			       (ggtt->mappable_base + vma->node.start) >> PAGE_SHIFT,
+ 			       min_t(u64, vma->size, area->vm_end - area->vm_start),
+ 			       &ggtt->mappable);
+-	if (ret)
+-		goto err_unpin;
+ 
+-	obj->fault_mappable = true;
+ err_unpin:
+ 	__i915_vma_unpin(vma);
+ err_unlock:
+@@ -1916,13 +1919,22 @@ err:
+ void
+ i915_gem_release_mmap(struct drm_i915_gem_object *obj)
+ {
++	struct drm_i915_private *i915 = to_i915(obj->base.dev);
++	bool zap = false;
++
+ 	/* Serialisation between user GTT access and our code depends upon
+ 	 * revoking the CPU's PTE whilst the mutex is held. The next user
+ 	 * pagefault then has to wait until we release the mutex.
+ 	 */
+-	lockdep_assert_held(&obj->base.dev->struct_mutex);
++	lockdep_assert_held(&i915->drm.struct_mutex);
+ 
+-	if (!obj->fault_mappable)
++	spin_lock(&i915->mm.userfault_lock);
++	if (!list_empty(&obj->userfault_link)) {
++		list_del_init(&obj->userfault_link);
++		zap = true;
++	}
++	spin_unlock(&i915->mm.userfault_lock);
++	if (!zap)
+ 		return;
+ 
+ 	drm_vma_node_unmap(&obj->base.vma_node,
+@@ -1936,8 +1948,6 @@ i915_gem_release_mmap(struct drm_i915_gem_object *obj)
+ 	 * memory writes before touching registers / GSM.
+ 	 */
+ 	wmb();
+-
+-	obj->fault_mappable = false;
+ }
+ 
+ void
+@@ -1945,8 +1955,19 @@ i915_gem_release_all_mmaps(struct drm_i915_private *dev_priv)
+ {
+ 	struct drm_i915_gem_object *obj;
+ 
+-	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_list)
+-		i915_gem_release_mmap(obj);
++	spin_lock(&dev_priv->mm.userfault_lock);
++	while ((obj = list_first_entry_or_null(&dev_priv->mm.userfault_list,
++					       struct drm_i915_gem_object,
++					       userfault_link))) {
++		list_del_init(&obj->userfault_link);
++		spin_unlock(&dev_priv->mm.userfault_lock);
++
++		drm_vma_node_unmap(&obj->base.vma_node,
++				   obj->base.dev->anon_inode->i_mapping);
++
++		spin_lock(&dev_priv->mm.userfault_lock);
++	}
++	spin_unlock(&dev_priv->mm.userfault_lock);
+ }
+ 
+ /**
+@@ -4125,6 +4146,7 @@ void i915_gem_object_init(struct drm_i915_gem_object *obj,
+ 	int i;
+ 
+ 	INIT_LIST_HEAD(&obj->global_list);
++	INIT_LIST_HEAD(&obj->userfault_link);
+ 	for (i = 0; i < I915_NUM_ENGINES; i++)
+ 		init_request_active(&obj->last_read[i],
+ 				    i915_gem_object_retire__read);
+@@ -4538,6 +4560,7 @@ int i915_gem_init(struct drm_device *dev)
+ 	int ret;
+ 
+ 	mutex_lock(&dev->struct_mutex);
++	spin_lock_init(&dev_priv->mm.userfault_lock);
+ 
+ 	if (!i915.enable_execlists) {
+ 		dev_priv->gt.resume = intel_legacy_submission_resume;
+@@ -4657,6 +4680,7 @@ i915_gem_load_init(struct drm_device *dev)
+ 	INIT_LIST_HEAD(&dev_priv->mm.unbound_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.bound_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.fence_list);
++	INIT_LIST_HEAD(&dev_priv->mm.userfault_list);
+ 	INIT_DELAYED_WORK(&dev_priv->gt.retire_work,
+ 			  i915_gem_retire_work_handler);
+ 	INIT_DELAYED_WORK(&dev_priv->gt.idle_work,
+diff --git a/drivers/gpu/drm/i915/i915_gem_evict.c b/drivers/gpu/drm/i915/i915_gem_evict.c
+index b5e9e66..a934f37 100644
+--- a/drivers/gpu/drm/i915/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/i915_gem_evict.c
+@@ -56,7 +56,7 @@ mark_free(struct i915_vma *vma, unsigned int flags, struct list_head *unwind)
+ 	if (WARN_ON(!list_empty(&vma->exec_list)))
+ 		return false;
+ 
+-	if (flags & PIN_NONFAULT && vma->obj->fault_mappable)
++	if (flags & PIN_NONFAULT && !list_empty(&vma->obj->userfault_link))
+ 		return false;
+ 
+ 	list_add(&vma->exec_list, unwind);
+diff --git a/drivers/gpu/drm/i915/i915_gem_fence.c b/drivers/gpu/drm/i915/i915_gem_fence.c
+index a6daf2d..6701317 100644
+--- a/drivers/gpu/drm/i915/i915_gem_fence.c
++++ b/drivers/gpu/drm/i915/i915_gem_fence.c
+@@ -391,7 +391,7 @@ void i915_gem_restore_fences(struct drm_device *dev)
+ 		 */
+ 		if (vma && !i915_gem_object_is_tiled(vma->obj)) {
+ 			GEM_BUG_ON(!reg->dirty);
+-			GEM_BUG_ON(vma->obj->fault_mappable);
++			GEM_BUG_ON(!list_empty(&vma->obj->userfault_link));
+ 
+ 			list_move(&reg->link, &dev_priv->mm.fence_list);
+ 			vma->fence = NULL;
+-- 
+1.7.5.4
+

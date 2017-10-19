@@ -1,0 +1,178 @@
+From ae60fceb80bb009857d4dc21adc20b134f890658 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 6 Dec 2016 12:40:51 +0000
+Subject: [PATCH 2210/4301] drm/i915: Use memcpy_from_wc for GPU error capture
+
+commit d637c17832bd020c27b3c29c0bd27275d1af9132 upstream
+
+On all platforms we now always read the contents of buffers via the GTT,
+i.e. using WC cpu access. Reads are slow, but they can be accelerated
+with an internal read buffer using sse4.1 (movntqda). This is our
+i915_memcpy_from_wc() routine which also checks for sse4.1 support and
+so we can fallback to using a regular slow memcpy if we need to.
+
+When compressing the pages, the reads are currently done inside zlib's
+fill_window() routine and so we must copy the page into a temporary
+which is then already inside the CPU cache and fast for zlib's
+compression. When not compressing the pages, we don't need a temporary
+and can just use the accelerated read from WC into the destination.
+
+v2: Use zstream locals to reduce diff and allocate the additional
+temporary storage only if sse4.1 is supported.
+v3: Use length=0 for the sse4.1 support check
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161206124051.17040-1-chris@chris-wilson.co.uk
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+---
+ drivers/gpu/drm/i915/i915_gpu_error.c |   50 ++++++++++++++++++++++++--------
+ 1 files changed, 37 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index a14f7ba..307999b 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -176,9 +176,14 @@ static void i915_error_puts(struct drm_i915_error_state_buf *e,
+ 
+ #ifdef CONFIG_DRM_I915_COMPRESS_ERROR
+ 
+-static bool compress_init(struct z_stream_s *zstream)
++struct compress {
++	struct z_stream_s zstream;
++	void *tmp;
++};
++
++static bool compress_init(struct compress *c)
+ {
+-	memset(zstream, 0, sizeof(*zstream));
++	struct z_stream_s *zstream = memset(&c->zstream, 0, sizeof(c->zstream));
+ 
+ 	zstream->workspace =
+ 		kmalloc(zlib_deflate_workspacesize(MAX_WBITS, MAX_MEM_LEVEL),
+@@ -191,14 +196,22 @@ static bool compress_init(struct z_stream_s *zstream)
+ 		return false;
+ 	}
+ 
++	c->tmp = NULL;
++	if (i915_memcpy_from_wc(NULL, 0, 0))
++		c->tmp = (void *)__get_free_page(GFP_ATOMIC | __GFP_NOWARN);
++
+ 	return true;
+ }
+ 
+-static int compress_page(struct z_stream_s *zstream,
++static int compress_page(struct compress *c,
+ 			 void *src,
+ 			 struct drm_i915_error_object *dst)
+ {
++	struct z_stream_s *zstream = &c->zstream;
++
+ 	zstream->next_in = src;
++	if (c->tmp && i915_memcpy_from_wc(c->tmp, src, PAGE_SIZE))
++		zstream->next_in = c->tmp;
+ 	zstream->avail_in = PAGE_SIZE;
+ 
+ 	do {
+@@ -226,9 +239,11 @@ static int compress_page(struct z_stream_s *zstream,
+ 	return 0;
+ }
+ 
+-static void compress_fini(struct z_stream_s *zstream,
++static void compress_fini(struct compress *c,
+ 			  struct drm_i915_error_object *dst)
+ {
++	struct z_stream_s *zstream = &c->zstream;
++
+ 	if (dst) {
+ 		zlib_deflate(zstream, Z_FINISH);
+ 		dst->unused = zstream->avail_out;
+@@ -236,6 +251,9 @@ static void compress_fini(struct z_stream_s *zstream,
+ 
+ 	zlib_deflateEnd(zstream);
+ 	kfree(zstream->workspace);
++
++	if (c->tmp)
++		free_page((unsigned long)c->tmp);
+ }
+ 
+ static void err_compression_marker(struct drm_i915_error_state_buf *m)
+@@ -245,28 +263,34 @@ static void err_compression_marker(struct drm_i915_error_state_buf *m)
+ 
+ #else
+ 
+-static bool compress_init(struct z_stream_s *zstream)
++struct compress {
++};
++
++static bool compress_init(struct compress *c)
+ {
+ 	return true;
+ }
+ 
+-static int compress_page(struct z_stream_s *zstream,
++static int compress_page(struct compress *c,
+ 			 void *src,
+ 			 struct drm_i915_error_object *dst)
+ {
+ 	unsigned long page;
++	void *ptr;
+ 
+ 	page = __get_free_page(GFP_ATOMIC | __GFP_NOWARN);
+ 	if (!page)
+ 		return -ENOMEM;
+ 
+-	dst->pages[dst->page_count++] =
+-		memcpy((void *)page, src, PAGE_SIZE);
++	ptr = (void *)page;
++	if (!i915_memcpy_from_wc(ptr, src, PAGE_SIZE))
++		memcpy(ptr, src, PAGE_SIZE);
++	dst->pages[dst->page_count++] = ptr;
+ 
+ 	return 0;
+ }
+ 
+-static void compress_fini(struct z_stream_s *zstream,
++static void compress_fini(struct compress *c,
+ 			  struct drm_i915_error_object *dst)
+ {
+ }
+@@ -784,7 +808,7 @@ i915_error_object_create(struct drm_i915_private *i915,
+ 	struct i915_ggtt *ggtt = &i915->ggtt;
+ 	const u64 slot = ggtt->error_capture.start;
+ 	struct drm_i915_error_object *dst;
+-	struct z_stream_s zstream;
++	struct compress compress;
+ 	unsigned long num_pages;
+ 	struct sgt_iter iter;
+ 	dma_addr_t dma;
+@@ -804,7 +828,7 @@ i915_error_object_create(struct drm_i915_private *i915,
+ 	dst->page_count = 0;
+ 	dst->unused = 0;
+ 
+-	if (!compress_init(&zstream)) {
++	if (!compress_init(&compress)) {
+ 		kfree(dst);
+ 		return NULL;
+ 	}
+@@ -817,7 +841,7 @@ i915_error_object_create(struct drm_i915_private *i915,
+ 				       I915_CACHE_NONE, 0);
+ 
+ 		s = io_mapping_map_atomic_wc(&ggtt->mappable, slot);
+-		ret = compress_page(&zstream, (void  __force *)s, dst);
++		ret = compress_page(&compress, (void  __force *)s, dst);
+ 		io_mapping_unmap_atomic(s);
+ 
+ 		if (ret)
+@@ -832,7 +856,7 @@ unwind:
+ 	dst = NULL;
+ 
+ out:
+-	compress_fini(&zstream, dst);
++	compress_fini(&compress, dst);
+ 	ggtt->base.clear_range(&ggtt->base, slot, PAGE_SIZE);
+ 	return dst;
+ }
+-- 
+1.7.5.4
+

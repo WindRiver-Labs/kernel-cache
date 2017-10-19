@@ -1,0 +1,382 @@
+From 85c5894690413558409bc10cb906eb6bd60c3568 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 28 Oct 2016 13:58:30 +0100
+Subject: [PATCH 1635/4301] drm/i915: Introduce an internal allocator for
+ disposable private objects
+
+commit 920cf4194954ec6f971506013c7fe3b7def178b6 upstream
+
+Quite a few of our objects used for internal hardware programming do not
+benefit from being swappable or from being zero initialised. As such
+they do not benefit from using a shmemfs backing storage and since they
+are internal and never directly exposed to the user, we do not need to
+worry about providing a filp. For these we can use an
+drm_i915_gem_object wrapper around a sg_table of plain struct page. They
+are not swap backed and not automatically pinned. If they are reaped
+by the shrinker, the pages are released and the contents discarded. For
+the internal use case, this is fine as for example, ringbuffers are
+pinned from being written by a request to be read by the hardware. Once
+they are idle, they can be discarded entirely. As such they are a good
+match for execlist ringbuffers and a small variety of other internal
+objects.
+
+In the first iteration, this is limited to the scratch batch buffers we
+use (for command parsing and state initialisation).
+
+v2: Allocate physically contiguous pages, where possible.
+v3: Reduce maximum order on subsequent requests following an allocation
+failure.
+v4: Fix up mismatch between swiotlb segment size and page count (it
+counts in 2k units, not 4k pages)
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161028125858.23563-7-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/Makefile                |    1 +
+ drivers/gpu/drm/i915/i915_drv.h              |    5 +
+ drivers/gpu/drm/i915/i915_gem_batch_pool.c   |   27 ++---
+ drivers/gpu/drm/i915/i915_gem_internal.c     |  170 ++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_gem_render_state.c |    2 +-
+ drivers/gpu/drm/i915/intel_engine_cs.c       |    2 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.c      |   14 ++-
+ 7 files changed, 197 insertions(+), 24 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/i915_gem_internal.c
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index b2814fc..9169a88 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -36,6 +36,7 @@ i915-y += i915_cmd_parser.o \
+ 	  i915_gem_execbuffer.o \
+ 	  i915_gem_fence.o \
+ 	  i915_gem_gtt.o \
++	  i915_gem_internal.o \
+ 	  i915_gem.o \
+ 	  i915_gem_render_state.o \
+ 	  i915_gem_request.o \
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index d34c87c..31ed5e2 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3583,6 +3583,11 @@ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
+ 					       u32 gtt_offset,
+ 					       u32 size);
+ 
++/* i915_gem_internal.c */
++struct drm_i915_gem_object *
++i915_gem_object_create_internal(struct drm_i915_private *dev_priv,
++				unsigned int size);
++
+ /* i915_gem_shrinker.c */
+ unsigned long i915_gem_shrink(struct drm_i915_private *dev_priv,
+ 			      unsigned long target,
+diff --git a/drivers/gpu/drm/i915/i915_gem_batch_pool.c b/drivers/gpu/drm/i915/i915_gem_batch_pool.c
+index cb25cad..aa4e1e0 100644
+--- a/drivers/gpu/drm/i915/i915_gem_batch_pool.c
++++ b/drivers/gpu/drm/i915/i915_gem_batch_pool.c
+@@ -97,9 +97,9 @@ i915_gem_batch_pool_get(struct i915_gem_batch_pool *pool,
+ 			size_t size)
+ {
+ 	struct drm_i915_gem_object *obj = NULL;
+-	struct drm_i915_gem_object *tmp, *next;
++	struct drm_i915_gem_object *tmp;
+ 	struct list_head *list;
+-	int n;
++	int n, ret;
+ 
+ 	lockdep_assert_held(&pool->engine->i915->drm.struct_mutex);
+ 
+@@ -112,19 +112,12 @@ i915_gem_batch_pool_get(struct i915_gem_batch_pool *pool,
+ 		n = ARRAY_SIZE(pool->cache_list) - 1;
+ 	list = &pool->cache_list[n];
+ 
+-	list_for_each_entry_safe(tmp, next, list, batch_pool_link) {
++	list_for_each_entry(tmp, list, batch_pool_link) {
+ 		/* The batches are strictly LRU ordered */
+ 		if (!i915_gem_active_is_idle(&tmp->last_read[pool->engine->id],
+ 					     &tmp->base.dev->struct_mutex))
+ 			break;
+ 
+-		/* While we're looping, do some clean up */
+-		if (tmp->madv == __I915_MADV_PURGED) {
+-			list_del(&tmp->batch_pool_link);
+-			i915_gem_object_put(tmp);
+-			continue;
+-		}
+-
+ 		if (tmp->base.size >= size) {
+ 			obj = tmp;
+ 			break;
+@@ -132,19 +125,15 @@ i915_gem_batch_pool_get(struct i915_gem_batch_pool *pool,
+ 	}
+ 
+ 	if (obj == NULL) {
+-		int ret;
+-
+-		obj = i915_gem_object_create(&pool->engine->i915->drm, size);
++		obj = i915_gem_object_create_internal(pool->engine->i915, size);
+ 		if (IS_ERR(obj))
+ 			return obj;
+-
+-		ret = i915_gem_object_get_pages(obj);
+-		if (ret)
+-			return ERR_PTR(ret);
+-
+-		obj->madv = I915_MADV_DONTNEED;
+ 	}
+ 
++	ret = i915_gem_object_get_pages(obj);
++	if (ret)
++		return ERR_PTR(ret);
++
+ 	list_move_tail(&obj->batch_pool_link, list);
+ 	i915_gem_object_pin_pages(obj);
+ 	return obj;
+diff --git a/drivers/gpu/drm/i915/i915_gem_internal.c b/drivers/gpu/drm/i915/i915_gem_internal.c
+new file mode 100644
+index 0000000..02e66fa
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_gem_internal.c
+@@ -0,0 +1,170 @@
++/*
++ * Copyright © 2014-2016 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++
++#include <drm/drmP.h>
++#include <drm/i915_drm.h>
++#include "i915_drv.h"
++
++#define QUIET (__GFP_NORETRY | __GFP_NOWARN)
++
++/* convert swiotlb segment size into sensible units (pages)! */
++#define IO_TLB_SEGPAGES (IO_TLB_SEGSIZE << IO_TLB_SHIFT >> PAGE_SHIFT)
++
++static void internal_free_pages(struct sg_table *st)
++{
++	struct scatterlist *sg;
++
++	for (sg = st->sgl; sg; sg = __sg_next(sg))
++		__free_pages(sg_page(sg), get_order(sg->length));
++
++	sg_free_table(st);
++	kfree(st);
++}
++
++static int i915_gem_object_get_pages_internal(struct drm_i915_gem_object *obj)
++{
++	struct drm_i915_private *i915 = to_i915(obj->base.dev);
++	unsigned int npages = obj->base.size / PAGE_SIZE;
++	struct sg_table *st;
++	struct scatterlist *sg;
++	int max_order;
++	gfp_t gfp;
++
++	st = kmalloc(sizeof(*st), GFP_KERNEL);
++	if (!st)
++		return -ENOMEM;
++
++	if (sg_alloc_table(st, npages, GFP_KERNEL)) {
++		kfree(st);
++		return -ENOMEM;
++	}
++
++	sg = st->sgl;
++	st->nents = 0;
++
++	max_order = MAX_ORDER;
++#ifdef CONFIG_SWIOTLB
++	if (swiotlb_nr_tbl()) /* minimum max swiotlb size is IO_TLB_SEGSIZE */
++		max_order = min(max_order, ilog2(IO_TLB_SEGPAGES));
++#endif
++
++	gfp = GFP_KERNEL | __GFP_HIGHMEM | __GFP_RECLAIMABLE;
++	if (IS_CRESTLINE(i915) || IS_BROADWATER(i915)) {
++		/* 965gm cannot relocate objects above 4GiB. */
++		gfp &= ~__GFP_HIGHMEM;
++		gfp |= __GFP_DMA32;
++	}
++
++	do {
++		int order = min(fls(npages) - 1, max_order);
++		struct page *page;
++
++		do {
++			page = alloc_pages(gfp | (order ? QUIET : 0), order);
++			if (page)
++				break;
++			if (!order--)
++				goto err;
++
++			/* Limit subsequent allocations as well */
++			max_order = order;
++		} while (1);
++
++		sg_set_page(sg, page, PAGE_SIZE << order, 0);
++		st->nents++;
++
++		npages -= 1 << order;
++		if (!npages) {
++			sg_mark_end(sg);
++			break;
++		}
++
++		sg = __sg_next(sg);
++	} while (1);
++	obj->pages = st;
++
++	if (i915_gem_gtt_prepare_object(obj)) {
++		obj->pages = NULL;
++		goto err;
++	}
++
++	/* Mark the pages as dontneed whilst they are still pinned. As soon
++	 * as they are unpinned they are allowed to be reaped by the shrinker,
++	 * and the caller is expected to repopulate - the contents of this
++	 * object are only valid whilst active and pinned.
++	 */
++	obj->madv = I915_MADV_DONTNEED;
++	return 0;
++
++err:
++	sg_mark_end(sg);
++	internal_free_pages(st);
++	return -ENOMEM;
++}
++
++static void i915_gem_object_put_pages_internal(struct drm_i915_gem_object *obj)
++{
++	i915_gem_gtt_finish_object(obj);
++	internal_free_pages(obj->pages);
++
++	obj->dirty = 0;
++	obj->madv = I915_MADV_WILLNEED;
++}
++
++static const struct drm_i915_gem_object_ops i915_gem_object_internal_ops = {
++	.flags = I915_GEM_OBJECT_HAS_STRUCT_PAGE,
++	.get_pages = i915_gem_object_get_pages_internal,
++	.put_pages = i915_gem_object_put_pages_internal,
++};
++
++/**
++ * Creates a new object that wraps some internal memory for private use.
++ * This object is not backed by swappable storage, and as such its contents
++ * are volatile and only valid whilst pinned. If the object is reaped by the
++ * shrinker, its pages and data will be discarded. Equally, it is not a full
++ * GEM object and so not valid for access from userspace. This makes it useful
++ * for hardware interfaces like ringbuffers (which are pinned from the time
++ * the request is written to the time the hardware stops accessing it), but
++ * not for contexts (which need to be preserved when not active for later
++ * reuse). Note that it is not cleared upon allocation.
++ */
++struct drm_i915_gem_object *
++i915_gem_object_create_internal(struct drm_i915_private *i915,
++				unsigned int size)
++{
++	struct drm_i915_gem_object *obj;
++
++	obj = i915_gem_object_alloc(&i915->drm);
++	if (!obj)
++		return ERR_PTR(-ENOMEM);
++
++	drm_gem_private_object_init(&i915->drm, &obj->base, size);
++	i915_gem_object_init(obj, &i915_gem_object_internal_ops);
++
++	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
++	obj->base.read_domains = I915_GEM_DOMAIN_CPU;
++	obj->cache_level = HAS_LLC(i915) ? I915_CACHE_LLC : I915_CACHE_NONE;
++
++	return obj;
++}
+diff --git a/drivers/gpu/drm/i915/i915_gem_render_state.c b/drivers/gpu/drm/i915/i915_gem_render_state.c
+index e7c3dbc..217e0b5 100644
+--- a/drivers/gpu/drm/i915/i915_gem_render_state.c
++++ b/drivers/gpu/drm/i915/i915_gem_render_state.c
+@@ -187,7 +187,7 @@ int i915_gem_render_state_init(struct drm_i915_gem_request *req)
+ 	if (so.rodata->batch_items * 4 > 4096)
+ 		return -EINVAL;
+ 
+-	obj = i915_gem_object_create(&req->i915->drm, 4096);
++	obj = i915_gem_object_create_internal(req->i915, 4096);
+ 	if (IS_ERR(obj))
+ 		return PTR_ERR(obj);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_engine_cs.c b/drivers/gpu/drm/i915/intel_engine_cs.c
+index 8cceb34..b2de371 100644
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -264,7 +264,7 @@ int intel_engine_create_scratch(struct intel_engine_cs *engine, int size)
+ 
+ 	obj = i915_gem_object_create_stolen(&engine->i915->drm, size);
+ 	if (!obj)
+-		obj = i915_gem_object_create(&engine->i915->drm, size);
++		obj = i915_gem_object_create_internal(engine->i915, size);
+ 	if (IS_ERR(obj)) {
+ 		DRM_ERROR("Failed to allocate scratch page\n");
+ 		return PTR_ERR(obj);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 562f66d..7509c77 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1774,9 +1774,10 @@ static int init_status_page(struct intel_engine_cs *engine)
+ 	struct drm_i915_gem_object *obj;
+ 	struct i915_vma *vma;
+ 	unsigned int flags;
++	void *vaddr;
+ 	int ret;
+ 
+-	obj = i915_gem_object_create(&engine->i915->drm, 4096);
++	obj = i915_gem_object_create_internal(engine->i915, 4096);
+ 	if (IS_ERR(obj)) {
+ 		DRM_ERROR("Failed to allocate status page\n");
+ 		return PTR_ERR(obj);
+@@ -1809,15 +1810,22 @@ static int init_status_page(struct intel_engine_cs *engine)
+ 	if (ret)
+ 		goto err;
+ 
++	vaddr = i915_gem_object_pin_map(obj, I915_MAP_WB);
++	if (IS_ERR(vaddr)) {
++		ret = PTR_ERR(vaddr);
++		goto err_unpin;
++	}
++
+ 	engine->status_page.vma = vma;
+ 	engine->status_page.ggtt_offset = i915_ggtt_offset(vma);
+-	engine->status_page.page_addr =
+-		i915_gem_object_pin_map(obj, I915_MAP_WB);
++	engine->status_page.page_addr = memset(vaddr, 0, 4096);
+ 
+ 	DRM_DEBUG_DRIVER("%s hws offset: 0x%08x\n",
+ 			 engine->name, i915_ggtt_offset(vma));
+ 	return 0;
+ 
++err_unpin:
++	i915_vma_unpin(vma);
+ err:
+ 	i915_gem_object_put(obj);
+ 	return ret;
+-- 
+1.7.5.4
+
