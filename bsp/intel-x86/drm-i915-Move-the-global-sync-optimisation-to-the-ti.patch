@@ -1,0 +1,309 @@
+From eecb42120dfc9a36b16cffd6e69204276013da6f Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 28 Oct 2016 13:58:53 +0100
+Subject: [PATCH 1658/4301] drm/i915: Move the global sync optimisation to the
+ timeline
+
+commit 85e17f5974b357bc4a127be09de71b430be265e0 upstream
+
+Currently we try to reduce the number of synchronisations (now the
+number of requests we need to wait upon) by noting that if we have
+earlier waited upon a request, all subsequent requests in the timeline
+will be after the wait. This only applies to requests in this timeline,
+as other timelines will not be ordered by that waiter.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161028125858.23563-30-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_debugfs.c      |    9 -----
+ drivers/gpu/drm/i915/i915_drv.h          |    1 -
+ drivers/gpu/drm/i915/i915_gem_request.c  |   29 ++++++++++-------
+ drivers/gpu/drm/i915/i915_gem_timeline.h |    1 +
+ drivers/gpu/drm/i915/i915_gpu_error.c    |   48 ++++++++++++++++++------------
+ drivers/gpu/drm/i915/intel_engine_cs.c   |    2 -
+ drivers/gpu/drm/i915/intel_ringbuffer.c  |    3 --
+ drivers/gpu/drm/i915/intel_ringbuffer.h  |   23 --------------
+ 8 files changed, 47 insertions(+), 69 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 90bc4a8..4655227 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -3347,15 +3347,6 @@ static int i915_semaphore_status(struct seq_file *m, void *unused)
+ 		seq_putc(m, '\n');
+ 	}
+ 
+-	seq_puts(m, "\nSync seqno:\n");
+-	for_each_engine(engine, dev_priv, id) {
+-		for (j = 0; j < num_rings; j++)
+-			seq_printf(m, "  0x%08x ",
+-				   engine->semaphore.sync_seqno[j]);
+-		seq_putc(m, '\n');
+-	}
+-	seq_putc(m, '\n');
+-
+ 	intel_runtime_pm_put(dev_priv);
+ 	mutex_unlock(&dev->struct_mutex);
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 39421b2..5c3bfa6 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -804,7 +804,6 @@ struct drm_i915_error_state {
+ 		u32 cpu_ring_tail;
+ 
+ 		u32 last_seqno;
+-		u32 semaphore_seqno[I915_NUM_ENGINES - 1];
+ 
+ 		/* Register state */
+ 		u32 start;
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index 06daa4d..9c34a4c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -238,35 +238,41 @@ static int i915_gem_check_wedge(struct drm_i915_private *dev_priv)
+ 	return 0;
+ }
+ 
+-static int i915_gem_init_global_seqno(struct drm_i915_private *dev_priv,
+-				      u32 seqno)
++static int i915_gem_init_global_seqno(struct drm_i915_private *i915, u32 seqno)
+ {
+-	struct i915_gem_timeline *timeline = &dev_priv->gt.global_timeline;
++	struct i915_gem_timeline *timeline = &i915->gt.global_timeline;
+ 	struct intel_engine_cs *engine;
+ 	enum intel_engine_id id;
+ 	int ret;
+ 
+ 	/* Carefully retire all requests without writing to the rings */
+-	ret = i915_gem_wait_for_idle(dev_priv,
++	ret = i915_gem_wait_for_idle(i915,
+ 				     I915_WAIT_INTERRUPTIBLE |
+ 				     I915_WAIT_LOCKED);
+ 	if (ret)
+ 		return ret;
+ 
+-	i915_gem_retire_requests(dev_priv);
++	i915_gem_retire_requests(i915);
+ 
+ 	/* If the seqno wraps around, we need to clear the breadcrumb rbtree */
+ 	if (!i915_seqno_passed(seqno, timeline->next_seqno)) {
+-		while (intel_kick_waiters(dev_priv) ||
+-		       intel_kick_signalers(dev_priv))
++		while (intel_kick_waiters(i915) || intel_kick_signalers(i915))
+ 			yield();
+ 		yield();
+ 	}
+ 
+ 	/* Finally reset hw state */
+-	for_each_engine(engine, dev_priv, id)
++	for_each_engine(engine, i915, id)
+ 		intel_engine_init_global_seqno(engine, seqno);
+ 
++	list_for_each_entry(timeline, &i915->gt.timelines, link) {
++		for_each_engine(engine, i915, id) {
++			struct intel_timeline *tl = &timeline->engine[id];
++
++			memset(tl->sync_seqno, 0, sizeof(tl->sync_seqno));
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -462,7 +468,7 @@ static int
+ i915_gem_request_await_request(struct drm_i915_gem_request *to,
+ 			       struct drm_i915_gem_request *from)
+ {
+-	int idx, ret;
++	int ret;
+ 
+ 	GEM_BUG_ON(to == from);
+ 
+@@ -483,8 +489,7 @@ i915_gem_request_await_request(struct drm_i915_gem_request *to,
+ 		return ret < 0 ? ret : 0;
+ 	}
+ 
+-	idx = intel_engine_sync_index(from->engine, to->engine);
+-	if (from->global_seqno <= from->engine->semaphore.sync_seqno[idx])
++	if (from->global_seqno <= to->timeline->sync_seqno[from->engine->id])
+ 		return 0;
+ 
+ 	trace_i915_gem_ring_sync_to(to, from);
+@@ -502,7 +507,7 @@ i915_gem_request_await_request(struct drm_i915_gem_request *to,
+ 			return ret;
+ 	}
+ 
+-	from->engine->semaphore.sync_seqno[idx] = from->global_seqno;
++	to->timeline->sync_seqno[from->engine->id] = from->global_seqno;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_timeline.h b/drivers/gpu/drm/i915/i915_gem_timeline.h
+index bfdf033..767b239 100644
+--- a/drivers/gpu/drm/i915/i915_gem_timeline.h
++++ b/drivers/gpu/drm/i915/i915_gem_timeline.h
+@@ -48,6 +48,7 @@ struct intel_timeline {
+ 	 * struct_mutex.
+ 	 */
+ 	struct i915_gem_active last_request;
++	u32 sync_seqno[I915_NUM_ENGINES];
+ 
+ 	struct i915_gem_timeline *common;
+ };
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 9aa197c..ef36981 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -415,17 +415,13 @@ static void error_print_engine(struct drm_i915_error_state_buf *m,
+ 	if (INTEL_GEN(m->i915) >= 6) {
+ 		err_printf(m, "  RC PSMI: 0x%08x\n", ee->rc_psmi);
+ 		err_printf(m, "  FAULT_REG: 0x%08x\n", ee->fault_reg);
+-		err_printf(m, "  SYNC_0: 0x%08x [last synced 0x%08x]\n",
+-			   ee->semaphore_mboxes[0],
+-			   ee->semaphore_seqno[0]);
+-		err_printf(m, "  SYNC_1: 0x%08x [last synced 0x%08x]\n",
+-			   ee->semaphore_mboxes[1],
+-			   ee->semaphore_seqno[1]);
+-		if (HAS_VEBOX(m->i915)) {
+-			err_printf(m, "  SYNC_2: 0x%08x [last synced 0x%08x]\n",
+-				   ee->semaphore_mboxes[2],
+-				   ee->semaphore_seqno[2]);
+-		}
++		err_printf(m, "  SYNC_0: 0x%08x\n",
++			   ee->semaphore_mboxes[0]);
++		err_printf(m, "  SYNC_1: 0x%08x\n",
++			   ee->semaphore_mboxes[1]);
++		if (HAS_VEBOX(m->i915))
++			err_printf(m, "  SYNC_2: 0x%08x\n",
++				   ee->semaphore_mboxes[2]);
+ 	}
+ 	if (USES_PPGTT(m->i915)) {
+ 		err_printf(m, "  GFX_MODE: 0x%08x\n", ee->vm_info.gfx_mode);
+@@ -972,6 +968,26 @@ static void i915_gem_record_fences(struct drm_i915_private *dev_priv,
+ 	}
+ }
+ 
++static inline u32
++gen8_engine_sync_index(struct intel_engine_cs *engine,
++		       struct intel_engine_cs *other)
++{
++	int idx;
++
++	/*
++	 * rcs -> 0 = vcs, 1 = bcs, 2 = vecs, 3 = vcs2;
++	 * vcs -> 0 = bcs, 1 = vecs, 2 = vcs2, 3 = rcs;
++	 * bcs -> 0 = vecs, 1 = vcs2. 2 = rcs, 3 = vcs;
++	 * vecs -> 0 = vcs2, 1 = rcs, 2 = vcs, 3 = bcs;
++	 * vcs2 -> 0 = rcs, 1 = vcs, 2 = bcs, 3 = vecs;
++	 */
++
++	idx = (other - engine) - 1;
++	if (idx < 0)
++		idx += I915_NUM_ENGINES;
++
++	return idx;
++}
+ 
+ static void gen8_record_semaphore_state(struct drm_i915_error_state *error,
+ 					struct intel_engine_cs *engine,
+@@ -995,10 +1011,9 @@ static void gen8_record_semaphore_state(struct drm_i915_error_state *error,
+ 		signal_offset =
+ 			(GEN8_SIGNAL_OFFSET(engine, id) & (PAGE_SIZE - 1)) / 4;
+ 		tmp = error->semaphore->pages[0];
+-		idx = intel_engine_sync_index(engine, to);
++		idx = gen8_engine_sync_index(engine, to);
+ 
+ 		ee->semaphore_mboxes[idx] = tmp[signal_offset];
+-		ee->semaphore_seqno[idx] = engine->semaphore.sync_seqno[idx];
+ 	}
+ }
+ 
+@@ -1009,14 +1024,9 @@ static void gen6_record_semaphore_state(struct intel_engine_cs *engine,
+ 
+ 	ee->semaphore_mboxes[0] = I915_READ(RING_SYNC_0(engine->mmio_base));
+ 	ee->semaphore_mboxes[1] = I915_READ(RING_SYNC_1(engine->mmio_base));
+-	ee->semaphore_seqno[0] = engine->semaphore.sync_seqno[0];
+-	ee->semaphore_seqno[1] = engine->semaphore.sync_seqno[1];
+-
+-	if (HAS_VEBOX(dev_priv)) {
++	if (HAS_VEBOX(dev_priv))
+ 		ee->semaphore_mboxes[2] =
+ 			I915_READ(RING_SYNC_2(engine->mmio_base));
+-		ee->semaphore_seqno[2] = engine->semaphore.sync_seqno[2];
+-	}
+ }
+ 
+ static void error_record_engine_waiters(struct intel_engine_cs *engine,
+diff --git a/drivers/gpu/drm/i915/intel_engine_cs.c b/drivers/gpu/drm/i915/intel_engine_cs.c
+index 6a31055..94de3d6 100644
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -204,8 +204,6 @@ void intel_engine_init_global_seqno(struct intel_engine_cs *engine, u32 seqno)
+ 				       I915_NUM_ENGINES * gen8_semaphore_seqno_size);
+ 		kunmap(page);
+ 	}
+-	memset(engine->semaphore.sync_seqno, 0,
+-	       sizeof(engine->semaphore.sync_seqno));
+ 
+ 	intel_write_status_page(engine, I915_GEM_HWS_INDEX, seqno);
+ 	if (engine->irq_seqno_barrier)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index f514b0b..b9a856c 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1995,9 +1995,6 @@ static int intel_init_ring_buffer(struct intel_engine_cs *engine)
+ 
+ 	intel_engine_setup_common(engine);
+ 
+-	memset(engine->semaphore.sync_seqno, 0,
+-	       sizeof(engine->semaphore.sync_seqno));
+-
+ 	ret = intel_engine_init_common(engine);
+ 	if (ret)
+ 		goto error;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 9d228be..891629c 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -314,8 +314,6 @@ struct intel_engine_cs {
+ 	 *  ie. transpose of f(x, y)
+ 	 */
+ 	struct {
+-		u32	sync_seqno[I915_NUM_ENGINES-1];
+-
+ 		union {
+ #define GEN6_SEMAPHORE_LAST	VECS_HW
+ #define GEN6_NUM_SEMAPHORES	(GEN6_SEMAPHORE_LAST + 1)
+@@ -385,27 +383,6 @@ intel_engine_flag(const struct intel_engine_cs *engine)
+ 	return 1 << engine->id;
+ }
+ 
+-static inline u32
+-intel_engine_sync_index(struct intel_engine_cs *engine,
+-			struct intel_engine_cs *other)
+-{
+-	int idx;
+-
+-	/*
+-	 * rcs -> 0 = vcs, 1 = bcs, 2 = vecs, 3 = vcs2;
+-	 * vcs -> 0 = bcs, 1 = vecs, 2 = vcs2, 3 = rcs;
+-	 * bcs -> 0 = vecs, 1 = vcs2. 2 = rcs, 3 = vcs;
+-	 * vecs -> 0 = vcs2, 1 = rcs, 2 = vcs, 3 = bcs;
+-	 * vcs2 -> 0 = rcs, 1 = vcs, 2 = bcs, 3 = vecs;
+-	 */
+-
+-	idx = (other->id - engine->id) - 1;
+-	if (idx < 0)
+-		idx += I915_NUM_ENGINES;
+-
+-	return idx;
+-}
+-
+ static inline void
+ intel_flush_status_page(struct intel_engine_cs *engine, int reg)
+ {
+-- 
+1.7.5.4
+

@@ -1,0 +1,194 @@
+From dfe63cca60d51401ff40075075a87fd7dffdd9f0 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 9 Sep 2016 14:11:54 +0100
+Subject: [PATCH 0748/4301] drm/i915: Drive request submission through fence
+ callbacks
+
+commit 5590af3e115a9db11c5d6689ddd0d0053be4f4e0 upstream
+
+Drive final request submission from a callback from the fence. This way
+the request is queued until all dependencies are resolved, at which
+point it is handed to the backend for queueing to hardware. At this
+point, no dependencies are set on the request, so the callback is
+immediate.
+
+A side-effect of imposing a heavier-irqsafe spinlock for execlist
+submission is that we lose the softirq enabling after scheduling the
+execlists tasklet. To compensate, we manually kickstart the softirq by
+disabling and enabling the bh around the fence signaling.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Reviewed-by: John Harrison <john.c.harrison@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20160909131201.16673-14-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_gem.c            |    3 +++
+ drivers/gpu/drm/i915/i915_gem_request.c    |   27 ++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_gem_request.h    |    3 +++
+ drivers/gpu/drm/i915/i915_guc_submission.c |    3 ++-
+ drivers/gpu/drm/i915/intel_breadcrumbs.c   |    3 +++
+ drivers/gpu/drm/i915/intel_lrc.c           |    5 +++--
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |    8 ++++++++
+ 7 files changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 2d5c81f..843d326 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2550,6 +2550,9 @@ i915_gem_find_active_request(struct intel_engine_cs *engine)
+ 		if (i915_gem_request_completed(request))
+ 			continue;
+ 
++		if (!i915_sw_fence_done(&request->submit))
++			break;
++
+ 		return request;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index 64c3706..074fc06 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -318,6 +318,26 @@ static int i915_gem_get_seqno(struct drm_i915_private *dev_priv, u32 *seqno)
+ 	return 0;
+ }
+ 
++static int __i915_sw_fence_call
++submit_notify(struct i915_sw_fence *fence, enum i915_sw_fence_notify state)
++{
++	struct drm_i915_gem_request *request =
++		container_of(fence, typeof(*request), submit);
++
++	/* Will be called from irq-context when using foreign DMA fences */
++
++	switch (state) {
++	case FENCE_COMPLETE:
++		request->engine->submit_request(request);
++		break;
++
++	case FENCE_FREE:
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
+ /**
+  * i915_gem_request_alloc - allocate a request structure
+  *
+@@ -396,6 +416,8 @@ i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 		   engine->fence_context,
+ 		   seqno);
+ 
++	i915_sw_fence_init(&req->submit, submit_notify);
++
+ 	INIT_LIST_HEAD(&req->active_list);
+ 	req->i915 = dev_priv;
+ 	req->engine = engine;
+@@ -530,7 +552,10 @@ void __i915_add_request(struct drm_i915_gem_request *request, bool flush_caches)
+ 		  reserved_tail, ret);
+ 
+ 	i915_gem_mark_busy(engine);
+-	engine->submit_request(request);
++
++	local_bh_disable();
++	i915_sw_fence_commit(&request->submit);
++	local_bh_enable(); /* Kick the execlists tasklet if just scheduled */
+ }
+ 
+ static void reset_wait_queue(wait_queue_head_t *q, wait_queue_t *wait)
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.h b/drivers/gpu/drm/i915/i915_gem_request.h
+index def3572..e141b1c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.h
++++ b/drivers/gpu/drm/i915/i915_gem_request.h
+@@ -28,6 +28,7 @@
+ #include <linux/fence.h>
+ 
+ #include "i915_gem.h"
++#include "i915_sw_fence.h"
+ 
+ struct intel_wait {
+ 	struct rb_node node;
+@@ -82,6 +83,8 @@ struct drm_i915_gem_request {
+ 	struct intel_ring *ring;
+ 	struct intel_signal_node signaling;
+ 
++	struct i915_sw_fence submit;
++
+ 	/** GEM sequence number associated with the previous request,
+ 	 * when the HWS breadcrumb is equal to this the GPU is processing
+ 	 * this request.
+diff --git a/drivers/gpu/drm/i915/i915_guc_submission.c b/drivers/gpu/drm/i915/i915_guc_submission.c
+index d5a4e9e..0eb6b71 100644
+--- a/drivers/gpu/drm/i915/i915_guc_submission.c
++++ b/drivers/gpu/drm/i915/i915_guc_submission.c
+@@ -1016,7 +1016,8 @@ int i915_guc_submission_enable(struct drm_i915_private *dev_priv)
+ 
+ 		/* Replay the current set of previously submitted requests */
+ 		list_for_each_entry(request, &engine->request_list, link)
+-			i915_guc_submit(request);
++			if (i915_sw_fence_done(&request->submit))
++				i915_guc_submit(request);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/intel_breadcrumbs.c b/drivers/gpu/drm/i915/intel_breadcrumbs.c
+index 2491e4c..9bad14d 100644
+--- a/drivers/gpu/drm/i915/intel_breadcrumbs.c
++++ b/drivers/gpu/drm/i915/intel_breadcrumbs.c
+@@ -462,7 +462,10 @@ static int intel_breadcrumbs_signaler(void *arg)
+ 			 */
+ 			intel_engine_remove_wait(engine,
+ 						 &request->signaling.wait);
++
++			local_bh_disable();
+ 			fence_signal(&request->fence);
++			local_bh_enable(); /* kick start the tasklets */
+ 
+ 			/* Find the next oldest signal. Note that as we have
+ 			 * not been holding the lock, another client may
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 58cdc2d..9d6358a 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -590,14 +590,15 @@ static void intel_lrc_irq_handler(unsigned long data)
+ static void execlists_submit_request(struct drm_i915_gem_request *request)
+ {
+ 	struct intel_engine_cs *engine = request->engine;
++	unsigned long flags;
+ 
+-	spin_lock_bh(&engine->execlist_lock);
++	spin_lock_irqsave(&engine->execlist_lock, flags);
+ 
+ 	list_add_tail(&request->execlist_link, &engine->execlist_queue);
+ 	if (execlists_elsp_idle(engine))
+ 		tasklet_hi_schedule(&engine->irq_tasklet);
+ 
+-	spin_unlock_bh(&engine->execlist_lock);
++	spin_unlock_irqrestore(&engine->execlist_lock, flags);
+ }
+ 
+ int intel_logical_ring_alloc_request_extras(struct drm_i915_gem_request *request)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 32f5274..7f64d61 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -226,7 +226,15 @@ struct intel_engine_cs {
+ #define I915_DISPATCH_PINNED BIT(1)
+ #define I915_DISPATCH_RS     BIT(2)
+ 	int		(*emit_request)(struct drm_i915_gem_request *req);
++
++	/* Pass the request to the hardware queue (e.g. directly into
++	 * the legacy ringbuffer or to the end of an execlist).
++	 *
++	 * This is called from an atomic context with irqs disabled; must
++	 * be irq safe.
++	 */
+ 	void		(*submit_request)(struct drm_i915_gem_request *req);
++
+ 	/* Some chipsets are not quite as coherent as advertised and need
+ 	 * an expensive kick to force a true read of the up-to-date seqno.
+ 	 * However, the up-to-date seqno is not always required and the last
+-- 
+1.7.5.4
+

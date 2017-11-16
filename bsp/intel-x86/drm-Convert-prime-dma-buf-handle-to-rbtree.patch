@@ -1,0 +1,227 @@
+From 153a2ac9f6ede6ba93817ab192c1820be65c3053 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 26 Sep 2016 21:44:14 +0100
+Subject: [PATCH 1009/4301] drm: Convert prime dma-buf <-> handle to rbtree
+
+commit 077675c1e8a193a6355d4a7c8c7bf63be310b472 upstream
+
+Currently we use a linear walk to lookup a handle and return a dma-buf,
+and vice versa. A long overdue TODO task is to convert that to a
+hashtable. Since the initial implementation of dma-buf/prime, we now
+have resizeable hashtables we can use (and now a future task is to RCU
+enable the lookup!). However, this patch opts to use an rbtree instead
+to provide O(lgN) lookups (and insertion, deletion). rbtrees were chosen
+over using the RCU backed resizable hashtable to firstly avoid the
+reallocations (rbtrees can be embedded entirely within the parent
+struct) and to favour simpler code with predictable worst case
+behaviour. In simple testing, the difference between using the constant
+lookup and insertion of the rhashtable and the rbtree was less than 10%
+of the wall time (igt/benchmarks/prime_lookup) - both are dramatic
+improvements over the existing linear lists.
+
+v2: Favour rbtree over rhashtable
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=94631
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Sean Paul <seanpaul@chromium.org>
+Cc: David Herrmann <dh.herrmann@gmail.com>
+Reviewed-by: David Herrmann <dh.herrmann@gmail.com>
+Reviewed-by: Sean Paul <seanpaul@chromium.org>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/20160926204414.23222-1-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/drm_prime.c |   85 +++++++++++++++++++++++++++++++++++++------
+ include/drm/drmP.h          |    5 ++-
+ 2 files changed, 77 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_prime.c b/drivers/gpu/drm/drm_prime.c
+index 9c4387d..80907b3 100644
+--- a/drivers/gpu/drm/drm_prime.c
++++ b/drivers/gpu/drm/drm_prime.c
+@@ -28,6 +28,7 @@
+ 
+ #include <linux/export.h>
+ #include <linux/dma-buf.h>
++#include <linux/rbtree.h>
+ #include <drm/drmP.h>
+ #include <drm/drm_gem.h>
+ 
+@@ -61,9 +62,11 @@
+  */
+ 
+ struct drm_prime_member {
+-	struct list_head entry;
+ 	struct dma_buf *dma_buf;
+ 	uint32_t handle;
++
++	struct rb_node dmabuf_rb;
++	struct rb_node handle_rb;
+ };
+ 
+ struct drm_prime_attachment {
+@@ -75,6 +78,7 @@ static int drm_prime_add_buf_handle(struct drm_prime_file_private *prime_fpriv,
+ 				    struct dma_buf *dma_buf, uint32_t handle)
+ {
+ 	struct drm_prime_member *member;
++	struct rb_node **p, *rb;
+ 
+ 	member = kmalloc(sizeof(*member), GFP_KERNEL);
+ 	if (!member)
+@@ -83,18 +87,56 @@ static int drm_prime_add_buf_handle(struct drm_prime_file_private *prime_fpriv,
+ 	get_dma_buf(dma_buf);
+ 	member->dma_buf = dma_buf;
+ 	member->handle = handle;
+-	list_add(&member->entry, &prime_fpriv->head);
++
++	rb = NULL;
++	p = &prime_fpriv->dmabufs.rb_node;
++	while (*p) {
++		struct drm_prime_member *pos;
++
++		rb = *p;
++		pos = rb_entry(rb, struct drm_prime_member, dmabuf_rb);
++		if (dma_buf > pos->dma_buf)
++			p = &rb->rb_right;
++		else
++			p = &rb->rb_left;
++	}
++	rb_link_node(&member->dmabuf_rb, rb, p);
++	rb_insert_color(&member->dmabuf_rb, &prime_fpriv->dmabufs);
++
++	rb = NULL;
++	p = &prime_fpriv->handles.rb_node;
++	while (*p) {
++		struct drm_prime_member *pos;
++
++		rb = *p;
++		pos = rb_entry(rb, struct drm_prime_member, handle_rb);
++		if (handle > pos->handle)
++			p = &rb->rb_right;
++		else
++			p = &rb->rb_left;
++	}
++	rb_link_node(&member->handle_rb, rb, p);
++	rb_insert_color(&member->handle_rb, &prime_fpriv->handles);
++
+ 	return 0;
+ }
+ 
+ static struct dma_buf *drm_prime_lookup_buf_by_handle(struct drm_prime_file_private *prime_fpriv,
+ 						      uint32_t handle)
+ {
+-	struct drm_prime_member *member;
++	struct rb_node *rb;
++
++	rb = prime_fpriv->handles.rb_node;
++	while (rb) {
++		struct drm_prime_member *member;
+ 
+-	list_for_each_entry(member, &prime_fpriv->head, entry) {
++		member = rb_entry(rb, struct drm_prime_member, handle_rb);
+ 		if (member->handle == handle)
+ 			return member->dma_buf;
++		else if (member->handle < handle)
++			rb = rb->rb_right;
++		else
++			rb = rb->rb_left;
+ 	}
+ 
+ 	return NULL;
+@@ -104,14 +146,23 @@ static int drm_prime_lookup_buf_handle(struct drm_prime_file_private *prime_fpri
+ 				       struct dma_buf *dma_buf,
+ 				       uint32_t *handle)
+ {
+-	struct drm_prime_member *member;
++	struct rb_node *rb;
++
++	rb = prime_fpriv->dmabufs.rb_node;
++	while (rb) {
++		struct drm_prime_member *member;
+ 
+-	list_for_each_entry(member, &prime_fpriv->head, entry) {
++		member = rb_entry(rb, struct drm_prime_member, dmabuf_rb);
+ 		if (member->dma_buf == dma_buf) {
+ 			*handle = member->handle;
+ 			return 0;
++		} else if (member->dma_buf < dma_buf) {
++			rb = rb->rb_right;
++		} else {
++			rb = rb->rb_left;
+ 		}
+ 	}
++
+ 	return -ENOENT;
+ }
+ 
+@@ -166,13 +217,24 @@ static void drm_gem_map_detach(struct dma_buf *dma_buf,
+ void drm_prime_remove_buf_handle_locked(struct drm_prime_file_private *prime_fpriv,
+ 					struct dma_buf *dma_buf)
+ {
+-	struct drm_prime_member *member, *safe;
++	struct rb_node *rb;
+ 
+-	list_for_each_entry_safe(member, safe, &prime_fpriv->head, entry) {
++	rb = prime_fpriv->dmabufs.rb_node;
++	while (rb) {
++		struct drm_prime_member *member;
++
++		member = rb_entry(rb, struct drm_prime_member, dmabuf_rb);
+ 		if (member->dma_buf == dma_buf) {
++			rb_erase(&member->handle_rb, &prime_fpriv->handles);
++			rb_erase(&member->dmabuf_rb, &prime_fpriv->dmabufs);
++
+ 			dma_buf_put(dma_buf);
+-			list_del(&member->entry);
+ 			kfree(member);
++			return;
++		} else if (member->dma_buf < dma_buf) {
++			rb = rb->rb_right;
++		} else {
++			rb = rb->rb_left;
+ 		}
+ 	}
+ }
+@@ -762,12 +824,13 @@ EXPORT_SYMBOL(drm_prime_gem_destroy);
+ 
+ void drm_prime_init_file_private(struct drm_prime_file_private *prime_fpriv)
+ {
+-	INIT_LIST_HEAD(&prime_fpriv->head);
+ 	mutex_init(&prime_fpriv->lock);
++	prime_fpriv->dmabufs = RB_ROOT;
++	prime_fpriv->handles = RB_ROOT;
+ }
+ 
+ void drm_prime_destroy_file_private(struct drm_prime_file_private *prime_fpriv)
+ {
+ 	/* by now drm_gem_release should've made sure the list is empty */
+-	WARN_ON(!list_empty(&prime_fpriv->head));
++	WARN_ON(!RB_EMPTY_ROOT(&prime_fpriv->dmabufs));
+ }
+diff --git a/include/drm/drmP.h b/include/drm/drmP.h
+index 0e6f0f1..9807fdb 100644
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -51,6 +51,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/poll.h>
+ #include <linux/ratelimit.h>
++#include <linux/rbtree.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
+@@ -362,10 +363,10 @@ struct drm_pending_event {
+ 		      we deliver the event, for tracing only */
+ };
+ 
+-/* initial implementaton using a linked list - todo hashtab */
+ struct drm_prime_file_private {
+-	struct list_head head;
+ 	struct mutex lock;
++	struct rb_root dmabufs;
++	struct rb_root handles;
+ };
+ 
+ /** File private data */
+-- 
+1.7.5.4
+

@@ -1,0 +1,483 @@
+From f7d29dec573e33bbc07f5c89eea4b7e3b0b20f1d Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@gmail.com>
+Date: Tue, 1 Nov 2016 11:56:54 -0400
+Subject: [PATCH 2164/4301] drm/msm/mdp5: dynamically assign hw pipes to
+ planes
+
+commit 4a0f012da3e21174f34637ae3b6818c0da60f2f9 upstream
+
+(re)assign the hw pipes to planes based on required caps, and to handle
+situations where we could not modify an in-use plane (ie. SMP block
+reallocation).
+
+This means all planes advertise the superset of formats and properties.
+Userspace must (as always) use atomic TEST_ONLY step for atomic updates,
+as not all planes may be available for use on every frame.
+
+The mapping of hwpipe to plane is stored in mdp5_state, so that state
+updates are atomically committed in the same way that plane/etc state
+updates are managed.  This is needed because the mdp5_plane_state keeps
+a pointer to the hwpipe, and we don't want global state to become out
+of sync with the plane state if an atomic update fails, we hit deadlock/
+backoff scenario, etc.  The use of state_lock keeps multiple parallel
+updates which both re-assign hwpipes properly serialized.
+
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+---
+ drivers/gpu/drm/msm/mdp/mdp5/mdp5_crtc.c  |    2 +-
+ drivers/gpu/drm/msm/mdp/mdp5/mdp5_kms.c   |    4 +-
+ drivers/gpu/drm/msm/mdp/mdp5/mdp5_kms.h   |    7 +-
+ drivers/gpu/drm/msm/mdp/mdp5/mdp5_pipe.c  |   71 +++++++++++++
+ drivers/gpu/drm/msm/mdp/mdp5/mdp5_pipe.h  |   10 ++
+ drivers/gpu/drm/msm/mdp/mdp5/mdp5_plane.c |  158 +++++++++++++++--------------
+ 6 files changed, 172 insertions(+), 80 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_crtc.c b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_crtc.c
+index ff56189..1272f40 100644
+--- a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_crtc.c
++++ b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_crtc.c
+@@ -403,7 +403,7 @@ static int mdp5_crtc_atomic_check(struct drm_crtc *crtc,
+ 	for (i = 0; i < cnt; i++) {
+ 		pstates[i].state->stage = STAGE_BASE + i + base;
+ 		DBG("%s: assign pipe %s on stage=%d", crtc->name,
+-				pipe2name(mdp5_plane_pipe(pstates[i].plane)),
++				pstates[i].plane->name,
+ 				pstates[i].state->stage);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_kms.c b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_kms.c
+index ca6dfeb..3542adf 100644
+--- a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_kms.c
++++ b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_kms.c
+@@ -92,7 +92,7 @@ struct mdp5_state *mdp5_get_state(struct drm_atomic_state *s)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	/* Copy state: */
+-	/* TODO */
++	new_state->hwpipe = mdp5_kms->state->hwpipe;
+ 
+ 	state->state = new_state;
+ 
+@@ -377,7 +377,7 @@ static int modeset_init(struct mdp5_kms *mdp5_kms)
+ 		struct drm_plane *plane;
+ 		struct drm_crtc *crtc;
+ 
+-		plane = mdp5_plane_init(dev, mdp5_kms->hwpipes[i], primary);
++		plane = mdp5_plane_init(dev, primary);
+ 		if (IS_ERR(plane)) {
+ 			ret = PTR_ERR(plane);
+ 			dev_err(dev->dev, "failed to construct plane %d (%d)\n", i, ret);
+diff --git a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_kms.h b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_kms.h
+index a8bff52..4b56e65 100644
+--- a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_kms.h
++++ b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_kms.h
+@@ -82,7 +82,7 @@ struct mdp5_kms {
+  * For atomic updates which require modifying global state,
+  */
+ struct mdp5_state {
+-	uint32_t dummy;
++	struct mdp5_hw_pipe_state hwpipe;
+ };
+ 
+ struct mdp5_state *__must_check
+@@ -94,6 +94,8 @@ mdp5_get_state(struct drm_atomic_state *s);
+ struct mdp5_plane_state {
+ 	struct drm_plane_state base;
+ 
++	struct mdp5_hw_pipe *hwpipe;
++
+ 	/* aligned with property */
+ 	uint8_t premultiplied;
+ 	uint8_t zpos;
+@@ -232,8 +234,7 @@ uint32_t mdp5_plane_get_flush(struct drm_plane *plane);
+ void mdp5_plane_complete_commit(struct drm_plane *plane,
+ 	struct drm_plane_state *state);
+ enum mdp5_pipe mdp5_plane_pipe(struct drm_plane *plane);
+-struct drm_plane *mdp5_plane_init(struct drm_device *dev,
+-		struct mdp5_hw_pipe *hwpipe, bool primary);
++struct drm_plane *mdp5_plane_init(struct drm_device *dev, bool primary);
+ 
+ uint32_t mdp5_crtc_vblank(struct drm_crtc *crtc);
+ 
+diff --git a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_pipe.c b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_pipe.c
+index 7f3e8e50..71c313b 100644
+--- a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_pipe.c
++++ b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_pipe.c
+@@ -17,6 +17,77 @@
+ 
+ #include "mdp5_kms.h"
+ 
++struct mdp5_hw_pipe *mdp5_pipe_assign(struct drm_atomic_state *s,
++		struct drm_plane *plane, uint32_t caps)
++{
++	struct msm_drm_private *priv = s->dev->dev_private;
++	struct mdp5_kms *mdp5_kms = to_mdp5_kms(to_mdp_kms(priv->kms));
++	struct mdp5_state *state;
++	struct mdp5_hw_pipe_state *old_state, *new_state;
++	struct mdp5_hw_pipe *hwpipe = NULL;
++	int i;
++
++	state = mdp5_get_state(s);
++	if (IS_ERR(state))
++		return ERR_CAST(state);
++
++	/* grab old_state after mdp5_get_state(), since now we hold lock: */
++	old_state = &mdp5_kms->state->hwpipe;
++	new_state = &state->hwpipe;
++
++	for (i = 0; i < mdp5_kms->num_hwpipes; i++) {
++		struct mdp5_hw_pipe *cur = mdp5_kms->hwpipes[i];
++
++		/* skip if already in-use.. check both new and old state,
++		 * since we cannot immediately re-use a pipe that is
++		 * released in the current update in some cases:
++		 *  (1) mdp5 can have SMP (non-double-buffered)
++		 *  (2) hw pipe previously assigned to different CRTC
++		 *      (vblanks might not be aligned)
++		 */
++		if (new_state->hwpipe_to_plane[cur->idx] ||
++				old_state->hwpipe_to_plane[cur->idx])
++			continue;
++
++		/* skip if doesn't support some required caps: */
++		if (caps & ~cur->caps)
++			continue;
++
++		/* possible candidate, take the one with the
++		 * fewest unneeded caps bits set:
++		 */
++		if (!hwpipe || (hweight_long(cur->caps & ~caps) <
++				hweight_long(hwpipe->caps & ~caps)))
++			hwpipe = cur;
++	}
++
++	if (!hwpipe)
++		return ERR_PTR(-ENOMEM);
++
++	DBG("%s: assign to plane %s for caps %x",
++			hwpipe->name, plane->name, caps);
++	new_state->hwpipe_to_plane[hwpipe->idx] = plane;
++
++	return hwpipe;
++}
++
++void mdp5_pipe_release(struct drm_atomic_state *s, struct mdp5_hw_pipe *hwpipe)
++{
++	struct mdp5_state *state = mdp5_get_state(s);
++	struct mdp5_hw_pipe_state *new_state = &state->hwpipe;
++
++	if (!hwpipe)
++		return;
++
++	if (WARN_ON(!new_state->hwpipe_to_plane[hwpipe->idx]))
++		return;
++
++	DBG("%s: release from plane %s", hwpipe->name,
++		new_state->hwpipe_to_plane[hwpipe->idx]->name);
++
++	new_state->hwpipe_to_plane[hwpipe->idx] = NULL;
++}
++
+ void mdp5_pipe_destroy(struct mdp5_hw_pipe *hwpipe)
+ {
+ 	kfree(hwpipe);
+diff --git a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_pipe.h b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_pipe.h
+index c9e3f71..e1f3314 100644
+--- a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_pipe.h
++++ b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_pipe.h
+@@ -34,6 +34,16 @@ struct mdp5_hw_pipe {
+ 	uint32_t flush_mask;      /* used to commit pipe registers */
+ };
+ 
++/* global atomic state of assignment between pipes and planes: */
++struct mdp5_hw_pipe_state {
++	struct drm_plane *hwpipe_to_plane[SSPP_MAX];
++};
++
++struct mdp5_hw_pipe *__must_check
++mdp5_pipe_assign(struct drm_atomic_state *s, struct drm_plane *plane,
++		uint32_t caps);
++void mdp5_pipe_release(struct drm_atomic_state *s, struct mdp5_hw_pipe *hwpipe);
++
+ struct mdp5_hw_pipe *mdp5_pipe_init(enum mdp5_pipe pipe,
+ 		uint32_t reg_offset, uint32_t caps);
+ void mdp5_pipe_destroy(struct mdp5_hw_pipe *hwpipe);
+diff --git a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_plane.c b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_plane.c
+index 5022f0b..58ab895 100644
+--- a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_plane.c
++++ b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_plane.c
+@@ -22,8 +22,6 @@
+ struct mdp5_plane {
+ 	struct drm_plane base;
+ 
+-	struct mdp5_hw_pipe *hwpipe;
+-
+ 	uint32_t nformats;
+ 	uint32_t formats[32];
+ };
+@@ -63,12 +61,6 @@ static void mdp5_plane_destroy(struct drm_plane *plane)
+ static void mdp5_plane_install_rotation_property(struct drm_device *dev,
+ 		struct drm_plane *plane)
+ {
+-	struct mdp5_plane *mdp5_plane = to_mdp5_plane(plane);
+-
+-	if (!(mdp5_plane->hwpipe->caps & MDP_PIPE_CAP_HFLIP) &&
+-		!(mdp5_plane->hwpipe->caps & MDP_PIPE_CAP_VFLIP))
+-		return;
+-
+ 	drm_plane_create_rotation_property(plane,
+ 					   DRM_ROTATE_0,
+ 					   DRM_ROTATE_0 |
+@@ -181,6 +173,8 @@ mdp5_plane_atomic_print_state(struct drm_printer *p,
+ {
+ 	struct mdp5_plane_state *pstate = to_mdp5_plane_state(state);
+ 
++	drm_printf(p, "\thwpipe=%s\n", pstate->hwpipe ?
++			pstate->hwpipe->name : "(null)");
+ 	drm_printf(p, "\tpremultiplied=%u\n", pstate->premultiplied);
+ 	drm_printf(p, "\tzpos=%u\n", pstate->zpos);
+ 	drm_printf(p, "\talpha=%u\n", pstate->alpha);
+@@ -234,10 +228,12 @@ mdp5_plane_duplicate_state(struct drm_plane *plane)
+ static void mdp5_plane_destroy_state(struct drm_plane *plane,
+ 		struct drm_plane_state *state)
+ {
++	struct mdp5_plane_state *pstate = to_mdp5_plane_state(state);
++
+ 	if (state->fb)
+ 		drm_framebuffer_unreference(state->fb);
+ 
+-	kfree(to_mdp5_plane_state(state));
++	kfree(pstate);
+ }
+ 
+ static const struct drm_plane_funcs mdp5_plane_funcs = {
+@@ -282,70 +278,81 @@ static void mdp5_plane_cleanup_fb(struct drm_plane *plane,
+ static int mdp5_plane_atomic_check(struct drm_plane *plane,
+ 		struct drm_plane_state *state)
+ {
+-	struct mdp5_plane *mdp5_plane = to_mdp5_plane(plane);
++	struct mdp5_plane_state *mdp5_state = to_mdp5_plane_state(state);
+ 	struct drm_plane_state *old_state = plane->state;
+-	const struct mdp_format *format;
+-	bool vflip, hflip;
++	bool new_hwpipe = false;
++	uint32_t caps = 0;
+ 
+ 	DBG("%s: check (%d -> %d)", plane->name,
+ 			plane_enabled(old_state), plane_enabled(state));
+ 
++	/* We don't allow faster-than-vblank updates.. if we did add this
++	 * some day, we would need to disallow in cases where hwpipe
++	 * changes
++	 */
++	if (WARN_ON(to_mdp5_plane_state(old_state)->pending))
++		return -EBUSY;
++
+ 	if (plane_enabled(state)) {
+ 		unsigned int rotation;
++		const struct mdp_format *format;
+ 
+ 		format = to_mdp_format(msm_framebuffer_format(state->fb));
+-		if (MDP_FORMAT_IS_YUV(format) &&
+-			!pipe_supports_yuv(mdp5_plane->hwpipe->caps)) {
+-			DBG("Pipe doesn't support YUV\n");
+-
+-			return -EINVAL;
+-		}
+-
+-		if (!(mdp5_plane->hwpipe->caps & MDP_PIPE_CAP_SCALE) &&
+-			(((state->src_w >> 16) != state->crtc_w) ||
+-			((state->src_h >> 16) != state->crtc_h))) {
+-			DBG("Pipe doesn't support scaling (%dx%d -> %dx%d)\n",
+-				state->src_w >> 16, state->src_h >> 16,
+-				state->crtc_w, state->crtc_h);
++		if (MDP_FORMAT_IS_YUV(format))
++			caps |= MDP_PIPE_CAP_SCALE | MDP_PIPE_CAP_CSC;
+ 
+-			return -EINVAL;
+-		}
++		if (((state->src_w >> 16) != state->crtc_w) ||
++				((state->src_h >> 16) != state->crtc_h))
++			caps |= MDP_PIPE_CAP_SCALE;
+ 
+ 		rotation = drm_rotation_simplify(state->rotation,
+ 						 DRM_ROTATE_0 |
+ 						 DRM_REFLECT_X |
+ 						 DRM_REFLECT_Y);
+ 
+-		hflip = !!(rotation & DRM_REFLECT_X);
+-		vflip = !!(rotation & DRM_REFLECT_Y);
+-
+-		if ((vflip && !(mdp5_plane->hwpipe->caps & MDP_PIPE_CAP_VFLIP)) ||
+-			(hflip && !(mdp5_plane->hwpipe->caps & MDP_PIPE_CAP_HFLIP))) {
+-			DBG("Pipe doesn't support flip\n");
+-
+-			return -EINVAL;
++		if (rotation & DRM_REFLECT_X)
++			caps |= MDP_PIPE_CAP_HFLIP;
++
++		if (rotation & DRM_REFLECT_Y)
++			caps |= MDP_PIPE_CAP_VFLIP;
++
++		/* (re)allocate hw pipe if we don't have one or caps-mismatch: */
++		if (!mdp5_state->hwpipe || (caps & ~mdp5_state->hwpipe->caps))
++			new_hwpipe = true;
++
++		if (plane_enabled(old_state)) {
++			bool full_modeset = false;
++			if (state->fb->pixel_format != old_state->fb->pixel_format) {
++				DBG("%s: pixel_format change!", plane->name);
++				full_modeset = true;
++			}
++			if (state->src_w != old_state->src_w) {
++				DBG("%s: src_w change!", plane->name);
++				full_modeset = true;
++			}
++			if (full_modeset) {
++				/* cannot change SMP block allocation during
++				 * scanout:
++				 */
++				if (get_kms(plane)->smp)
++					new_hwpipe = true;
++			}
+ 		}
+-	}
+ 
+-	if (plane_enabled(state) && plane_enabled(old_state)) {
+-		/* we cannot change SMP block configuration during scanout: */
+-		bool full_modeset = false;
+-		if (state->fb->pixel_format != old_state->fb->pixel_format) {
+-			DBG("%s: pixel_format change!", plane->name);
+-			full_modeset = true;
+-		}
+-		if (state->src_w != old_state->src_w) {
+-			DBG("%s: src_w change!", plane->name);
+-			full_modeset = true;
+-		}
+-		if (to_mdp5_plane_state(old_state)->pending) {
+-			DBG("%s: still pending!", plane->name);
+-			full_modeset = true;
+-		}
+-		if (full_modeset) {
+-			struct drm_crtc_state *crtc_state =
+-					drm_atomic_get_crtc_state(state->state, state->crtc);
+-			crtc_state->mode_changed = true;
++		/* (re)assign hwpipe if needed, otherwise keep old one: */
++		if (new_hwpipe) {
++			/* TODO maybe we want to re-assign hwpipe sometimes
++			 * in cases when we no-longer need some caps to make
++			 * it available for other planes?
++			 */
++			struct mdp5_hw_pipe *old_hwpipe = mdp5_state->hwpipe;
++			mdp5_state->hwpipe =
++				mdp5_pipe_assign(state->state, plane, caps);
++			if (IS_ERR(mdp5_state->hwpipe)) {
++				DBG("%s: failed to assign hwpipe!", plane->name);
++				return PTR_ERR(mdp5_state->hwpipe);
++			}
++			mdp5_pipe_release(state->state, old_hwpipe);
+ 		}
+ 	}
+ 
+@@ -386,9 +393,9 @@ static const struct drm_plane_helper_funcs mdp5_plane_helper_funcs = {
+ static void set_scanout_locked(struct drm_plane *plane,
+ 		struct drm_framebuffer *fb)
+ {
+-	struct mdp5_plane *mdp5_plane = to_mdp5_plane(plane);
+ 	struct mdp5_kms *mdp5_kms = get_kms(plane);
+-	enum mdp5_pipe pipe = mdp5_plane->hwpipe->pipe;
++	struct mdp5_hw_pipe *hwpipe = to_mdp5_plane_state(plane->state)->hwpipe;
++	enum mdp5_pipe pipe = hwpipe->pipe;
+ 
+ 	mdp5_write(mdp5_kms, REG_MDP5_PIPE_SRC_STRIDE_A(pipe),
+ 			MDP5_PIPE_SRC_STRIDE_A_P0(fb->pitches[0]) |
+@@ -668,9 +675,8 @@ static int mdp5_plane_mode_set(struct drm_plane *plane,
+ 		uint32_t src_x, uint32_t src_y,
+ 		uint32_t src_w, uint32_t src_h)
+ {
+-	struct mdp5_plane *mdp5_plane = to_mdp5_plane(plane);
+ 	struct drm_plane_state *pstate = plane->state;
+-	struct mdp5_hw_pipe *hwpipe = mdp5_plane->hwpipe;
++	struct mdp5_hw_pipe *hwpipe = to_mdp5_plane_state(pstate)->hwpipe;
+ 	struct mdp5_kms *mdp5_kms = get_kms(plane);
+ 	enum mdp5_pipe pipe = hwpipe->pipe;
+ 	const struct mdp_format *format;
+@@ -837,15 +843,22 @@ static int mdp5_plane_mode_set(struct drm_plane *plane,
+ 
+ enum mdp5_pipe mdp5_plane_pipe(struct drm_plane *plane)
+ {
+-	struct mdp5_plane *mdp5_plane = to_mdp5_plane(plane);
+-	return mdp5_plane->hwpipe->pipe;
++	struct mdp5_plane_state *pstate = to_mdp5_plane_state(plane->state);
++
++	if (WARN_ON(!pstate->hwpipe))
++		return 0;
++
++	return pstate->hwpipe->pipe;
+ }
+ 
+ uint32_t mdp5_plane_get_flush(struct drm_plane *plane)
+ {
+-	struct mdp5_plane *mdp5_plane = to_mdp5_plane(plane);
++	struct mdp5_plane_state *pstate = to_mdp5_plane_state(plane->state);
++
++	if (WARN_ON(!pstate->hwpipe))
++		return 0;
+ 
+-	return mdp5_plane->hwpipe->flush_mask;
++	return pstate->hwpipe->flush_mask;
+ }
+ 
+ /* called after vsync in thread context */
+@@ -853,10 +866,11 @@ void mdp5_plane_complete_commit(struct drm_plane *plane,
+ 	struct drm_plane_state *state)
+ {
+ 	struct mdp5_kms *mdp5_kms = get_kms(plane);
+-	struct mdp5_plane *mdp5_plane = to_mdp5_plane(plane);
+-	enum mdp5_pipe pipe = mdp5_plane->hwpipe->pipe;
++	struct mdp5_plane_state *pstate = to_mdp5_plane_state(plane->state);
++
++	if (mdp5_kms->smp && pstate->hwpipe) {
++		enum mdp5_pipe pipe = pstate->hwpipe->pipe;
+ 
+-	if (mdp5_kms->smp) {
+ 		if (plane_enabled(plane->state)) {
+ 			DBG("%s: complete flip", plane->name);
+ 			mdp5_smp_commit(mdp5_kms->smp, pipe);
+@@ -866,12 +880,11 @@ void mdp5_plane_complete_commit(struct drm_plane *plane,
+ 		}
+ 	}
+ 
+-	to_mdp5_plane_state(plane->state)->pending = false;
++	pstate->pending = false;
+ }
+ 
+ /* initialize plane */
+-struct drm_plane *mdp5_plane_init(struct drm_device *dev,
+-		struct mdp5_hw_pipe *hwpipe, bool primary)
++struct drm_plane *mdp5_plane_init(struct drm_device *dev, bool primary)
+ {
+ 	struct drm_plane *plane = NULL;
+ 	struct mdp5_plane *mdp5_plane;
+@@ -886,16 +899,13 @@ struct drm_plane *mdp5_plane_init(struct drm_device *dev,
+ 
+ 	plane = &mdp5_plane->base;
+ 
+-	mdp5_plane->hwpipe = hwpipe;
+-
+ 	mdp5_plane->nformats = mdp_get_formats(mdp5_plane->formats,
+-		ARRAY_SIZE(mdp5_plane->formats),
+-		!pipe_supports_yuv(hwpipe->caps));
++		ARRAY_SIZE(mdp5_plane->formats), false);
+ 
+ 	type = primary ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
+ 	ret = drm_universal_plane_init(dev, plane, 0xff, &mdp5_plane_funcs,
+ 				 mdp5_plane->formats, mdp5_plane->nformats,
+-				 type, "%s", hwpipe->name);
++				 type, NULL);
+ 	if (ret)
+ 		goto fail;
+ 
+-- 
+1.7.5.4
+

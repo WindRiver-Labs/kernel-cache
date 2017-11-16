@@ -1,0 +1,896 @@
+From b6819a71b7ad6208ab7009894d0019c7ed1df9b0 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Sun, 18 Dec 2016 15:37:20 +0000
+Subject: [PATCH 2257/4301] drm/i915: Unify active context tracking between
+ legacy/execlists/guc
+
+commit e8a9c58fcd9a5081f71f57f370af1347ed6a310b upstream
+
+The requests conversion introduced a nasty bug where we could generate a
+new request in the middle of constructing a request if we needed to idle
+the system in order to evict space for a context. The request to idle
+would be executed (and waited upon) before the current one, creating a
+minor havoc in the seqno accounting, as we will consider the current
+request to already be completed (prior to deferred seqno assignment) but
+ring->last_retired_head would have been updated and still could allow
+us to overwrite the current request before execution.
+
+We also employed two different mechanisms to track the active context
+until it was switched out. The legacy method allowed for waiting upon an
+active context (it could forcibly evict any vma, including context's),
+but the execlists method took a step backwards by pinning the vma for
+the entire active lifespan of the context (the only way to evict was to
+idle the entire GPU, not individual contexts). However, to circumvent
+the tricky issue of locking (i.e. we cannot take struct_mutex at the
+time of i915_gem_request_submit(), where we would want to move the
+previous context onto the active tracker and unpin it), we take the
+execlists approach and keep the contexts pinned until retirement.
+The benefit of the execlists approach, more important for execlists than
+legacy, was the reduction in work in pinning the context for each
+request - as the context was kept pinned until idle, it could short
+circuit the pinning for all active contexts.
+
+We introduce new engine vfuncs to pin and unpin the context
+respectively. The context is pinned at the start of the request, and
+only unpinned when the following request is retired (this ensures that
+the context is idle and coherent in main memory before we unpin it). We
+move the engine->last_context tracking into the retirement itself
+(rather than during request submission) in order to allow the submission
+to be reordered or unwound without undue difficultly.
+
+And finally an ulterior motive for unifying context handling was to
+prepare for mock requests.
+
+v2: Rename to last_retired_context, split out legacy_context tracking
+for MI_SET_CONTEXT.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161218153724.8439-3-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    4 -
+ drivers/gpu/drm/i915/i915_gem.c            |    2 +-
+ drivers/gpu/drm/i915/i915_gem_context.c    |  110 ++++------------------------
+ drivers/gpu/drm/i915/i915_gem_request.c    |   38 ++++++---
+ drivers/gpu/drm/i915/i915_gem_request.h    |   11 ---
+ drivers/gpu/drm/i915/i915_guc_submission.c |   11 ---
+ drivers/gpu/drm/i915/i915_perf.c           |   18 ++---
+ drivers/gpu/drm/i915/intel_display.c       |    3 +-
+ drivers/gpu/drm/i915/intel_engine_cs.c     |   21 +++++-
+ drivers/gpu/drm/i915/intel_lrc.c           |   62 +++++----------
+ drivers/gpu/drm/i915/intel_lrc.h           |    5 +-
+ drivers/gpu/drm/i915/intel_pm.c            |    2 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |   58 +++++++++------
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |   23 ++++++-
+ 14 files changed, 151 insertions(+), 217 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 0ec1a6a..0655ff3 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2460,7 +2460,6 @@ struct drm_i915_private {
+ 			struct i915_perf_stream *exclusive_stream;
+ 
+ 			u32 specific_ctx_id;
+-			struct i915_vma *pinned_rcs_vma;
+ 
+ 			struct hrtimer poll_check_timer;
+ 			wait_queue_head_t poll_wq;
+@@ -3515,9 +3514,6 @@ int i915_gem_context_open(struct drm_device *dev, struct drm_file *file);
+ void i915_gem_context_close(struct drm_device *dev, struct drm_file *file);
+ int i915_switch_context(struct drm_i915_gem_request *req);
+ int i915_gem_switch_to_kernel_context(struct drm_i915_private *dev_priv);
+-struct i915_vma *
+-i915_gem_context_pin_legacy(struct i915_gem_context *ctx,
+-			    unsigned int flags);
+ void i915_gem_context_free(struct kref *ctx_ref);
+ struct i915_gem_context *
+ i915_gem_context_create_gvt(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 782be62..9b308af 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4206,7 +4206,7 @@ static void assert_kernel_context_is_current(struct drm_i915_private *dev_priv)
+ 	enum intel_engine_id id;
+ 
+ 	for_each_engine(engine, dev_priv, id)
+-		GEM_BUG_ON(engine->last_context != dev_priv->kernel_context);
++		GEM_BUG_ON(engine->last_retired_context != dev_priv->kernel_context);
+ }
+ 
+ int i915_gem_suspend(struct drm_i915_private *dev_priv)
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index a57c226..598a70d 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -416,21 +416,6 @@ out:
+ 	return ctx;
+ }
+ 
+-static void i915_gem_context_unpin(struct i915_gem_context *ctx,
+-				   struct intel_engine_cs *engine)
+-{
+-	if (i915.enable_execlists) {
+-		intel_lr_context_unpin(ctx, engine);
+-	} else {
+-		struct intel_context *ce = &ctx->engine[engine->id];
+-
+-		if (ce->state)
+-			i915_vma_unpin(ce->state);
+-
+-		i915_gem_context_put(ctx);
+-	}
+-}
+-
+ int i915_gem_context_init(struct drm_i915_private *dev_priv)
+ {
+ 	struct i915_gem_context *ctx;
+@@ -490,10 +475,13 @@ void i915_gem_context_lost(struct drm_i915_private *dev_priv)
+ 	lockdep_assert_held(&dev_priv->drm.struct_mutex);
+ 
+ 	for_each_engine(engine, dev_priv, id) {
+-		if (engine->last_context) {
+-			i915_gem_context_unpin(engine->last_context, engine);
+-			engine->last_context = NULL;
+-		}
++		engine->legacy_active_context = NULL;
++
++		if (!engine->last_retired_context)
++			continue;
++
++		engine->context_unpin(engine, engine->last_retired_context);
++		engine->last_retired_context = NULL;
+ 	}
+ 
+ 	/* Force the GPU state to be restored on enabling */
+@@ -715,7 +703,7 @@ static inline bool skip_rcs_switch(struct i915_hw_ppgtt *ppgtt,
+ 	if (ppgtt && (intel_engine_flag(engine) & ppgtt->pd_dirty_rings))
+ 		return false;
+ 
+-	return to == engine->last_context;
++	return to == engine->legacy_active_context;
+ }
+ 
+ static bool
+@@ -727,11 +715,11 @@ needs_pd_load_pre(struct i915_hw_ppgtt *ppgtt,
+ 		return false;
+ 
+ 	/* Always load the ppgtt on first use */
+-	if (!engine->last_context)
++	if (!engine->legacy_active_context)
+ 		return true;
+ 
+ 	/* Same context without new entries, skip */
+-	if (engine->last_context == to &&
++	if (engine->legacy_active_context == to &&
+ 	    !(intel_engine_flag(engine) & ppgtt->pd_dirty_rings))
+ 		return false;
+ 
+@@ -761,57 +749,20 @@ needs_pd_load_post(struct i915_hw_ppgtt *ppgtt,
+ 	return false;
+ }
+ 
+-struct i915_vma *
+-i915_gem_context_pin_legacy(struct i915_gem_context *ctx,
+-			    unsigned int flags)
+-{
+-	struct i915_vma *vma = ctx->engine[RCS].state;
+-	int ret;
+-
+-	/* Clear this page out of any CPU caches for coherent swap-in/out.
+-	 * We only want to do this on the first bind so that we do not stall
+-	 * on an active context (which by nature is already on the GPU).
+-	 */
+-	if (!(vma->flags & I915_VMA_GLOBAL_BIND)) {
+-		ret = i915_gem_object_set_to_gtt_domain(vma->obj, false);
+-		if (ret)
+-			return ERR_PTR(ret);
+-	}
+-
+-	ret = i915_vma_pin(vma, 0, ctx->ggtt_alignment, PIN_GLOBAL | flags);
+-	if (ret)
+-		return ERR_PTR(ret);
+-
+-	return vma;
+-}
+-
+ static int do_rcs_switch(struct drm_i915_gem_request *req)
+ {
+ 	struct i915_gem_context *to = req->ctx;
+ 	struct intel_engine_cs *engine = req->engine;
+ 	struct i915_hw_ppgtt *ppgtt = to->ppgtt ?: req->i915->mm.aliasing_ppgtt;
+-	struct i915_vma *vma;
+-	struct i915_gem_context *from;
++	struct i915_gem_context *from = engine->legacy_active_context;
+ 	u32 hw_flags;
+ 	int ret, i;
+ 
++	GEM_BUG_ON(engine->id != RCS);
++
+ 	if (skip_rcs_switch(ppgtt, engine, to))
+ 		return 0;
+ 
+-	/* Trying to pin first makes error handling easier. */
+-	vma = i915_gem_context_pin_legacy(to, 0);
+-	if (IS_ERR(vma))
+-		return PTR_ERR(vma);
+-
+-	/*
+-	 * Pin can switch back to the default context if we end up calling into
+-	 * evict_everything - as a last ditch gtt defrag effort that also
+-	 * switches to the default context. Hence we need to reload from here.
+-	 *
+-	 * XXX: Doing so is painfully broken!
+-	 */
+-	from = engine->last_context;
+-
+ 	if (needs_pd_load_pre(ppgtt, engine, to)) {
+ 		/* Older GENs and non render rings still want the load first,
+ 		 * "PP_DCLV followed by PP_DIR_BASE register through Load
+@@ -820,7 +771,7 @@ static int do_rcs_switch(struct drm_i915_gem_request *req)
+ 		trace_switch_mm(engine, to);
+ 		ret = ppgtt->switch_mm(ppgtt, req);
+ 		if (ret)
+-			goto err;
++			return ret;
+ 	}
+ 
+ 	if (!to->engine[RCS].initialised || i915_gem_context_is_default(to))
+@@ -837,29 +788,10 @@ static int do_rcs_switch(struct drm_i915_gem_request *req)
+ 	if (to != from || (hw_flags & MI_FORCE_RESTORE)) {
+ 		ret = mi_set_context(req, hw_flags);
+ 		if (ret)
+-			goto err;
+-	}
++			return ret;
+ 
+-	/* The backing object for the context is done after switching to the
+-	 * *next* context. Therefore we cannot retire the previous context until
+-	 * the next context has already started running. In fact, the below code
+-	 * is a bit suboptimal because the retiring can occur simply after the
+-	 * MI_SET_CONTEXT instead of when the next seqno has completed.
+-	 */
+-	if (from != NULL) {
+-		/* As long as MI_SET_CONTEXT is serializing, ie. it flushes the
+-		 * whole damn pipeline, we don't need to explicitly mark the
+-		 * object dirty. The only exception is that the context must be
+-		 * correct in case the object gets swapped out. Ideally we'd be
+-		 * able to defer doing this until we know the object would be
+-		 * swapped, but there is no way to do that yet.
+-		 */
+-		i915_vma_move_to_active(from->engine[RCS].state, req, 0);
+-		/* state is kept alive until the next request */
+-		i915_vma_unpin(from->engine[RCS].state);
+-		i915_gem_context_put(from);
++		engine->legacy_active_context = to;
+ 	}
+-	engine->last_context = i915_gem_context_get(to);
+ 
+ 	/* GEN8 does *not* require an explicit reload if the PDPs have been
+ 	 * setup, and we do not wish to move them.
+@@ -900,10 +832,6 @@ static int do_rcs_switch(struct drm_i915_gem_request *req)
+ 	}
+ 
+ 	return 0;
+-
+-err:
+-	i915_vma_unpin(vma);
+-	return ret;
+ }
+ 
+ /**
+@@ -943,12 +871,6 @@ int i915_switch_context(struct drm_i915_gem_request *req)
+ 			ppgtt->pd_dirty_rings &= ~intel_engine_flag(engine);
+ 		}
+ 
+-		if (to != engine->last_context) {
+-			if (engine->last_context)
+-				i915_gem_context_put(engine->last_context);
+-			engine->last_context = i915_gem_context_get(to);
+-		}
+-
+ 		return 0;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index fcf22b0..475d557 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -206,6 +206,7 @@ void i915_gem_retire_noop(struct i915_gem_active *active,
+ 
+ static void i915_gem_request_retire(struct drm_i915_gem_request *request)
+ {
++	struct intel_engine_cs *engine = request->engine;
+ 	struct i915_gem_active *active, *next;
+ 
+ 	lockdep_assert_held(&request->i915->drm.struct_mutex);
+@@ -216,9 +217,9 @@ static void i915_gem_request_retire(struct drm_i915_gem_request *request)
+ 
+ 	trace_i915_gem_request_retire(request);
+ 
+-	spin_lock_irq(&request->engine->timeline->lock);
++	spin_lock_irq(&engine->timeline->lock);
+ 	list_del_init(&request->link);
+-	spin_unlock_irq(&request->engine->timeline->lock);
++	spin_unlock_irq(&engine->timeline->lock);
+ 
+ 	/* We know the GPU must have read the request to have
+ 	 * sent us the seqno + interrupt, so use the position
+@@ -266,17 +267,20 @@ static void i915_gem_request_retire(struct drm_i915_gem_request *request)
+ 
+ 	i915_gem_request_remove_from_client(request);
+ 
+-	if (request->previous_context) {
+-		if (i915.enable_execlists)
+-			intel_lr_context_unpin(request->previous_context,
+-					       request->engine);
+-	}
+-
+ 	/* Retirement decays the ban score as it is a sign of ctx progress */
+ 	if (request->ctx->ban_score > 0)
+ 		request->ctx->ban_score--;
+ 
+-	i915_gem_context_put(request->ctx);
++	/* The backing object for the context is done after switching to the
++	 * *next* context. Therefore we cannot retire the previous context until
++	 * the next context has already started running. However, since we
++	 * cannot take the required locks at i915_gem_request_submit() we
++	 * defer the unpinning of the active context to now, retirement of
++	 * the subsequent request.
++	 */
++	if (engine->last_retired_context)
++		engine->context_unpin(engine, engine->last_retired_context);
++	engine->last_retired_context = request->ctx;
+ 
+ 	dma_fence_signal(&request->fence);
+ 
+@@ -524,10 +528,18 @@ i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
+-	ret = reserve_global_seqno(dev_priv);
++	/* Pinning the contexts may generate requests in order to acquire
++	 * GGTT space, so do this first before we reserve a seqno for
++	 * ourselves.
++	 */
++	ret = engine->context_pin(engine, ctx);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
++	ret = reserve_global_seqno(dev_priv);
++	if (ret)
++		goto err_unpin;
++
+ 	/* Move the oldest request to the slab-cache (if not in use!) */
+ 	req = list_first_entry_or_null(&engine->timeline->requests,
+ 				       typeof(*req), link);
+@@ -593,11 +605,10 @@ i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 	INIT_LIST_HEAD(&req->active_list);
+ 	req->i915 = dev_priv;
+ 	req->engine = engine;
+-	req->ctx = i915_gem_context_get(ctx);
++	req->ctx = ctx;
+ 
+ 	/* No zalloc, must clear what we need by hand */
+ 	req->global_seqno = 0;
+-	req->previous_context = NULL;
+ 	req->file_priv = NULL;
+ 	req->batch = NULL;
+ 
+@@ -633,10 +644,11 @@ err_ctx:
+ 	GEM_BUG_ON(!list_empty(&req->priotree.signalers_list));
+ 	GEM_BUG_ON(!list_empty(&req->priotree.waiters_list));
+ 
+-	i915_gem_context_put(ctx);
+ 	kmem_cache_free(dev_priv->requests, req);
+ err_unreserve:
+ 	dev_priv->gt.active_requests--;
++err_unpin:
++	engine->context_unpin(engine, ctx);
+ 	return ERR_PTR(ret);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.h b/drivers/gpu/drm/i915/i915_gem_request.h
+index e2b077d..8569b35 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.h
++++ b/drivers/gpu/drm/i915/i915_gem_request.h
+@@ -170,17 +170,6 @@ struct drm_i915_gem_request {
+ 	/** Preallocate space in the ring for the emitting the request */
+ 	u32 reserved_space;
+ 
+-	/**
+-	 * Context related to the previous request.
+-	 * As the contexts are accessed by the hardware until the switch is
+-	 * completed to a new context, the hardware may still be writing
+-	 * to the context object after the breadcrumb is visible. We must
+-	 * not unpin/unbind/prune that object whilst still active and so
+-	 * we keep the previous context pinned until the following (this)
+-	 * request is retired.
+-	 */
+-	struct i915_gem_context *previous_context;
+-
+ 	/** Batch buffer related to this request if any (used for
+ 	 * error state dump only).
+ 	 */
+diff --git a/drivers/gpu/drm/i915/i915_guc_submission.c b/drivers/gpu/drm/i915/i915_guc_submission.c
+index a123203..3e20fe2 100644
+--- a/drivers/gpu/drm/i915/i915_guc_submission.c
++++ b/drivers/gpu/drm/i915/i915_guc_submission.c
+@@ -534,17 +534,6 @@ static void __i915_guc_submit(struct drm_i915_gem_request *rq)
+ 
+ static void i915_guc_submit(struct drm_i915_gem_request *rq)
+ {
+-	struct intel_engine_cs *engine = rq->engine;
+-
+-	/* We keep the previous context alive until we retire the following
+-	 * request. This ensures that any the context object is still pinned
+-	 * for any residual writes the HW makes into it on the context switch
+-	 * into the next object following the breadcrumb. Otherwise, we may
+-	 * retire the context too early.
+-	 */
+-	rq->previous_context = engine->last_context;
+-	engine->last_context = rq->ctx;
+-
+ 	i915_gem_request_submit(rq);
+ 	__i915_guc_submit(rq);
+ }
+diff --git a/drivers/gpu/drm/i915/i915_perf.c b/drivers/gpu/drm/i915/i915_perf.c
+index ae7bd0e..da8537c 100644
+--- a/drivers/gpu/drm/i915/i915_perf.c
++++ b/drivers/gpu/drm/i915/i915_perf.c
+@@ -743,7 +743,7 @@ static int i915_oa_read(struct i915_perf_stream *stream,
+ static int oa_get_render_ctx_id(struct i915_perf_stream *stream)
+ {
+ 	struct drm_i915_private *dev_priv = stream->dev_priv;
+-	struct i915_vma *vma;
++	struct intel_engine_cs *engine = dev_priv->engine[RCS];
+ 	int ret;
+ 
+ 	ret = i915_mutex_lock_interruptible(&dev_priv->drm);
+@@ -755,19 +755,16 @@ static int oa_get_render_ctx_id(struct i915_perf_stream *stream)
+ 	 *
+ 	 * NB: implied RCS engine...
+ 	 */
+-	vma = i915_gem_context_pin_legacy(stream->ctx, 0);
+-	if (IS_ERR(vma)) {
+-		ret = PTR_ERR(vma);
++	ret = engine->context_pin(engine, stream->ctx);
++	if (ret)
+ 		goto unlock;
+-	}
+-
+-	dev_priv->perf.oa.pinned_rcs_vma = vma;
+ 
+ 	/* Explicitly track the ID (instead of calling i915_ggtt_offset()
+ 	 * on the fly) considering the difference with gen8+ and
+ 	 * execlists
+ 	 */
+-	dev_priv->perf.oa.specific_ctx_id = i915_ggtt_offset(vma);
++	dev_priv->perf.oa.specific_ctx_id =
++		i915_ggtt_offset(stream->ctx->engine[engine->id].state);
+ 
+ unlock:
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+@@ -785,13 +782,12 @@ unlock:
+ static void oa_put_render_ctx_id(struct i915_perf_stream *stream)
+ {
+ 	struct drm_i915_private *dev_priv = stream->dev_priv;
++	struct intel_engine_cs *engine = dev_priv->engine[RCS];
+ 
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+ 
+-	i915_vma_unpin(dev_priv->perf.oa.pinned_rcs_vma);
+-	dev_priv->perf.oa.pinned_rcs_vma = NULL;
+-
+ 	dev_priv->perf.oa.specific_ctx_id = INVALID_CTX_ID;
++	engine->context_unpin(engine, stream->ctx);
+ 
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+ }
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 47140fe..5cc6a9a 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -12319,7 +12319,8 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 		INIT_WORK(&work->mmio_work, intel_mmio_flip_work_func);
+ 		queue_work(system_unbound_wq, &work->mmio_work);
+ 	} else {
+-		request = i915_gem_request_alloc(engine, engine->last_context);
++		request = i915_gem_request_alloc(engine,
++						 dev_priv->kernel_context);
+ 		if (IS_ERR(request)) {
+ 			ret = PTR_ERR(request);
+ 			goto cleanup_unpin;
+diff --git a/drivers/gpu/drm/i915/intel_engine_cs.c b/drivers/gpu/drm/i915/intel_engine_cs.c
+index e8afe11..97bbbc3 100644
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -304,15 +304,30 @@ int intel_engine_init_common(struct intel_engine_cs *engine)
+ {
+ 	int ret;
+ 
+-	ret = intel_engine_init_breadcrumbs(engine);
++	/* We may need to do things with the shrinker which
++	 * require us to immediately switch back to the default
++	 * context. This can cause a problem as pinning the
++	 * default context also requires GTT space which may not
++	 * be available. To avoid this we always pin the default
++	 * context.
++	 */
++	ret = engine->context_pin(engine, engine->i915->kernel_context);
+ 	if (ret)
+ 		return ret;
+ 
++	ret = intel_engine_init_breadcrumbs(engine);
++	if (ret)
++		goto err_unpin;
++
+ 	ret = i915_gem_render_state_init(engine);
+ 	if (ret)
+-		return ret;
++		goto err_unpin;
+ 
+ 	return 0;
++
++err_unpin:
++	engine->context_unpin(engine, engine->i915->kernel_context);
++	return ret;
+ }
+ 
+ /**
+@@ -330,6 +345,8 @@ void intel_engine_cleanup_common(struct intel_engine_cs *engine)
+ 	intel_engine_fini_breadcrumbs(engine);
+ 	intel_engine_cleanup_cmd_parser(engine);
+ 	i915_gem_batch_pool_fini(&engine->batch_pool);
++
++	engine->context_unpin(engine, engine->i915->kernel_context);
+ }
+ 
+ u64 intel_engine_get_active_head(struct intel_engine_cs *engine)
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 916426e..d38b438 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -512,15 +512,6 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 		RB_CLEAR_NODE(&cursor->priotree.node);
+ 		cursor->priotree.priority = INT_MAX;
+ 
+-		/* We keep the previous context alive until we retire the
+-		 * following request. This ensures that any the context object
+-		 * is still pinned for any residual writes the HW makes into it
+-		 * on the context switch into the next object following the
+-		 * breadcrumb. Otherwise, we may retire the context too early.
+-		 */
+-		cursor->previous_context = engine->last_context;
+-		engine->last_context = cursor->ctx;
+-
+ 		__i915_gem_request_submit(cursor);
+ 		last = cursor;
+ 		submit = true;
+@@ -772,8 +763,8 @@ static void execlists_schedule(struct drm_i915_gem_request *request, int prio)
+ 	/* XXX Do we need to preempt to make room for us and our deps? */
+ }
+ 
+-static int intel_lr_context_pin(struct i915_gem_context *ctx,
+-				struct intel_engine_cs *engine)
++static int execlists_context_pin(struct intel_engine_cs *engine,
++				 struct i915_gem_context *ctx)
+ {
+ 	struct intel_context *ce = &ctx->engine[engine->id];
+ 	void *vaddr;
+@@ -784,6 +775,12 @@ static int intel_lr_context_pin(struct i915_gem_context *ctx,
+ 	if (ce->pin_count++)
+ 		return 0;
+ 
++	if (!ce->state) {
++		ret = execlists_context_deferred_alloc(ctx, engine);
++		if (ret)
++			goto err;
++	}
++
+ 	ret = i915_vma_pin(ce->state, 0, GEN8_LR_CONTEXT_ALIGN,
+ 			   PIN_OFFSET_BIAS | GUC_WOPCM_TOP | PIN_GLOBAL);
+ 	if (ret)
+@@ -825,8 +822,8 @@ err:
+ 	return ret;
+ }
+ 
+-void intel_lr_context_unpin(struct i915_gem_context *ctx,
+-			    struct intel_engine_cs *engine)
++static void execlists_context_unpin(struct intel_engine_cs *engine,
++				    struct i915_gem_context *ctx)
+ {
+ 	struct intel_context *ce = &ctx->engine[engine->id];
+ 
+@@ -850,24 +847,17 @@ int intel_logical_ring_alloc_request_extras(struct drm_i915_gem_request *request
+ 	struct intel_context *ce = &request->ctx->engine[engine->id];
+ 	int ret;
+ 
++	GEM_BUG_ON(!ce->pin_count);
++
+ 	/* Flush enough space to reduce the likelihood of waiting after
+ 	 * we start building the request - in which case we will just
+ 	 * have to repeat work.
+ 	 */
+ 	request->reserved_space += EXECLISTS_REQUEST_SIZE;
+ 
+-	if (!ce->state) {
+-		ret = execlists_context_deferred_alloc(request->ctx, engine);
+-		if (ret)
+-			return ret;
+-	}
+-
++	GEM_BUG_ON(!ce->ring);
+ 	request->ring = ce->ring;
+ 
+-	ret = intel_lr_context_pin(request->ctx, engine);
+-	if (ret)
+-		return ret;
+-
+ 	if (i915.enable_guc_submission) {
+ 		/*
+ 		 * Check that the GuC has space for the request before
+@@ -876,7 +866,7 @@ int intel_logical_ring_alloc_request_extras(struct drm_i915_gem_request *request
+ 		 */
+ 		ret = i915_guc_wq_reserve(request);
+ 		if (ret)
+-			goto err_unpin;
++			goto err;
+ 	}
+ 
+ 	ret = intel_ring_begin(request, 0);
+@@ -904,8 +894,7 @@ int intel_logical_ring_alloc_request_extras(struct drm_i915_gem_request *request
+ err_unreserve:
+ 	if (i915.enable_guc_submission)
+ 		i915_guc_wq_unreserve(request);
+-err_unpin:
+-	intel_lr_context_unpin(request->ctx, engine);
++err:
+ 	return ret;
+ }
+ 
+@@ -1779,13 +1768,12 @@ void intel_logical_ring_cleanup(struct intel_engine_cs *engine)
+ 	if (engine->cleanup)
+ 		engine->cleanup(engine);
+ 
+-	intel_engine_cleanup_common(engine);
+-
+ 	if (engine->status_page.vma) {
+ 		i915_gem_object_unpin_map(engine->status_page.vma->obj);
+ 		engine->status_page.vma = NULL;
+ 	}
+-	intel_lr_context_unpin(dev_priv->kernel_context, engine);
++
++	intel_engine_cleanup_common(engine);
+ 
+ 	lrc_destroy_wa_ctx_obj(engine);
+ 	engine->i915 = NULL;
+@@ -1810,6 +1798,10 @@ logical_ring_default_vfuncs(struct intel_engine_cs *engine)
+ 	/* Default vfuncs which can be overriden by each engine. */
+ 	engine->init_hw = gen8_init_common_ring;
+ 	engine->reset_hw = reset_common_ring;
++
++	engine->context_pin = execlists_context_pin;
++	engine->context_unpin = execlists_context_unpin;
++
+ 	engine->emit_flush = gen8_emit_flush;
+ 	engine->emit_breadcrumb = gen8_emit_breadcrumb;
+ 	engine->emit_breadcrumb_sz = gen8_emit_breadcrumb_sz;
+@@ -1892,18 +1884,6 @@ logical_ring_init(struct intel_engine_cs *engine)
+ 	if (ret)
+ 		goto error;
+ 
+-	ret = execlists_context_deferred_alloc(dctx, engine);
+-	if (ret)
+-		goto error;
+-
+-	/* As this is the default context, always pin it */
+-	ret = intel_lr_context_pin(dctx, engine);
+-	if (ret) {
+-		DRM_ERROR("Failed to pin context for %s: %d\n",
+-			  engine->name, ret);
+-		goto error;
+-	}
+-
+ 	/* And setup the hardware status page. */
+ 	ret = lrc_setup_hws(engine, dctx->engine[engine->id].state);
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/i915/intel_lrc.h b/drivers/gpu/drm/i915/intel_lrc.h
+index 7c64032..b563033 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -79,13 +79,10 @@ int intel_engines_init(struct drm_i915_private *dev_priv);
+ #define LRC_PPHWSP_PN	(LRC_GUCSHR_PN + 1)
+ #define LRC_STATE_PN	(LRC_PPHWSP_PN + 1)
+ 
++struct drm_i915_private;
+ struct i915_gem_context;
+ 
+ uint32_t intel_lr_context_size(struct intel_engine_cs *engine);
+-void intel_lr_context_unpin(struct i915_gem_context *ctx,
+-			    struct intel_engine_cs *engine);
+-
+-struct drm_i915_private;
+ 
+ void intel_lr_context_resume(struct drm_i915_private *dev_priv);
+ uint64_t intel_lr_context_descriptor(struct i915_gem_context *ctx,
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 6f99161..44105d1 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -6823,7 +6823,7 @@ static void __intel_autoenable_gt_powersave(struct work_struct *work)
+ 		goto out;
+ 
+ 	rcs = dev_priv->engine[RCS];
+-	if (rcs->last_context)
++	if (rcs->last_retired_context)
+ 		goto out;
+ 
+ 	if (!rcs->init_context)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 4e987d5..4ee956e 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1931,8 +1931,26 @@ intel_ring_free(struct intel_ring *ring)
+ 	kfree(ring);
+ }
+ 
+-static int intel_ring_context_pin(struct i915_gem_context *ctx,
+-				  struct intel_engine_cs *engine)
++static int context_pin(struct i915_gem_context *ctx, unsigned int flags)
++{
++	struct i915_vma *vma = ctx->engine[RCS].state;
++	int ret;
++
++	/* Clear this page out of any CPU caches for coherent swap-in/out.
++	 * We only want to do this on the first bind so that we do not stall
++	 * on an active context (which by nature is already on the GPU).
++	 */
++	if (!(vma->flags & I915_VMA_GLOBAL_BIND)) {
++		ret = i915_gem_object_set_to_gtt_domain(vma->obj, false);
++		if (ret)
++			return ret;
++	}
++
++	return i915_vma_pin(vma, 0, ctx->ggtt_alignment, PIN_GLOBAL | flags);
++}
++
++static int intel_ring_context_pin(struct intel_engine_cs *engine,
++				  struct i915_gem_context *ctx)
+ {
+ 	struct intel_context *ce = &ctx->engine[engine->id];
+ 	int ret;
+@@ -1943,13 +1961,15 @@ static int intel_ring_context_pin(struct i915_gem_context *ctx,
+ 		return 0;
+ 
+ 	if (ce->state) {
+-		struct i915_vma *vma;
++		unsigned int flags;
++
++		flags = 0;
++		if (ctx == ctx->i915->kernel_context)
++			flags = PIN_HIGH;
+ 
+-		vma = i915_gem_context_pin_legacy(ctx, PIN_HIGH);
+-		if (IS_ERR(vma)) {
+-			ret = PTR_ERR(vma);
++		ret = context_pin(ctx, flags);
++		if (ret)
+ 			goto error;
+-		}
+ 	}
+ 
+ 	/* The kernel context is only used as a placeholder for flushing the
+@@ -1970,12 +1990,13 @@ error:
+ 	return ret;
+ }
+ 
+-static void intel_ring_context_unpin(struct i915_gem_context *ctx,
+-				     struct intel_engine_cs *engine)
++static void intel_ring_context_unpin(struct intel_engine_cs *engine,
++				     struct i915_gem_context *ctx)
+ {
+ 	struct intel_context *ce = &ctx->engine[engine->id];
+ 
+ 	lockdep_assert_held(&ctx->i915->drm.struct_mutex);
++	GEM_BUG_ON(ce->pin_count == 0);
+ 
+ 	if (--ce->pin_count)
+ 		return;
+@@ -2000,17 +2021,6 @@ static int intel_init_ring_buffer(struct intel_engine_cs *engine)
+ 	if (ret)
+ 		goto error;
+ 
+-	/* We may need to do things with the shrinker which
+-	 * require us to immediately switch back to the default
+-	 * context. This can cause a problem as pinning the
+-	 * default context also requires GTT space which may not
+-	 * be available. To avoid this we always pin the default
+-	 * context.
+-	 */
+-	ret = intel_ring_context_pin(dev_priv->kernel_context, engine);
+-	if (ret)
+-		goto error;
+-
+ 	ring = intel_engine_create_ring(engine, 32 * PAGE_SIZE);
+ 	if (IS_ERR(ring)) {
+ 		ret = PTR_ERR(ring);
+@@ -2069,8 +2079,6 @@ void intel_engine_cleanup(struct intel_engine_cs *engine)
+ 
+ 	intel_engine_cleanup_common(engine);
+ 
+-	intel_ring_context_unpin(dev_priv->kernel_context, engine);
+-
+ 	engine->i915 = NULL;
+ 	dev_priv->engine[engine->id] = NULL;
+ 	kfree(engine);
+@@ -2091,12 +2099,15 @@ int intel_ring_alloc_request_extras(struct drm_i915_gem_request *request)
+ {
+ 	int ret;
+ 
++	GEM_BUG_ON(!request->ctx->engine[request->engine->id].pin_count);
++
+ 	/* Flush enough space to reduce the likelihood of waiting after
+ 	 * we start building the request - in which case we will just
+ 	 * have to repeat work.
+ 	 */
+ 	request->reserved_space += LEGACY_REQUEST_SIZE;
+ 
++	GEM_BUG_ON(!request->engine->buffer);
+ 	request->ring = request->engine->buffer;
+ 
+ 	ret = intel_ring_begin(request, 0);
+@@ -2576,6 +2587,9 @@ static void intel_ring_default_vfuncs(struct drm_i915_private *dev_priv,
+ 	engine->init_hw = init_ring_common;
+ 	engine->reset_hw = reset_ring_common;
+ 
++	engine->context_pin = intel_ring_context_pin;
++	engine->context_unpin = intel_ring_context_unpin;
++
+ 	engine->emit_breadcrumb = i9xx_emit_breadcrumb;
+ 	engine->emit_breadcrumb_sz = i9xx_emit_breadcrumb_sz;
+ 	if (i915.semaphores) {
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 3f43ade..4f12718 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -266,6 +266,10 @@ struct intel_engine_cs {
+ 	void		(*reset_hw)(struct intel_engine_cs *engine,
+ 				    struct drm_i915_gem_request *req);
+ 
++	int		(*context_pin)(struct intel_engine_cs *engine,
++				       struct i915_gem_context *ctx);
++	void		(*context_unpin)(struct intel_engine_cs *engine,
++					 struct i915_gem_context *ctx);
+ 	int		(*init_context)(struct drm_i915_gem_request *req);
+ 
+ 	int		(*emit_flush)(struct drm_i915_gem_request *request,
+@@ -379,7 +383,24 @@ struct intel_engine_cs {
+ 	bool preempt_wa;
+ 	u32 ctx_desc_template;
+ 
+-	struct i915_gem_context *last_context;
++	/* Contexts are pinned whilst they are active on the GPU. The last
++	 * context executed remains active whilst the GPU is idle - the
++	 * switch away and write to the context object only occurs on the
++	 * next execution.  Contexts are only unpinned on retirement of the
++	 * following request ensuring that we can always write to the object
++	 * on the context switch even after idling. Across suspend, we switch
++	 * to the kernel context and trash it as the save may not happen
++	 * before the hardware is powered down.
++	 */
++	struct i915_gem_context *last_retired_context;
++
++	/* We track the current MI_SET_CONTEXT in order to eliminate
++	 * redudant context switches. This presumes that requests are not
++	 * reordered! Or when they are the tracking is updated along with
++	 * the emission of individual requests into the legacy command
++	 * stream (ring).
++	 */
++	struct i915_gem_context *legacy_active_context;
+ 
+ 	struct intel_engine_hangcheck hangcheck;
+ 
+-- 
+1.7.5.4
+

@@ -1,0 +1,509 @@
+From 3792fbb454d1860eeb97a75199d18a963ebf05e5 Mon Sep 17 00:00:00 2001
+From: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Date: Fri, 18 Nov 2016 15:09:04 +0200
+Subject: [PATCH 1985/4301] drm/i915: Decouple hang detection from hangcheck
+ period
+
+commit 3fe3b030bd2d7a51c12aa6fe0e5178b9f1a726ec upstream
+
+Hangcheck state accumulation has gained more steps
+along the years, like head movement and more recently the
+subunit inactivity check. As the subunit sampling is only
+done if the previous state check showed inactivity, we
+have added more stages (and time) to reach a hang verdict.
+
+Asymmetric engine states led to different actual weight of
+'one hangcheck unit' and it was demonstrated in some
+hangs that due to difference in stages, simpler engines
+were accused falsely of a hang as their scoring was much
+more quicker to accumulate above the hang treshold.
+
+To completely decouple the hangcheck guilty score
+from the hangcheck period, convert hangcheck score to a
+rough period of inactivity measurement. As these are
+tracked as jiffies, they are meaningful also across
+reset boundaries. This makes finding a guilty engine
+more accurate across multi engine activity scenarios,
+especially across asymmetric engines.
+
+We lose the ability to detect cross batch malicious attempts
+to hinder the progress. Plan is to move this functionality
+to be part of context banning which is more natural fit,
+later in the series.
+
+v2: use time_before macros (Chris)
+    reinstate the pardoning of moving engine after hc (Chris)
+v3: avoid global state for per engine stall detection (Chris)
+v4: take timeline last retirement into account (Chris)
+v5: do debug print on pardoning, split out retirement timestamp (Chris)
+
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Mika Kuoppala <mika.kuoppala@intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c     |   17 +++--
+ drivers/gpu/drm/i915/i915_drv.h         |    6 ++-
+ drivers/gpu/drm/i915/i915_gem.c         |    8 ++-
+ drivers/gpu/drm/i915/i915_gpu_error.c   |   46 ++++----------
+ drivers/gpu/drm/i915/intel_hangcheck.c  |  108 +++++++++++++++----------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |   40 +++++++++---
+ 6 files changed, 117 insertions(+), 108 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index fb47efd..437212a 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -1351,10 +1351,12 @@ static int i915_hangcheck_info(struct seq_file *m, void *unused)
+ 		seq_printf(m, "\tseqno = %x [current %x, last %x]\n",
+ 			   engine->hangcheck.seqno, seqno[id],
+ 			   intel_engine_last_submit(engine));
+-		seq_printf(m, "\twaiters? %s, fake irq active? %s\n",
++		seq_printf(m, "\twaiters? %s, fake irq active? %s, stalled? %s\n",
+ 			   yesno(intel_engine_has_waiter(engine)),
+ 			   yesno(test_bit(engine->id,
+-					  &dev_priv->gpu_error.missed_irq_rings)));
++					  &dev_priv->gpu_error.missed_irq_rings)),
++			   yesno(engine->hangcheck.stalled));
++
+ 		spin_lock_irq(&b->lock);
+ 		for (rb = rb_first(&b->waiters); rb; rb = rb_next(rb)) {
+ 			struct intel_wait *w = container_of(rb, typeof(*w), node);
+@@ -1367,8 +1369,11 @@ static int i915_hangcheck_info(struct seq_file *m, void *unused)
+ 		seq_printf(m, "\tACTHD = 0x%08llx [current 0x%08llx]\n",
+ 			   (long long)engine->hangcheck.acthd,
+ 			   (long long)acthd[id]);
+-		seq_printf(m, "\tscore = %d\n", engine->hangcheck.score);
+-		seq_printf(m, "\taction = %d\n", engine->hangcheck.action);
++		seq_printf(m, "\taction = %s(%d) %d ms ago\n",
++			   hangcheck_action_to_str(engine->hangcheck.action),
++			   engine->hangcheck.action,
++			   jiffies_to_msecs(jiffies -
++					    engine->hangcheck.action_timestamp));
+ 
+ 		if (engine->id == RCS) {
+ 			seq_puts(m, "\tinstdone read =\n");
+@@ -3162,11 +3167,11 @@ static int i915_engine_info(struct seq_file *m, void *unused)
+ 		u64 addr;
+ 
+ 		seq_printf(m, "%s\n", engine->name);
+-		seq_printf(m, "\tcurrent seqno %x, last %x, hangcheck %x [score %d]\n",
++		seq_printf(m, "\tcurrent seqno %x, last %x, hangcheck %x [%d ms]\n",
+ 			   intel_engine_get_seqno(engine),
+ 			   intel_engine_last_submit(engine),
+ 			   engine->hangcheck.seqno,
+-			   engine->hangcheck.score);
++			   jiffies_to_msecs(jiffies - engine->hangcheck.action_timestamp));
+ 
+ 		rcu_read_lock();
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 8a13e2d..c2a8899 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -802,7 +802,8 @@ struct drm_i915_error_state {
+ 		/* Software tracked state */
+ 		bool waiting;
+ 		int num_waiters;
+-		int hangcheck_score;
++		unsigned long hangcheck_timestamp;
++		bool hangcheck_stalled;
+ 		enum intel_engine_hangcheck_action hangcheck_action;
+ 		struct i915_address_space *vm;
+ 		int num_requests;
+@@ -1460,6 +1461,9 @@ struct i915_error_state_file_priv {
+ #define I915_RESET_TIMEOUT (10 * HZ) /* 10s */
+ #define I915_FENCE_TIMEOUT (10 * HZ) /* 10s */
+ 
++#define I915_ENGINE_DEAD_TIMEOUT  (4 * HZ)  /* Seqno, head and subunits dead */
++#define I915_SEQNO_DEAD_TIMEOUT   (12 * HZ) /* Seqno dead with active head */
++
+ struct i915_gpu_error {
+ 	/* For hangcheck timer */
+ #define DRM_I915_HANGCHECK_PERIOD 1500 /* in ms */
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 902fa42..1f8dfd4 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2705,9 +2705,13 @@ static void i915_gem_reset_engine(struct intel_engine_cs *engine)
+ 	if (!request)
+ 		return;
+ 
+-	ring_hung = engine->hangcheck.score >= HANGCHECK_SCORE_RING_HUNG;
+-	if (engine->hangcheck.seqno != intel_engine_get_seqno(engine))
++	ring_hung = engine->hangcheck.stalled;
++	if (engine->hangcheck.seqno != intel_engine_get_seqno(engine)) {
++		DRM_DEBUG_DRIVER("%s pardoned, was guilty? %s\n",
++				 engine->name,
++				 yesno(ring_hung));
+ 		ring_hung = false;
++	}
+ 
+ 	i915_set_reset_status(request->ctx, ring_hung);
+ 	if (!ring_hung)
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 4bcf1a0..d5a4ec9 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -316,28 +316,6 @@ static void print_error_buffers(struct drm_i915_error_state_buf *m,
+ 	}
+ }
+ 
+-static const char *hangcheck_action_to_str(enum intel_engine_hangcheck_action a)
+-{
+-	switch (a) {
+-	case HANGCHECK_IDLE:
+-		return "idle";
+-	case HANGCHECK_WAIT:
+-		return "wait";
+-	case HANGCHECK_ACTIVE_SEQNO:
+-		return "active seqno";
+-	case HANGCHECK_ACTIVE_HEAD:
+-		return "active head";
+-	case HANGCHECK_ACTIVE_SUBUNITS:
+-		return "active subunits";
+-	case HANGCHECK_KICK:
+-		return "kick";
+-	case HANGCHECK_HUNG:
+-		return "hung";
+-	}
+-
+-	return "unknown";
+-}
+-
+ static void error_print_instdone(struct drm_i915_error_state_buf *m,
+ 				 struct drm_i915_error_engine *ee)
+ {
+@@ -445,9 +423,13 @@ static void error_print_engine(struct drm_i915_error_state_buf *m,
+ 	err_printf(m, "  waiting: %s\n", yesno(ee->waiting));
+ 	err_printf(m, "  ring->head: 0x%08x\n", ee->cpu_ring_head);
+ 	err_printf(m, "  ring->tail: 0x%08x\n", ee->cpu_ring_tail);
+-	err_printf(m, "  hangcheck: %s [%d]\n",
+-		   hangcheck_action_to_str(ee->hangcheck_action),
+-		   ee->hangcheck_score);
++	err_printf(m, "  hangcheck stall: %s\n", yesno(ee->hangcheck_stalled));
++	err_printf(m, "  hangcheck action: %s\n",
++		   hangcheck_action_to_str(ee->hangcheck_action));
++	err_printf(m, "  hangcheck action timestamp: %lu, %u ms ago\n",
++		   ee->hangcheck_timestamp,
++		   jiffies_to_msecs(jiffies - ee->hangcheck_timestamp));
++
+ 	error_print_request(m, "  ELSP[0]: ", &ee->execlist[0]);
+ 	error_print_request(m, "  ELSP[1]: ", &ee->execlist[1]);
+ }
+@@ -536,7 +518,6 @@ int i915_error_state_to_str(struct drm_i915_error_state_buf *m,
+ 	struct pci_dev *pdev = dev_priv->drm.pdev;
+ 	struct drm_i915_error_state *error = error_priv->error;
+ 	struct drm_i915_error_object *obj;
+-	int max_hangcheck_score;
+ 	int i, j;
+ 
+ 	if (!error) {
+@@ -553,13 +534,9 @@ int i915_error_state_to_str(struct drm_i915_error_state_buf *m,
+ 	err_printf(m, "Uptime: %ld s %ld us\n",
+ 		   error->uptime.tv_sec, error->uptime.tv_usec);
+ 	err_print_capabilities(m, &error->device_info);
+-	max_hangcheck_score = 0;
+-	for (i = 0; i < ARRAY_SIZE(error->engine); i++) {
+-		if (error->engine[i].hangcheck_score > max_hangcheck_score)
+-			max_hangcheck_score = error->engine[i].hangcheck_score;
+-	}
++
+ 	for (i = 0; i < ARRAY_SIZE(error->engine); i++) {
+-		if (error->engine[i].hangcheck_score == max_hangcheck_score &&
++		if (error->engine[i].hangcheck_stalled &&
+ 		    error->engine[i].pid != -1) {
+ 			err_printf(m, "Active process (on ring %s): %s [%d]\n",
+ 				   engine_str(i),
+@@ -945,7 +922,7 @@ static uint32_t i915_error_generate_code(struct drm_i915_private *dev_priv,
+ 	 * strictly a client bug. Use instdone to differentiate those some.
+ 	 */
+ 	for (i = 0; i < I915_NUM_ENGINES; i++) {
+-		if (error->engine[i].hangcheck_action == HANGCHECK_HUNG) {
++		if (error->engine[i].hangcheck_stalled) {
+ 			if (engine_id)
+ 				*engine_id = i;
+ 
+@@ -1163,8 +1140,9 @@ static void error_record_engine_registers(struct drm_i915_error_state *error,
+ 		ee->hws = I915_READ(mmio);
+ 	}
+ 
+-	ee->hangcheck_score = engine->hangcheck.score;
++	ee->hangcheck_timestamp = engine->hangcheck.action_timestamp;
+ 	ee->hangcheck_action = engine->hangcheck.action;
++	ee->hangcheck_stalled = engine->hangcheck.stalled;
+ 
+ 	if (USES_PPGTT(dev_priv)) {
+ 		int i;
+diff --git a/drivers/gpu/drm/i915/intel_hangcheck.c b/drivers/gpu/drm/i915/intel_hangcheck.c
+index 3d2e81c..c03db02 100644
+--- a/drivers/gpu/drm/i915/intel_hangcheck.c
++++ b/drivers/gpu/drm/i915/intel_hangcheck.c
+@@ -236,13 +236,13 @@ head_stuck(struct intel_engine_cs *engine, u64 acthd)
+ 		memset(&engine->hangcheck.instdone, 0,
+ 		       sizeof(engine->hangcheck.instdone));
+ 
+-		return HANGCHECK_ACTIVE_HEAD;
++		return ENGINE_ACTIVE_HEAD;
+ 	}
+ 
+ 	if (!subunits_stuck(engine))
+-		return HANGCHECK_ACTIVE_SUBUNITS;
++		return ENGINE_ACTIVE_SUBUNITS;
+ 
+-	return HANGCHECK_HUNG;
++	return ENGINE_DEAD;
+ }
+ 
+ static enum intel_engine_hangcheck_action
+@@ -253,11 +253,11 @@ engine_stuck(struct intel_engine_cs *engine, u64 acthd)
+ 	u32 tmp;
+ 
+ 	ha = head_stuck(engine, acthd);
+-	if (ha != HANGCHECK_HUNG)
++	if (ha != ENGINE_DEAD)
+ 		return ha;
+ 
+ 	if (IS_GEN2(dev_priv))
+-		return HANGCHECK_HUNG;
++		return ENGINE_DEAD;
+ 
+ 	/* Is the chip hanging on a WAIT_FOR_EVENT?
+ 	 * If so we can simply poke the RB_WAIT bit
+@@ -270,25 +270,25 @@ engine_stuck(struct intel_engine_cs *engine, u64 acthd)
+ 				  "Kicking stuck wait on %s",
+ 				  engine->name);
+ 		I915_WRITE_CTL(engine, tmp);
+-		return HANGCHECK_KICK;
++		return ENGINE_WAIT_KICK;
+ 	}
+ 
+ 	if (INTEL_GEN(dev_priv) >= 6 && tmp & RING_WAIT_SEMAPHORE) {
+ 		switch (semaphore_passed(engine)) {
+ 		default:
+-			return HANGCHECK_HUNG;
++			return ENGINE_DEAD;
+ 		case 1:
+ 			i915_handle_error(dev_priv, 0,
+ 					  "Kicking stuck semaphore on %s",
+ 					  engine->name);
+ 			I915_WRITE_CTL(engine, tmp);
+-			return HANGCHECK_KICK;
++			return ENGINE_WAIT_KICK;
+ 		case 0:
+-			return HANGCHECK_WAIT;
++			return ENGINE_WAIT;
+ 		}
+ 	}
+ 
+-	return HANGCHECK_HUNG;
++	return ENGINE_DEAD;
+ }
+ 
+ static void hangcheck_load_sample(struct intel_engine_cs *engine,
+@@ -306,7 +306,6 @@ static void hangcheck_load_sample(struct intel_engine_cs *engine,
+ 
+ 	hc->acthd = intel_engine_get_active_head(engine);
+ 	hc->seqno = intel_engine_get_seqno(engine);
+-	hc->score = engine->hangcheck.score;
+ }
+ 
+ static void hangcheck_store_sample(struct intel_engine_cs *engine,
+@@ -314,8 +313,8 @@ static void hangcheck_store_sample(struct intel_engine_cs *engine,
+ {
+ 	engine->hangcheck.acthd = hc->acthd;
+ 	engine->hangcheck.seqno = hc->seqno;
+-	engine->hangcheck.score = hc->score;
+ 	engine->hangcheck.action = hc->action;
++	engine->hangcheck.stalled = hc->stalled;
+ }
+ 
+ static enum intel_engine_hangcheck_action
+@@ -323,10 +322,10 @@ hangcheck_get_action(struct intel_engine_cs *engine,
+ 		     const struct intel_engine_hangcheck *hc)
+ {
+ 	if (engine->hangcheck.seqno != hc->seqno)
+-		return HANGCHECK_ACTIVE_SEQNO;
++		return ENGINE_ACTIVE_SEQNO;
+ 
+ 	if (i915_seqno_passed(hc->seqno, intel_engine_last_submit(engine)))
+-		return HANGCHECK_IDLE;
++		return ENGINE_IDLE;
+ 
+ 	return engine_stuck(engine, hc->acthd);
+ }
+@@ -334,60 +333,57 @@ hangcheck_get_action(struct intel_engine_cs *engine,
+ static void hangcheck_accumulate_sample(struct intel_engine_cs *engine,
+ 					struct intel_engine_hangcheck *hc)
+ {
++	unsigned long timeout = I915_ENGINE_DEAD_TIMEOUT;
++
+ 	hc->action = hangcheck_get_action(engine, hc);
+ 
+-	switch (hc->action) {
+-	case HANGCHECK_IDLE:
+-	case HANGCHECK_WAIT:
+-		break;
++	/* We always increment the progress
++	 * if the engine is busy and still processing
++	 * the same request, so that no single request
++	 * can run indefinitely (such as a chain of
++	 * batches). The only time we do not increment
++	 * the hangcheck score on this ring, if this
++	 * engine is in a legitimate wait for another
++	 * engine. In that case the waiting engine is a
++	 * victim and we want to be sure we catch the
++	 * right culprit. Then every time we do kick
++	 * the ring, make it as a progress as the seqno
++	 * advancement might ensure and if not, it
++	 * will catch the hanging engine.
++	 */
+ 
+-	case HANGCHECK_ACTIVE_HEAD:
+-	case HANGCHECK_ACTIVE_SUBUNITS:
+-		/* We always increment the hangcheck score
+-		 * if the engine is busy and still processing
+-		 * the same request, so that no single request
+-		 * can run indefinitely (such as a chain of
+-		 * batches). The only time we do not increment
+-		 * the hangcheck score on this ring, if this
+-		 * engine is in a legitimate wait for another
+-		 * engine. In that case the waiting engine is a
+-		 * victim and we want to be sure we catch the
+-		 * right culprit. Then every time we do kick
+-		 * the ring, add a small increment to the
+-		 * score so that we can catch a batch that is
+-		 * being repeatedly kicked and so responsible
+-		 * for stalling the machine.
+-		 */
+-		hc->score += 1;
+-		break;
++	switch (hc->action) {
++	case ENGINE_IDLE:
++	case ENGINE_ACTIVE_SEQNO:
++		/* Clear head and subunit states on seqno movement */
++		hc->acthd = 0;
+ 
+-	case HANGCHECK_KICK:
+-		hc->score += 5;
+-		break;
++		memset(&engine->hangcheck.instdone, 0,
++		       sizeof(engine->hangcheck.instdone));
+ 
+-	case HANGCHECK_HUNG:
+-		hc->score += 20;
++		/* Intentional fall through */
++	case ENGINE_WAIT_KICK:
++	case ENGINE_WAIT:
++		engine->hangcheck.action_timestamp = jiffies;
+ 		break;
+ 
+-	case HANGCHECK_ACTIVE_SEQNO:
+-		/* Gradually reduce the count so that we catch DoS
+-		 * attempts across multiple batches.
++	case ENGINE_ACTIVE_HEAD:
++	case ENGINE_ACTIVE_SUBUNITS:
++		/* Seqno stuck with still active engine gets leeway,
++		 * in hopes that it is just a long shader.
+ 		 */
+-		if (hc->score > 0)
+-			hc->score -= 15;
+-		if (hc->score < 0)
+-			hc->score = 0;
+-
+-		/* Clear head and subunit states on seqno movement */
+-		hc->acthd = 0;
++		timeout = I915_SEQNO_DEAD_TIMEOUT;
++		break;
+ 
+-		memset(&engine->hangcheck.instdone, 0,
+-		       sizeof(engine->hangcheck.instdone));
++	case ENGINE_DEAD:
+ 		break;
+ 
+ 	default:
+ 		MISSING_CASE(hc->action);
+ 	}
++
++	hc->stalled = time_after(jiffies,
++				 engine->hangcheck.action_timestamp + timeout);
+ }
+ 
+ static void hangcheck_declare_hang(struct drm_i915_private *i915,
+@@ -454,9 +450,9 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
+ 		hangcheck_accumulate_sample(engine, hc);
+ 		hangcheck_store_sample(engine, hc);
+ 
+-		if (hc->score >= HANGCHECK_SCORE_RING_HUNG) {
++		if (engine->hangcheck.stalled) {
+ 			hung |= intel_engine_flag(engine);
+-			if (hc->action != HANGCHECK_HUNG)
++			if (hc->action != ENGINE_DEAD)
+ 				stuck |= intel_engine_flag(engine);
+ 		}
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 3152b2b..3f43ade 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -65,16 +65,37 @@ struct intel_hw_status_page {
+ 	 GEN8_SEMAPHORE_OFFSET(from, (__ring)->id))
+ 
+ enum intel_engine_hangcheck_action {
+-	HANGCHECK_IDLE = 0,
+-	HANGCHECK_WAIT,
+-	HANGCHECK_ACTIVE_SEQNO,
+-	HANGCHECK_ACTIVE_HEAD,
+-	HANGCHECK_ACTIVE_SUBUNITS,
+-	HANGCHECK_KICK,
+-	HANGCHECK_HUNG,
++	ENGINE_IDLE = 0,
++	ENGINE_WAIT,
++	ENGINE_ACTIVE_SEQNO,
++	ENGINE_ACTIVE_HEAD,
++	ENGINE_ACTIVE_SUBUNITS,
++	ENGINE_WAIT_KICK,
++	ENGINE_DEAD,
+ };
+ 
+-#define HANGCHECK_SCORE_RING_HUNG 31
++static inline const char *
++hangcheck_action_to_str(const enum intel_engine_hangcheck_action a)
++{
++	switch (a) {
++	case ENGINE_IDLE:
++		return "idle";
++	case ENGINE_WAIT:
++		return "wait";
++	case ENGINE_ACTIVE_SEQNO:
++		return "active seqno";
++	case ENGINE_ACTIVE_HEAD:
++		return "active head";
++	case ENGINE_ACTIVE_SUBUNITS:
++		return "active subunits";
++	case ENGINE_WAIT_KICK:
++		return "wait kick";
++	case ENGINE_DEAD:
++		return "dead";
++	}
++
++	return "unknown";
++}
+ 
+ #define I915_MAX_SLICES	3
+ #define I915_MAX_SUBSLICES 3
+@@ -106,10 +127,11 @@ struct intel_instdone {
+ struct intel_engine_hangcheck {
+ 	u64 acthd;
+ 	u32 seqno;
+-	int score;
+ 	enum intel_engine_hangcheck_action action;
++	unsigned long action_timestamp;
+ 	int deadlock;
+ 	struct intel_instdone instdone;
++	bool stalled;
+ };
+ 
+ struct intel_ring {
+-- 
+1.7.5.4
+

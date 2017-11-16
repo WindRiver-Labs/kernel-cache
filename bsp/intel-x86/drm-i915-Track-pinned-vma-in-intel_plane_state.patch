@@ -1,0 +1,673 @@
+From 834f1e5bd3fa67d9aa124f5373a571b42248da4d Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 16 Jan 2017 15:21:27 +0000
+Subject: [PATCH 2785/4301] drm/i915: Track pinned vma in intel_plane_state
+
+commit be1e341513ca23b0668b7b0f26fa6e2ffc46ba20 upstream
+
+With atomic plane states we are able to track an allocation right from
+preparation, during use and through to the final free after being
+swapped out for a new plane. We can couple the VMA we pin for the
+framebuffer (and its rotation) to this lifetime and avoid all the clumsy
+lookups in between.
+
+v2: Remove residual vma on plane cleanup (Chris)
+v3: Add a description for the vma destruction in
+    intel_plane_destroy_state (Maarten)
+
+References: https://bugs.freedesktop.org/show_bug.cgi?id=98829
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170116152131.18089-1-chris@chris-wilson.co.uk
+Acked-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h           |   16 +---
+ drivers/gpu/drm/i915/intel_atomic_plane.c |   20 +++++
+ drivers/gpu/drm/i915/intel_display.c      |  130 ++++++++++------------------
+ drivers/gpu/drm/i915/intel_drv.h          |    9 ++-
+ drivers/gpu/drm/i915/intel_fbc.c          |   52 +++++-------
+ drivers/gpu/drm/i915/intel_fbdev.c        |    4 +-
+ drivers/gpu/drm/i915/intel_sprite.c       |    8 +-
+ 7 files changed, 104 insertions(+), 135 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 08ee7fd..94eaa1f 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1071,6 +1071,8 @@ struct intel_fbc {
+ 	struct work_struct underrun_work;
+ 
+ 	struct intel_fbc_state_cache {
++		struct i915_vma *vma;
++
+ 		struct {
+ 			unsigned int mode_flags;
+ 			uint32_t hsw_bdw_pixel_rate;
+@@ -1084,15 +1086,14 @@ struct intel_fbc {
+ 		} plane;
+ 
+ 		struct {
+-			u64 ilk_ggtt_offset;
+ 			const struct drm_format_info *format;
+ 			unsigned int stride;
+-			int fence_reg;
+-			unsigned int tiling_mode;
+ 		} fb;
+ 	} state_cache;
+ 
+ 	struct intel_fbc_reg_params {
++		struct i915_vma *vma;
++
+ 		struct {
+ 			enum pipe pipe;
+ 			enum plane plane;
+@@ -1100,10 +1101,8 @@ struct intel_fbc {
+ 		} crtc;
+ 
+ 		struct {
+-			u64 ggtt_offset;
+ 			const struct drm_format_info *format;
+ 			unsigned int stride;
+-			int fence_reg;
+ 		} fb;
+ 
+ 		int cfb_size;
+@@ -3425,13 +3424,6 @@ i915_gem_object_to_ggtt(struct drm_i915_gem_object *obj,
+ 	return i915_gem_obj_to_vma(obj, &to_i915(obj->base.dev)->ggtt.base, view);
+ }
+ 
+-static inline unsigned long
+-i915_gem_object_ggtt_offset(struct drm_i915_gem_object *o,
+-			    const struct i915_ggtt_view *view)
+-{
+-	return i915_ggtt_offset(i915_gem_object_to_ggtt(o, view));
+-}
+-
+ /* i915_gem_fence_reg.c */
+ int __must_check i915_vma_get_fence(struct i915_vma *vma);
+ int __must_check i915_vma_put_fence(struct i915_vma *vma);
+diff --git a/drivers/gpu/drm/i915/intel_atomic_plane.c b/drivers/gpu/drm/i915/intel_atomic_plane.c
+index 4612ffd..41fd94e 100644
+--- a/drivers/gpu/drm/i915/intel_atomic_plane.c
++++ b/drivers/gpu/drm/i915/intel_atomic_plane.c
+@@ -85,6 +85,8 @@ intel_plane_duplicate_state(struct drm_plane *plane)
+ 
+ 	__drm_atomic_helper_plane_duplicate_state(plane, state);
+ 
++	intel_state->vma = NULL;
++
+ 	return state;
+ }
+ 
+@@ -100,6 +102,24 @@ void
+ intel_plane_destroy_state(struct drm_plane *plane,
+ 			  struct drm_plane_state *state)
+ {
++	struct i915_vma *vma;
++
++	vma = fetch_and_zero(&to_intel_plane_state(state)->vma);
++
++	/*
++	 * FIXME: Normally intel_cleanup_plane_fb handles destruction of vma.
++	 * We currently don't clear all planes during driver unload, so we have
++	 * to be able to unpin vma here for now.
++	 *
++	 * Normally this can only happen during unload when kmscon is disabled
++	 * and userspace doesn't attempt to set a framebuffer at all.
++	 */
++	if (vma) {
++		mutex_lock(&plane->dev->struct_mutex);
++		intel_unpin_fb_vma(vma);
++		mutex_unlock(&plane->dev->struct_mutex);
++	}
++
+ 	drm_atomic_helper_plane_destroy_state(plane, state);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 58942e2..0210ab7 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2234,24 +2234,19 @@ intel_pin_and_fence_fb_obj(struct drm_framebuffer *fb, unsigned int rotation)
+ 			i915_vma_pin_fence(vma);
+ 	}
+ 
++	i915_vma_get(vma);
+ err:
+ 	intel_runtime_pm_put(dev_priv);
+ 	return vma;
+ }
+ 
+-void intel_unpin_fb_obj(struct drm_framebuffer *fb, unsigned int rotation)
++void intel_unpin_fb_vma(struct i915_vma *vma)
+ {
+-	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
+-	struct i915_ggtt_view view;
+-	struct i915_vma *vma;
+-
+-	WARN_ON(!mutex_is_locked(&obj->base.dev->struct_mutex));
+-
+-	intel_fill_fb_ggtt_view(&view, fb, rotation);
+-	vma = i915_gem_object_to_ggtt(obj, &view);
++	lockdep_assert_held(&vma->vm->i915->drm.struct_mutex);
+ 
+ 	i915_vma_unpin_fence(vma);
+ 	i915_gem_object_unpin_from_display_plane(vma);
++	i915_vma_put(vma);
+ }
+ 
+ static int intel_fb_pitch(const struct drm_framebuffer *fb, int plane,
+@@ -2744,7 +2739,6 @@ intel_find_initial_plane_obj(struct intel_crtc *intel_crtc,
+ 	struct drm_device *dev = intel_crtc->base.dev;
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+ 	struct drm_crtc *c;
+-	struct intel_crtc *i;
+ 	struct drm_i915_gem_object *obj;
+ 	struct drm_plane *primary = intel_crtc->base.primary;
+ 	struct drm_plane_state *plane_state = primary->state;
+@@ -2769,20 +2763,20 @@ intel_find_initial_plane_obj(struct intel_crtc *intel_crtc,
+ 	 * an fb with another CRTC instead
+ 	 */
+ 	for_each_crtc(dev, c) {
+-		i = to_intel_crtc(c);
++		struct intel_plane_state *state;
+ 
+ 		if (c == &intel_crtc->base)
+ 			continue;
+ 
+-		if (!i->active)
++		if (!to_intel_crtc(c)->active)
+ 			continue;
+ 
+-		fb = c->primary->fb;
+-		if (!fb)
++		state = to_intel_plane_state(c->primary->state);
++		if (!state->vma)
+ 			continue;
+ 
+-		obj = intel_fb_obj(fb);
+-		if (i915_gem_object_ggtt_offset(obj, NULL) == plane_config->base) {
++		if (intel_plane_ggtt_offset(state) == plane_config->base) {
++			fb = c->primary->fb;
+ 			drm_framebuffer_reference(fb);
+ 			goto valid_fb;
+ 		}
+@@ -2803,6 +2797,19 @@ intel_find_initial_plane_obj(struct intel_crtc *intel_crtc,
+ 	return;
+ 
+ valid_fb:
++	mutex_lock(&dev->struct_mutex);
++	intel_state->vma =
++		intel_pin_and_fence_fb_obj(fb, primary->state->rotation);
++	mutex_unlock(&dev->struct_mutex);
++	if (IS_ERR(intel_state->vma)) {
++		DRM_ERROR("failed to pin boot fb on pipe %d: %li\n",
++			  intel_crtc->pipe, PTR_ERR(intel_state->vma));
++
++		intel_state->vma = NULL;
++		drm_framebuffer_unreference(fb);
++		return;
++	}
++
+ 	plane_state->src_x = 0;
+ 	plane_state->src_y = 0;
+ 	plane_state->src_w = fb->width << 16;
+@@ -3095,13 +3102,13 @@ static void i9xx_update_primary_plane(struct drm_plane *primary,
+ 	I915_WRITE(DSPSTRIDE(plane), fb->pitches[0]);
+ 	if (INTEL_GEN(dev_priv) >= 4) {
+ 		I915_WRITE(DSPSURF(plane),
+-			   intel_fb_gtt_offset(fb, rotation) +
++			   intel_plane_ggtt_offset(plane_state) +
+ 			   intel_crtc->dspaddr_offset);
+ 		I915_WRITE(DSPTILEOFF(plane), (y << 16) | x);
+ 		I915_WRITE(DSPLINOFF(plane), linear_offset);
+ 	} else {
+ 		I915_WRITE(DSPADDR(plane),
+-			   intel_fb_gtt_offset(fb, rotation) +
++			   intel_plane_ggtt_offset(plane_state) +
+ 			   intel_crtc->dspaddr_offset);
+ 	}
+ 	POSTING_READ(reg);
+@@ -3198,7 +3205,7 @@ static void ironlake_update_primary_plane(struct drm_plane *primary,
+ 
+ 	I915_WRITE(DSPSTRIDE(plane), fb->pitches[0]);
+ 	I915_WRITE(DSPSURF(plane),
+-		   intel_fb_gtt_offset(fb, rotation) +
++		   intel_plane_ggtt_offset(plane_state) +
+ 		   intel_crtc->dspaddr_offset);
+ 	if (IS_HASWELL(dev_priv) || IS_BROADWELL(dev_priv)) {
+ 		I915_WRITE(DSPOFFSET(plane), (y << 16) | x);
+@@ -3221,23 +3228,6 @@ u32 intel_fb_stride_alignment(const struct drm_i915_private *dev_priv,
+ 	}
+ }
+ 
+-u32 intel_fb_gtt_offset(struct drm_framebuffer *fb,
+-			unsigned int rotation)
+-{
+-	struct drm_i915_gem_object *obj = intel_fb_obj(fb);
+-	struct i915_ggtt_view view;
+-	struct i915_vma *vma;
+-
+-	intel_fill_fb_ggtt_view(&view, fb, rotation);
+-
+-	vma = i915_gem_object_to_ggtt(obj, &view);
+-	if (WARN(!vma, "ggtt vma for display object not found! (view=%u)\n",
+-		 view.type))
+-		return -1;
+-
+-	return i915_ggtt_offset(vma);
+-}
+-
+ static void skl_detach_scaler(struct intel_crtc *intel_crtc, int id)
+ {
+ 	struct drm_device *dev = intel_crtc->base.dev;
+@@ -3433,7 +3423,7 @@ static void skylake_update_primary_plane(struct drm_plane *plane,
+ 	}
+ 
+ 	I915_WRITE(PLANE_SURF(pipe, plane_id),
+-		   intel_fb_gtt_offset(fb, rotation) + surf_addr);
++		   intel_plane_ggtt_offset(plane_state) + surf_addr);
+ 
+ 	POSTING_READ(PLANE_SURF(pipe, plane_id));
+ }
+@@ -11586,7 +11576,7 @@ static void intel_unpin_work_fn(struct work_struct *__work)
+ 		flush_work(&work->mmio_work);
+ 
+ 	mutex_lock(&dev->struct_mutex);
+-	intel_unpin_fb_obj(work->old_fb, primary->state->rotation);
++	intel_unpin_fb_vma(work->old_vma);
+ 	i915_gem_object_put(work->pending_flip_obj);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+@@ -12296,8 +12286,10 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 		goto cleanup_pending;
+ 	}
+ 
+-	work->gtt_offset = intel_fb_gtt_offset(fb, primary->state->rotation);
+-	work->gtt_offset += intel_crtc->dspaddr_offset;
++	work->old_vma = to_intel_plane_state(primary->state)->vma;
++	to_intel_plane_state(primary->state)->vma = vma;
++
++	work->gtt_offset = i915_ggtt_offset(vma) + intel_crtc->dspaddr_offset;
+ 	work->rotation = crtc->primary->state->rotation;
+ 
+ 	/*
+@@ -12352,7 +12344,8 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ cleanup_request:
+ 	i915_add_request_no_flush(request);
+ cleanup_unpin:
+-	intel_unpin_fb_obj(fb, crtc->primary->state->rotation);
++	to_intel_plane_state(primary->state)->vma = work->old_vma;
++	intel_unpin_fb_vma(vma);
+ cleanup_pending:
+ 	atomic_dec(&intel_crtc->unpin_work_count);
+ unlock:
+@@ -14853,6 +14846,8 @@ intel_prepare_plane_fb(struct drm_plane *plane,
+ 			DRM_DEBUG_KMS("failed to pin object\n");
+ 			return PTR_ERR(vma);
+ 		}
++
++		to_intel_plane_state(new_state)->vma = vma;
+ 	}
+ 
+ 	return 0;
+@@ -14871,19 +14866,12 @@ void
+ intel_cleanup_plane_fb(struct drm_plane *plane,
+ 		       struct drm_plane_state *old_state)
+ {
+-	struct drm_i915_private *dev_priv = to_i915(plane->dev);
+-	struct intel_plane_state *old_intel_state;
+-	struct drm_i915_gem_object *old_obj = intel_fb_obj(old_state->fb);
+-	struct drm_i915_gem_object *obj = intel_fb_obj(plane->state->fb);
+-
+-	old_intel_state = to_intel_plane_state(old_state);
+-
+-	if (!obj && !old_obj)
+-		return;
++	struct i915_vma *vma;
+ 
+-	if (old_obj && (plane->type != DRM_PLANE_TYPE_CURSOR ||
+-	    !INTEL_INFO(dev_priv)->cursor_needs_physical))
+-		intel_unpin_fb_obj(old_state->fb, old_state->rotation);
++	/* Should only be called after a successful intel_prepare_plane_fb()! */
++	vma = fetch_and_zero(&to_intel_plane_state(old_state)->vma);
++	if (vma)
++		intel_unpin_fb_vma(vma);
+ }
+ 
+ int
+@@ -15035,6 +15023,7 @@ intel_legacy_cursor_update(struct drm_plane *plane,
+ 	struct intel_plane *intel_plane = to_intel_plane(plane);
+ 	struct drm_framebuffer *old_fb;
+ 	struct drm_crtc_state *crtc_state = crtc->state;
++	struct i915_vma *old_vma;
+ 
+ 	/*
+ 	 * When crtc is inactive or there is a modeset pending,
+@@ -15106,9 +15095,12 @@ intel_legacy_cursor_update(struct drm_plane *plane,
+ 			ret = PTR_ERR(vma);
+ 			goto out_unlock;
+ 		}
++
++		to_intel_plane_state(new_plane_state)->vma = vma;
+ 	}
+ 
+ 	old_fb = old_plane_state->fb;
++	old_vma = to_intel_plane_state(old_plane_state)->vma;
+ 
+ 	i915_gem_track_fb(intel_fb_obj(old_fb), intel_fb_obj(fb),
+ 			  intel_plane->frontbuffer_bit);
+@@ -15118,6 +15110,7 @@ intel_legacy_cursor_update(struct drm_plane *plane,
+ 	*to_intel_plane_state(old_plane_state) = *to_intel_plane_state(new_plane_state);
+ 	new_plane_state->fence = NULL;
+ 	new_plane_state->fb = old_fb;
++	to_intel_plane_state(new_plane_state)->vma = old_vma;
+ 
+ 	intel_plane->update_plane(plane,
+ 				  to_intel_crtc_state(crtc->state),
+@@ -15356,7 +15349,7 @@ intel_update_cursor_plane(struct drm_plane *plane,
+ 	if (!obj)
+ 		addr = 0;
+ 	else if (!INTEL_INFO(dev_priv)->cursor_needs_physical)
+-		addr = i915_gem_object_ggtt_offset(obj, NULL);
++		addr = intel_plane_ggtt_offset(state);
+ 	else
+ 		addr = obj->phys_handle->busaddr;
+ 
+@@ -17324,41 +17317,12 @@ void intel_display_resume(struct drm_device *dev)
+ void intel_modeset_gem_init(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+-	struct drm_crtc *c;
+-	struct drm_i915_gem_object *obj;
+ 
+ 	intel_init_gt_powersave(dev_priv);
+ 
+ 	intel_modeset_init_hw(dev);
+ 
+ 	intel_setup_overlay(dev_priv);
+-
+-	/*
+-	 * Make sure any fbs we allocated at startup are properly
+-	 * pinned & fenced.  When we do the allocation it's too early
+-	 * for this.
+-	 */
+-	for_each_crtc(dev, c) {
+-		struct i915_vma *vma;
+-
+-		obj = intel_fb_obj(c->primary->fb);
+-		if (obj == NULL)
+-			continue;
+-
+-		mutex_lock(&dev->struct_mutex);
+-		vma = intel_pin_and_fence_fb_obj(c->primary->fb,
+-						 c->primary->state->rotation);
+-		mutex_unlock(&dev->struct_mutex);
+-		if (IS_ERR(vma)) {
+-			DRM_ERROR("failed to pin boot fb on pipe %d\n",
+-				  to_intel_crtc(c)->pipe);
+-			drm_framebuffer_unreference(c->primary->fb);
+-			c->primary->fb = NULL;
+-			c->primary->crtc = c->primary->state->crtc = NULL;
+-			update_state_fb(c->primary);
+-			c->state->plane_mask &= ~(1 << drm_plane_index(c->primary));
+-		}
+-	}
+ }
+ 
+ int intel_connector_register(struct drm_connector *connector)
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 91e3743..0608e4e 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -376,6 +376,7 @@ struct intel_atomic_state {
+ struct intel_plane_state {
+ 	struct drm_plane_state base;
+ 	struct drm_rect clip;
++	struct i915_vma *vma;
+ 
+ 	struct {
+ 		u32 offset;
+@@ -1078,6 +1079,7 @@ struct intel_flip_work {
+ 	struct work_struct mmio_work;
+ 
+ 	struct drm_crtc *crtc;
++	struct i915_vma *old_vma;
+ 	struct drm_framebuffer *old_fb;
+ 	struct drm_i915_gem_object *pending_flip_obj;
+ 	struct drm_pending_vblank_event *event;
+@@ -1313,7 +1315,7 @@ void intel_release_load_detect_pipe(struct drm_connector *connector,
+ 				    struct drm_modeset_acquire_ctx *ctx);
+ struct i915_vma *
+ intel_pin_and_fence_fb_obj(struct drm_framebuffer *fb, unsigned int rotation);
+-void intel_unpin_fb_obj(struct drm_framebuffer *fb, unsigned int rotation);
++void intel_unpin_fb_vma(struct i915_vma *vma);
+ struct drm_framebuffer *
+ __intel_framebuffer_create(struct drm_device *dev,
+ 			   struct drm_mode_fb_cmd2 *mode_cmd,
+@@ -1405,7 +1407,10 @@ void intel_mode_from_pipe_config(struct drm_display_mode *mode,
+ int skl_update_scaler_crtc(struct intel_crtc_state *crtc_state);
+ int skl_max_scale(struct intel_crtc *crtc, struct intel_crtc_state *crtc_state);
+ 
+-u32 intel_fb_gtt_offset(struct drm_framebuffer *fb, unsigned int rotation);
++static inline u32 intel_plane_ggtt_offset(const struct intel_plane_state *state)
++{
++	return i915_ggtt_offset(state->vma);
++}
+ 
+ u32 skl_plane_ctl_format(uint32_t pixel_format);
+ u32 skl_plane_ctl_tiling(uint64_t fb_modifier);
+diff --git a/drivers/gpu/drm/i915/intel_fbc.c b/drivers/gpu/drm/i915/intel_fbc.c
+index 98cb85c..89fe5c8 100644
+--- a/drivers/gpu/drm/i915/intel_fbc.c
++++ b/drivers/gpu/drm/i915/intel_fbc.c
+@@ -173,7 +173,7 @@ static void i8xx_fbc_activate(struct drm_i915_private *dev_priv)
+ 	if (IS_I945GM(dev_priv))
+ 		fbc_ctl |= FBC_CTL_C3_IDLE; /* 945 needs special SR handling */
+ 	fbc_ctl |= (cfb_pitch & 0xff) << FBC_CTL_STRIDE_SHIFT;
+-	fbc_ctl |= params->fb.fence_reg;
++	fbc_ctl |= params->vma->fence->id;
+ 	I915_WRITE(FBC_CONTROL, fbc_ctl);
+ }
+ 
+@@ -193,8 +193,8 @@ static void g4x_fbc_activate(struct drm_i915_private *dev_priv)
+ 	else
+ 		dpfc_ctl |= DPFC_CTL_LIMIT_1X;
+ 
+-	if (params->fb.fence_reg != I915_FENCE_REG_NONE) {
+-		dpfc_ctl |= DPFC_CTL_FENCE_EN | params->fb.fence_reg;
++	if (params->vma->fence) {
++		dpfc_ctl |= DPFC_CTL_FENCE_EN | params->vma->fence->id;
+ 		I915_WRITE(DPFC_FENCE_YOFF, params->crtc.fence_y_offset);
+ 	} else {
+ 		I915_WRITE(DPFC_FENCE_YOFF, 0);
+@@ -251,13 +251,14 @@ static void ilk_fbc_activate(struct drm_i915_private *dev_priv)
+ 		break;
+ 	}
+ 
+-	if (params->fb.fence_reg != I915_FENCE_REG_NONE) {
++	if (params->vma->fence) {
+ 		dpfc_ctl |= DPFC_CTL_FENCE_EN;
+ 		if (IS_GEN5(dev_priv))
+-			dpfc_ctl |= params->fb.fence_reg;
++			dpfc_ctl |= params->vma->fence->id;
+ 		if (IS_GEN6(dev_priv)) {
+ 			I915_WRITE(SNB_DPFC_CTL_SA,
+-				   SNB_CPU_FENCE_ENABLE | params->fb.fence_reg);
++				   SNB_CPU_FENCE_ENABLE |
++				   params->vma->fence->id);
+ 			I915_WRITE(DPFC_CPU_FENCE_OFFSET,
+ 				   params->crtc.fence_y_offset);
+ 		}
+@@ -269,7 +270,8 @@ static void ilk_fbc_activate(struct drm_i915_private *dev_priv)
+ 	}
+ 
+ 	I915_WRITE(ILK_DPFC_FENCE_YOFF, params->crtc.fence_y_offset);
+-	I915_WRITE(ILK_FBC_RT_BASE, params->fb.ggtt_offset | ILK_FBC_RT_VALID);
++	I915_WRITE(ILK_FBC_RT_BASE,
++		   i915_ggtt_offset(params->vma) | ILK_FBC_RT_VALID);
+ 	/* enable it... */
+ 	I915_WRITE(ILK_DPFC_CONTROL, dpfc_ctl | DPFC_CTL_EN);
+ 
+@@ -319,10 +321,11 @@ static void gen7_fbc_activate(struct drm_i915_private *dev_priv)
+ 		break;
+ 	}
+ 
+-	if (params->fb.fence_reg != I915_FENCE_REG_NONE) {
++	if (params->vma->fence) {
+ 		dpfc_ctl |= IVB_DPFC_CTL_FENCE_EN;
+ 		I915_WRITE(SNB_DPFC_CTL_SA,
+-			   SNB_CPU_FENCE_ENABLE | params->fb.fence_reg);
++			   SNB_CPU_FENCE_ENABLE |
++			   params->vma->fence->id);
+ 		I915_WRITE(DPFC_CPU_FENCE_OFFSET, params->crtc.fence_y_offset);
+ 	} else {
+ 		I915_WRITE(SNB_DPFC_CTL_SA,0);
+@@ -727,14 +730,6 @@ static bool intel_fbc_hw_tracking_covers_screen(struct intel_crtc *crtc)
+ 	return effective_w <= max_w && effective_h <= max_h;
+ }
+ 
+-/* XXX replace me when we have VMA tracking for intel_plane_state */
+-static int get_fence_id(struct drm_framebuffer *fb)
+-{
+-	struct i915_vma *vma = i915_gem_object_to_ggtt(intel_fb_obj(fb), NULL);
+-
+-	return vma && vma->fence ? vma->fence->id : I915_FENCE_REG_NONE;
+-}
+-
+ static void intel_fbc_update_state_cache(struct intel_crtc *crtc,
+ 					 struct intel_crtc_state *crtc_state,
+ 					 struct intel_plane_state *plane_state)
+@@ -743,7 +738,8 @@ static void intel_fbc_update_state_cache(struct intel_crtc *crtc,
+ 	struct intel_fbc *fbc = &dev_priv->fbc;
+ 	struct intel_fbc_state_cache *cache = &fbc->state_cache;
+ 	struct drm_framebuffer *fb = plane_state->base.fb;
+-	struct drm_i915_gem_object *obj;
++
++	cache->vma = NULL;
+ 
+ 	cache->crtc.mode_flags = crtc_state->base.adjusted_mode.flags;
+ 	if (IS_HASWELL(dev_priv) || IS_BROADWELL(dev_priv))
+@@ -758,16 +754,10 @@ static void intel_fbc_update_state_cache(struct intel_crtc *crtc,
+ 	if (!cache->plane.visible)
+ 		return;
+ 
+-	obj = intel_fb_obj(fb);
+-
+-	/* FIXME: We lack the proper locking here, so only run this on the
+-	 * platforms that need. */
+-	if (IS_GEN(dev_priv, 5, 6))
+-		cache->fb.ilk_ggtt_offset = i915_gem_object_ggtt_offset(obj, NULL);
+ 	cache->fb.format = fb->format;
+ 	cache->fb.stride = fb->pitches[0];
+-	cache->fb.fence_reg = get_fence_id(fb);
+-	cache->fb.tiling_mode = i915_gem_object_get_tiling(obj);
++
++	cache->vma = plane_state->vma;
+ }
+ 
+ static bool intel_fbc_can_activate(struct intel_crtc *crtc)
+@@ -784,7 +774,7 @@ static bool intel_fbc_can_activate(struct intel_crtc *crtc)
+ 		return false;
+ 	}
+ 
+-	if (!cache->plane.visible) {
++	if (!cache->vma) {
+ 		fbc->no_fbc_reason = "primary plane not visible";
+ 		return false;
+ 	}
+@@ -807,8 +797,7 @@ static bool intel_fbc_can_activate(struct intel_crtc *crtc)
+ 	 * so have no fence associated with it) due to aperture constaints
+ 	 * at the time of pinning.
+ 	 */
+-	if (cache->fb.tiling_mode != I915_TILING_X ||
+-	    cache->fb.fence_reg == I915_FENCE_REG_NONE) {
++	if (!cache->vma->fence) {
+ 		fbc->no_fbc_reason = "framebuffer not tiled or fenced";
+ 		return false;
+ 	}
+@@ -888,17 +877,16 @@ static void intel_fbc_get_reg_params(struct intel_crtc *crtc,
+ 	 * zero. */
+ 	memset(params, 0, sizeof(*params));
+ 
++	params->vma = cache->vma;
++
+ 	params->crtc.pipe = crtc->pipe;
+ 	params->crtc.plane = crtc->plane;
+ 	params->crtc.fence_y_offset = get_crtc_fence_y_offset(crtc);
+ 
+ 	params->fb.format = cache->fb.format;
+ 	params->fb.stride = cache->fb.stride;
+-	params->fb.fence_reg = cache->fb.fence_reg;
+ 
+ 	params->cfb_size = intel_fbc_calculate_cfb_size(dev_priv, cache);
+-
+-	params->fb.ggtt_offset = cache->fb.ilk_ggtt_offset;
+ }
+ 
+ static bool intel_fbc_reg_params_equal(struct intel_fbc_reg_params *params1,
+diff --git a/drivers/gpu/drm/i915/intel_fbdev.c b/drivers/gpu/drm/i915/intel_fbdev.c
+index bb0e9bf..e0d9e72 100644
+--- a/drivers/gpu/drm/i915/intel_fbdev.c
++++ b/drivers/gpu/drm/i915/intel_fbdev.c
+@@ -284,7 +284,7 @@ static int intelfb_create(struct drm_fb_helper *helper,
+ out_destroy_fbi:
+ 	drm_fb_helper_release_fbi(helper);
+ out_unpin:
+-	intel_unpin_fb_obj(&ifbdev->fb->base, DRM_ROTATE_0);
++	intel_unpin_fb_vma(vma);
+ out_unlock:
+ 	mutex_unlock(&dev->struct_mutex);
+ 	return ret;
+@@ -549,7 +549,7 @@ static void intel_fbdev_destroy(struct intel_fbdev *ifbdev)
+ 
+ 	if (ifbdev->fb) {
+ 		mutex_lock(&ifbdev->helper.dev->struct_mutex);
+-		intel_unpin_fb_obj(&ifbdev->fb->base, DRM_ROTATE_0);
++		intel_unpin_fb_vma(ifbdev->vma);
+ 		mutex_unlock(&ifbdev->helper.dev->struct_mutex);
+ 
+ 		drm_framebuffer_remove(&ifbdev->fb->base);
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index 88c22b2..90f10bc 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -273,7 +273,7 @@ skl_update_plane(struct drm_plane *drm_plane,
+ 
+ 	I915_WRITE(PLANE_CTL(pipe, plane_id), plane_ctl);
+ 	I915_WRITE(PLANE_SURF(pipe, plane_id),
+-		   intel_fb_gtt_offset(fb, rotation) + surf_addr);
++		   intel_plane_ggtt_offset(plane_state) + surf_addr);
+ 	POSTING_READ(PLANE_SURF(pipe, plane_id));
+ }
+ 
+@@ -458,7 +458,7 @@ vlv_update_plane(struct drm_plane *dplane,
+ 	I915_WRITE(SPSIZE(pipe, plane_id), (crtc_h << 16) | crtc_w);
+ 	I915_WRITE(SPCNTR(pipe, plane_id), sprctl);
+ 	I915_WRITE(SPSURF(pipe, plane_id),
+-		   intel_fb_gtt_offset(fb, rotation) + sprsurf_offset);
++		   intel_plane_ggtt_offset(plane_state) + sprsurf_offset);
+ 	POSTING_READ(SPSURF(pipe, plane_id));
+ }
+ 
+@@ -594,7 +594,7 @@ ivb_update_plane(struct drm_plane *plane,
+ 		I915_WRITE(SPRSCALE(pipe), sprscale);
+ 	I915_WRITE(SPRCTL(pipe), sprctl);
+ 	I915_WRITE(SPRSURF(pipe),
+-		   intel_fb_gtt_offset(fb, rotation) + sprsurf_offset);
++		   intel_plane_ggtt_offset(plane_state) + sprsurf_offset);
+ 	POSTING_READ(SPRSURF(pipe));
+ }
+ 
+@@ -721,7 +721,7 @@ ilk_update_plane(struct drm_plane *plane,
+ 	I915_WRITE(DVSSCALE(pipe), dvsscale);
+ 	I915_WRITE(DVSCNTR(pipe), dvscntr);
+ 	I915_WRITE(DVSSURF(pipe),
+-		   intel_fb_gtt_offset(fb, rotation) + dvssurf_offset);
++		   intel_plane_ggtt_offset(plane_state) + dvssurf_offset);
+ 	POSTING_READ(DVSSURF(pipe));
+ }
+ 
+-- 
+1.7.5.4
+

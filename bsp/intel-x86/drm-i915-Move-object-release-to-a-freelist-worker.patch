@@ -1,0 +1,569 @@
+From 79a1ba25d87b97e6f80a217e29ce98be17ce6b8d Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 28 Oct 2016 13:58:42 +0100
+Subject: [PATCH 1647/4301] drm/i915: Move object release to a freelist +
+ worker
+
+commit fbbd37b36fa5e16a03aca07a922192d3db28588d upstream
+
+We want to hide the latency of releasing objects and their backing
+storage from the submission, so we move the actual free to a worker.
+This allows us to switch to struct_mutex freeing of the object in the
+next patch.
+
+Furthermore, if we know that the object we are dereferencing remains valid
+for the duration of our access, we can forgo the usual synchronisation
+barriers and atomic reference counting. To ensure this we defer freeing
+an object til after an RCU grace period, such that any lookup of the
+object within an RCU read critical section will remain valid until
+after we exit that critical section. We also employ this delay for
+rate-limiting the serialisation on reallocation - we have to slow down
+object creation in order to prevent resource starvation (in particular,
+files).
+
+v2: Return early in i915_gem_tiling() ioctl to skip over superfluous
+work on error.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161028125858.23563-19-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_debugfs.c      |   15 ++-
+ drivers/gpu/drm/i915/i915_drv.c          |   19 ++--
+ drivers/gpu/drm/i915/i915_drv.h          |   44 ++++++++-
+ drivers/gpu/drm/i915/i915_gem.c          |  166 +++++++++++++++++++++---------
+ drivers/gpu/drm/i915/i915_gem_shrinker.c |   14 ++-
+ drivers/gpu/drm/i915/i915_gem_tiling.c   |   21 +++--
+ 6 files changed, 202 insertions(+), 77 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index e97a16c..b0b0100 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -4957,10 +4957,12 @@ DEFINE_SIMPLE_ATTRIBUTE(i915_ring_test_irq_fops,
+ #define DROP_BOUND 0x2
+ #define DROP_RETIRE 0x4
+ #define DROP_ACTIVE 0x8
+-#define DROP_ALL (DROP_UNBOUND | \
+-		  DROP_BOUND | \
+-		  DROP_RETIRE | \
+-		  DROP_ACTIVE)
++#define DROP_FREED 0x10
++#define DROP_ALL (DROP_UNBOUND	| \
++		  DROP_BOUND	| \
++		  DROP_RETIRE	| \
++		  DROP_ACTIVE	| \
++		  DROP_FREED)
+ static int
+ i915_drop_caches_get(void *data, u64 *val)
+ {
+@@ -5004,6 +5006,11 @@ i915_drop_caches_set(void *data, u64 val)
+ unlock:
+ 	mutex_unlock(&dev->struct_mutex);
+ 
++	if (val & DROP_FREED) {
++		synchronize_rcu();
++		flush_work(&dev_priv->mm.free_work);
++	}
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index af3559d..b308f71 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -537,14 +537,17 @@ static const struct vga_switcheroo_client_ops i915_switcheroo_ops = {
+ 	.can_switch = i915_switcheroo_can_switch,
+ };
+ 
+-static void i915_gem_fini(struct drm_device *dev)
++static void i915_gem_fini(struct drm_i915_private *dev_priv)
+ {
+-	mutex_lock(&dev->struct_mutex);
+-	i915_gem_cleanup_engines(dev);
+-	i915_gem_context_fini(dev);
+-	mutex_unlock(&dev->struct_mutex);
++	mutex_lock(&dev_priv->drm.struct_mutex);
++	i915_gem_cleanup_engines(&dev_priv->drm);
++	i915_gem_context_fini(&dev_priv->drm);
++	mutex_unlock(&dev_priv->drm.struct_mutex);
++
++	synchronize_rcu();
++	flush_work(&dev_priv->mm.free_work);
+ 
+-	WARN_ON(!list_empty(&to_i915(dev)->context_list));
++	WARN_ON(!list_empty(&dev_priv->context_list));
+ }
+ 
+ static int i915_load_modeset_init(struct drm_device *dev)
+@@ -619,7 +622,7 @@ static int i915_load_modeset_init(struct drm_device *dev)
+ cleanup_gem:
+ 	if (i915_gem_suspend(dev))
+ 		DRM_ERROR("failed to idle hardware; continuing to unload!\n");
+-	i915_gem_fini(dev);
++	i915_gem_fini(dev_priv);
+ cleanup_irq:
+ 	intel_guc_fini(dev);
+ 	drm_irq_uninstall(dev);
+@@ -1305,7 +1308,7 @@ void i915_driver_unload(struct drm_device *dev)
+ 	drain_workqueue(dev_priv->wq);
+ 
+ 	intel_guc_fini(dev);
+-	i915_gem_fini(dev);
++	i915_gem_fini(dev_priv);
+ 	intel_fbc_cleanup_cfb(dev_priv);
+ 
+ 	intel_power_domains_fini(dev_priv);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 678db07..4f42fee 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1379,8 +1379,8 @@ struct i915_gem_mm {
+ 	struct list_head bound_list;
+ 	/**
+ 	 * List of objects which are not bound to the GTT (thus
+-	 * are idle and not used by the GPU) but still have
+-	 * (presumably uncached) pages still attached.
++	 * are idle and not used by the GPU). These objects may or may
++	 * not actually have any pages attached.
+ 	 */
+ 	struct list_head unbound_list;
+ 
+@@ -1389,6 +1389,12 @@ struct i915_gem_mm {
+ 	 */
+ 	struct list_head userfault_list;
+ 
++	/**
++	 * List of objects which are pending destruction.
++	 */
++	struct llist_head free_list;
++	struct work_struct free_work;
++
+ 	/** Usable portion of the GTT for GEM */
+ 	unsigned long stolen_base; /* limited to low memory (32-bit) */
+ 
+@@ -2251,6 +2257,10 @@ struct drm_i915_gem_object {
+ 	/** Stolen memory for this object, instead of being backed by shmem. */
+ 	struct drm_mm_node *stolen;
+ 	struct list_head global_list;
++	union {
++		struct rcu_head rcu;
++		struct llist_node freed;
++	};
+ 
+ 	/**
+ 	 * Whether the object is currently in the GGTT mmap.
+@@ -2368,10 +2378,38 @@ to_intel_bo(struct drm_gem_object *gem)
+ 	return container_of(gem, struct drm_i915_gem_object, base);
+ }
+ 
++/**
++ * i915_gem_object_lookup_rcu - look up a temporary GEM object from its handle
++ * @filp: DRM file private date
++ * @handle: userspace handle
++ *
++ * Returns:
++ *
++ * A pointer to the object named by the handle if such exists on @filp, NULL
++ * otherwise. This object is only valid whilst under the RCU read lock, and
++ * note carefully the object may be in the process of being destroyed.
++ */
++static inline struct drm_i915_gem_object *
++i915_gem_object_lookup_rcu(struct drm_file *file, u32 handle)
++{
++#ifdef CONFIG_LOCKDEP
++	WARN_ON(debug_locks && !lock_is_held(&rcu_lock_map));
++#endif
++	return idr_find(&file->object_idr, handle);
++}
++
+ static inline struct drm_i915_gem_object *
+ i915_gem_object_lookup(struct drm_file *file, u32 handle)
+ {
+-	return to_intel_bo(drm_gem_object_lookup(file, handle));
++	struct drm_i915_gem_object *obj;
++
++	rcu_read_lock();
++	obj = i915_gem_object_lookup_rcu(file, handle);
++	if (obj && !kref_get_unless_zero(&obj->base.refcount))
++		obj = NULL;
++	rcu_read_unlock();
++
++	return obj;
+ }
+ 
+ __deprecated
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index d3fa286..f720b79 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -42,6 +42,7 @@
+ #include <linux/pci.h>
+ #include <linux/dma-buf.h>
+ 
++static void i915_gem_flush_free_objects(struct drm_i915_private *i915);
+ static void i915_gem_object_flush_gtt_write_domain(struct drm_i915_gem_object *obj);
+ static void i915_gem_object_flush_cpu_write_domain(struct drm_i915_gem_object *obj);
+ 
+@@ -648,6 +649,8 @@ i915_gem_create_ioctl(struct drm_device *dev, void *data,
+ {
+ 	struct drm_i915_gem_create *args = data;
+ 
++	i915_gem_flush_free_objects(to_i915(dev));
++
+ 	return i915_gem_create(file, dev,
+ 			       args->size, &args->handle);
+ }
+@@ -3525,10 +3528,14 @@ int i915_gem_get_caching_ioctl(struct drm_device *dev, void *data,
+ {
+ 	struct drm_i915_gem_caching *args = data;
+ 	struct drm_i915_gem_object *obj;
++	int err = 0;
+ 
+-	obj = i915_gem_object_lookup(file, args->handle);
+-	if (!obj)
+-		return -ENOENT;
++	rcu_read_lock();
++	obj = i915_gem_object_lookup_rcu(file, args->handle);
++	if (!obj) {
++		err = -ENOENT;
++		goto out;
++	}
+ 
+ 	switch (obj->cache_level) {
+ 	case I915_CACHE_LLC:
+@@ -3544,9 +3551,9 @@ int i915_gem_get_caching_ioctl(struct drm_device *dev, void *data,
+ 		args->caching = I915_CACHING_NONE;
+ 		break;
+ 	}
+-
+-	i915_gem_object_put_unlocked(obj);
+-	return 0;
++out:
++	rcu_read_unlock();
++	return err;
+ }
+ 
+ int i915_gem_set_caching_ioctl(struct drm_device *dev, void *data,
+@@ -4104,10 +4111,14 @@ i915_gem_busy_ioctl(struct drm_device *dev, void *data,
+ 	struct drm_i915_gem_busy *args = data;
+ 	struct drm_i915_gem_object *obj;
+ 	unsigned long active;
++	int err;
+ 
+-	obj = i915_gem_object_lookup(file, args->handle);
+-	if (!obj)
+-		return -ENOENT;
++	rcu_read_lock();
++	obj = i915_gem_object_lookup_rcu(file, args->handle);
++	if (!obj) {
++		err = -ENOENT;
++		goto out;
++	}
+ 
+ 	args->busy = 0;
+ 	active = __I915_BO_ACTIVE(obj);
+@@ -4137,7 +4148,6 @@ i915_gem_busy_ioctl(struct drm_device *dev, void *data,
+ 		 * are busy is not completely reliable - we only guarantee
+ 		 * that the object was busy.
+ 		 */
+-		rcu_read_lock();
+ 
+ 		for_each_active(active, idx)
+ 			args->busy |= busy_check_reader(&obj->last_read[idx]);
+@@ -4155,12 +4165,11 @@ i915_gem_busy_ioctl(struct drm_device *dev, void *data,
+ 		 * the result.
+ 		 */
+ 		args->busy |= busy_check_writer(&obj->last_write);
+-
+-		rcu_read_unlock();
+ 	}
+ 
+-	i915_gem_object_put_unlocked(obj);
+-	return 0;
++out:
++	rcu_read_unlock();
++	return err;
+ }
+ 
+ int
+@@ -4323,7 +4332,6 @@ i915_gem_object_create(struct drm_device *dev, u64 size)
+ 
+ fail:
+ 	i915_gem_object_free(obj);
+-
+ 	return ERR_PTR(ret);
+ }
+ 
+@@ -4351,16 +4359,69 @@ static bool discard_backing_storage(struct drm_i915_gem_object *obj)
+ 	return atomic_long_read(&obj->base.filp->f_count) == 1;
+ }
+ 
+-void i915_gem_free_object(struct drm_gem_object *gem_obj)
++static void __i915_gem_free_objects(struct drm_i915_private *i915,
++				    struct llist_node *freed)
+ {
+-	struct drm_i915_gem_object *obj = to_intel_bo(gem_obj);
+-	struct drm_device *dev = obj->base.dev;
+-	struct drm_i915_private *dev_priv = to_i915(dev);
+-	struct i915_vma *vma, *next;
++	struct drm_i915_gem_object *obj, *on;
+ 
+-	intel_runtime_pm_get(dev_priv);
++	mutex_lock(&i915->drm.struct_mutex);
++	intel_runtime_pm_get(i915);
++	llist_for_each_entry(obj, freed, freed) {
++		struct i915_vma *vma, *vn;
++
++		trace_i915_gem_object_destroy(obj);
++
++		GEM_BUG_ON(i915_gem_object_is_active(obj));
++		list_for_each_entry_safe(vma, vn,
++					 &obj->vma_list, obj_link) {
++			GEM_BUG_ON(!i915_vma_is_ggtt(vma));
++			GEM_BUG_ON(i915_vma_is_active(vma));
++			vma->flags &= ~I915_VMA_PIN_MASK;
++			i915_vma_close(vma);
++		}
++
++		list_del(&obj->global_list);
++	}
++	intel_runtime_pm_put(i915);
++	mutex_unlock(&i915->drm.struct_mutex);
++
++	llist_for_each_entry_safe(obj, on, freed, freed) {
++		GEM_BUG_ON(obj->bind_count);
++		GEM_BUG_ON(atomic_read(&obj->frontbuffer_bits));
++
++		if (obj->ops->release)
++			obj->ops->release(obj);
++
++		if (WARN_ON(i915_gem_object_has_pinned_pages(obj)))
++			atomic_set(&obj->mm.pages_pin_count, 0);
++		__i915_gem_object_put_pages(obj);
++		GEM_BUG_ON(obj->mm.pages);
++
++		if (obj->base.import_attach)
++			drm_prime_gem_destroy(&obj->base, NULL);
++
++		drm_gem_object_release(&obj->base);
++		i915_gem_info_remove_obj(i915, obj->base.size);
++
++		kfree(obj->bit_17);
++		i915_gem_object_free(obj);
++	}
++}
+ 
+-	trace_i915_gem_object_destroy(obj);
++static void i915_gem_flush_free_objects(struct drm_i915_private *i915)
++{
++	struct llist_node *freed;
++
++	freed = llist_del_all(&i915->mm.free_list);
++	if (unlikely(freed))
++		__i915_gem_free_objects(i915, freed);
++}
++
++static void __i915_gem_free_work(struct work_struct *work)
++{
++	struct drm_i915_private *i915 =
++		container_of(work, struct drm_i915_private, mm.free_work);
++	struct llist_node *freed;
+ 
+ 	/* All file-owned VMA should have been released by this point through
+ 	 * i915_gem_close_object(), or earlier by i915_gem_context_close().
+@@ -4369,42 +4430,44 @@ void i915_gem_free_object(struct drm_gem_object *gem_obj)
+ 	 * the GTT either for the user or for scanout). Those VMA still need to
+ 	 * unbound now.
+ 	 */
+-	list_for_each_entry_safe(vma, next, &obj->vma_list, obj_link) {
+-		GEM_BUG_ON(!i915_vma_is_ggtt(vma));
+-		GEM_BUG_ON(i915_vma_is_active(vma));
+-		vma->flags &= ~I915_VMA_PIN_MASK;
+-		i915_vma_close(vma);
+-	}
+-	GEM_BUG_ON(obj->bind_count);
+ 
+-	WARN_ON(atomic_read(&obj->frontbuffer_bits));
++	while ((freed = llist_del_all(&i915->mm.free_list)))
++		__i915_gem_free_objects(i915, freed);
++}
+ 
+-	if (obj->mm.pages && obj->mm.madv == I915_MADV_WILLNEED &&
+-	    dev_priv->quirks & QUIRK_PIN_SWIZZLED_PAGES &&
+-	    i915_gem_object_is_tiled(obj))
+-		__i915_gem_object_unpin_pages(obj);
++static void __i915_gem_free_object_rcu(struct rcu_head *head)
++{
++	struct drm_i915_gem_object *obj =
++		container_of(head, typeof(*obj), rcu);
++	struct drm_i915_private *i915 = to_i915(obj->base.dev);
+ 
+-	if (obj->ops->release)
+-		obj->ops->release(obj);
++	/* We can't simply use call_rcu() from i915_gem_free_object()
++	 * as we need to block whilst unbinding, and the call_rcu
++	 * task may be called from softirq context. So we take a
++	 * detour through a worker.
++	 */
++	if (llist_add(&obj->freed, &i915->mm.free_list))
++		schedule_work(&i915->mm.free_work);
++}
++
++void i915_gem_free_object(struct drm_gem_object *gem_obj)
++{
++	struct drm_i915_gem_object *obj = to_intel_bo(gem_obj);
+ 
+-	if (WARN_ON(i915_gem_object_has_pinned_pages(obj)))
+-		atomic_set(&obj->mm.pages_pin_count, 0);
+ 	if (discard_backing_storage(obj))
+ 		obj->mm.madv = I915_MADV_DONTNEED;
+-	__i915_gem_object_put_pages(obj);
+ 
+-	GEM_BUG_ON(obj->mm.pages);
+-
+-	if (obj->base.import_attach)
+-		drm_prime_gem_destroy(&obj->base, NULL);
+-
+-	drm_gem_object_release(&obj->base);
+-	i915_gem_info_remove_obj(dev_priv, obj->base.size);
+-
+-	kfree(obj->bit_17);
+-	i915_gem_object_free(obj);
++	if (obj->mm.pages && obj->mm.madv == I915_MADV_WILLNEED &&
++	    to_i915(obj->base.dev)->quirks & QUIRK_PIN_SWIZZLED_PAGES &&
++	    i915_gem_object_is_tiled(obj))
++		__i915_gem_object_unpin_pages(obj);
+ 
+-	intel_runtime_pm_put(dev_priv);
++	/* Before we free the object, make sure any pure RCU-only
++	 * read-side critical sections are complete, e.g.
++	 * i915_gem_busy_ioctl(). For the corresponding synchronized
++	 * lookup see i915_gem_object_lookup_rcu().
++	 */
++	call_rcu(&obj->rcu, __i915_gem_free_object_rcu);
+ }
+ 
+ void __i915_gem_object_release_unless_active(struct drm_i915_gem_object *obj)
+@@ -4453,6 +4516,7 @@ int i915_gem_suspend(struct drm_device *dev)
+ 	cancel_delayed_work_sync(&dev_priv->gpu_error.hangcheck_work);
+ 	cancel_delayed_work_sync(&dev_priv->gt.retire_work);
+ 	flush_delayed_work(&dev_priv->gt.idle_work);
++	flush_work(&dev_priv->mm.free_work);
+ 
+ 	/* Assert that we sucessfully flushed all the work and
+ 	 * reset the GPU back to its idle, low power state.
+@@ -4768,6 +4832,8 @@ i915_gem_load_init(struct drm_device *dev)
+ 				  NULL);
+ 
+ 	INIT_LIST_HEAD(&dev_priv->context_list);
++	INIT_WORK(&dev_priv->mm.free_work, __i915_gem_free_work);
++	init_llist_head(&dev_priv->mm.free_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.unbound_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.bound_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.fence_list);
+diff --git a/drivers/gpu/drm/i915/i915_gem_shrinker.c b/drivers/gpu/drm/i915/i915_gem_shrinker.c
+index c8a4c40..0241658 100644
+--- a/drivers/gpu/drm/i915/i915_gem_shrinker.c
++++ b/drivers/gpu/drm/i915/i915_gem_shrinker.c
+@@ -201,6 +201,10 @@ i915_gem_shrink(struct drm_i915_private *dev_priv,
+ 						       typeof(*obj),
+ 						       global_list))) {
+ 			list_move_tail(&obj->global_list, &still_in_list);
++			if (!obj->mm.pages) {
++				list_del_init(&obj->global_list);
++				continue;
++			}
+ 
+ 			if (flags & I915_SHRINK_PURGEABLE &&
+ 			    obj->mm.madv != I915_MADV_DONTNEED)
+@@ -218,8 +222,6 @@ i915_gem_shrink(struct drm_i915_private *dev_priv,
+ 			if (!can_release_pages(obj))
+ 				continue;
+ 
+-			i915_gem_object_get(obj);
+-
+ 			if (unsafe_drop_pages(obj)) {
+ 				mutex_lock(&obj->mm.lock);
+ 				if (!obj->mm.pages) {
+@@ -228,8 +230,6 @@ i915_gem_shrink(struct drm_i915_private *dev_priv,
+ 				}
+ 				mutex_unlock(&obj->mm.lock);
+ 			}
+-
+-			i915_gem_object_put(obj);
+ 		}
+ 		list_splice(&still_in_list, phase->list);
+ 	}
+@@ -396,12 +396,18 @@ i915_gem_shrinker_oom(struct notifier_block *nb, unsigned long event, void *ptr)
+ 	 */
+ 	unbound = bound = unevictable = 0;
+ 	list_for_each_entry(obj, &dev_priv->mm.unbound_list, global_list) {
++		if (!obj->mm.pages)
++			continue;
++
+ 		if (!can_release_pages(obj))
+ 			unevictable += obj->base.size >> PAGE_SHIFT;
+ 		else
+ 			unbound += obj->base.size >> PAGE_SHIFT;
+ 	}
+ 	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_list) {
++		if (!obj->mm.pages)
++			continue;
++
+ 		if (!can_release_pages(obj))
+ 			unevictable += obj->base.size >> PAGE_SHIFT;
+ 		else
+diff --git a/drivers/gpu/drm/i915/i915_gem_tiling.c b/drivers/gpu/drm/i915/i915_gem_tiling.c
+index 6608799..c63a9cf 100644
+--- a/drivers/gpu/drm/i915/i915_gem_tiling.c
++++ b/drivers/gpu/drm/i915/i915_gem_tiling.c
+@@ -325,12 +325,19 @@ i915_gem_get_tiling(struct drm_device *dev, void *data,
+ 	struct drm_i915_gem_get_tiling *args = data;
+ 	struct drm_i915_private *dev_priv = to_i915(dev);
+ 	struct drm_i915_gem_object *obj;
++	int err = -ENOENT;
++
++	rcu_read_lock();
++	obj = i915_gem_object_lookup_rcu(file, args->handle);
++	if (obj) {
++		args->tiling_mode =
++			READ_ONCE(obj->tiling_and_stride) & TILING_MASK;
++		err = 0;
++	}
++	rcu_read_unlock();
++	if (unlikely(err))
++		return err;
+ 
+-	obj = i915_gem_object_lookup(file, args->handle);
+-	if (!obj)
+-		return -ENOENT;
+-
+-	args->tiling_mode = READ_ONCE(obj->tiling_and_stride) & TILING_MASK;
+ 	switch (args->tiling_mode) {
+ 	case I915_TILING_X:
+ 		args->swizzle_mode = dev_priv->mm.bit_6_swizzle_x;
+@@ -338,11 +345,10 @@ i915_gem_get_tiling(struct drm_device *dev, void *data,
+ 	case I915_TILING_Y:
+ 		args->swizzle_mode = dev_priv->mm.bit_6_swizzle_y;
+ 		break;
++	default:
+ 	case I915_TILING_NONE:
+ 		args->swizzle_mode = I915_BIT_6_SWIZZLE_NONE;
+ 		break;
+-	default:
+-		DRM_ERROR("unknown tiling mode\n");
+ 	}
+ 
+ 	/* Hide bit 17 from the user -- see comment in i915_gem_set_tiling */
+@@ -355,6 +361,5 @@ i915_gem_get_tiling(struct drm_device *dev, void *data,
+ 	if (args->swizzle_mode == I915_BIT_6_SWIZZLE_9_10_17)
+ 		args->swizzle_mode = I915_BIT_6_SWIZZLE_9_10;
+ 
+-	i915_gem_object_put_unlocked(obj);
+ 	return 0;
+ }
+-- 
+1.7.5.4
+

@@ -1,0 +1,1020 @@
+From 02714a2be8b260b2363fa9f5ca4a92ff013819ae Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 28 Oct 2016 13:58:27 +0100
+Subject: [PATCH 1632/4301] drm/i915: Rearrange i915_wait_request() accounting
+ with callers
+
+commit e95433c73a11759203af1cae5958f998c9673370 upstream
+
+Our low-level wait routine has evolved from our generic wait interface
+that handled unlocked, RPS boosting, waits with time tracking. If we
+push our GEM fence tracking to use reservation_objects (required for
+handling multiple timelines), we lose the ability to pass the required
+information down to i915_wait_request(). However, if we push the extra
+functionality from i915_wait_request() to the individual callsites
+(i915_gem_object_wait_rendering and i915_gem_wait_ioctl) that make use
+of those extras, we can both simplify our low level wait and prepare for
+extending the GEM interface for use of reservation_objects.
+
+v2: Rewrite i915_wait_request() kerneldocs
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Matthew Auld <matthew.william.auld@gmail.com>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161028125858.23563-4-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/gvt/scheduler.c    |    9 +-
+ drivers/gpu/drm/i915/i915_drv.h         |    7 +-
+ drivers/gpu/drm/i915/i915_gem.c         |  309 +++++++++++++++++++++++--------
+ drivers/gpu/drm/i915/i915_gem_request.c |  146 ++++-----------
+ drivers/gpu/drm/i915/i915_gem_request.h |   32 ++--
+ drivers/gpu/drm/i915/i915_gem_userptr.c |   12 +-
+ drivers/gpu/drm/i915/intel_display.c    |   27 ++-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   14 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    3 +-
+ 9 files changed, 316 insertions(+), 243 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gvt/scheduler.c b/drivers/gpu/drm/i915/gvt/scheduler.c
+index f7e320b..18acb45 100644
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -400,6 +400,7 @@ static int workload_thread(void *priv)
+ 	int ring_id = p->ring_id;
+ 	struct intel_gvt_workload_scheduler *scheduler = &gvt->scheduler;
+ 	struct intel_vgpu_workload *workload = NULL;
++	long lret;
+ 	int ret;
+ 	bool need_force_wake = IS_SKYLAKE(gvt->dev_priv);
+ 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
+@@ -449,10 +450,12 @@ static int workload_thread(void *priv)
+ 		gvt_dbg_sched("ring id %d wait workload %p\n",
+ 				workload->ring_id, workload);
+ 
+-		workload->status = i915_wait_request(workload->req,
+-						     0, NULL, NULL);
+-		if (workload->status != 0)
++		lret = i915_wait_request(workload->req,
++					 0, MAX_SCHEDULE_TIMEOUT);
++		if (lret < 0) {
++			workload->status = lret;
+ 			gvt_err("fail to wait workload, skip\n");
++		}
+ 
+ complete:
+ 		gvt_dbg_sched("will complete workload %p\n, status: %d\n",
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 33ae6f3..2a9d8cc 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3346,9 +3346,10 @@ int __must_check i915_gem_wait_for_idle(struct drm_i915_private *dev_priv,
+ int __must_check i915_gem_suspend(struct drm_device *dev);
+ void i915_gem_resume(struct drm_device *dev);
+ int i915_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
+-int __must_check
+-i915_gem_object_wait_rendering(struct drm_i915_gem_object *obj,
+-			       bool readonly);
++int i915_gem_object_wait(struct drm_i915_gem_object *obj,
++			 unsigned int flags,
++			 long timeout,
++			 struct intel_rps_client *rps);
+ int __must_check
+ i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj,
+ 				  bool write);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index b70da6e..d8261f7 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -292,7 +292,12 @@ int i915_gem_object_unbind(struct drm_i915_gem_object *obj)
+ 	 * must wait for all rendering to complete to the object (as unbinding
+ 	 * must anyway), and retire the requests.
+ 	 */
+-	ret = i915_gem_object_wait_rendering(obj, false);
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE |
++				   I915_WAIT_LOCKED |
++				   I915_WAIT_ALL,
++				   MAX_SCHEDULE_TIMEOUT,
++				   NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -311,88 +316,172 @@ int i915_gem_object_unbind(struct drm_i915_gem_object *obj)
+ 	return ret;
+ }
+ 
+-/**
+- * Ensures that all rendering to the object has completed and the object is
+- * safe to unbind from the GTT or access from the CPU.
+- * @obj: i915 gem object
+- * @readonly: waiting for just read access or read-write access
+- */
+-int
+-i915_gem_object_wait_rendering(struct drm_i915_gem_object *obj,
+-			       bool readonly)
++static long
++i915_gem_object_wait_fence(struct dma_fence *fence,
++			   unsigned int flags,
++			   long timeout,
++			   struct intel_rps_client *rps)
+ {
+-	struct reservation_object *resv;
+-	struct i915_gem_active *active;
+-	unsigned long active_mask;
+-	int idx;
++	struct drm_i915_gem_request *rq;
+ 
+-	lockdep_assert_held(&obj->base.dev->struct_mutex);
++	BUILD_BUG_ON(I915_WAIT_INTERRUPTIBLE != 0x1);
+ 
+-	if (!readonly) {
+-		active = obj->last_read;
+-		active_mask = i915_gem_object_get_active(obj);
+-	} else {
+-		active_mask = 1;
+-		active = &obj->last_write;
++	if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags))
++		return timeout;
++
++	if (!dma_fence_is_i915(fence))
++		return dma_fence_wait_timeout(fence,
++					      flags & I915_WAIT_INTERRUPTIBLE,
++					      timeout);
++
++	rq = to_request(fence);
++	if (i915_gem_request_completed(rq))
++		goto out;
++
++	/* This client is about to stall waiting for the GPU. In many cases
++	 * this is undesirable and limits the throughput of the system, as
++	 * many clients cannot continue processing user input/output whilst
++	 * blocked. RPS autotuning may take tens of milliseconds to respond
++	 * to the GPU load and thus incurs additional latency for the client.
++	 * We can circumvent that by promoting the GPU frequency to maximum
++	 * before we wait. This makes the GPU throttle up much more quickly
++	 * (good for benchmarks and user experience, e.g. window animations),
++	 * but at a cost of spending more power processing the workload
++	 * (bad for battery). Not all clients even want their results
++	 * immediately and for them we should just let the GPU select its own
++	 * frequency to maximise efficiency. To prevent a single client from
++	 * forcing the clocks too high for the whole system, we only allow
++	 * each client to waitboost once in a busy period.
++	 */
++	if (rps) {
++		if (INTEL_GEN(rq->i915) >= 6)
++			gen6_rps_boost(rq->i915, rps, rq->emitted_jiffies);
++		else
++			rps = NULL;
+ 	}
+ 
+-	for_each_active(active_mask, idx) {
++	timeout = i915_wait_request(rq, flags, timeout);
++
++out:
++	if (flags & I915_WAIT_LOCKED && i915_gem_request_completed(rq))
++		i915_gem_request_retire_upto(rq);
++
++	if (rps && rq->fence.seqno == rq->engine->last_submitted_seqno) {
++		/* The GPU is now idle and this client has stalled.
++		 * Since no other client has submitted a request in the
++		 * meantime, assume that this client is the only one
++		 * supplying work to the GPU but is unable to keep that
++		 * work supplied because it is waiting. Since the GPU is
++		 * then never kept fully busy, RPS autoclocking will
++		 * keep the clocks relatively low, causing further delays.
++		 * Compensate by giving the synchronous client credit for
++		 * a waitboost next time.
++		 */
++		spin_lock(&rq->i915->rps.client_lock);
++		list_del_init(&rps->link);
++		spin_unlock(&rq->i915->rps.client_lock);
++	}
++
++	return timeout;
++}
++
++static long
++i915_gem_object_wait_reservation(struct reservation_object *resv,
++				 unsigned int flags,
++				 long timeout,
++				 struct intel_rps_client *rps)
++{
++	struct dma_fence *excl;
++
++	if (flags & I915_WAIT_ALL) {
++		struct dma_fence **shared;
++		unsigned int count, i;
+ 		int ret;
+ 
+-		ret = i915_gem_active_wait(&active[idx],
+-					   &obj->base.dev->struct_mutex);
++		ret = reservation_object_get_fences_rcu(resv,
++							&excl, &count, &shared);
+ 		if (ret)
+ 			return ret;
+-	}
+ 
+-	resv = i915_gem_object_get_dmabuf_resv(obj);
+-	if (resv) {
+-		long err;
++		for (i = 0; i < count; i++) {
++			timeout = i915_gem_object_wait_fence(shared[i],
++							     flags, timeout,
++							     rps);
++			if (timeout <= 0)
++				break;
++
++			dma_fence_put(shared[i]);
++		}
+ 
+-		err = reservation_object_wait_timeout_rcu(resv, !readonly, true,
+-							  MAX_SCHEDULE_TIMEOUT);
+-		if (err < 0)
+-			return err;
++		for (; i < count; i++)
++			dma_fence_put(shared[i]);
++		kfree(shared);
++	} else {
++		excl = reservation_object_get_excl_rcu(resv);
+ 	}
+ 
+-	return 0;
++	if (excl && timeout > 0)
++		timeout = i915_gem_object_wait_fence(excl, flags, timeout, rps);
++
++	dma_fence_put(excl);
++
++	return timeout;
+ }
+ 
+-/* A nonblocking variant of the above wait. Must be called prior to
+- * acquiring the mutex for the object, as the object state may change
+- * during this call. A reference must be held by the caller for the object.
++/**
++ * Waits for rendering to the object to be completed
++ * @obj: i915 gem object
++ * @flags: how to wait (under a lock, for all rendering or just for writes etc)
++ * @timeout: how long to wait
++ * @rps: client (user process) to charge for any waitboosting
+  */
+-static __must_check int
+-__unsafe_wait_rendering(struct drm_i915_gem_object *obj,
+-			struct intel_rps_client *rps,
+-			bool readonly)
++int
++i915_gem_object_wait(struct drm_i915_gem_object *obj,
++		     unsigned int flags,
++		     long timeout,
++		     struct intel_rps_client *rps)
+ {
++	struct reservation_object *resv;
+ 	struct i915_gem_active *active;
+ 	unsigned long active_mask;
+ 	int idx;
+ 
+-	active_mask = __I915_BO_ACTIVE(obj);
+-	if (!active_mask)
+-		return 0;
++	might_sleep();
++#if IS_ENABLED(CONFIG_LOCKDEP)
++	GEM_BUG_ON(debug_locks &&
++		   !!lockdep_is_held(&obj->base.dev->struct_mutex) !=
++		   !!(flags & I915_WAIT_LOCKED));
++#endif
++	GEM_BUG_ON(timeout < 0);
+ 
+-	if (!readonly) {
++	if (flags & I915_WAIT_ALL) {
+ 		active = obj->last_read;
++		active_mask = i915_gem_object_get_active(obj);
+ 	} else {
+ 		active_mask = 1;
+ 		active = &obj->last_write;
+ 	}
+ 
+ 	for_each_active(active_mask, idx) {
+-		int ret;
+-
+-		ret = i915_gem_active_wait_unlocked(&active[idx],
+-						    I915_WAIT_INTERRUPTIBLE,
+-						    NULL, rps);
+-		if (ret)
+-			return ret;
++		struct drm_i915_gem_request *request;
++
++		request = i915_gem_active_get_unlocked(&active[idx]);
++		if (request) {
++			timeout = i915_gem_object_wait_fence(&request->fence,
++							     flags, timeout,
++							     rps);
++			i915_gem_request_put(request);
++		}
++		if (timeout < 0)
++			return timeout;
+ 	}
+ 
+-	return 0;
++	resv = i915_gem_object_get_dmabuf_resv(obj);
++	if (resv)
++		timeout = i915_gem_object_wait_reservation(resv,
++							   flags, timeout,
++							   rps);
++	return timeout < 0 ? timeout : 0;
+ }
+ 
+ static struct intel_rps_client *to_rps_client(struct drm_file *file)
+@@ -449,12 +538,18 @@ i915_gem_phys_pwrite(struct drm_i915_gem_object *obj,
+ 	struct drm_device *dev = obj->base.dev;
+ 	void *vaddr = obj->phys_handle->vaddr + args->offset;
+ 	char __user *user_data = u64_to_user_ptr(args->data_ptr);
+-	int ret = 0;
++	int ret;
+ 
+ 	/* We manually control the domain here and pretend that it
+ 	 * remains coherent i.e. in the GTT domain, like shmem_pwrite.
+ 	 */
+-	ret = i915_gem_object_wait_rendering(obj, false);
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE |
++				   I915_WAIT_LOCKED |
++				   I915_WAIT_ALL,
++				   MAX_SCHEDULE_TIMEOUT,
++				   to_rps_client(file_priv));
+ 	if (ret)
+ 		return ret;
+ 
+@@ -614,12 +709,17 @@ int i915_gem_obj_prepare_shmem_read(struct drm_i915_gem_object *obj,
+ {
+ 	int ret;
+ 
+-	*needs_clflush = 0;
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
+ 
++	*needs_clflush = 0;
+ 	if (!i915_gem_object_has_struct_page(obj))
+ 		return -ENODEV;
+ 
+-	ret = i915_gem_object_wait_rendering(obj, true);
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE |
++				   I915_WAIT_LOCKED,
++				   MAX_SCHEDULE_TIMEOUT,
++				   NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -661,11 +761,18 @@ int i915_gem_obj_prepare_shmem_write(struct drm_i915_gem_object *obj,
+ {
+ 	int ret;
+ 
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
++
+ 	*needs_clflush = 0;
+ 	if (!i915_gem_object_has_struct_page(obj))
+ 		return -ENODEV;
+ 
+-	ret = i915_gem_object_wait_rendering(obj, false);
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE |
++				   I915_WAIT_LOCKED |
++				   I915_WAIT_ALL,
++				   MAX_SCHEDULE_TIMEOUT,
++				   NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1051,7 +1158,10 @@ i915_gem_pread_ioctl(struct drm_device *dev, void *data,
+ 
+ 	trace_i915_gem_object_pread(obj, args->offset, args->size);
+ 
+-	ret = __unsafe_wait_rendering(obj, to_rps_client(file), true);
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE,
++				   MAX_SCHEDULE_TIMEOUT,
++				   to_rps_client(file));
+ 	if (ret)
+ 		goto err;
+ 
+@@ -1449,7 +1559,11 @@ i915_gem_pwrite_ioctl(struct drm_device *dev, void *data,
+ 
+ 	trace_i915_gem_object_pwrite(obj, args->offset, args->size);
+ 
+-	ret = __unsafe_wait_rendering(obj, to_rps_client(file), false);
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE |
++				   I915_WAIT_ALL,
++				   MAX_SCHEDULE_TIMEOUT,
++				   to_rps_client(file));
+ 	if (ret)
+ 		goto err;
+ 
+@@ -1536,7 +1650,11 @@ i915_gem_set_domain_ioctl(struct drm_device *dev, void *data,
+ 	 * We will repeat the flush holding the lock in the normal manner
+ 	 * to catch cases where we are gazumped.
+ 	 */
+-	ret = __unsafe_wait_rendering(obj, to_rps_client(file), !write_domain);
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE |
++				   (write_domain ? I915_WAIT_ALL : 0),
++				   MAX_SCHEDULE_TIMEOUT,
++				   to_rps_client(file));
+ 	if (ret)
+ 		goto err;
+ 
+@@ -1772,7 +1890,10 @@ int i915_gem_fault(struct vm_area_struct *area, struct vm_fault *vmf)
+ 	 * repeat the flush holding the lock in the normal manner to catch cases
+ 	 * where we are gazumped.
+ 	 */
+-	ret = __unsafe_wait_rendering(obj, NULL, !write);
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE,
++				   MAX_SCHEDULE_TIMEOUT,
++				   NULL);
+ 	if (ret)
+ 		goto err;
+ 
+@@ -2818,6 +2939,17 @@ void i915_gem_close_object(struct drm_gem_object *gem, struct drm_file *file)
+ 	mutex_unlock(&obj->base.dev->struct_mutex);
+ }
+ 
++static unsigned long to_wait_timeout(s64 timeout_ns)
++{
++	if (timeout_ns < 0)
++		return MAX_SCHEDULE_TIMEOUT;
++
++	if (timeout_ns == 0)
++		return 0;
++
++	return nsecs_to_jiffies_timeout(timeout_ns);
++}
++
+ /**
+  * i915_gem_wait_ioctl - implements DRM_IOCTL_I915_GEM_WAIT
+  * @dev: drm device pointer
+@@ -2846,10 +2978,9 @@ int
+ i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
+ {
+ 	struct drm_i915_gem_wait *args = data;
+-	struct intel_rps_client *rps = to_rps_client(file);
+ 	struct drm_i915_gem_object *obj;
+-	unsigned long active;
+-	int idx, ret = 0;
++	ktime_t start;
++	long ret;
+ 
+ 	if (args->flags != 0)
+ 		return -EINVAL;
+@@ -2858,14 +2989,17 @@ i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
+ 	if (!obj)
+ 		return -ENOENT;
+ 
+-	active = __I915_BO_ACTIVE(obj);
+-	for_each_active(active, idx) {
+-		s64 *timeout = args->timeout_ns >= 0 ? &args->timeout_ns : NULL;
+-		ret = i915_gem_active_wait_unlocked(&obj->last_read[idx],
+-						    I915_WAIT_INTERRUPTIBLE,
+-						    timeout, rps);
+-		if (ret)
+-			break;
++	start = ktime_get();
++
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE | I915_WAIT_ALL,
++				   to_wait_timeout(args->timeout_ns),
++				   to_rps_client(file));
++
++	if (args->timeout_ns > 0) {
++		args->timeout_ns -= ktime_to_ns(ktime_sub(ktime_get(), start));
++		if (args->timeout_ns < 0)
++			args->timeout_ns = 0;
+ 	}
+ 
+ 	i915_gem_object_put_unlocked(obj);
+@@ -3284,7 +3418,13 @@ i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj, bool write)
+ 	uint32_t old_write_domain, old_read_domains;
+ 	int ret;
+ 
+-	ret = i915_gem_object_wait_rendering(obj, !write);
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE |
++				   I915_WAIT_LOCKED |
++				   (write ? I915_WAIT_ALL : 0),
++				   MAX_SCHEDULE_TIMEOUT,
++				   NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -3401,7 +3541,12 @@ restart:
+ 		 * If we wait upon the object, we know that all the bound
+ 		 * VMA are no longer active.
+ 		 */
+-		ret = i915_gem_object_wait_rendering(obj, false);
++		ret = i915_gem_object_wait(obj,
++					   I915_WAIT_INTERRUPTIBLE |
++					   I915_WAIT_LOCKED |
++					   I915_WAIT_ALL,
++					   MAX_SCHEDULE_TIMEOUT,
++					   NULL);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -3662,7 +3807,13 @@ i915_gem_object_set_to_cpu_domain(struct drm_i915_gem_object *obj, bool write)
+ 	uint32_t old_write_domain, old_read_domains;
+ 	int ret;
+ 
+-	ret = i915_gem_object_wait_rendering(obj, !write);
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE |
++				   I915_WAIT_LOCKED |
++				   (write ? I915_WAIT_ALL : 0),
++				   MAX_SCHEDULE_TIMEOUT,
++				   NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -3718,7 +3869,7 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+ 	struct drm_i915_file_private *file_priv = file->driver_priv;
+ 	unsigned long recent_enough = jiffies - DRM_I915_THROTTLE_JIFFIES;
+ 	struct drm_i915_gem_request *request, *target = NULL;
+-	int ret;
++	long ret;
+ 
+ 	/* ABI: return -EIO if already wedged */
+ 	if (i915_terminally_wedged(&dev_priv->gpu_error))
+@@ -3745,10 +3896,12 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+ 	if (target == NULL)
+ 		return 0;
+ 
+-	ret = i915_wait_request(target, I915_WAIT_INTERRUPTIBLE, NULL, NULL);
++	ret = i915_wait_request(target,
++				I915_WAIT_INTERRUPTIBLE,
++				MAX_SCHEDULE_TIMEOUT);
+ 	i915_gem_request_put(target);
+ 
+-	return ret;
++	return ret < 0 ? ret : 0;
+ }
+ 
+ static bool
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index 5e38bc0..fbe0923 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -59,31 +59,9 @@ static bool i915_fence_enable_signaling(struct dma_fence *fence)
+ 
+ static signed long i915_fence_wait(struct dma_fence *fence,
+ 				   bool interruptible,
+-				   signed long timeout_jiffies)
++				   signed long timeout)
+ {
+-	s64 timeout_ns, *timeout;
+-	int ret;
+-
+-	if (timeout_jiffies != MAX_SCHEDULE_TIMEOUT) {
+-		timeout_ns = jiffies_to_nsecs(timeout_jiffies);
+-		timeout = &timeout_ns;
+-	} else {
+-		timeout = NULL;
+-	}
+-
+-	ret = i915_wait_request(to_request(fence),
+-				interruptible, timeout,
+-				NO_WAITBOOST);
+-	if (ret == -ETIME)
+-		return 0;
+-
+-	if (ret < 0)
+-		return ret;
+-
+-	if (timeout_jiffies != MAX_SCHEDULE_TIMEOUT)
+-		timeout_jiffies = nsecs_to_jiffies(timeout_ns);
+-
+-	return timeout_jiffies;
++	return i915_wait_request(to_request(fence), interruptible, timeout);
+ }
+ 
+ static void i915_fence_value_str(struct dma_fence *fence, char *str, int size)
+@@ -166,7 +144,7 @@ static void i915_gem_request_retire(struct drm_i915_gem_request *request)
+ 	struct i915_gem_active *active, *next;
+ 
+ 	trace_i915_gem_request_retire(request);
+-	list_del(&request->link);
++	list_del_init(&request->link);
+ 
+ 	/* We know the GPU must have read the request to have
+ 	 * sent us the seqno + interrupt, so use the position
+@@ -224,7 +202,8 @@ void i915_gem_request_retire_upto(struct drm_i915_gem_request *req)
+ 	struct drm_i915_gem_request *tmp;
+ 
+ 	lockdep_assert_held(&req->i915->drm.struct_mutex);
+-	GEM_BUG_ON(list_empty(&req->link));
++	if (list_empty(&req->link))
++		return;
+ 
+ 	do {
+ 		tmp = list_first_entry(&engine->request_list,
+@@ -780,75 +759,48 @@ bool __i915_spin_request(const struct drm_i915_gem_request *req,
+ 
+ /**
+  * i915_wait_request - wait until execution of request has finished
+- * @req: duh!
++ * @req: the request to wait upon
+  * @flags: how to wait
+- * @timeout: in - how long to wait (NULL forever); out - how much time remaining
+- * @rps: client to charge for RPS boosting
++ * @timeout: how long to wait in jiffies
++ *
++ * i915_wait_request() waits for the request to be completed, for a
++ * maximum of @timeout jiffies (with MAX_SCHEDULE_TIMEOUT implying an
++ * unbounded wait).
+  *
+- * Note: It is of utmost importance that the passed in seqno and reset_counter
+- * values have been read by the caller in an smp safe manner. Where read-side
+- * locks are involved, it is sufficient to read the reset_counter before
+- * unlocking the lock that protects the seqno. For lockless tricks, the
+- * reset_counter _must_ be read before, and an appropriate smp_rmb must be
+- * inserted.
++ * If the caller holds the struct_mutex, the caller must pass I915_WAIT_LOCKED
++ * in via the flags, and vice versa if the struct_mutex is not held, the caller
++ * must not specify that the wait is locked.
+  *
+- * Returns 0 if the request was found within the alloted time. Else returns the
+- * errno with remaining time filled in timeout argument.
++ * Returns the remaining time (in jiffies) if the request completed, which may
++ * be zero or -ETIME if the request is unfinished after the timeout expires.
++ * May return -EINTR is called with I915_WAIT_INTERRUPTIBLE and a signal is
++ * pending before the request completes.
+  */
+-int i915_wait_request(struct drm_i915_gem_request *req,
+-		      unsigned int flags,
+-		      s64 *timeout,
+-		      struct intel_rps_client *rps)
++long i915_wait_request(struct drm_i915_gem_request *req,
++		       unsigned int flags,
++		       long timeout)
+ {
+ 	const int state = flags & I915_WAIT_INTERRUPTIBLE ?
+ 		TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE;
+ 	DEFINE_WAIT(reset);
+ 	struct intel_wait wait;
+-	unsigned long timeout_remain;
+-	int ret = 0;
+ 
+ 	might_sleep();
+ #if IS_ENABLED(CONFIG_LOCKDEP)
+-	GEM_BUG_ON(!!lockdep_is_held(&req->i915->drm.struct_mutex) !=
++	GEM_BUG_ON(debug_locks &&
++		   !!lockdep_is_held(&req->i915->drm.struct_mutex) !=
+ 		   !!(flags & I915_WAIT_LOCKED));
+ #endif
++	GEM_BUG_ON(timeout < 0);
+ 
+ 	if (i915_gem_request_completed(req))
+-		return 0;
++		return timeout;
+ 
+-	timeout_remain = MAX_SCHEDULE_TIMEOUT;
+-	if (timeout) {
+-		if (WARN_ON(*timeout < 0))
+-			return -EINVAL;
+-
+-		if (*timeout == 0)
+-			return -ETIME;
+-
+-		/* Record current time in case interrupted, or wedged */
+-		timeout_remain = nsecs_to_jiffies_timeout(*timeout);
+-		*timeout += ktime_get_raw_ns();
+-	}
++	if (!timeout)
++		return -ETIME;
+ 
+ 	trace_i915_gem_request_wait_begin(req);
+ 
+-	/* This client is about to stall waiting for the GPU. In many cases
+-	 * this is undesirable and limits the throughput of the system, as
+-	 * many clients cannot continue processing user input/output whilst
+-	 * blocked. RPS autotuning may take tens of milliseconds to respond
+-	 * to the GPU load and thus incurs additional latency for the client.
+-	 * We can circumvent that by promoting the GPU frequency to maximum
+-	 * before we wait. This makes the GPU throttle up much more quickly
+-	 * (good for benchmarks and user experience, e.g. window animations),
+-	 * but at a cost of spending more power processing the workload
+-	 * (bad for battery). Not all clients even want their results
+-	 * immediately and for them we should just let the GPU select its own
+-	 * frequency to maximise efficiency. To prevent a single client from
+-	 * forcing the clocks too high for the whole system, we only allow
+-	 * each client to waitboost once in a busy period.
+-	 */
+-	if (IS_RPS_CLIENT(rps) && INTEL_GEN(req->i915) >= 6)
+-		gen6_rps_boost(req->i915, rps, req->emitted_jiffies);
+-
+ 	/* Optimistic short spin before touching IRQs */
+ 	if (i915_spin_request(req, state, 5))
+ 		goto complete;
+@@ -867,16 +819,17 @@ int i915_wait_request(struct drm_i915_gem_request *req,
+ 
+ 	for (;;) {
+ 		if (signal_pending_state(state, current)) {
+-			ret = -ERESTARTSYS;
++			timeout = -ERESTARTSYS;
+ 			break;
+ 		}
+ 
+-		timeout_remain = io_schedule_timeout(timeout_remain);
+-		if (timeout_remain == 0) {
+-			ret = -ETIME;
++		if (!timeout) {
++			timeout = -ETIME;
+ 			break;
+ 		}
+ 
++		timeout = io_schedule_timeout(timeout);
++
+ 		if (intel_wait_complete(&wait))
+ 			break;
+ 
+@@ -923,40 +876,7 @@ wakeup:
+ complete:
+ 	trace_i915_gem_request_wait_end(req);
+ 
+-	if (timeout) {
+-		*timeout -= ktime_get_raw_ns();
+-		if (*timeout < 0)
+-			*timeout = 0;
+-
+-		/*
+-		 * Apparently ktime isn't accurate enough and occasionally has a
+-		 * bit of mismatch in the jiffies<->nsecs<->ktime loop. So patch
+-		 * things up to make the test happy. We allow up to 1 jiffy.
+-		 *
+-		 * This is a regrssion from the timespec->ktime conversion.
+-		 */
+-		if (ret == -ETIME && *timeout < jiffies_to_usecs(1)*1000)
+-			*timeout = 0;
+-	}
+-
+-	if (IS_RPS_USER(rps) &&
+-	    req->fence.seqno == req->engine->last_submitted_seqno) {
+-		/* The GPU is now idle and this client has stalled.
+-		 * Since no other client has submitted a request in the
+-		 * meantime, assume that this client is the only one
+-		 * supplying work to the GPU but is unable to keep that
+-		 * work supplied because it is waiting. Since the GPU is
+-		 * then never kept fully busy, RPS autoclocking will
+-		 * keep the clocks relatively low, causing further delays.
+-		 * Compensate by giving the synchronous client credit for
+-		 * a waitboost next time.
+-		 */
+-		spin_lock(&req->i915->rps.client_lock);
+-		list_del_init(&rps->link);
+-		spin_unlock(&req->i915->rps.client_lock);
+-	}
+-
+-	return ret;
++	return timeout;
+ }
+ 
+ static bool engine_retire_requests(struct intel_engine_cs *engine)
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.h b/drivers/gpu/drm/i915/i915_gem_request.h
+index 4e6d038..ae0913a 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.h
++++ b/drivers/gpu/drm/i915/i915_gem_request.h
+@@ -228,13 +228,13 @@ struct intel_rps_client;
+ #define IS_RPS_CLIENT(p) (!IS_ERR(p))
+ #define IS_RPS_USER(p) (!IS_ERR_OR_NULL(p))
+ 
+-int i915_wait_request(struct drm_i915_gem_request *req,
+-		      unsigned int flags,
+-		      s64 *timeout,
+-		      struct intel_rps_client *rps)
++long i915_wait_request(struct drm_i915_gem_request *req,
++		       unsigned int flags,
++		       long timeout)
+ 	__attribute__((nonnull(1)));
+ #define I915_WAIT_INTERRUPTIBLE	BIT(0)
+ #define I915_WAIT_LOCKED	BIT(1) /* struct_mutex held, handle GPU reset */
++#define I915_WAIT_ALL		BIT(2) /* used by i915_gem_object_wait() */
+ 
+ static inline u32 intel_engine_get_seqno(struct intel_engine_cs *engine);
+ 
+@@ -583,14 +583,16 @@ static inline int __must_check
+ i915_gem_active_wait(const struct i915_gem_active *active, struct mutex *mutex)
+ {
+ 	struct drm_i915_gem_request *request;
++	long ret;
+ 
+ 	request = i915_gem_active_peek(active, mutex);
+ 	if (!request)
+ 		return 0;
+ 
+-	return i915_wait_request(request,
+-				 I915_WAIT_INTERRUPTIBLE | I915_WAIT_LOCKED,
+-				 NULL, NULL);
++	ret = i915_wait_request(request,
++				I915_WAIT_INTERRUPTIBLE | I915_WAIT_LOCKED,
++				MAX_SCHEDULE_TIMEOUT);
++	return ret < 0 ? ret : 0;
+ }
+ 
+ /**
+@@ -617,20 +619,18 @@ i915_gem_active_wait(const struct i915_gem_active *active, struct mutex *mutex)
+  */
+ static inline int
+ i915_gem_active_wait_unlocked(const struct i915_gem_active *active,
+-			      unsigned int flags,
+-			      s64 *timeout,
+-			      struct intel_rps_client *rps)
++			      unsigned int flags)
+ {
+ 	struct drm_i915_gem_request *request;
+-	int ret = 0;
++	long ret = 0;
+ 
+ 	request = i915_gem_active_get_unlocked(active);
+ 	if (request) {
+-		ret = i915_wait_request(request, flags, timeout, rps);
++		ret = i915_wait_request(request, flags, MAX_SCHEDULE_TIMEOUT);
+ 		i915_gem_request_put(request);
+ 	}
+ 
+-	return ret;
++	return ret < 0 ? ret : 0;
+ }
+ 
+ /**
+@@ -647,7 +647,7 @@ i915_gem_active_retire(struct i915_gem_active *active,
+ 		       struct mutex *mutex)
+ {
+ 	struct drm_i915_gem_request *request;
+-	int ret;
++	long ret;
+ 
+ 	request = i915_gem_active_raw(active, mutex);
+ 	if (!request)
+@@ -655,8 +655,8 @@ i915_gem_active_retire(struct i915_gem_active *active,
+ 
+ 	ret = i915_wait_request(request,
+ 				I915_WAIT_INTERRUPTIBLE | I915_WAIT_LOCKED,
+-				NULL, NULL);
+-	if (ret)
++				MAX_SCHEDULE_TIMEOUT);
++	if (ret < 0)
+ 		return ret;
+ 
+ 	list_del_init(&active->link);
+diff --git a/drivers/gpu/drm/i915/i915_gem_userptr.c b/drivers/gpu/drm/i915/i915_gem_userptr.c
+index c6f780f..c49dd95 100644
+--- a/drivers/gpu/drm/i915/i915_gem_userptr.c
++++ b/drivers/gpu/drm/i915/i915_gem_userptr.c
+@@ -61,23 +61,13 @@ struct i915_mmu_object {
+ 	bool attached;
+ };
+ 
+-static void wait_rendering(struct drm_i915_gem_object *obj)
+-{
+-	unsigned long active = __I915_BO_ACTIVE(obj);
+-	int idx;
+-
+-	for_each_active(active, idx)
+-		i915_gem_active_wait_unlocked(&obj->last_read[idx],
+-					      0, NULL, NULL);
+-}
+-
+ static void cancel_userptr(struct work_struct *work)
+ {
+ 	struct i915_mmu_object *mo = container_of(work, typeof(*mo), work);
+ 	struct drm_i915_gem_object *obj = mo->obj;
+ 	struct drm_device *dev = obj->base.dev;
+ 
+-	wait_rendering(obj);
++	i915_gem_object_wait(obj, I915_WAIT_ALL, MAX_SCHEDULE_TIMEOUT, NULL);
+ 
+ 	mutex_lock(&dev->struct_mutex);
+ 	/* Cancel any active worker and force us to re-evaluate gup */
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index ab3a65b..ee8aff1 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -12107,7 +12107,7 @@ static void intel_mmio_flip_work_func(struct work_struct *w)
+ 
+ 	if (work->flip_queued_req)
+ 		WARN_ON(i915_wait_request(work->flip_queued_req,
+-					  0, NULL, NO_WAITBOOST));
++					  0, MAX_SCHEDULE_TIMEOUT) < 0);
+ 
+ 	/* For framebuffer backed by dmabuf, wait for fence */
+ 	resv = i915_gem_object_get_dmabuf_resv(obj);
+@@ -14225,19 +14225,21 @@ static int intel_atomic_prepare_commit(struct drm_device *dev,
+ 		for_each_plane_in_state(state, plane, plane_state, i) {
+ 			struct intel_plane_state *intel_plane_state =
+ 				to_intel_plane_state(plane_state);
++			long timeout;
+ 
+ 			if (!intel_plane_state->wait_req)
+ 				continue;
+ 
+-			ret = i915_wait_request(intel_plane_state->wait_req,
+-						I915_WAIT_INTERRUPTIBLE,
+-						NULL, NULL);
+-			if (ret) {
++			timeout = i915_wait_request(intel_plane_state->wait_req,
++						    I915_WAIT_INTERRUPTIBLE,
++						    MAX_SCHEDULE_TIMEOUT);
++			if (timeout < 0) {
+ 				/* Any hang should be swallowed by the wait */
+-				WARN_ON(ret == -EIO);
++				WARN_ON(timeout == -EIO);
+ 				mutex_lock(&dev->struct_mutex);
+ 				drm_atomic_helper_cleanup_planes(dev, state);
+ 				mutex_unlock(&dev->struct_mutex);
++				ret = timeout;
+ 				break;
+ 			}
+ 		}
+@@ -14441,7 +14443,7 @@ static void intel_atomic_commit_tail(struct drm_atomic_state *state)
+ 	bool hw_check = intel_state->modeset;
+ 	unsigned long put_domains[I915_MAX_PIPES] = {};
+ 	unsigned crtc_vblank_mask = 0;
+-	int i, ret;
++	int i;
+ 
+ 	for_each_plane_in_state(state, plane, plane_state, i) {
+ 		struct intel_plane_state *intel_plane_state =
+@@ -14450,11 +14452,10 @@ static void intel_atomic_commit_tail(struct drm_atomic_state *state)
+ 		if (!intel_plane_state->wait_req)
+ 			continue;
+ 
+-		ret = i915_wait_request(intel_plane_state->wait_req,
+-					0, NULL, NULL);
+ 		/* EIO should be eaten, and we can't get interrupted in the
+ 		 * worker, and blocking commits have waited already. */
+-		WARN_ON(ret);
++		WARN_ON(i915_wait_request(intel_plane_state->wait_req,
++					  0, MAX_SCHEDULE_TIMEOUT) < 0);
+ 	}
+ 
+ 	drm_atomic_helper_wait_for_dependencies(state);
+@@ -14818,7 +14819,11 @@ intel_prepare_plane_fb(struct drm_plane *plane,
+ 		 * can safely continue.
+ 		 */
+ 		if (needs_modeset(crtc_state))
+-			ret = i915_gem_object_wait_rendering(old_obj, true);
++			ret = i915_gem_object_wait(old_obj,
++						   I915_WAIT_INTERRUPTIBLE |
++						   I915_WAIT_LOCKED,
++						   MAX_SCHEDULE_TIMEOUT,
++						   NULL);
+ 		if (ret) {
+ 			/* GPU hangs should have been swallowed by the wait */
+ 			WARN_ON(ret == -EIO);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 34713c4..7bacd5f 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2147,7 +2147,9 @@ static int wait_for_space(struct drm_i915_gem_request *req, int bytes)
+ {
+ 	struct intel_ring *ring = req->ring;
+ 	struct drm_i915_gem_request *target;
+-	int ret;
++	long timeout;
++
++	lockdep_assert_held(&req->i915->drm.struct_mutex);
+ 
+ 	intel_ring_update_space(ring);
+ 	if (ring->space >= bytes)
+@@ -2177,11 +2179,11 @@ static int wait_for_space(struct drm_i915_gem_request *req, int bytes)
+ 	if (WARN_ON(&target->ring_link == &ring->request_list))
+ 		return -ENOSPC;
+ 
+-	ret = i915_wait_request(target,
+-				I915_WAIT_INTERRUPTIBLE | I915_WAIT_LOCKED,
+-				NULL, NO_WAITBOOST);
+-	if (ret)
+-		return ret;
++	timeout = i915_wait_request(target,
++				    I915_WAIT_INTERRUPTIBLE | I915_WAIT_LOCKED,
++				    MAX_SCHEDULE_TIMEOUT);
++	if (timeout < 0)
++		return timeout;
+ 
+ 	i915_gem_request_retire_upto(target);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 32b2e63..884a5ae 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -524,8 +524,7 @@ static inline int intel_engine_idle(struct intel_engine_cs *engine,
+ 				    unsigned int flags)
+ {
+ 	/* Wait upon the last request to be completed */
+-	return i915_gem_active_wait_unlocked(&engine->last_request,
+-					     flags, NULL, NULL);
++	return i915_gem_active_wait_unlocked(&engine->last_request, flags);
+ }
+ 
+ int intel_init_render_ring_buffer(struct intel_engine_cs *engine);
+-- 
+1.7.5.4
+

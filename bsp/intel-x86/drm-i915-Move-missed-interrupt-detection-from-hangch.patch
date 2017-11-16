@@ -1,0 +1,359 @@
+From 923ce32f9c9927e5e8f896a5d047e864b3c70de2 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 9 Aug 2016 17:47:51 +0100
+Subject: [PATCH 0317/4301] drm/i915: Move missed interrupt detection from
+ hangcheck to breadcrumbs
+
+commit 83348ba84ee0d5d4d982e5382bfbc8b2a2d05e75 upstream
+
+In commit 2529d57050af ("drm/i915: Drop racy markup of missed-irqs from
+idle-worker") the racy detection of missed interrupts was removed when
+we went idle. This however opened up the issue that the stuck waiters
+were not being reported, causing a test case failure. If we move the
+stuck waiter detection out of hangcheck and into the breadcrumb
+mechanims (i.e. the waiter) itself, we can avoid this issue entirely.
+This leaves hangcheck looking for a stuck GPU (inspecting for request
+advancement and HEAD motion), and breadcrumbs looking for a stuck
+waiter - hopefully make both easier to understand by their segregation.
+
+v2: Reduce the error message as we now run independently of hangcheck,
+and the hanging batch used by igt also counts as a stuck waiter causing
+extra warnings in dmesg.
+v3: Move the breadcrumb's hangcheck kickstart to the first missed wait.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=97104
+Fixes: 2529d57050af (waiter"drm/i915: Drop racy markup of missed-irqs...")
+Testcase: igt/drv_missed_irq
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1470761272-1245-2-git-send-email-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_debugfs.c      |   11 ++---
+ drivers/gpu/drm/i915/i915_gem.c          |   10 ----
+ drivers/gpu/drm/i915/i915_irq.c          |   26 +-----------
+ drivers/gpu/drm/i915/intel_breadcrumbs.c |   69 ++++++++++++++++++++---------
+ drivers/gpu/drm/i915/intel_engine_cs.c   |    1 +
+ drivers/gpu/drm/i915/intel_ringbuffer.h  |    6 +-
+ 6 files changed, 56 insertions(+), 67 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index f62285c..96bfc74 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -787,8 +787,6 @@ static void i915_ring_seqno_info(struct seq_file *m,
+ 
+ 	seq_printf(m, "Current sequence (%s): %x\n",
+ 		   engine->name, intel_engine_get_seqno(engine));
+-	seq_printf(m, "Current user interrupts (%s): %lx\n",
+-		   engine->name, READ_ONCE(engine->breadcrumbs.irq_wakeups));
+ 
+ 	spin_lock(&b->lock);
+ 	for (rb = rb_first(&b->waiters); rb; rb = rb_next(rb)) {
+@@ -1434,11 +1432,10 @@ static int i915_hangcheck_info(struct seq_file *m, void *unused)
+ 			   engine->hangcheck.seqno,
+ 			   seqno[id],
+ 			   engine->last_submitted_seqno);
+-		seq_printf(m, "\twaiters? %d\n",
+-			   intel_engine_has_waiter(engine));
+-		seq_printf(m, "\tuser interrupts = %lx [current %lx]\n",
+-			   engine->hangcheck.user_interrupts,
+-			   READ_ONCE(engine->breadcrumbs.irq_wakeups));
++		seq_printf(m, "\twaiters? %s, fake irq active? %s\n",
++			   yesno(intel_engine_has_waiter(engine)),
++			   yesno(test_bit(engine->id,
++					  &dev_priv->gpu_error.missed_irq_rings)));
+ 		seq_printf(m, "\tACTHD = 0x%08llx [current 0x%08llx]\n",
+ 			   (long long)engine->hangcheck.acthd,
+ 			   (long long)acthd[id]);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 624babf..3539317 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2525,7 +2525,6 @@ i915_gem_idle_work_handler(struct work_struct *work)
+ 		container_of(work, typeof(*dev_priv), gt.idle_work.work);
+ 	struct drm_device *dev = &dev_priv->drm;
+ 	struct intel_engine_cs *engine;
+-	unsigned int stuck_engines;
+ 	bool rearm_hangcheck;
+ 
+ 	if (!READ_ONCE(dev_priv->gt.awake))
+@@ -2555,15 +2554,6 @@ i915_gem_idle_work_handler(struct work_struct *work)
+ 	dev_priv->gt.awake = false;
+ 	rearm_hangcheck = false;
+ 
+-	/* As we have disabled hangcheck, we need to unstick any waiters still
+-	 * hanging around. However, as we may be racing against the interrupt
+-	 * handler or the waiters themselves, we skip enabling the fake-irq.
+-	 */
+-	stuck_engines = intel_kick_waiters(dev_priv);
+-	if (unlikely(stuck_engines))
+-		DRM_DEBUG_DRIVER("kicked stuck waiters (%x)...missed irq?\n",
+-				 stuck_engines);
+-
+ 	if (INTEL_GEN(dev_priv) >= 6)
+ 		gen6_rps_idle(dev_priv);
+ 	intel_runtime_pm_put(dev_priv);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 32ffcd1..1d31117 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1008,10 +1008,8 @@ static void ironlake_rps_change_irq_handler(struct drm_i915_private *dev_priv)
+ static void notify_ring(struct intel_engine_cs *engine)
+ {
+ 	smp_store_mb(engine->breadcrumbs.irq_posted, true);
+-	if (intel_engine_wakeup(engine)) {
++	if (intel_engine_wakeup(engine))
+ 		trace_i915_gem_request_notify(engine);
+-		engine->breadcrumbs.irq_wakeups++;
+-	}
+ }
+ 
+ static void vlv_c0_read(struct drm_i915_private *dev_priv,
+@@ -3198,22 +3196,6 @@ engine_stuck(struct intel_engine_cs *engine, u64 acthd)
+ 	return HANGCHECK_HUNG;
+ }
+ 
+-static unsigned long kick_waiters(struct intel_engine_cs *engine)
+-{
+-	struct drm_i915_private *i915 = engine->i915;
+-	unsigned long irq_count = READ_ONCE(engine->breadcrumbs.irq_wakeups);
+-
+-	if (engine->hangcheck.user_interrupts == irq_count &&
+-	    !test_and_set_bit(engine->id, &i915->gpu_error.missed_irq_rings)) {
+-		if (!test_bit(engine->id, &i915->gpu_error.test_irq_rings))
+-			DRM_ERROR("Hangcheck timer elapsed... %s idle\n",
+-				  engine->name);
+-
+-		intel_engine_enable_fake_irq(engine);
+-	}
+-
+-	return irq_count;
+-}
+ /*
+  * This is called when the chip hasn't reported back with completed
+  * batchbuffers in a long time. We keep track per ring seqno progress and
+@@ -3251,7 +3233,6 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
+ 		bool busy = intel_engine_has_waiter(engine);
+ 		u64 acthd;
+ 		u32 seqno;
+-		unsigned user_interrupts;
+ 
+ 		semaphore_clear_deadlocks(dev_priv);
+ 
+@@ -3268,15 +3249,11 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
+ 		acthd = intel_engine_get_active_head(engine);
+ 		seqno = intel_engine_get_seqno(engine);
+ 
+-		/* Reset stuck interrupts between batch advances */
+-		user_interrupts = 0;
+-
+ 		if (engine->hangcheck.seqno == seqno) {
+ 			if (!intel_engine_is_active(engine)) {
+ 				engine->hangcheck.action = HANGCHECK_IDLE;
+ 				if (busy) {
+ 					/* Safeguard against driver failure */
+-					user_interrupts = kick_waiters(engine);
+ 					engine->hangcheck.score += BUSY;
+ 				}
+ 			} else {
+@@ -3339,7 +3316,6 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
+ 
+ 		engine->hangcheck.seqno = seqno;
+ 		engine->hangcheck.acthd = acthd;
+-		engine->hangcheck.user_interrupts = user_interrupts;
+ 		busy_count += busy;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/intel_breadcrumbs.c b/drivers/gpu/drm/i915/intel_breadcrumbs.c
+index 9086744..7be9af1 100644
+--- a/drivers/gpu/drm/i915/intel_breadcrumbs.c
++++ b/drivers/gpu/drm/i915/intel_breadcrumbs.c
+@@ -26,6 +26,40 @@
+ 
+ #include "i915_drv.h"
+ 
++static void intel_breadcrumbs_hangcheck(unsigned long data)
++{
++	struct intel_engine_cs *engine = (struct intel_engine_cs *)data;
++	struct intel_breadcrumbs *b = &engine->breadcrumbs;
++
++	if (!b->irq_enabled)
++		return;
++
++	if (time_before(jiffies, b->timeout)) {
++		mod_timer(&b->hangcheck, b->timeout);
++		return;
++	}
++
++	DRM_DEBUG("Hangcheck timer elapsed... %s idle\n", engine->name);
++	set_bit(engine->id, &engine->i915->gpu_error.missed_irq_rings);
++	mod_timer(&engine->breadcrumbs.fake_irq, jiffies + 1);
++
++	/* Ensure that even if the GPU hangs, we get woken up.
++	 *
++	 * However, note that if no one is waiting, we never notice
++	 * a gpu hang. Eventually, we will have to wait for a resource
++	 * held by the GPU and so trigger a hangcheck. In the most
++	 * pathological case, this will be upon memory starvation! To
++	 * prevent this, we also queue the hangcheck from the retire
++	 * worker.
++	 */
++	i915_queue_hangcheck(engine->i915);
++}
++
++static unsigned long wait_timeout(void)
++{
++	return round_jiffies_up(jiffies + DRM_I915_HANGCHECK_JIFFIES);
++}
++
+ static void intel_breadcrumbs_fake_irq(unsigned long data)
+ {
+ 	struct intel_engine_cs *engine = (struct intel_engine_cs *)data;
+@@ -51,13 +85,6 @@ static void irq_enable(struct intel_engine_cs *engine)
+ 	 */
+ 	engine->breadcrumbs.irq_posted = true;
+ 
+-	/* Make sure the current hangcheck doesn't falsely accuse a just
+-	 * started irq handler from missing an interrupt (because the
+-	 * interrupt count still matches the stale value from when
+-	 * the irq handler was disabled, many hangchecks ago).
+-	 */
+-	engine->breadcrumbs.irq_wakeups++;
+-
+ 	spin_lock_irq(&engine->i915->irq_lock);
+ 	engine->irq_enable(engine);
+ 	spin_unlock_irq(&engine->i915->irq_lock);
+@@ -98,17 +125,13 @@ static void __intel_breadcrumbs_enable_irq(struct intel_breadcrumbs *b)
+ 	}
+ 
+ 	if (!b->irq_enabled ||
+-	    test_bit(engine->id, &i915->gpu_error.missed_irq_rings))
++	    test_bit(engine->id, &i915->gpu_error.missed_irq_rings)) {
+ 		mod_timer(&b->fake_irq, jiffies + 1);
+-
+-	/* Ensure that even if the GPU hangs, we get woken up.
+-	 *
+-	 * However, note that if no one is waiting, we never notice
+-	 * a gpu hang. Eventually, we will have to wait for a resource
+-	 * held by the GPU and so trigger a hangcheck. In the most
+-	 * pathological case, this will be upon memory starvation!
+-	 */
+-	i915_queue_hangcheck(i915);
++	} else {
++		/* Ensure we never sleep indefinitely */
++		GEM_BUG_ON(!time_after(b->timeout, jiffies));
++		mod_timer(&b->hangcheck, b->timeout);
++	}
+ }
+ 
+ static void __intel_breadcrumbs_disable_irq(struct intel_breadcrumbs *b)
+@@ -219,6 +242,7 @@ static bool __intel_engine_add_wait(struct intel_engine_cs *engine,
+ 		GEM_BUG_ON(!next && !first);
+ 		if (next && next != &wait->node) {
+ 			GEM_BUG_ON(first);
++			b->timeout = wait_timeout();
+ 			b->first_wait = to_wait(next);
+ 			smp_store_mb(b->irq_seqno_bh, b->first_wait->tsk);
+ 			/* As there is a delay between reading the current
+@@ -245,6 +269,7 @@ static bool __intel_engine_add_wait(struct intel_engine_cs *engine,
+ 
+ 	if (first) {
+ 		GEM_BUG_ON(rb_first(&b->waiters) != &wait->node);
++		b->timeout = wait_timeout();
+ 		b->first_wait = wait;
+ 		smp_store_mb(b->irq_seqno_bh, wait->tsk);
+ 		/* After assigning ourselves as the new bottom-half, we must
+@@ -277,11 +302,6 @@ bool intel_engine_add_wait(struct intel_engine_cs *engine,
+ 	return first;
+ }
+ 
+-void intel_engine_enable_fake_irq(struct intel_engine_cs *engine)
+-{
+-	mod_timer(&engine->breadcrumbs.fake_irq, jiffies + 1);
+-}
+-
+ static inline bool chain_wakeup(struct rb_node *rb, int priority)
+ {
+ 	return rb && to_wait(rb)->tsk->prio <= priority;
+@@ -359,6 +379,7 @@ void intel_engine_remove_wait(struct intel_engine_cs *engine,
+ 			 * the interrupt, or if we have to handle an
+ 			 * exception rather than a seqno completion.
+ 			 */
++			b->timeout = wait_timeout();
+ 			b->first_wait = to_wait(next);
+ 			smp_store_mb(b->irq_seqno_bh, b->first_wait->tsk);
+ 			if (b->first_wait->seqno != wait->seqno)
+@@ -536,6 +557,9 @@ int intel_engine_init_breadcrumbs(struct intel_engine_cs *engine)
+ 	setup_timer(&b->fake_irq,
+ 		    intel_breadcrumbs_fake_irq,
+ 		    (unsigned long)engine);
++	setup_timer(&b->hangcheck,
++		    intel_breadcrumbs_hangcheck,
++		    (unsigned long)engine);
+ 
+ 	/* Spawn a thread to provide a common bottom-half for all signals.
+ 	 * As this is an asynchronous interface we cannot steal the current
+@@ -560,6 +584,7 @@ void intel_engine_fini_breadcrumbs(struct intel_engine_cs *engine)
+ 	if (!IS_ERR_OR_NULL(b->signaler))
+ 		kthread_stop(b->signaler);
+ 
++	del_timer_sync(&b->hangcheck);
+ 	del_timer_sync(&b->fake_irq);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_engine_cs.c b/drivers/gpu/drm/i915/intel_engine_cs.c
+index e9b301a..0dd3d1d 100644
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -164,6 +164,7 @@ cleanup:
+ void intel_engine_init_hangcheck(struct intel_engine_cs *engine)
+ {
+ 	memset(&engine->hangcheck, 0, sizeof(engine->hangcheck));
++	clear_bit(engine->id, &engine->i915->gpu_error.missed_irq_rings);
+ }
+ 
+ static void intel_engine_init_requests(struct intel_engine_cs *engine)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index bf9a6e5..c7a6db3 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -75,7 +75,6 @@ enum intel_engine_hangcheck_action {
+ 
+ struct intel_engine_hangcheck {
+ 	u64 acthd;
+-	unsigned long user_interrupts;
+ 	u32 seqno;
+ 	int score;
+ 	enum intel_engine_hangcheck_action action;
+@@ -173,7 +172,6 @@ struct intel_engine_cs {
+ 	 */
+ 	struct intel_breadcrumbs {
+ 		struct task_struct *irq_seqno_bh; /* bh for user interrupts */
+-		unsigned long irq_wakeups;
+ 		bool irq_posted;
+ 
+ 		spinlock_t lock; /* protects the lists of requests */
+@@ -183,6 +181,9 @@ struct intel_engine_cs {
+ 		struct task_struct *signaler; /* used for fence signalling */
+ 		struct drm_i915_gem_request *first_signal;
+ 		struct timer_list fake_irq; /* used after a missed interrupt */
++		struct timer_list hangcheck; /* detect missed interrupts */
++
++		unsigned long timeout;
+ 
+ 		bool irq_enabled : 1;
+ 		bool rpm_wakelock : 1;
+@@ -560,7 +561,6 @@ static inline bool intel_engine_wakeup(struct intel_engine_cs *engine)
+ 	return wakeup;
+ }
+ 
+-void intel_engine_enable_fake_irq(struct intel_engine_cs *engine);
+ void intel_engine_fini_breadcrumbs(struct intel_engine_cs *engine);
+ unsigned int intel_kick_waiters(struct drm_i915_private *i915);
+ unsigned int intel_kick_signalers(struct drm_i915_private *i915);
+-- 
+1.7.5.4
+

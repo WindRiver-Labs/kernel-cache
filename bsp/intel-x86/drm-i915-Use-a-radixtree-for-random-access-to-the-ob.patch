@@ -1,0 +1,400 @@
+From 91d455092cd45e9259cfccacb2989b63eabe0d0c Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 28 Oct 2016 13:58:33 +0100
+Subject: [PATCH 1638/4301] drm/i915: Use a radixtree for random access to the
+ object's backing storage
+
+commit 96d776345277d81dc96e984f13d8f2b84ab0dee4 upstream
+
+A while ago we switched from a contiguous array of pages into an sglist,
+for that was both more convenient for mapping to hardware and avoided
+the requirement for a vmalloc array of pages on every object. However,
+certain GEM API calls (like pwrite, pread as well as performing
+relocations) do desire access to individual struct pages. A quick hack
+was to introduce a cache of the last access such that finding the
+following page was quick - this works so long as the caller desired
+sequential access. Walking backwards, or multiple callers, still hits a
+slow linear search for each page. One solution is to store each
+successful lookup in a radix tree.
+
+v2: Rewrite building the radixtree for clarity, hopefully.
+
+v3: Rearrange execbuf to avoid calling i915_gem_object_get_sg() from
+within an atomic section and so relax the allocation context to a simple
+GFP_KERNEL and mutex.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161028125858.23563-10-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_drv.h         |   69 +++++-------
+ drivers/gpu/drm/i915/i915_gem.c         |  185 ++++++++++++++++++++++++++++---
+ drivers/gpu/drm/i915/i915_gem_stolen.c  |    4 +-
+ drivers/gpu/drm/i915/i915_gem_userptr.c |    4 +-
+ 4 files changed, 199 insertions(+), 63 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 3676270..103af0e 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2313,9 +2313,12 @@ struct drm_i915_gem_object {
+ 
+ 	struct sg_table *pages;
+ 	int pages_pin_count;
+-	struct get_page {
+-		struct scatterlist *sg;
+-		int last;
++	struct i915_gem_object_page_iter {
++		struct scatterlist *sg_pos;
++		unsigned int sg_idx; /* in pages, but 32bit eek! */
++
++		struct radix_tree_root radix;
++		struct mutex lock; /* protects this cache */
+ 	} get_page;
+ 	void *mapping;
+ 
+@@ -2518,6 +2521,14 @@ static __always_inline struct sgt_iter {
+ 	return s;
+ }
+ 
++static inline struct scatterlist *____sg_next(struct scatterlist *sg)
++{
++	++sg;
++	if (unlikely(sg_is_chain(sg)))
++		sg = sg_chain_ptr(sg);
++	return sg;
++}
++
+ /**
+  * __sg_next - return the next scatterlist entry in a list
+  * @sg:		The current sg entry
+@@ -2532,9 +2543,7 @@ static inline struct scatterlist *__sg_next(struct scatterlist *sg)
+ #ifdef CONFIG_DEBUG_SG
+ 	BUG_ON(sg->sg_magic != SG_MAGIC);
+ #endif
+-	return sg_is_last(sg) ? NULL :
+-		likely(!sg_is_chain(++sg)) ? sg :
+-		sg_chain_ptr(sg);
++	return sg_is_last(sg) ? NULL : ____sg_next(sg);
+ }
+ 
+ /**
+@@ -3212,45 +3221,21 @@ static inline int __sg_page_count(struct scatterlist *sg)
+ 	return sg->length >> PAGE_SHIFT;
+ }
+ 
+-struct page *
+-i915_gem_object_get_dirty_page(struct drm_i915_gem_object *obj, int n);
+-
+-static inline dma_addr_t
+-i915_gem_object_get_dma_address(struct drm_i915_gem_object *obj, int n)
+-{
+-	if (n < obj->get_page.last) {
+-		obj->get_page.sg = obj->pages->sgl;
+-		obj->get_page.last = 0;
+-	}
+-
+-	while (obj->get_page.last + __sg_page_count(obj->get_page.sg) <= n) {
+-		obj->get_page.last += __sg_page_count(obj->get_page.sg++);
+-		if (unlikely(sg_is_chain(obj->get_page.sg)))
+-			obj->get_page.sg = sg_chain_ptr(obj->get_page.sg);
+-	}
++struct scatterlist *
++i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
++		       unsigned int n, unsigned int *offset);
+ 
+-	return sg_dma_address(obj->get_page.sg) + ((n - obj->get_page.last) << PAGE_SHIFT);
+-}
+-
+-static inline struct page *
+-i915_gem_object_get_page(struct drm_i915_gem_object *obj, int n)
+-{
+-	if (WARN_ON(n >= obj->base.size >> PAGE_SHIFT))
+-		return NULL;
+-
+-	if (n < obj->get_page.last) {
+-		obj->get_page.sg = obj->pages->sgl;
+-		obj->get_page.last = 0;
+-	}
++struct page *
++i915_gem_object_get_page(struct drm_i915_gem_object *obj,
++			 unsigned int n);
+ 
+-	while (obj->get_page.last + __sg_page_count(obj->get_page.sg) <= n) {
+-		obj->get_page.last += __sg_page_count(obj->get_page.sg++);
+-		if (unlikely(sg_is_chain(obj->get_page.sg)))
+-			obj->get_page.sg = sg_chain_ptr(obj->get_page.sg);
+-	}
++struct page *
++i915_gem_object_get_dirty_page(struct drm_i915_gem_object *obj,
++			       unsigned int n);
+ 
+-	return nth_page(sg_page(obj->get_page.sg), n - obj->get_page.last);
+-}
++dma_addr_t
++i915_gem_object_get_dma_address(struct drm_i915_gem_object *obj,
++				unsigned long n);
+ 
+ static inline void i915_gem_object_pin_pages(struct drm_i915_gem_object *obj)
+ {
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 44d9833..338a9e8 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2330,6 +2330,15 @@ i915_gem_object_put_pages_gtt(struct drm_i915_gem_object *obj)
+ 	kfree(obj->pages);
+ }
+ 
++static void __i915_gem_object_reset_page_iter(struct drm_i915_gem_object *obj)
++{
++	struct radix_tree_iter iter;
++	void **slot;
++
++	radix_tree_for_each_slot(slot, &obj->get_page.radix, &iter, 0)
++		radix_tree_delete(&obj->get_page.radix, iter.index);
++}
++
+ int
+ i915_gem_object_put_pages(struct drm_i915_gem_object *obj)
+ {
+@@ -2362,6 +2371,8 @@ i915_gem_object_put_pages(struct drm_i915_gem_object *obj)
+ 		obj->mapping = NULL;
+ 	}
+ 
++	__i915_gem_object_reset_page_iter(obj);
++
+ 	ops->put_pages(obj);
+ 	obj->pages = NULL;
+ 
+@@ -2532,8 +2543,8 @@ i915_gem_object_get_pages(struct drm_i915_gem_object *obj)
+ 
+ 	list_add_tail(&obj->global_list, &dev_priv->mm.unbound_list);
+ 
+-	obj->get_page.sg = obj->pages->sgl;
+-	obj->get_page.last = 0;
++	obj->get_page.sg_pos = obj->pages->sgl;
++	obj->get_page.sg_idx = 0;
+ 
+ 	return 0;
+ }
+@@ -4352,6 +4363,8 @@ void i915_gem_object_init(struct drm_i915_gem_object *obj,
+ 
+ 	obj->frontbuffer_ggtt_origin = ORIGIN_GTT;
+ 	obj->madv = I915_MADV_WILLNEED;
++	INIT_RADIX_TREE(&obj->get_page.radix, GFP_KERNEL | __GFP_NOWARN);
++	mutex_init(&obj->get_page.lock);
+ 
+ 	i915_gem_info_add_obj(to_i915(obj->base.dev), obj->base.size);
+ }
+@@ -5047,21 +5060,6 @@ void i915_gem_track_fb(struct drm_i915_gem_object *old,
+ 	}
+ }
+ 
+-/* Like i915_gem_object_get_page(), but mark the returned page dirty */
+-struct page *
+-i915_gem_object_get_dirty_page(struct drm_i915_gem_object *obj, int n)
+-{
+-	struct page *page;
+-
+-	/* Only default objects have per-page dirty tracking */
+-	if (WARN_ON(!i915_gem_object_has_struct_page(obj)))
+-		return NULL;
+-
+-	page = i915_gem_object_get_page(obj, n);
+-	set_page_dirty(page);
+-	return page;
+-}
+-
+ /* Allocate a new GEM object and fill it with the supplied data */
+ struct drm_i915_gem_object *
+ i915_gem_object_create_from_data(struct drm_device *dev,
+@@ -5102,3 +5100,156 @@ fail:
+ 	i915_gem_object_put(obj);
+ 	return ERR_PTR(ret);
+ }
++
++struct scatterlist *
++i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
++		       unsigned int n,
++		       unsigned int *offset)
++{
++	struct i915_gem_object_page_iter *iter = &obj->get_page;
++	struct scatterlist *sg;
++	unsigned int idx, count;
++
++	might_sleep();
++	GEM_BUG_ON(n >= obj->base.size >> PAGE_SHIFT);
++	GEM_BUG_ON(obj->pages_pin_count == 0);
++
++	/* As we iterate forward through the sg, we record each entry in a
++	 * radixtree for quick repeated (backwards) lookups. If we have seen
++	 * this index previously, we will have an entry for it.
++	 *
++	 * Initial lookup is O(N), but this is amortized to O(1) for
++	 * sequential page access (where each new request is consecutive
++	 * to the previous one). Repeated lookups are O(lg(obj->base.size)),
++	 * i.e. O(1) with a large constant!
++	 */
++	if (n < READ_ONCE(iter->sg_idx))
++		goto lookup;
++
++	mutex_lock(&iter->lock);
++
++	/* We prefer to reuse the last sg so that repeated lookup of this
++	 * (or the subsequent) sg are fast - comparing against the last
++	 * sg is faster than going through the radixtree.
++	 */
++
++	sg = iter->sg_pos;
++	idx = iter->sg_idx;
++	count = __sg_page_count(sg);
++
++	while (idx + count <= n) {
++		unsigned long exception, i;
++		int ret;
++
++		/* If we cannot allocate and insert this entry, or the
++		 * individual pages from this range, cancel updating the
++		 * sg_idx so that on this lookup we are forced to linearly
++		 * scan onwards, but on future lookups we will try the
++		 * insertion again (in which case we need to be careful of
++		 * the error return reporting that we have already inserted
++		 * this index).
++		 */
++		ret = radix_tree_insert(&iter->radix, idx, sg);
++		if (ret && ret != -EEXIST)
++			goto scan;
++
++		exception =
++			RADIX_TREE_EXCEPTIONAL_ENTRY |
++			idx << RADIX_TREE_EXCEPTIONAL_SHIFT;
++		for (i = 1; i < count; i++) {
++			ret = radix_tree_insert(&iter->radix, idx + i,
++						(void *)exception);
++			if (ret && ret != -EEXIST)
++				goto scan;
++		}
++
++		idx += count;
++		sg = ____sg_next(sg);
++		count = __sg_page_count(sg);
++	}
++
++scan:
++	iter->sg_pos = sg;
++	iter->sg_idx = idx;
++
++	mutex_unlock(&iter->lock);
++
++	if (unlikely(n < idx)) /* insertion completed by another thread */
++		goto lookup;
++
++	/* In case we failed to insert the entry into the radixtree, we need
++	 * to look beyond the current sg.
++	 */
++	while (idx + count <= n) {
++		idx += count;
++		sg = ____sg_next(sg);
++		count = __sg_page_count(sg);
++	}
++
++	*offset = n - idx;
++	return sg;
++
++lookup:
++	rcu_read_lock();
++
++	sg = radix_tree_lookup(&iter->radix, n);
++	GEM_BUG_ON(!sg);
++
++	/* If this index is in the middle of multi-page sg entry,
++	 * the radixtree will contain an exceptional entry that points
++	 * to the start of that range. We will return the pointer to
++	 * the base page and the offset of this page within the
++	 * sg entry's range.
++	 */
++	*offset = 0;
++	if (unlikely(radix_tree_exception(sg))) {
++		unsigned long base =
++			(unsigned long)sg >> RADIX_TREE_EXCEPTIONAL_SHIFT;
++
++		sg = radix_tree_lookup(&iter->radix, base);
++		GEM_BUG_ON(!sg);
++
++		*offset = n - base;
++	}
++
++	rcu_read_unlock();
++
++	return sg;
++}
++
++struct page *
++i915_gem_object_get_page(struct drm_i915_gem_object *obj, unsigned int n)
++{
++	struct scatterlist *sg;
++	unsigned int offset;
++
++	GEM_BUG_ON(!i915_gem_object_has_struct_page(obj));
++
++	sg = i915_gem_object_get_sg(obj, n, &offset);
++	return nth_page(sg_page(sg), offset);
++}
++
++/* Like i915_gem_object_get_page(), but mark the returned page dirty */
++struct page *
++i915_gem_object_get_dirty_page(struct drm_i915_gem_object *obj,
++			       unsigned int n)
++{
++	struct page *page;
++
++	page = i915_gem_object_get_page(obj, n);
++	if (!obj->dirty)
++		set_page_dirty(page);
++
++	return page;
++}
++
++dma_addr_t
++i915_gem_object_get_dma_address(struct drm_i915_gem_object *obj,
++				unsigned long n)
++{
++	struct scatterlist *sg;
++	unsigned int offset;
++
++	sg = i915_gem_object_get_sg(obj, n, &offset);
++	return sg_dma_address(sg) + (offset << PAGE_SHIFT);
++}
+diff --git a/drivers/gpu/drm/i915/i915_gem_stolen.c b/drivers/gpu/drm/i915/i915_gem_stolen.c
+index 008b161..29d4cdc 100644
+--- a/drivers/gpu/drm/i915/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/i915_gem_stolen.c
+@@ -599,8 +599,8 @@ _i915_gem_object_create_stolen(struct drm_device *dev,
+ 	if (obj->pages == NULL)
+ 		goto cleanup;
+ 
+-	obj->get_page.sg = obj->pages->sgl;
+-	obj->get_page.last = 0;
++	obj->get_page.sg_pos = obj->pages->sgl;
++	obj->get_page.sg_idx = 0;
+ 
+ 	i915_gem_object_pin_pages(obj);
+ 	obj->stolen = stolen;
+diff --git a/drivers/gpu/drm/i915/i915_gem_userptr.c b/drivers/gpu/drm/i915/i915_gem_userptr.c
+index c49dd95..e2fa970 100644
+--- a/drivers/gpu/drm/i915/i915_gem_userptr.c
++++ b/drivers/gpu/drm/i915/i915_gem_userptr.c
+@@ -530,8 +530,8 @@ __i915_gem_userptr_get_pages_worker(struct work_struct *_work)
+ 			if (ret == 0) {
+ 				list_add_tail(&obj->global_list,
+ 					      &to_i915(dev)->mm.unbound_list);
+-				obj->get_page.sg = obj->pages->sgl;
+-				obj->get_page.last = 0;
++				obj->get_page.sg_pos = obj->pages->sgl;
++				obj->get_page.sg_idx = 0;
+ 				pinned = 0;
+ 			}
+ 		}
+-- 
+1.7.5.4
+

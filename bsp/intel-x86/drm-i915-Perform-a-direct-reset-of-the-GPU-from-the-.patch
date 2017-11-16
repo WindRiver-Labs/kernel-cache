@@ -1,0 +1,189 @@
+From a34ce08775ae693d5e61a252cf2365284652f5e1 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 9 Sep 2016 14:11:51 +0100
+Subject: [PATCH 0745/4301] drm/i915: Perform a direct reset of the GPU from
+ the waiter
+
+commit 221fe7994554cc3985fc5d761ed7e44dcae0fa52 upstream
+
+If a waiter is holding the struct_mutex, then the reset worker cannot
+reset the GPU until the waiter returns. We do not want to return -EAGAIN
+form i915_wait_request as that breaks delicate operations like
+i915_vma_unbind() which often cannot be restarted easily, and returning
+-EIO is just as useless (and has in the past proven dangerous). The
+remaining WARN_ON(i915_wait_request) serve as a valuable reminder that
+handling errors from an indefinite wait are tricky.
+
+We can keep the current semantic that knowing after a reset is complete,
+so is the request, by performing the reset ourselves if we hold the
+mutex.
+
+uevent emission is still handled by the reset worker, so it may appear
+slightly out of order with respect to the actual reset (and concurrent
+use of the device).
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20160909131201.16673-11-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_drv.c         |   11 ++++++-----
+ drivers/gpu/drm/i915/i915_drv.h         |   15 +++------------
+ drivers/gpu/drm/i915/i915_gem_request.c |   29 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_irq.c         |    2 ++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    3 ---
+ 5 files changed, 40 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index bdfc9f8..592a903 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -1729,6 +1729,8 @@ int i915_resume_switcheroo(struct drm_device *dev)
+  * Reset the chip.  Useful if a hang is detected. Returns zero on successful
+  * reset or otherwise an error code.
+  *
++ * Caller must hold the struct_mutex.
++ *
+  * Procedure is fairly simple:
+  *   - reset the chip using the reset reg
+  *   - re-init context state
+@@ -1743,7 +1745,10 @@ int i915_reset(struct drm_i915_private *dev_priv)
+ 	struct i915_gpu_error *error = &dev_priv->gpu_error;
+ 	int ret;
+ 
+-	mutex_lock(&dev->struct_mutex);
++	lockdep_assert_held(&dev->struct_mutex);
++
++	if (!test_and_clear_bit(I915_RESET_IN_PROGRESS, &error->flags))
++		return test_bit(I915_WEDGED, &error->flags) ? -EIO : 0;
+ 
+ 	/* Clear any previous failed attempts at recovery. Time to try again. */
+ 	__clear_bit(I915_WEDGED, &error->flags);
+@@ -1784,9 +1789,6 @@ int i915_reset(struct drm_i915_private *dev_priv)
+ 		goto error;
+ 	}
+ 
+-	clear_bit(I915_RESET_IN_PROGRESS, &error->flags);
+-	mutex_unlock(&dev->struct_mutex);
+-
+ 	/*
+ 	 * rps/rc6 re-init is necessary to restore state lost after the
+ 	 * reset and the re-install of gt irqs. Skip for ironlake per
+@@ -1800,7 +1802,6 @@ int i915_reset(struct drm_i915_private *dev_priv)
+ 
+ error:
+ 	set_bit(I915_WEDGED, &error->flags);
+-	mutex_unlock(&dev->struct_mutex);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 91d8266..0ff66c6 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3895,7 +3895,9 @@ wait_remaining_ms_from_jiffies(unsigned long timestamp_jiffies, int to_wait_ms)
+ 			    schedule_timeout_uninterruptible(remaining_jiffies);
+ 	}
+ }
+-static inline bool __i915_request_irq_complete(struct drm_i915_gem_request *req)
++
++static inline bool
++__i915_request_irq_complete(struct drm_i915_gem_request *req)
+ {
+ 	struct intel_engine_cs *engine = req->engine;
+ 
+@@ -3957,17 +3959,6 @@ static inline bool __i915_request_irq_complete(struct drm_i915_gem_request *req)
+ 			return true;
+ 	}
+ 
+-	/* We need to check whether any gpu reset happened in between
+-	 * the request being submitted and now. If a reset has occurred,
+-	 * the seqno will have been advance past ours and our request
+-	 * is complete. If we are in the process of handling a reset,
+-	 * the request is effectively complete as the rendering will
+-	 * be discarded, but we need to return in order to drop the
+-	 * struct_mutex.
+-	 */
+-	if (i915_reset_in_progress(&req->i915->gpu_error))
+-		return true;
+-
+ 	return false;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index 5f89801..64c3706 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -533,6 +533,16 @@ void __i915_add_request(struct drm_i915_gem_request *request, bool flush_caches)
+ 	engine->submit_request(request);
+ }
+ 
++static void reset_wait_queue(wait_queue_head_t *q, wait_queue_t *wait)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&q->lock, flags);
++	if (list_empty(&wait->task_list))
++		__add_wait_queue(q, wait);
++	spin_unlock_irqrestore(&q->lock, flags);
++}
++
+ static unsigned long local_clock_us(unsigned int *cpu)
+ {
+ 	unsigned long t;
+@@ -710,6 +720,25 @@ wakeup:
+ 		if (__i915_request_irq_complete(req))
+ 			break;
+ 
++		/* If the GPU is hung, and we hold the lock, reset the GPU
++		 * and then check for completion. On a full reset, the engine's
++		 * HW seqno will be advanced passed us and we are complete.
++		 * If we do a partial reset, we have to wait for the GPU to
++		 * resume and update the breadcrumb.
++		 *
++		 * If we don't hold the mutex, we can just wait for the worker
++		 * to come along and update the breadcrumb (either directly
++		 * itself, or indirectly by recovering the GPU).
++		 */
++		if (flags & I915_WAIT_LOCKED &&
++		    i915_reset_in_progress(&req->i915->gpu_error)) {
++			__set_current_state(TASK_RUNNING);
++			i915_reset(req->i915);
++			reset_wait_queue(&req->i915->gpu_error.wait_queue,
++					 &reset);
++			continue;
++		}
++
+ 		/* Only spin if we know the GPU is processing this request */
+ 		if (i915_spin_request(req, state, 2))
+ 			break;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index c5e051c..6369c75 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2609,7 +2609,9 @@ static void i915_reset_and_wakeup(struct drm_i915_private *dev_priv)
+ 	 * pending state and not properly drop locks, resulting in
+ 	 * deadlocks with the reset work.
+ 	 */
++	mutex_lock(&dev_priv->drm.struct_mutex);
+ 	ret = i915_reset(dev_priv);
++	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 
+ 	intel_finish_reset(dev_priv);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index e1ffa30..035cc4d 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -2221,9 +2221,6 @@ static int wait_for_space(struct drm_i915_gem_request *req, int bytes)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (i915_reset_in_progress(&target->i915->gpu_error))
+-		return -EAGAIN;
+-
+ 	i915_gem_request_retire_upto(target);
+ 
+ 	intel_ring_update_space(ring);
+-- 
+1.7.5.4
+

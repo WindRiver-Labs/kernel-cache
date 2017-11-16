@@ -1,0 +1,280 @@
+From ac2fc1dc35b0343658d0cd6562b0ac51732981ad Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 14 Nov 2016 20:41:02 +0000
+Subject: [PATCH 1787/4301] drm/i915/scheduler: Record all dependencies upon
+ request construction
+
+commit 52e542090701ab983a695cc33ecba19e6a0335a2 upstream
+
+The scheduler needs to know the dependencies of each request for the
+lifetime of the request, as it may choose to reschedule the requests at
+any time and must ensure the dependency tree is not broken. This is in
+additional to using the fence to only allow execution after all
+dependencies have been completed.
+
+One option was to extend the fence to support the bidirectional
+dependency tracking required by the scheduler. However the mismatch in
+lifetimes between the submit fence and the request essentially meant
+that we had to build a completely separate struct (and we could not
+simply reuse the existing waitqueue in the fence for one half of the
+dependency tracking). The extra dependency tracking simply did not mesh
+well with the fence, and keeping it separate both keeps the fence
+implementation simpler and allows us to extend the dependency tracking
+into a priority tree (whilst maintaining support for reordering the
+tree).
+
+To avoid the additional allocations and list manipulations, the use of
+the priotree is disabled when there are no schedulers to use it.
+
+v2: Create a dedicated slab for i915_dependency.
+    Rename the lists.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161114204105.29171-7-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    1 +
+ drivers/gpu/drm/i915/i915_gem.c         |   11 ++++-
+ drivers/gpu/drm/i915/i915_gem_request.c |   91 ++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_gem_request.h |   33 +++++++++++
+ 4 files changed, 134 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 37a2cbf..6d209d3 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1792,6 +1792,7 @@ struct drm_i915_private {
+ 	struct kmem_cache *objects;
+ 	struct kmem_cache *vmas;
+ 	struct kmem_cache *requests;
++	struct kmem_cache *dependencies;
+ 
+ 	const struct intel_device_info info;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 9306201..a102e82 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4435,12 +4435,18 @@ i915_gem_load_init(struct drm_device *dev)
+ 	if (!dev_priv->requests)
+ 		goto err_vmas;
+ 
++	dev_priv->dependencies = KMEM_CACHE(i915_dependency,
++					    SLAB_HWCACHE_ALIGN |
++					    SLAB_RECLAIM_ACCOUNT);
++	if (!dev_priv->dependencies)
++		goto err_requests;
++
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+ 	INIT_LIST_HEAD(&dev_priv->gt.timelines);
+ 	err = i915_gem_timeline_init__global(dev_priv);
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 	if (err)
+-		goto err_requests;
++		goto err_dependencies;
+ 
+ 	INIT_LIST_HEAD(&dev_priv->context_list);
+ 	INIT_WORK(&dev_priv->mm.free_work, __i915_gem_free_work);
+@@ -4468,6 +4474,8 @@ i915_gem_load_init(struct drm_device *dev)
+ 
+ 	return 0;
+ 
++err_dependencies:
++	kmem_cache_destroy(dev_priv->dependencies);
+ err_requests:
+ 	kmem_cache_destroy(dev_priv->requests);
+ err_vmas:
+@@ -4484,6 +4492,7 @@ void i915_gem_load_cleanup(struct drm_device *dev)
+ 
+ 	WARN_ON(!llist_empty(&dev_priv->mm.free_list));
+ 
++	kmem_cache_destroy(dev_priv->dependencies);
+ 	kmem_cache_destroy(dev_priv->requests);
+ 	kmem_cache_destroy(dev_priv->vmas);
+ 	kmem_cache_destroy(dev_priv->objects);
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index 1118cf4..78c87d9 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -113,6 +113,77 @@ i915_gem_request_remove_from_client(struct drm_i915_gem_request *request)
+ 	spin_unlock(&file_priv->mm.lock);
+ }
+ 
++static struct i915_dependency *
++i915_dependency_alloc(struct drm_i915_private *i915)
++{
++	return kmem_cache_alloc(i915->dependencies, GFP_KERNEL);
++}
++
++static void
++i915_dependency_free(struct drm_i915_private *i915,
++		     struct i915_dependency *dep)
++{
++	kmem_cache_free(i915->dependencies, dep);
++}
++
++static void
++__i915_priotree_add_dependency(struct i915_priotree *pt,
++			       struct i915_priotree *signal,
++			       struct i915_dependency *dep,
++			       unsigned long flags)
++{
++	list_add(&dep->wait_link, &signal->waiters_list);
++	list_add(&dep->signal_link, &pt->signalers_list);
++	dep->signaler = signal;
++	dep->flags = flags;
++}
++
++static int
++i915_priotree_add_dependency(struct drm_i915_private *i915,
++			     struct i915_priotree *pt,
++			     struct i915_priotree *signal)
++{
++	struct i915_dependency *dep;
++
++	dep = i915_dependency_alloc(i915);
++	if (!dep)
++		return -ENOMEM;
++
++	__i915_priotree_add_dependency(pt, signal, dep, I915_DEPENDENCY_ALLOC);
++	return 0;
++}
++
++static void
++i915_priotree_fini(struct drm_i915_private *i915, struct i915_priotree *pt)
++{
++	struct i915_dependency *dep, *next;
++
++	/* Everyone we depended upon (the fences we wait to be signaled)
++	 * should retire before us and remove themselves from our list.
++	 * However, retirement is run independently on each timeline and
++	 * so we may be called out-of-order.
++	 */
++	list_for_each_entry_safe(dep, next, &pt->signalers_list, signal_link) {
++		list_del(&dep->wait_link);
++		if (dep->flags & I915_DEPENDENCY_ALLOC)
++			i915_dependency_free(i915, dep);
++	}
++
++	/* Remove ourselves from everyone who depends upon us */
++	list_for_each_entry_safe(dep, next, &pt->waiters_list, wait_link) {
++		list_del(&dep->signal_link);
++		if (dep->flags & I915_DEPENDENCY_ALLOC)
++			i915_dependency_free(i915, dep);
++	}
++}
++
++static void
++i915_priotree_init(struct i915_priotree *pt)
++{
++	INIT_LIST_HEAD(&pt->signalers_list);
++	INIT_LIST_HEAD(&pt->waiters_list);
++}
++
+ void i915_gem_retire_noop(struct i915_gem_active *active,
+ 			  struct drm_i915_gem_request *request)
+ {
+@@ -182,6 +253,8 @@ static void i915_gem_request_retire(struct drm_i915_gem_request *request)
+ 	i915_gem_context_put(request->ctx);
+ 
+ 	dma_fence_signal(&request->fence);
++
++	i915_priotree_fini(request->i915, &request->priotree);
+ 	i915_gem_request_put(request);
+ }
+ 
+@@ -467,6 +540,8 @@ i915_gem_request_alloc(struct intel_engine_cs *engine,
+ 	 */
+ 	i915_sw_fence_await_sw_fence(&req->execute, &req->submit, &req->execq);
+ 
++	i915_priotree_init(&req->priotree);
++
+ 	INIT_LIST_HEAD(&req->active_list);
+ 	req->i915 = dev_priv;
+ 	req->engine = engine;
+@@ -520,6 +595,14 @@ i915_gem_request_await_request(struct drm_i915_gem_request *to,
+ 
+ 	GEM_BUG_ON(to == from);
+ 
++	if (to->engine->schedule) {
++		ret = i915_priotree_add_dependency(to->i915,
++						   &to->priotree,
++						   &from->priotree);
++		if (ret < 0)
++			return ret;
++	}
++
+ 	if (to->timeline == from->timeline)
+ 		return 0;
+ 
+@@ -743,9 +826,15 @@ void __i915_add_request(struct drm_i915_gem_request *request, bool flush_caches)
+ 
+ 	prev = i915_gem_active_raw(&timeline->last_request,
+ 				   &request->i915->drm.struct_mutex);
+-	if (prev)
++	if (prev) {
+ 		i915_sw_fence_await_sw_fence(&request->submit, &prev->submit,
+ 					     &request->submitq);
++		if (engine->schedule)
++			__i915_priotree_add_dependency(&request->priotree,
++						       &prev->priotree,
++						       &request->dep,
++						       0);
++	}
+ 
+ 	spin_lock_irq(&timeline->lock);
+ 	list_add_tail(&request->link, &timeline->requests);
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.h b/drivers/gpu/drm/i915/i915_gem_request.h
+index 4d27846..943c39d 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.h
++++ b/drivers/gpu/drm/i915/i915_gem_request.h
+@@ -44,6 +44,28 @@ struct intel_signal_node {
+ 	struct intel_wait wait;
+ };
+ 
++struct i915_dependency {
++	struct i915_priotree *signaler;
++	struct list_head signal_link;
++	struct list_head wait_link;
++	unsigned long flags;
++#define I915_DEPENDENCY_ALLOC BIT(0)
++};
++
++/* Requests exist in a complex web of interdependencies. Each request
++ * has to wait for some other request to complete before it is ready to be run
++ * (e.g. we have to wait until the pixels have been rendering into a texture
++ * before we can copy from it). We track the readiness of a request in terms
++ * of fences, but we also need to keep the dependency tree for the lifetime
++ * of the request (beyond the life of an individual fence). We use the tree
++ * at various points to reorder the requests whilst keeping the requests
++ * in order with respect to their various dependencies.
++ */
++struct i915_priotree {
++	struct list_head signalers_list; /* those before us, we depend upon */
++	struct list_head waiters_list; /* those after us, they depend upon us */
++};
++
+ /**
+  * Request queue structure.
+  *
+@@ -105,6 +127,17 @@ struct drm_i915_gem_request {
+ 	wait_queue_t submitq;
+ 	wait_queue_t execq;
+ 
++	/* A list of everyone we wait upon, and everyone who waits upon us.
++	 * Even though we will not be submitted to the hardware before the
++	 * submit fence is signaled (it waits for all external events as well
++	 * as our own requests), the scheduler still needs to know the
++	 * dependency tree for the lifetime of the request (from execbuf
++	 * to retirement), i.e. bidirectional dependency information for the
++	 * request not tied to individual fences.
++	 */
++	struct i915_priotree priotree;
++	struct i915_dependency dep;
++
+ 	u32 global_seqno;
+ 
+ 	/** GEM sequence number associated with the previous request,
+-- 
+1.7.5.4
+

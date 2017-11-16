@@ -1,0 +1,425 @@
+From 87e8dcc7a67ee07632189fe10456d8f14dfdb711 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 14 Nov 2016 20:41:03 +0000
+Subject: [PATCH 1788/4301] drm/i915/scheduler: Execute requests in order of
+ priorities
+
+commit 20311bd35060435badba8a0d46b06d5d184abaf7 upstream
+
+Track the priority of each request and use it to determine the order in
+which we submit requests to the hardware via execlists.
+
+The priority of the request is determined by the user (eventually via
+the context) but may be overridden at any time by the driver. When we set
+the priority of the request, we bump the priority of all of its
+dependencies to match - so that a high priority drawing operation is not
+stuck behind a background task.
+
+When the request is ready to execute (i.e. we have signaled the submit
+fence following completion of all its dependencies, including third
+party fences), we put the request into a priority sorted rbtree to be
+submitted to the hardware. If the request is higher priority than all
+pending requests, it will be submitted on the next context-switch
+interrupt as soon as the hardware has completed the current request. We
+do not currently preempt any current execution to immediately run a very
+high priority request, at least not yet.
+
+One more limitation, is that this is first implementation is for
+execlists only so currently limited to gen8/gen9.
+
+v2: Replace recursive priority inheritance bumping with an iterative
+depth-first search list.
+v3: list_next_entry() for walking lists
+v4: Explain how the dfs solves the recursion problem with PI.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20161114204105.29171-8-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/i915_debugfs.c        |    7 +-
+ drivers/gpu/drm/i915/i915_gem.c            |    3 +-
+ drivers/gpu/drm/i915/i915_gem_request.c    |    5 +
+ drivers/gpu/drm/i915/i915_gem_request.h    |    8 +-
+ drivers/gpu/drm/i915/i915_guc_submission.c |    1 +
+ drivers/gpu/drm/i915/intel_engine_cs.c     |    3 +-
+ drivers/gpu/drm/i915/intel_lrc.c           |  151 ++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |    3 +-
+ 8 files changed, 165 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 5832758..93e9a0e 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -631,8 +631,9 @@ static void print_request(struct seq_file *m,
+ 			  struct drm_i915_gem_request *rq,
+ 			  const char *prefix)
+ {
+-	seq_printf(m, "%s%x [%x:%x] @ %d: %s\n", prefix,
++	seq_printf(m, "%s%x [%x:%x] prio=%d @ %dms: %s\n", prefix,
+ 		   rq->global_seqno, rq->ctx->hw_id, rq->fence.seqno,
++		   rq->priotree.priority,
+ 		   jiffies_to_msecs(jiffies - rq->emitted_jiffies),
+ 		   rq->timeline->common->name);
+ }
+@@ -3218,6 +3219,7 @@ static int i915_engine_info(struct seq_file *m, void *unused)
+ 
+ 		if (i915.enable_execlists) {
+ 			u32 ptr, read, write;
++			struct rb_node *rb;
+ 
+ 			seq_printf(m, "\tExeclist status: 0x%08x %08x\n",
+ 				   I915_READ(RING_EXECLIST_STATUS_LO(engine)),
+@@ -3257,7 +3259,8 @@ static int i915_engine_info(struct seq_file *m, void *unused)
+ 			rcu_read_unlock();
+ 
+ 			spin_lock_irq(&engine->timeline->lock);
+-			list_for_each_entry(rq, &engine->execlist_queue, execlist_link) {
++			for (rb = engine->execlist_first; rb; rb = rb_next(rb)) {
++				rq = rb_entry(rb, typeof(*rq), priotree.node);
+ 				print_request(m, rq, "\t\tQ ");
+ 			}
+ 			spin_unlock_irq(&engine->timeline->lock);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index a102e82..1211b51 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2722,10 +2722,11 @@ static void i915_gem_cleanup_engine(struct intel_engine_cs *engine)
+ 
+ 		spin_lock_irqsave(&engine->timeline->lock, flags);
+ 
+-		INIT_LIST_HEAD(&engine->execlist_queue);
+ 		i915_gem_request_put(engine->execlist_port[0].request);
+ 		i915_gem_request_put(engine->execlist_port[1].request);
+ 		memset(engine->execlist_port, 0, sizeof(engine->execlist_port));
++		engine->execlist_queue = RB_ROOT;
++		engine->execlist_first = NULL;
+ 
+ 		spin_unlock_irqrestore(&engine->timeline->lock, flags);
+ 	}
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.c b/drivers/gpu/drm/i915/i915_gem_request.c
+index 78c87d9..13574a1 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -132,6 +132,7 @@ __i915_priotree_add_dependency(struct i915_priotree *pt,
+ 			       struct i915_dependency *dep,
+ 			       unsigned long flags)
+ {
++	INIT_LIST_HEAD(&dep->dfs_link);
+ 	list_add(&dep->wait_link, &signal->waiters_list);
+ 	list_add(&dep->signal_link, &pt->signalers_list);
+ 	dep->signaler = signal;
+@@ -158,6 +159,8 @@ i915_priotree_fini(struct drm_i915_private *i915, struct i915_priotree *pt)
+ {
+ 	struct i915_dependency *dep, *next;
+ 
++	GEM_BUG_ON(!RB_EMPTY_NODE(&pt->node));
++
+ 	/* Everyone we depended upon (the fences we wait to be signaled)
+ 	 * should retire before us and remove themselves from our list.
+ 	 * However, retirement is run independently on each timeline and
+@@ -182,6 +185,8 @@ i915_priotree_init(struct i915_priotree *pt)
+ {
+ 	INIT_LIST_HEAD(&pt->signalers_list);
+ 	INIT_LIST_HEAD(&pt->waiters_list);
++	RB_CLEAR_NODE(&pt->node);
++	pt->priority = INT_MIN;
+ }
+ 
+ void i915_gem_retire_noop(struct i915_gem_active *active,
+diff --git a/drivers/gpu/drm/i915/i915_gem_request.h b/drivers/gpu/drm/i915/i915_gem_request.h
+index 943c39d..e2b077d 100644
+--- a/drivers/gpu/drm/i915/i915_gem_request.h
++++ b/drivers/gpu/drm/i915/i915_gem_request.h
+@@ -48,6 +48,7 @@ struct i915_dependency {
+ 	struct i915_priotree *signaler;
+ 	struct list_head signal_link;
+ 	struct list_head wait_link;
++	struct list_head dfs_link;
+ 	unsigned long flags;
+ #define I915_DEPENDENCY_ALLOC BIT(0)
+ };
+@@ -64,6 +65,10 @@ struct i915_dependency {
+ struct i915_priotree {
+ 	struct list_head signalers_list; /* those before us, we depend upon */
+ 	struct list_head waiters_list; /* those after us, they depend upon us */
++	struct rb_node node;
++	int priority;
++#define I915_PRIORITY_MAX 1024
++#define I915_PRIORITY_MIN (-I915_PRIORITY_MAX)
+ };
+ 
+ /**
+@@ -194,9 +199,6 @@ struct drm_i915_gem_request {
+ 	struct drm_i915_file_private *file_priv;
+ 	/** file_priv list entry for this request */
+ 	struct list_head client_list;
+-
+-	/** Link in the execlist submission queue, guarded by execlist_lock. */
+-	struct list_head execlist_link;
+ };
+ 
+ extern const struct dma_fence_ops i915_fence_ops;
+diff --git a/drivers/gpu/drm/i915/i915_guc_submission.c b/drivers/gpu/drm/i915/i915_guc_submission.c
+index 942f500..4462112 100644
+--- a/drivers/gpu/drm/i915/i915_guc_submission.c
++++ b/drivers/gpu/drm/i915/i915_guc_submission.c
+@@ -1532,6 +1532,7 @@ int i915_guc_submission_enable(struct drm_i915_private *dev_priv)
+ 	/* Take over from manual control of ELSP (execlists) */
+ 	for_each_engine(engine, dev_priv, id) {
+ 		engine->submit_request = i915_guc_submit;
++		engine->schedule = NULL;
+ 
+ 		/* Replay the current set of previously submitted requests */
+ 		list_for_each_entry(request,
+diff --git a/drivers/gpu/drm/i915/intel_engine_cs.c b/drivers/gpu/drm/i915/intel_engine_cs.c
+index c9171a0..3da4d46 100644
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -239,7 +239,8 @@ static void intel_engine_init_timeline(struct intel_engine_cs *engine)
+  */
+ void intel_engine_setup_common(struct intel_engine_cs *engine)
+ {
+-	INIT_LIST_HEAD(&engine->execlist_queue);
++	engine->execlist_queue = RB_ROOT;
++	engine->execlist_first = NULL;
+ 
+ 	intel_engine_init_timeline(engine);
+ 	intel_engine_init_hangcheck(engine);
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 70baff0..e2436e2 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -432,9 +432,10 @@ static bool can_merge_ctx(const struct i915_gem_context *prev,
+ 
+ static void execlists_dequeue(struct intel_engine_cs *engine)
+ {
+-	struct drm_i915_gem_request *cursor, *last;
++	struct drm_i915_gem_request *last;
+ 	struct execlist_port *port = engine->execlist_port;
+ 	unsigned long flags;
++	struct rb_node *rb;
+ 	bool submit = false;
+ 
+ 	last = port->request;
+@@ -471,7 +472,11 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 	 */
+ 
+ 	spin_lock_irqsave(&engine->timeline->lock, flags);
+-	list_for_each_entry(cursor, &engine->execlist_queue, execlist_link) {
++	rb = engine->execlist_first;
++	while (rb) {
++		struct drm_i915_gem_request *cursor =
++			rb_entry(rb, typeof(*cursor), priotree.node);
++
+ 		/* Can we combine this request with the current port? It has to
+ 		 * be the same context/ringbuffer and not have any exceptions
+ 		 * (e.g. GVT saying never to combine contexts).
+@@ -503,6 +508,11 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 			port++;
+ 		}
+ 
++		rb = rb_next(rb);
++		rb_erase(&cursor->priotree.node, &engine->execlist_queue);
++		RB_CLEAR_NODE(&cursor->priotree.node);
++		cursor->priotree.priority = INT_MAX;
++
+ 		/* We keep the previous context alive until we retire the
+ 		 * following request. This ensures that any the context object
+ 		 * is still pinned for any residual writes the HW makes into it
+@@ -517,11 +527,8 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 		submit = true;
+ 	}
+ 	if (submit) {
+-		/* Decouple all the requests submitted from the queue */
+-		engine->execlist_queue.next = &cursor->execlist_link;
+-		cursor->execlist_link.prev = &engine->execlist_queue;
+-
+ 		i915_gem_request_assign(&port->request, last);
++		engine->execlist_first = rb;
+ 	}
+ 	spin_unlock_irqrestore(&engine->timeline->lock, flags);
+ 
+@@ -626,6 +633,32 @@ static void intel_lrc_irq_handler(unsigned long data)
+ 	intel_uncore_forcewake_put(dev_priv, engine->fw_domains);
+ }
+ 
++static bool insert_request(struct i915_priotree *pt, struct rb_root *root)
++{
++	struct rb_node **p, *rb;
++	bool first = true;
++
++	/* most positive priority is scheduled first, equal priorities fifo */
++	rb = NULL;
++	p = &root->rb_node;
++	while (*p) {
++		struct i915_priotree *pos;
++
++		rb = *p;
++		pos = rb_entry(rb, typeof(*pos), node);
++		if (pt->priority > pos->priority) {
++			p = &rb->rb_left;
++		} else {
++			p = &rb->rb_right;
++			first = false;
++		}
++	}
++	rb_link_node(&pt->node, rb, p);
++	rb_insert_color(&pt->node, root);
++
++	return first;
++}
++
+ static void execlists_submit_request(struct drm_i915_gem_request *request)
+ {
+ 	struct intel_engine_cs *engine = request->engine;
+@@ -634,13 +667,112 @@ static void execlists_submit_request(struct drm_i915_gem_request *request)
+ 	/* Will be called from irq-context when using foreign fences. */
+ 	spin_lock_irqsave(&engine->timeline->lock, flags);
+ 
+-	list_add_tail(&request->execlist_link, &engine->execlist_queue);
++	if (insert_request(&request->priotree, &engine->execlist_queue))
++		engine->execlist_first = &request->priotree.node;
+ 	if (execlists_elsp_idle(engine))
+ 		tasklet_hi_schedule(&engine->irq_tasklet);
+ 
+ 	spin_unlock_irqrestore(&engine->timeline->lock, flags);
+ }
+ 
++static struct intel_engine_cs *
++pt_lock_engine(struct i915_priotree *pt, struct intel_engine_cs *locked)
++{
++	struct intel_engine_cs *engine;
++
++	engine = container_of(pt,
++			      struct drm_i915_gem_request,
++			      priotree)->engine;
++	if (engine != locked) {
++		if (locked)
++			spin_unlock_irq(&locked->timeline->lock);
++		spin_lock_irq(&engine->timeline->lock);
++	}
++
++	return engine;
++}
++
++static void execlists_schedule(struct drm_i915_gem_request *request, int prio)
++{
++	struct intel_engine_cs *engine = NULL;
++	struct i915_dependency *dep, *p;
++	struct i915_dependency stack;
++	LIST_HEAD(dfs);
++
++	if (prio <= READ_ONCE(request->priotree.priority))
++		return;
++
++	/* Need BKL in order to use the temporary link inside i915_dependency */
++	lockdep_assert_held(&request->i915->drm.struct_mutex);
++
++	stack.signaler = &request->priotree;
++	list_add(&stack.dfs_link, &dfs);
++
++	/* Recursively bump all dependent priorities to match the new request.
++	 *
++	 * A naive approach would be to use recursion:
++	 * static void update_priorities(struct i915_priotree *pt, prio) {
++	 *	list_for_each_entry(dep, &pt->signalers_list, signal_link)
++	 *		update_priorities(dep->signal, prio)
++	 *	insert_request(pt);
++	 * }
++	 * but that may have unlimited recursion depth and so runs a very
++	 * real risk of overunning the kernel stack. Instead, we build
++	 * a flat list of all dependencies starting with the current request.
++	 * As we walk the list of dependencies, we add all of its dependencies
++	 * to the end of the list (this may include an already visited
++	 * request) and continue to walk onwards onto the new dependencies. The
++	 * end result is a topological list of requests in reverse order, the
++	 * last element in the list is the request we must execute first.
++	 */
++	list_for_each_entry_safe(dep, p, &dfs, dfs_link) {
++		struct i915_priotree *pt = dep->signaler;
++
++		list_for_each_entry(p, &pt->signalers_list, signal_link)
++			if (prio > READ_ONCE(p->signaler->priority))
++				list_move_tail(&p->dfs_link, &dfs);
++
++		p = list_next_entry(dep, dfs_link);
++		if (!RB_EMPTY_NODE(&pt->node))
++			continue;
++
++		engine = pt_lock_engine(pt, engine);
++
++		/* If it is not already in the rbtree, we can update the
++		 * priority inplace and skip over it (and its dependencies)
++		 * if it is referenced *again* as we descend the dfs.
++		 */
++		if (prio > pt->priority && RB_EMPTY_NODE(&pt->node)) {
++			pt->priority = prio;
++			list_del_init(&dep->dfs_link);
++		}
++	}
++
++	/* Fifo and depth-first replacement ensure our deps execute before us */
++	list_for_each_entry_safe_reverse(dep, p, &dfs, dfs_link) {
++		struct i915_priotree *pt = dep->signaler;
++
++		INIT_LIST_HEAD(&dep->dfs_link);
++
++		engine = pt_lock_engine(pt, engine);
++
++		if (prio <= pt->priority)
++			continue;
++
++		GEM_BUG_ON(RB_EMPTY_NODE(&pt->node));
++
++		pt->priority = prio;
++		rb_erase(&pt->node, &engine->execlist_queue);
++		if (insert_request(pt, &engine->execlist_queue))
++			engine->execlist_first = &pt->node;
++	}
++
++	if (engine)
++		spin_unlock_irq(&engine->timeline->lock);
++
++	/* XXX Do we need to preempt to make room for us and our deps? */
++}
++
+ int intel_logical_ring_alloc_request_extras(struct drm_i915_gem_request *request)
+ {
+ 	struct intel_engine_cs *engine = request->engine;
+@@ -1667,8 +1799,10 @@ void intel_execlists_enable_submission(struct drm_i915_private *dev_priv)
+ 	struct intel_engine_cs *engine;
+ 	enum intel_engine_id id;
+ 
+-	for_each_engine(engine, dev_priv, id)
++	for_each_engine(engine, dev_priv, id) {
+ 		engine->submit_request = execlists_submit_request;
++		engine->schedule = execlists_schedule;
++	}
+ }
+ 
+ static void
+@@ -1681,6 +1815,7 @@ logical_ring_default_vfuncs(struct intel_engine_cs *engine)
+ 	engine->emit_breadcrumb = gen8_emit_breadcrumb;
+ 	engine->emit_breadcrumb_sz = gen8_emit_breadcrumb_sz;
+ 	engine->submit_request = execlists_submit_request;
++	engine->schedule = execlists_schedule;
+ 
+ 	engine->irq_enable = gen8_logical_ring_enable_irq;
+ 	engine->irq_disable = gen8_logical_ring_disable_irq;
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index b958394..3466b4e 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -348,7 +348,8 @@ struct intel_engine_cs {
+ 		struct drm_i915_gem_request *request;
+ 		unsigned int count;
+ 	} execlist_port[2];
+-	struct list_head execlist_queue;
++	struct rb_root execlist_queue;
++	struct rb_node *execlist_first;
+ 	unsigned int fw_domains;
+ 	bool disable_lite_restore_wa;
+ 	bool preempt_wa;
+-- 
+1.7.5.4
+

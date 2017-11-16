@@ -1,0 +1,318 @@
+From 4ae954766ea45d800f0c2f0269a45818fbae29df Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 11 Jan 2017 11:23:10 +0000
+Subject: [PATCH 2726/4301] drm/i915: Use the MRU stack search after evicting
+
+commit e007b19d7ba7424735fd4f17a355b145ae153e4c upstream
+
+When we evict from the GTT to make room for an object, the hole we
+create is put onto the MRU stack inside the drm_mm range manager. On the
+next search pass, we can speed up a PIN_HIGH allocation by referencing
+that stack for the new hole.
+
+v2: Pull together the 3 identical implements (ahem, a couple were
+outdated) into a common routine for allocating a node and evicting as
+necessary.
+v3: Detect invalid calls to i915_gem_gtt_insert()
+v4: kerneldoc
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170111112312.31493-1-chris@chris-wilson.co.uk
+---
+ drivers/gpu/drm/i915/gvt/aperture_gm.c |   33 +++------
+ drivers/gpu/drm/i915/i915_gem_gtt.c    |  121 ++++++++++++++++++++++++++------
+ drivers/gpu/drm/i915/i915_gem_gtt.h    |    5 ++
+ drivers/gpu/drm/i915/i915_vma.c        |   40 +----------
+ 4 files changed, 119 insertions(+), 80 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gvt/aperture_gm.c b/drivers/gpu/drm/i915/gvt/aperture_gm.c
+index 7d33b60..1bb7a5b 100644
+--- a/drivers/gpu/drm/i915/gvt/aperture_gm.c
++++ b/drivers/gpu/drm/i915/gvt/aperture_gm.c
+@@ -48,47 +48,34 @@ static int alloc_gm(struct intel_vgpu *vgpu, bool high_gm)
+ {
+ 	struct intel_gvt *gvt = vgpu->gvt;
+ 	struct drm_i915_private *dev_priv = gvt->dev_priv;
+-	u32 alloc_flag, search_flag;
++	unsigned int flags;
+ 	u64 start, end, size;
+ 	struct drm_mm_node *node;
+-	int retried = 0;
+ 	int ret;
+ 
+ 	if (high_gm) {
+-		search_flag = DRM_MM_SEARCH_BELOW;
+-		alloc_flag = DRM_MM_CREATE_TOP;
+ 		node = &vgpu->gm.high_gm_node;
+ 		size = vgpu_hidden_sz(vgpu);
+ 		start = gvt_hidden_gmadr_base(gvt);
+ 		end = gvt_hidden_gmadr_end(gvt);
++		flags = PIN_HIGH;
+ 	} else {
+-		search_flag = DRM_MM_SEARCH_DEFAULT;
+-		alloc_flag = DRM_MM_CREATE_DEFAULT;
+ 		node = &vgpu->gm.low_gm_node;
+ 		size = vgpu_aperture_sz(vgpu);
+ 		start = gvt_aperture_gmadr_base(gvt);
+ 		end = gvt_aperture_gmadr_end(gvt);
++		flags = PIN_MAPPABLE;
+ 	}
+ 
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+-search_again:
+-	ret = drm_mm_insert_node_in_range_generic(&dev_priv->ggtt.base.mm,
+-						  node, size, 4096,
+-						  I915_COLOR_UNEVICTABLE,
+-						  start, end, search_flag,
+-						  alloc_flag);
+-	if (ret) {
+-		ret = i915_gem_evict_something(&dev_priv->ggtt.base,
+-					       size, 4096,
+-					       I915_COLOR_UNEVICTABLE,
+-					       start, end, 0);
+-		if (ret == 0 && ++retried < 3)
+-			goto search_again;
+-
+-		gvt_err("fail to alloc %s gm space from host, retried %d\n",
+-				high_gm ? "high" : "low", retried);
+-	}
++	ret = i915_gem_gtt_insert(&dev_priv->ggtt.base, node,
++				  size, 4096, I915_COLOR_UNEVICTABLE,
++				  start, end, flags);
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
++	if (ret)
++		gvt_err("fail to alloc %s gm space from host\n",
++			high_gm ? "high" : "low");
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 8aca11f..f0f17b2 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -23,10 +23,13 @@
+  *
+  */
+ 
++#include <linux/log2.h>
+ #include <linux/seq_file.h>
+ #include <linux/stop_machine.h>
++
+ #include <drm/drmP.h>
+ #include <drm/i915_drm.h>
++
+ #include "i915_drv.h"
+ #include "i915_vgpu.h"
+ #include "i915_trace.h"
+@@ -2032,7 +2035,6 @@ static int gen6_ppgtt_allocate_page_directories(struct i915_hw_ppgtt *ppgtt)
+ 	struct i915_address_space *vm = &ppgtt->base;
+ 	struct drm_i915_private *dev_priv = ppgtt->base.i915;
+ 	struct i915_ggtt *ggtt = &dev_priv->ggtt;
+-	bool retried = false;
+ 	int ret;
+ 
+ 	/* PPGTT PDEs reside in the GGTT and consists of 512 entries. The
+@@ -2045,29 +2047,14 @@ static int gen6_ppgtt_allocate_page_directories(struct i915_hw_ppgtt *ppgtt)
+ 	if (ret)
+ 		return ret;
+ 
+-alloc:
+-	ret = drm_mm_insert_node_in_range_generic(&ggtt->base.mm, &ppgtt->node,
+-						  GEN6_PD_SIZE, GEN6_PD_ALIGN,
+-						  I915_COLOR_UNEVICTABLE,
+-						  0, ggtt->base.total,
+-						  DRM_MM_TOPDOWN);
+-	if (ret == -ENOSPC && !retried) {
+-		ret = i915_gem_evict_something(&ggtt->base,
+-					       GEN6_PD_SIZE, GEN6_PD_ALIGN,
+-					       I915_COLOR_UNEVICTABLE,
+-					       0, ggtt->base.total,
+-					       0);
+-		if (ret)
+-			goto err_out;
+-
+-		retried = true;
+-		goto alloc;
+-	}
+-
++	ret = i915_gem_gtt_insert(&ggtt->base, &ppgtt->node,
++				  GEN6_PD_SIZE, GEN6_PD_ALIGN,
++				  I915_COLOR_UNEVICTABLE,
++				  0, ggtt->base.total,
++				  PIN_HIGH);
+ 	if (ret)
+ 		goto err_out;
+ 
+-
+ 	if (ppgtt->node.start < ggtt->mappable_end)
+ 		DRM_DEBUG("Forced to use aperture for PDEs\n");
+ 
+@@ -3567,3 +3554,95 @@ i915_get_ggtt_vma_pages(struct i915_vma *vma)
+ 	return ret;
+ }
+ 
++/**
++ * i915_gem_gtt_insert - insert a node into an address_space (GTT)
++ * @vm - the &struct i915_address_space
++ * @node - the &struct drm_mm_node (typically i915_vma.node)
++ * @size - how much space to allocate inside the GTT,
++ *         must be #I915_GTT_PAGE_SIZE aligned
++ * @alignment - required alignment of starting offset, may be 0 but
++ *              if specified, this must be a power-of-two and at least
++ *              #I915_GTT_MIN_ALIGNMENT
++ * @color - color to apply to node
++ * @start - start of any range restriction inside GTT (0 for all),
++ *          must be #I915_GTT_PAGE_SIZE aligned
++ * @end - end of any range restriction inside GTT (U64_MAX for all),
++ *        must be #I915_GTT_PAGE_SIZE aligned if not U64_MAX
++ * @flags - control search and eviction behaviour
++ *
++ * i915_gem_gtt_insert() first searches for an available hole into which
++ * is can insert the node. The hole address is aligned to @alignment and
++ * its @size must then fit entirely within the [@start, @end] bounds. The
++ * nodes on either side of the hole must match @color, or else a guard page
++ * will be inserted between the two nodes (or the node evicted). If no
++ * suitable hole is found, then the LRU list of objects within the GTT
++ * is scanned to find the first set of replacement nodes to create the hole.
++ * Those old overlapping nodes are evicted from the GTT (and so must be
++ * rebound before any future use). Any node that is currently pinned cannot
++ * be evicted (see i915_vma_pin()). Similar if the node's VMA is currently
++ * active and #PIN_NONBLOCK is specified, that node is also skipped when
++ * searching for an eviction candidate. See i915_gem_evict_something() for
++ * the gory details on the eviction algorithm.
++ *
++ * Returns: 0 on success, -ENOSPC if no suitable hole is found, -EINTR if
++ * asked to wait for eviction and interrupted.
++ */
++int i915_gem_gtt_insert(struct i915_address_space *vm,
++			struct drm_mm_node *node,
++			u64 size, u64 alignment, unsigned long color,
++			u64 start, u64 end, unsigned int flags)
++{
++	u32 search_flag, alloc_flag;
++	int err;
++
++	lockdep_assert_held(&vm->i915->drm.struct_mutex);
++	GEM_BUG_ON(!size);
++	GEM_BUG_ON(!IS_ALIGNED(size, I915_GTT_PAGE_SIZE));
++	GEM_BUG_ON(alignment && !is_power_of_2(alignment));
++	GEM_BUG_ON(alignment && !IS_ALIGNED(alignment, I915_GTT_MIN_ALIGNMENT));
++	GEM_BUG_ON(start >= end);
++	GEM_BUG_ON(start > 0  && !IS_ALIGNED(start, I915_GTT_PAGE_SIZE));
++	GEM_BUG_ON(end < U64_MAX && !IS_ALIGNED(end, I915_GTT_PAGE_SIZE));
++
++	if (unlikely(range_overflows(start, size, end)))
++		return -ENOSPC;
++
++	if (unlikely(round_up(start, alignment) > round_down(end - size, alignment)))
++		return -ENOSPC;
++
++	if (flags & PIN_HIGH) {
++		search_flag = DRM_MM_SEARCH_BELOW;
++		alloc_flag = DRM_MM_CREATE_TOP;
++	} else {
++		search_flag = DRM_MM_SEARCH_DEFAULT;
++		alloc_flag = DRM_MM_CREATE_DEFAULT;
++	}
++
++	/* We only allocate in PAGE_SIZE/GTT_PAGE_SIZE (4096) chunks,
++	 * so we know that we always have a minimum alignment of 4096.
++	 * The drm_mm range manager is optimised to return results
++	 * with zero alignment, so where possible use the optimal
++	 * path.
++	 */
++	BUILD_BUG_ON(I915_GTT_MIN_ALIGNMENT > I915_GTT_PAGE_SIZE);
++	if (alignment <= I915_GTT_MIN_ALIGNMENT)
++		alignment = 0;
++
++	err = drm_mm_insert_node_in_range_generic(&vm->mm, node,
++						  size, alignment, color,
++						  start, end,
++						  search_flag, alloc_flag);
++	if (err != -ENOSPC)
++		return err;
++
++	err = i915_gem_evict_something(vm, size, alignment, color,
++				       start, end, flags);
++	if (err)
++		return err;
++
++	search_flag = DRM_MM_SEARCH_DEFAULT;
++	return drm_mm_insert_node_in_range_generic(&vm->mm, node,
++						   size, alignment, color,
++						   start, end,
++						   search_flag, alloc_flag);
++}
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.h b/drivers/gpu/drm/i915/i915_gem_gtt.h
+index 34a4fd5..7919835 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -532,6 +532,11 @@ int __must_check i915_gem_gtt_prepare_pages(struct drm_i915_gem_object *obj,
+ void i915_gem_gtt_finish_pages(struct drm_i915_gem_object *obj,
+ 			       struct sg_table *pages);
+ 
++int i915_gem_gtt_insert(struct i915_address_space *vm,
++			struct drm_mm_node *node,
++			u64 size, u64 alignment, unsigned long color,
++			u64 start, u64 end, unsigned int flags);
++
+ /* Flags used by pin/bind&friends. */
+ #define PIN_NONBLOCK		BIT(0)
+ #define PIN_MAPPABLE		BIT(1)
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index dc0fe5a..dc857ab 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -431,43 +431,11 @@ i915_vma_insert(struct i915_vma *vma, u64 size, u64 alignment, u64 flags)
+ 				goto err_unpin;
+ 		}
+ 	} else {
+-		u32 search_flag, alloc_flag;
+-
+-		if (flags & PIN_HIGH) {
+-			search_flag = DRM_MM_SEARCH_BELOW;
+-			alloc_flag = DRM_MM_CREATE_TOP;
+-		} else {
+-			search_flag = DRM_MM_SEARCH_DEFAULT;
+-			alloc_flag = DRM_MM_CREATE_DEFAULT;
+-		}
+-
+-		/* We only allocate in PAGE_SIZE/GTT_PAGE_SIZE (4096) chunks,
+-		 * so we know that we always have a minimum alignment of 4096.
+-		 * The drm_mm range manager is optimised to return results
+-		 * with zero alignment, so where possible use the optimal
+-		 * path.
+-		 */
+-		if (alignment <= I915_GTT_MIN_ALIGNMENT)
+-			alignment = 0;
+-
+-search_free:
+-		ret = drm_mm_insert_node_in_range_generic(&vma->vm->mm,
+-							  &vma->node,
+-							  size, alignment,
+-							  obj->cache_level,
+-							  start, end,
+-							  search_flag,
+-							  alloc_flag);
+-		if (ret) {
+-			ret = i915_gem_evict_something(vma->vm, size, alignment,
+-						       obj->cache_level,
+-						       start, end,
+-						       flags);
+-			if (ret == 0)
+-				goto search_free;
+-
++		ret = i915_gem_gtt_insert(vma->vm, &vma->node,
++					  size, alignment, obj->cache_level,
++					  start, end, flags);
++		if (ret)
+ 			goto err_unpin;
+-		}
+ 
+ 		GEM_BUG_ON(vma->node.start < start);
+ 		GEM_BUG_ON(vma->node.start + vma->node.size > end);
+-- 
+1.7.5.4
+
