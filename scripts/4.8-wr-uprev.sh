@@ -1,4 +1,3 @@
-
 # check for new BSPs
 # git checkout master ;  for i in `git branch |grep -v master |grep -v rebase `; do grep -q $i ~/git/kernel-cache/scripts/4.8-wr-uprev.sh ; if [ $? != 0 ]; then echo git checkout $i ; fi ; done
 # paste output into appropriate places here.
@@ -15,7 +14,7 @@ git merge --no-edit	standard/base		|| bash
 git checkout 		standard/axxiaarm
 git merge --no-edit	standard/base		|| bash
 
-git			checkout standard/bcm-2xxx-rpi
+git checkout		standard/bcm-2xxx-rpi
 git merge --no-edit	standard/base		|| bash
 
 git checkout		standard/bcm-587xx
@@ -66,6 +65,13 @@ git merge --no-edit	standard/base		|| bash
 git checkout		standard/xilinx-zynqmp
 git merge --no-edit	standard/base		|| bash
 
+git checkout		standard/xilinx/base
+git merge --no-edit	standard/base		|| bash
+git checkout		standard/xilinx/sdk-2017-01/base
+git merge --no-edit	standard/xilinx/base	|| bash
+git checkout		standard/xilinx/sdk-2017-01/xilinx-zynq
+git merge --no-edit	standard/xilinx/base	|| bash
+
 git checkout		standard/nxp/base
 git merge --no-edit	standard/base		|| bash
 git checkout		standard/nxp/sdk-2-0/base
@@ -81,6 +87,16 @@ git checkout		standard/nxp-imx/sdk-4.1.15/base
 git merge --no-edit	standard/nxp-imx/base	|| bash
 git checkout		standard/nxp-imx/sdk-4.1.15/nxp-imx6
 git merge --no-edit	standard/nxp-imx/sdk-4.1.15/base
+
+git checkout		standard/nxp/sdk-2-0/sdk-2-0-1703/base
+git merge --no-edit	standard/base		|| bash
+git checkout		standard/nxp/sdk-2-0/sdk-2-0-1703/nxp-ls1012
+git merge --no-edit	standard/nxp/sdk-2-0/sdk-2-0-1703/base	|| bash
+git checkout		standard/nxp/sdk-2-0/sdk-2-0-1703/nxp-ls1046
+git merge --no-edit	standard/nxp/sdk-2-0/sdk-2-0-1703/base	|| bash
+
+git checkout		standard/ti-am335x
+git merge --no-edit	standard/base		|| bash
 
 # tiny
 
@@ -121,8 +137,22 @@ git merge --no-edit	standard/cgl/base	|| bash
 git checkout		standard/cgl/nxp/sdk-2-0/nxp-t4xxx
 git merge --no-edit	standard/cgl/nxp/base	|| bash
 
+git checkout		standard/cgl/nxp/sdk-2-0/sdk-2-0-1703/base
+git merge --no-edit	standard/cgl/base	|| bash
+git checkout		standard/cgl/nxp/sdk-2-0/sdk-2-0-1703/nxp-ls1012
+git merge --no-edit	standard/cgl/nxp/sdk-2-0/sdk-2-0-1703/base
+git checkout		standard/cgl/nxp/sdk-2-0/sdk-2-0-1703/nxp-ls1046
+git merge --no-edit	standard/cgl/nxp/sdk-2-0/sdk-2-0-1703/base
+
 git checkout		standard/cgl/xilinx-zynq
 git merge --no-edit	standard/cgl/base	|| bash
+
+git checkout		standard/cgl/xilinx/base
+git merge --no-edit	standard/cgl/base	|| bash
+git checkout		standard/cgl/xilinx/sdk-2017-01/base
+git merge --no-edit	standard/cgl/xilinx/base || bash
+git checkout		standard/cgl/xilinx/sdk-2017-01/xilinx-zynq
+git merge --no-edit	standard/cgl/xilinx/sdk-2017-01/base
 
 # -rt
 
@@ -166,7 +196,16 @@ git merge --no-edit	standard/preempt-rt/nxp-imx/base	|| bash
 git checkout		standard/preempt-rt/nxp-imx/sdk-4.1.15/nxp-imx6
 git merge --no-edit	standard/preempt-rt/nxp-imx/base	|| bash
 
+git checkout		standard/preempt-rt/nxp/sdk-2-0/sdk-2-0-1703/base
+git merge --no-edit	standard/preempt-rt/base		|| bash
+git checkout		standard/preempt-rt/nxp/sdk-2-0/sdk-2-0-1703/nxp-ls1012
+git merge --no-edit	standard/preempt-rt/nxp/sdk-2-0/sdk-2-0-1703/base	|| bash
+git checkout		standard/preempt-rt/nxp/sdk-2-0/sdk-2-0-1703/nxp-ls1046
+git merge --no-edit	standard/preempt-rt/nxp/sdk-2-0/sdk-2-0-1703/base	|| bash
+
 git checkout		standard/preempt-rt/ti-66ak2xxx
+git merge --no-edit	standard/preempt-rt/base		|| bash
+git checkout		standard/preempt-rt/ti-am335x
 git merge --no-edit	standard/preempt-rt/base		|| bash
 
 git checkout		standard/preempt-rt/xilinx-zynq
@@ -174,6 +213,13 @@ git merge --no-edit	standard/preempt-rt/base		|| bash
 
 git checkout		standard/preempt-rt/xilinx-zynqmp
 git merge --no-edit	standard/preempt-rt/base		|| bash
+
+git checkout		standard/preempt-rt/xilinx/base
+git merge --no-edit	standard/preempt-rt/base		|| bash
+git checkout		standard/preempt-rt/xilinx/sdk-2017-01/base
+git merge --no-edit	standard/preempt-rt/xilinx/base		|| bash
+git checkout		standard/preempt-rt/xilinx/sdk-2017-01/xilinx-zynq
+git merge --no-edit	standard/preempt-rt/xilinx/sdk-2017-01/base	|| bash
 
 git checkout		standard/ovp/base
 git merge --no-edit	standard/preempt-rt/base		|| bash
