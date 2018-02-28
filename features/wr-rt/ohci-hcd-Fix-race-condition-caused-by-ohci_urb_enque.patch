@@ -1,0 +1,153 @@
+From 9593f6b95af17c67272a43a1e3df458c403b463b Mon Sep 17 00:00:00 2001
+From: Haiqing Bai <Haiqing.Bai@windriver.com>
+Date: Mon, 5 Feb 2018 08:02:44 +0000
+Subject: [PATCH] ohci-hcd: Fix race condition caused by ohci_urb_enqueue()
+ and io_watchdog_func()
+
+The original patch taken from https://patchwork.kernel.org/patch/10196261/
+
+Running io_watchdog_func() while ohci_urb_enqueue() is running can
+cause a race condition where ohci->prev_frame_no is corrupted and the
+watchdog can mis-detect following error:
+
+  ohci-platform 664a0800.usb: frame counter not updating; disabled
+  ohci-platform 664a0800.usb: HC died; cleaning up
+
+Specifically, following scenario causes a race condition:
+
+  1. ohci_urb_enqueue() calls spin_lock_irqsave(&ohci->lock, flags)
+     and enters the critical section
+  2. ohci_urb_enqueue() calls timer_pending(&ohci->io_watchdog) and it
+     returns false
+  3. ohci_urb_enqueue() sets ohci->prev_frame_no to a frame number
+     read by ohci_frame_no(ohci)
+  4. ohci_urb_enqueue() schedules io_watchdog_func() with mod_timer()
+  5. ohci_urb_enqueue() calls spin_unlock_irqrestore(&ohci->lock,
+     flags) and exits the critical section
+  6. Later, ohci_urb_enqueue() is called
+  7. ohci_urb_enqueue() calls spin_lock_irqsave(&ohci->lock, flags)
+     and enters the critical section
+  8. The timer scheduled on step 4 expires and io_watchdog_func() runs
+  9. io_watchdog_func() calls spin_lock_irqsave(&ohci->lock, flags)
+     and waits on it because ohci_urb_enqueue() is already in the
+     critical section on step 7
+ 10. ohci_urb_enqueue() calls timer_pending(&ohci->io_watchdog) and it
+     returns false
+ 11. ohci_urb_enqueue() sets ohci->prev_frame_no to new frame number
+     read by ohci_frame_no(ohci) because the frame number proceeded
+     between step 3 and 6
+ 12. ohci_urb_enqueue() schedules io_watchdog_func() with mod_timer()
+ 13. ohci_urb_enqueue() calls spin_unlock_irqrestore(&ohci->lock,
+     flags) and exits the critical section, then wake up
+     io_watchdog_func() which is waiting on step 9
+ 14. io_watchdog_func() enters the critical section
+ 15. io_watchdog_func() calls ohci_frame_no(ohci) and set frame_no
+     variable to the frame number
+ 16. io_watchdog_func() compares frame_no and ohci->prev_frame_no
+
+On step 16, because this calling of io_watchdog_func() is scheduled on
+step 4, the frame number set in ohci->prev_frame_no is expected to the
+number set on step 3.  However, ohci->prev_frame_no is overwritten on
+step 11.  Because step 16 is executed soon after step 11, the frame
+number might not proceed, so ohci->prev_frame_no must equals to
+frame_no.
+
+To address above scenario, this patch introduces a special sentinel
+value IO_WATCHDOG_OFF and set this value to ohci->prev_frame_no when
+the watchdog is not pending or running.  When ohci_urb_enqueue()
+schedules the watchdog (step 4 and 12 above), it compares
+ohci->prev_frame_no to IO_WATCHDOG_OFF so that ohci->prev_frame_no is
+not overwritten while io_watchdog_func() is running.
+
+v2: Instead of adding an extra flag variable, defining IO_WATCHDOG_OFF
+    as a special sentinel value for prev_frame_no.
+
+Signed-off-by: Shigeru Yoshida <Shigeru.Yoshida@windriver.com>
+Signed-off-by: Haiqing Bai <Haiqing.Bai@windriver.com>
+---
+ drivers/usb/host/ohci-hcd.c |   10 +++++++---
+ drivers/usb/host/ohci-hub.c |    4 +++-
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/usb/host/ohci-hcd.c b/drivers/usb/host/ohci-hcd.c
+index 86612ac..9dd3fde 100644
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -73,6 +73,7 @@ static const char	hcd_name [] = "ohci_hcd";
+ 
+ #define	STATECHANGE_DELAY	msecs_to_jiffies(300)
+ #define	IO_WATCHDOG_DELAY	msecs_to_jiffies(275)
++#define	IO_WATCHDOG_OFF		0xffffff00
+ 
+ #include "ohci.h"
+ #include "pci-quirks.h"
+@@ -230,7 +231,7 @@ static int ohci_urb_enqueue (
+ 		}
+ 
+ 		/* Start up the I/O watchdog timer, if it's not running */
+-		if (!timer_pending(&ohci->io_watchdog) &&
++		if (ohci->prev_frame_no == IO_WATCHDOG_OFF &&
+ 				list_empty(&ohci->eds_in_use)) {
+ 			ohci->prev_frame_no = ohci_frame_no(ohci);
+ 			mod_timer(&ohci->io_watchdog,
+@@ -500,6 +501,7 @@ static int ohci_init (struct ohci_hcd *ohci)
+ 
+ 	setup_timer(&ohci->io_watchdog, io_watchdog_func,
+ 			(unsigned long) ohci);
++	ohci->prev_frame_no = IO_WATCHDOG_OFF;
+ 
+ 	ohci->hcca = dma_alloc_coherent (hcd->self.controller,
+ 			sizeof(*ohci->hcca), &ohci->hcca_dma, GFP_KERNEL);
+@@ -729,7 +731,7 @@ static void io_watchdog_func(unsigned long _ohci)
+ 	u32		head;
+ 	struct ed	*ed;
+ 	struct td	*td, *td_start, *td_next;
+-	unsigned	frame_no;
++	unsigned int	frame_no, prev_frame_no = IO_WATCHDOG_OFF;
+ 	unsigned long	flags;
+ 
+ 	spin_lock_irqsave(&ohci->lock, flags);
+@@ -834,7 +836,7 @@ static void io_watchdog_func(unsigned long _ohci)
+ 			}
+ 		}
+ 		if (!list_empty(&ohci->eds_in_use)) {
+-			ohci->prev_frame_no = frame_no;
++			prev_frame_no = frame_no;
+ 			ohci->prev_wdh_cnt = ohci->wdh_cnt;
+ 			ohci->prev_donehead = ohci_readl(ohci,
+ 					&ohci->regs->donehead);
+@@ -844,6 +846,7 @@ static void io_watchdog_func(unsigned long _ohci)
+ 	}
+ 
+  done:
++	ohci->prev_frame_no = prev_frame_no;
+ 	spin_unlock_irqrestore(&ohci->lock, flags);
+ }
+ 
+@@ -972,6 +975,7 @@ static void ohci_stop (struct usb_hcd *hcd)
+ 	if (quirk_nec(ohci))
+ 		flush_work(&ohci->nec_work);
+ 	del_timer_sync(&ohci->io_watchdog);
++	ohci->prev_frame_no = IO_WATCHDOG_OFF;
+ 
+ 	ohci_writel (ohci, OHCI_INTR_MIE, &ohci->regs->intrdisable);
+ 	ohci_usb_reset(ohci);
+diff --git a/drivers/usb/host/ohci-hub.c b/drivers/usb/host/ohci-hub.c
+index ed678c17..798b2d2 100644
+--- a/drivers/usb/host/ohci-hub.c
++++ b/drivers/usb/host/ohci-hub.c
+@@ -310,8 +310,10 @@ static int ohci_bus_suspend (struct usb_hcd *hcd)
+ 		rc = ohci_rh_suspend (ohci, 0);
+ 	spin_unlock_irq (&ohci->lock);
+ 
+-	if (rc == 0)
++	if (rc == 0) {
+ 		del_timer_sync(&ohci->io_watchdog);
++		ohci->prev_frame_no = IO_WATCHDOG_OFF;
++	}
+ 	return rc;
+ }
+ 
+-- 
+1.7.5.4
+
