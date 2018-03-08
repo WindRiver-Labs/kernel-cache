@@ -72,6 +72,15 @@ git merge --no-edit	standard/xilinx/base	|| bash
 git checkout		standard/xilinx/sdk-2017-01/xilinx-zynq
 git merge --no-edit	standard/xilinx/base	|| bash
 
+git checkout		standard/xilinx/sdk-2017-01/xilinx-zynqmp
+git merge --no-edit	standard/xilinx/base	|| bash
+
+git checkout		standard/xilinx/sdk-2017-01/sdk-2017-03/base
+git merge --no-edit	standard/xilinx/base	|| bash
+
+git checkout		standard/xilinx/sdk-2017-01/sdk-2017-03/xilinx-zynqmp
+git merge --no-edit	standard/xilinx/sdk-2017-01/sdk-2017-03/base
+
 git checkout		standard/nxp/base
 git merge --no-edit	standard/base		|| bash
 git checkout		standard/nxp/sdk-2-0/base
@@ -147,6 +156,11 @@ git merge --no-edit	standard/cgl/nxp/sdk-2-0/sdk-2-0-1703/base
 git checkout		standard/cgl/xilinx-zynq
 git merge --no-edit	standard/cgl/base	|| bash
 
+git checkout		standard/cgl/xilinx/sdk-2017-01/sdk-2017-03/base
+git merge --no-edit	standard/cgl/base	|| bash
+git checkout		standard/cgl/xilinx/sdk-2017-01/sdk-2017-03/xilinx-zynqmp
+git merge --no-edit	standard/cgl/xilinx/sdk-2017-01/sdk-2017-03/base
+
 git checkout		standard/cgl/xilinx/base
 git merge --no-edit	standard/cgl/base	|| bash
 git checkout		standard/cgl/xilinx/sdk-2017-01/base
@@ -220,6 +234,15 @@ git checkout		standard/preempt-rt/xilinx/sdk-2017-01/base
 git merge --no-edit	standard/preempt-rt/xilinx/base		|| bash
 git checkout		standard/preempt-rt/xilinx/sdk-2017-01/xilinx-zynq
 git merge --no-edit	standard/preempt-rt/xilinx/sdk-2017-01/base	|| bash
+
+git checkout		standard/preempt-rt/xilinx/sdk-2017-01/xilinx-zynqmp
+git merge --no-edit	standard/preempt-rt/base		|| bash
+
+git checkout		standard/preempt-rt/xilinx/sdk-2017-01/sdk-2017-03/base
+git merge --no-edit	standard/preempt-rt/base		|| bash
+
+git checkout		standard/preempt-rt/xilinx/sdk-2017-01/sdk-2017-03/xilinx-zynqmp
+git merge --no-edit	standard/preempt-rt/xilinx/sdk-2017-01/sdk-2017-03/base
 
 git checkout		standard/ovp/base
 git merge --no-edit	standard/preempt-rt/base		|| bash
