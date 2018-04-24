@@ -1,0 +1,248 @@
+From 7fc29b418687f48d5469bd06a3bd07a0c38103b3 Mon Sep 17 00:00:00 2001
+From: Jon Maloy <jon.maloy@ericsson.com>
+Date: Mon, 15 Jan 2018 17:56:28 +0100
+Subject: [PATCH 366/376] tipc: fix race condition at topology server receive
+
+commit e88f2be83282d5ffc8f5ffe4c22606bf62eb1ac7 upstream
+
+We have identified a race condition during reception of socket
+events and messages in the topology server.
+
+- The function tipc_close_conn() is releasing the corresponding
+  struct tipc_subscriber instance without considering that there
+  may still be items in the receive work queue. When those are
+  scheduled, in the function tipc_receive_from_work(), they are
+  using the subscriber pointer stored in struct tipc_conn, without
+  first checking if this is valid or not. This will sometimes
+  lead to crashes, as the next call of tipc_conn_recvmsg() will
+  access the now deleted item.
+  We fix this by making the usage of this pointer conditional on
+  whether the connection is active or not. I.e., we check the condition
+  test_bit(CF_CONNECTED) before making the call tipc_conn_recvmsg().
+
+- Since the two functions may be running on different cores, the
+  condition test described above is not enough. tipc_close_conn()
+  may come in between and delete the subscriber item after the condition
+  test is done, but before tipc_conn_recv_msg() is finished. This
+  happens less frequently than the problem described above, but leads
+  to the same symptoms.
+
+  We fix this by using the existing sk_callback_lock for mutual
+  exclusion in the two functions. In addition, we have to move
+  a call to tipc_conn_terminate() outside the mentioned lock to
+  avoid deadlock.
+
+Acked-by: Ying Xue <ying.xue@windriver.com>
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ net/tipc/server.c |   70 ++++++++++++++++++++++++++++-------------------------
+ net/tipc/server.h |    6 ++--
+ net/tipc/subscr.c |   21 ++++++++-------
+ 3 files changed, 51 insertions(+), 46 deletions(-)
+
+diff --git a/net/tipc/server.c b/net/tipc/server.c
+index 125da16..df0c563 100644
+--- a/net/tipc/server.c
++++ b/net/tipc/server.c
+@@ -132,10 +132,11 @@ static struct tipc_conn *tipc_conn_lookup(struct tipc_server *s, int conid)
+ 
+ 	spin_lock_bh(&s->idr_lock);
+ 	con = idr_find(&s->conn_idr, conid);
+-	if (con && test_bit(CF_CONNECTED, &con->flags))
+-		conn_get(con);
+-	else
+-		con = NULL;
++	if (con) {
++		if (!test_bit(CF_CONNECTED, &con->flags) ||
++		    !kref_get_unless_zero(&con->kref))
++			con = NULL;
++	}
+ 	spin_unlock_bh(&s->idr_lock);
+ 	return con;
+ }
+@@ -183,35 +184,28 @@ static void tipc_register_callbacks(struct socket *sock, struct tipc_conn *con)
+ 	write_unlock_bh(&sk->sk_callback_lock);
+ }
+ 
+-static void tipc_unregister_callbacks(struct tipc_conn *con)
+-{
+-	struct sock *sk = con->sock->sk;
+-
+-	write_lock_bh(&sk->sk_callback_lock);
+-	sk->sk_user_data = NULL;
+-	write_unlock_bh(&sk->sk_callback_lock);
+-}
+-
+ static void tipc_close_conn(struct tipc_conn *con)
+ {
+ 	struct tipc_server *s = con->server;
++	struct sock *sk = con->sock->sk;
++	bool disconnect = false;
+ 
+-	if (test_and_clear_bit(CF_CONNECTED, &con->flags)) {
+-		if (con->sock)
+-			tipc_unregister_callbacks(con);
+-
++	write_lock_bh(&sk->sk_callback_lock);
++	disconnect = test_and_clear_bit(CF_CONNECTED, &con->flags);
++	if (disconnect) {
++		sk->sk_user_data = NULL;
+ 		if (con->conid)
+ 			s->tipc_conn_release(con->conid, con->usr_data);
+-
+-		/* We shouldn't flush pending works as we may be in the
+-		 * thread. In fact the races with pending rx/tx work structs
+-		 * are harmless for us here as we have already deleted this
+-		 * connection from server connection list.
+-		 */
+-		if (con->sock)
+-			kernel_sock_shutdown(con->sock, SHUT_RDWR);
+-		conn_put(con);
+ 	}
++	write_unlock_bh(&sk->sk_callback_lock);
++
++	/* Handle concurrent calls from sending and receiving threads */
++	if (!disconnect)
++		return;
++
++	/* Don't flush pending works, -just let them expire */
++	kernel_sock_shutdown(con->sock, SHUT_RDWR);
++	conn_put(con);
+ }
+ 
+ static struct tipc_conn *tipc_alloc_conn(struct tipc_server *s)
+@@ -248,9 +242,10 @@ static struct tipc_conn *tipc_alloc_conn(struct tipc_server *s)
+ 
+ static int tipc_receive_from_sock(struct tipc_conn *con)
+ {
+-	struct msghdr msg = {};
+ 	struct tipc_server *s = con->server;
++	struct sock *sk = con->sock->sk;
+ 	struct sockaddr_tipc addr;
++	struct msghdr msg = {};
+ 	struct kvec iov;
+ 	void *buf;
+ 	int ret;
+@@ -271,12 +266,15 @@ static int tipc_receive_from_sock(struct tipc_conn *con)
+ 		goto out_close;
+ 	}
+ 
+-	s->tipc_conn_recvmsg(sock_net(con->sock->sk), con->conid, &addr,
+-			     con->usr_data, buf, ret);
+-
++	read_lock_bh(&sk->sk_callback_lock);
++	if (test_bit(CF_CONNECTED, &con->flags))
++		ret = s->tipc_conn_recvmsg(sock_net(con->sock->sk), con->conid,
++					   &addr, con->usr_data, buf, ret);
++	read_unlock_bh(&sk->sk_callback_lock);
+ 	kmem_cache_free(s->rcvbuf_cache, buf);
+-
+-	return 0;
++	if (ret < 0)
++		tipc_conn_terminate(s, con->conid);
++	return ret;
+ 
+ out_close:
+ 	if (ret != -EWOULDBLOCK)
+@@ -525,11 +523,17 @@ bool tipc_topsrv_kern_subscr(struct net *net, u32 port, u32 type, u32 lower,
+ void tipc_topsrv_kern_unsubscr(struct net *net, int conid)
+ {
+ 	struct tipc_conn *con;
++	struct tipc_server *srv;
+ 
+ 	con = tipc_conn_lookup(tipc_topsrv(net), conid);
+ 	if (!con)
+ 		return;
+-	tipc_close_conn(con);
++
++	test_and_clear_bit(CF_CONNECTED, &con->flags);
++	srv = con->server;
++	if (con->conid)
++		srv->tipc_conn_release(con->conid, con->usr_data);
++	conn_put(con);
+ 	conn_put(con);
+ }
+ 
+diff --git a/net/tipc/server.h b/net/tipc/server.h
+index 17f49ee..64df751 100644
+--- a/net/tipc/server.h
++++ b/net/tipc/server.h
+@@ -74,9 +74,9 @@ struct tipc_server {
+ 	int max_rcvbuf_size;
+ 	void *(*tipc_conn_new)(int conid);
+ 	void (*tipc_conn_release)(int conid, void *usr_data);
+-	void (*tipc_conn_recvmsg)(struct net *net, int conid,
+-				  struct sockaddr_tipc *addr, void *usr_data,
+-				  void *buf, size_t len);
++	int (*tipc_conn_recvmsg)(struct net *net, int conid,
++				 struct sockaddr_tipc *addr, void *usr_data,
++				 void *buf, size_t len);
+ 	struct sockaddr_tipc *saddr;
+ 	char name[TIPC_SERVER_NAME_LEN];
+ 	int imp;
+diff --git a/net/tipc/subscr.c b/net/tipc/subscr.c
+index 44df528..68e2647 100644
+--- a/net/tipc/subscr.c
++++ b/net/tipc/subscr.c
+@@ -289,17 +289,16 @@ static struct tipc_subscription *tipc_subscrp_create(struct net *net,
+ 	return sub;
+ }
+ 
+-static void tipc_subscrp_subscribe(struct net *net, struct tipc_subscr *s,
+-				   struct tipc_subscriber *subscriber, int swap,
+-				   bool status)
++static int tipc_subscrp_subscribe(struct net *net, struct tipc_subscr *s,
++				  struct tipc_subscriber *subscriber, int swap,
++				  bool status)
+ {
+-	struct tipc_net *tn = net_generic(net, tipc_net_id);
+ 	struct tipc_subscription *sub = NULL;
+ 	u32 timeout;
+ 
+ 	sub = tipc_subscrp_create(net, s, swap);
+ 	if (!sub)
+-		return tipc_conn_terminate(tn->topsrv, subscriber->conid);
++		return -1;
+ 
+ 	spin_lock_bh(&subscriber->lock);
+ 	list_add(&sub->subscrp_list, &subscriber->subscrp_list);
+@@ -313,6 +312,7 @@ static void tipc_subscrp_subscribe(struct net *net, struct tipc_subscr *s,
+ 
+ 	if (timeout != TIPC_WAIT_FOREVER)
+ 		mod_timer(&sub->timer, jiffies + msecs_to_jiffies(timeout));
++	return 0;
+ }
+ 
+ /* Handle one termination request for the subscriber */
+@@ -322,9 +322,9 @@ static void tipc_subscrb_release_cb(int conid, void *usr_data)
+ }
+ 
+ /* Handle one request to create a new subscription for the subscriber */
+-static void tipc_subscrb_rcv_cb(struct net *net, int conid,
+-				struct sockaddr_tipc *addr, void *usr_data,
+-				void *buf, size_t len)
++static int tipc_subscrb_rcv_cb(struct net *net, int conid,
++			       struct sockaddr_tipc *addr, void *usr_data,
++			       void *buf, size_t len)
+ {
+ 	struct tipc_subscriber *subscriber = usr_data;
+ 	struct tipc_subscr *s = (struct tipc_subscr *)buf;
+@@ -338,10 +338,11 @@ static void tipc_subscrb_rcv_cb(struct net *net, int conid,
+ 	/* Detect & process a subscription cancellation request */
+ 	if (s->filter & htohl(TIPC_SUB_CANCEL, swap)) {
+ 		s->filter &= ~htohl(TIPC_SUB_CANCEL, swap);
+-		return tipc_subscrp_cancel(s, subscriber);
++		tipc_subscrp_cancel(s, subscriber);
++		return 0;
+ 	}
+ 	status = !(s->filter & htohl(TIPC_SUB_NO_STATUS, swap));
+-	tipc_subscrp_subscribe(net, s, subscriber, swap, status);
++	return tipc_subscrp_subscribe(net, s, subscriber, swap, status);
+ }
+ 
+ /* Handle one request to establish a new subscriber */
+-- 
+1.7.5.4
+
