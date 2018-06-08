@@ -1,0 +1,248 @@
+From 7e9e5cbc53640aac60c0b9ebf089de17c32645d5 Mon Sep 17 00:00:00 2001
+From: Haiqing Bai <Haiqing.Bai@windriver.com>
+Date: Tue, 5 Jun 2018 15:36:58 +0800
+Subject: [PATCH] mm: Tighten x86 /dev/mem with zeroing reads
+
+commit a4866aa812518ed1a37d8ea0c881dc946409de94 upstream
+This fixes CVE-2017-7889
+
+Under CONFIG_STRICT_DEVMEM, reading System RAM through /dev/mem is
+disallowed. However, on x86, the first 1MB was always allowed for BIOS
+and similar things, regardless of it actually being System RAM. It was
+possible for heap to end up getting allocated in low 1MB RAM, and then
+read by things like x86info or dd, which would trip hardened usercopy:
+
+usercopy: kernel memory exposure attempt detected from ffff880000090000 (dma-kmalloc-256) (4096 bytes)
+
+This changes the x86 exception for the low 1MB by reading back zeros for
+System RAM areas instead of blindly allowing them. More work is needed to
+extend this to mmap, but currently mmap doesn't go through usercopy, so
+hardened usercopy won't Oops the kernel.
+
+Reported-by: Tommi Rantala <tommi.t.rantala@nokia.com>
+Tested-by: Tommi Rantala <tommi.t.rantala@nokia.com>
+Signed-off-by: Kees Cook <keescook@chromium.org>
+Signed-off-by: Haiqing Bai <Haiqing.Bai@windriver.com>
+---
+ arch/x86/mm/init.c |   37 ++++++++++++------
+ drivers/char/mem.c |  104 ++++++++++++++++++++++++++++++---------------------
+ 2 files changed, 86 insertions(+), 55 deletions(-)
+
+diff --git a/arch/x86/mm/init.c b/arch/x86/mm/init.c
+index c96ab0d..cadbe39 100644
+--- a/arch/x86/mm/init.c
++++ b/arch/x86/mm/init.c
+@@ -513,27 +513,40 @@ int devmem_is_allowed(unsigned long pagenr)
+ 	/* if tboot is in use, allow access to its hardcoded serial log range */
+ 	if (tboot_enabled() && ((0x60000 >> PAGE_SHIFT) <= pagenr) && (pagenr < (0x68000 >> PAGE_SHIFT)))
+ 		return 1;
++
++	/* throw out everything else below 1MB */
++	if (pagenr <= 256)
++		return 0;
+ #else
+-	if (!pagenr)
+-		return 1;
+ #ifdef CONFIG_VM86
+ 	if (pagenr < (ISA_START_ADDRESS >> PAGE_SHIFT))
+ 		return 1;
+ #endif
+ #endif
++	if (page_is_ram(pagenr)) {
++		/*
++		 * For disallowed memory regions in the low 1MB range,
++		 * request that the page be shown as all zeros.
++		 */
++		if (pagenr < 256)
++			return 2;
+ 
+-	if ((ISA_START_ADDRESS >> PAGE_SHIFT) <= pagenr && pagenr < (ISA_END_ADDRESS >> PAGE_SHIFT))
+-		return 1;
+-#ifdef CONFIG_GRKERNSEC_KMEM
+-	/* throw out everything else below 1MB */
+-	if (pagenr <= 256)
+ 		return 0;
+-#endif
+-	if (iomem_is_exclusive(pagenr << PAGE_SHIFT))
++	}
++
++	/*
++	 * This must follow RAM test, since System RAM is considered a
++	 * restricted resource under CONFIG_STRICT_IOMEM.
++	 */
++	if (iomem_is_exclusive(pagenr << PAGE_SHIFT)) {
++		/* Low 1MB bypasses iomem restrictions. */
++		if (pagenr < 256)
++			return 1;
++
+ 		return 0;
+-	if (!page_is_ram(pagenr))
+-		return 1;
+-	return 0;
++	}
++
++	return 1;
+ }
+ 
+ void free_init_pages(char *what, unsigned long begin, unsigned long end)
+diff --git a/drivers/char/mem.c b/drivers/char/mem.c
+index 6ad651a..ae1faca 100644
+--- a/drivers/char/mem.c
++++ b/drivers/char/mem.c
+@@ -66,6 +66,11 @@ static inline int valid_mmap_phys_addr_range(unsigned long pfn, size_t size)
+ #endif
+ 
+ #ifdef CONFIG_STRICT_DEVMEM
++static inline int page_is_allowed(unsigned long pfn)
++{
++	return devmem_is_allowed(pfn);
++}
++
+ static inline int range_is_allowed(unsigned long pfn, unsigned long size)
+ {
+ 	u64 from = ((u64)pfn) << PAGE_SHIFT;
+@@ -94,6 +99,11 @@ static inline int range_is_allowed(unsigned long pfn, unsigned long size)
+ 	return 0;
+ }
+ #else
++static inline int page_is_allowed(unsigned long pfn)
++{
++	return 1;
++}
++
+ static inline int range_is_allowed(unsigned long pfn, unsigned long size)
+ {
+ 	return 1;
+@@ -136,39 +146,43 @@ static ssize_t read_mem(struct file *file, char __user *buf,
+ 	while (count > 0) {
+ 		unsigned long remaining;
+ 		char *temp;
++		int allowed;
+ 
+ 		sz = size_inside_page(p, count);
+ 
+-		if (!range_is_allowed(p >> PAGE_SHIFT, count))
++		allowed = page_is_allowed(p >> PAGE_SHIFT);
++		if (!allowed)
+ 			return -EPERM;
+-
+-		/*
+-		 * On ia64 if a page has been mapped somewhere as uncached, then
+-		 * it must also be accessed uncached by the kernel or data
+-		 * corruption may occur.
+-		 */
+-		ptr = xlate_dev_mem_ptr(p);
+-		if (!ptr)
+-			return -EFAULT;
+-
++		if (allowed == 2) {
++			/* Show zeros for restricted memory. */
++			remaining = clear_user(buf, sz);
++		} else {
++			/*
++			 * On ia64 if a page has been mapped somewhere as
++			 * uncached, then it must also be accessed uncached
++			 * by the kernel or data corruption may occur.
++			 */
++			ptr = xlate_dev_mem_ptr(p);
++			if (!ptr)
++				return -EFAULT;
+ #ifdef CONFIG_PAX_USERCOPY
+-		temp = kmalloc(sz, GFP_KERNEL|GFP_USERCOPY);
+-		if (!temp) {
+-			unxlate_dev_mem_ptr(p, ptr);
+-			return -ENOMEM;
+-		}
+-		memcpy(temp, ptr, sz);
++			temp = kmalloc(sz, GFP_KERNEL|GFP_USERCOPY);
++			if (!temp) {
++				unxlate_dev_mem_ptr(p, ptr);
++				return -ENOMEM;
++			}
++			memcpy(temp, ptr, sz);
+ #else
+-		temp = ptr;
++			temp = ptr;
+ #endif
+-
+-		remaining = copy_to_user(buf, temp, sz);
++			remaining = copy_to_user(buf, temp, sz);
++			unxlate_dev_mem_ptr(p, ptr);
+ 
+ #ifdef CONFIG_PAX_USERCOPY
+-		kfree(temp);
++			kfree(temp);
+ #endif
++		}
+ 
+-		unxlate_dev_mem_ptr(p, ptr);
+ 		if (remaining)
+ 			return -EFAULT;
+ 
+@@ -208,38 +222,42 @@ static ssize_t write_mem(struct file *file, const char __user *buf,
+ #endif
+ 
+ 	while (count > 0) {
++		int allowed;
++
+ 		sz = size_inside_page(p, count);
+ 
+-		if (!range_is_allowed(p >> PAGE_SHIFT, sz))
++		allowed = page_is_allowed(p >> PAGE_SHIFT);
++		if (!allowed)
+ 			return -EPERM;
+ 
+-		/*
+-		 * On ia64 if a page has been mapped somewhere as uncached, then
+-		 * it must also be accessed uncached by the kernel or data
+-		 * corruption may occur.
+-		 */
+-		ptr = xlate_dev_mem_ptr(p);
+-		if (!ptr) {
+-			if (written)
+-				break;
+-			return -EFAULT;
+-		}
++		/* Skip actual writing when a page is marked as restricted. */
++		if (allowed == 1) {
++			/*
++			 * On ia64 if a page has been mapped somewhere as
++			 * uncached, then it must also be accessed uncached
++			 * by the kernel or data corruption may occur.
++			 */
++			ptr = xlate_dev_mem_ptr(p);
++			if (!ptr) {
++				if (written)
++					break;
++				return -EFAULT;
++			}
+ 
+-		copied = copy_from_user(ptr, buf, sz);
+-		unxlate_dev_mem_ptr(p, ptr);
+-		if (copied) {
+-			written += sz - copied;
+-			if (written)
+-				break;
+-			return -EFAULT;
++			copied = copy_from_user(ptr, buf, sz);
++			unxlate_dev_mem_ptr(p, ptr);
++			if (copied) {
++				written += sz - copied;
++				if (written)
++					break;
++				return -EFAULT;
++			}
+ 		}
+-
+ 		buf += sz;
+ 		p += sz;
+ 		count -= sz;
+ 		written += sz;
+ 	}
+-
+ 	*ppos += written;
+ 	return written;
+ }
+-- 
+1.7.5.4
+
