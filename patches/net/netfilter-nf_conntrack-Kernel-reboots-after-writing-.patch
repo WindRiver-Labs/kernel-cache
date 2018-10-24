@@ -1,0 +1,165 @@
+From b72cb4465bbe996667603c163932972a18f9f6e3 Mon Sep 17 00:00:00 2001
+From: Jiping Ma <jiping.ma2@windriver.com>
+Date: Mon, 15 Oct 2018 06:36:38 +0000
+Subject: [PATCH] netfilter: nf_conntrack: Kernel reboots after writing to
+ /sys/module/nf_conntrack/parameters/hashsize
+
+b16c29191dc89bd877af99a7b04ce4866728a3e0 upstream
+
+netfilter: nf_conntrack: use safer way to lock all buckets
+When we need to lock all buckets in the connection hashtable we'd attempt to
+lock 1024 spinlocks, which is way more preemption levels than supported by
+the kernel. Furthermore, this behavior was hidden by checking if lockdep is
+enabled, and if it was - use only 8 buckets(!).
+
+Fix this by using a global lock and synchronize all buckets on it when we
+need to lock them all. This is pretty heavyweight, but is only done when we
+need to resize the hashtable, and that doesn't happen often enough (or at all).
+
+Signed-off-by: Sasha Levin <sasha.levin@oracle.com>
+Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Reviewed-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Jiping Ma <jiping.ma2@windriver.com>
+---
+ include/net/netfilter/nf_conntrack_core.h |    7 +++---
+ net/netfilter/nf_conntrack_core.c         |   38 +++++++++++++++++++++--------
+ net/netfilter/nf_conntrack_helper.c       |    2 +-
+ net/netfilter/nf_conntrack_netlink.c      |    2 +-
+ 4 files changed, 33 insertions(+), 16 deletions(-)
+
+diff --git a/include/net/netfilter/nf_conntrack_core.h b/include/net/netfilter/nf_conntrack_core.h
+index f2f0fa3..a7ddde1 100644
+--- a/include/net/netfilter/nf_conntrack_core.h
++++ b/include/net/netfilter/nf_conntrack_core.h
+@@ -77,13 +77,12 @@ print_tuple(struct seq_file *s, const struct nf_conntrack_tuple *tuple,
+             const struct nf_conntrack_l3proto *l3proto,
+             const struct nf_conntrack_l4proto *proto);
+ 
+-#ifdef CONFIG_LOCKDEP
+-# define CONNTRACK_LOCKS 8
+-#else
+ # define CONNTRACK_LOCKS 1024
+-#endif
++
+ extern spinlock_t nf_conntrack_locks[CONNTRACK_LOCKS];
+ 
+ extern spinlock_t nf_conntrack_expect_lock;
+ 
++void nf_conntrack_lock(spinlock_t *lock) __acquires(lock);
++
+ #endif /* _NF_CONNTRACK_CORE_H */
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+index 13fad86..b90ffe6 100644
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -66,6 +66,21 @@ EXPORT_SYMBOL_GPL(nf_conntrack_locks);
+ __cacheline_aligned_in_smp DEFINE_SPINLOCK(nf_conntrack_expect_lock);
+ EXPORT_SYMBOL_GPL(nf_conntrack_expect_lock);
+ 
++static __read_mostly spinlock_t nf_conntrack_locks_all_lock;
++static __read_mostly bool nf_conntrack_locks_all;
++
++void nf_conntrack_lock(spinlock_t *lock) __acquires(lock)
++{
++	spin_lock(lock);
++	while (unlikely(nf_conntrack_locks_all)) {
++		spin_unlock(lock);
++		spin_lock(&nf_conntrack_locks_all_lock);
++		spin_unlock(&nf_conntrack_locks_all_lock);
++		spin_lock(lock);
++	}
++}
++EXPORT_SYMBOL_GPL(nf_conntrack_lock);
++
+ static void nf_conntrack_double_unlock(unsigned int h1, unsigned int h2)
+ {
+ 	h1 %= CONNTRACK_LOCKS;
+@@ -82,12 +97,12 @@ static bool nf_conntrack_double_lock(struct net *net, unsigned int h1,
+ 	h1 %= CONNTRACK_LOCKS;
+ 	h2 %= CONNTRACK_LOCKS;
+ 	if (h1 <= h2) {
+-		spin_lock(&nf_conntrack_locks[h1]);
++		nf_conntrack_lock(&nf_conntrack_locks[h1]);
+ 		if (h1 != h2)
+ 			spin_lock_nested(&nf_conntrack_locks[h2],
+ 					 SINGLE_DEPTH_NESTING);
+ 	} else {
+-		spin_lock(&nf_conntrack_locks[h2]);
++		nf_conntrack_lock(&nf_conntrack_locks[h2]);
+ 		spin_lock_nested(&nf_conntrack_locks[h1],
+ 				 SINGLE_DEPTH_NESTING);
+ 	}
+@@ -102,16 +117,19 @@ static void nf_conntrack_all_lock(void)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < CONNTRACK_LOCKS; i++)
+-		spin_lock_nested(&nf_conntrack_locks[i], i);
++	spin_lock(&nf_conntrack_locks_all_lock);
++	nf_conntrack_locks_all = true;
++
++	for (i = 0; i < CONNTRACK_LOCKS; i++) {
++		spin_lock(&nf_conntrack_locks[i]);
++		spin_unlock(&nf_conntrack_locks[i]);
++	}
+ }
+ 
+ static void nf_conntrack_all_unlock(void)
+ {
+-	int i;
+-
+-	for (i = 0; i < CONNTRACK_LOCKS; i++)
+-		spin_unlock(&nf_conntrack_locks[i]);
++	nf_conntrack_locks_all = false;
++	spin_unlock(&nf_conntrack_locks_all_lock);
+ }
+ 
+ unsigned int nf_conntrack_htable_size __read_mostly;
+@@ -733,7 +751,7 @@ restart:
+ 	hash = hash_bucket(_hash, net);
+ 	for (; i < net->ct.htable_size; i++) {
+ 		lockp = &nf_conntrack_locks[hash % CONNTRACK_LOCKS];
+-		spin_lock(lockp);
++		nf_conntrack_lock(lockp);
+ 		if (read_seqcount_retry(&net->ct.generation, sequence)) {
+ 			spin_unlock(lockp);
+ 			goto restart;
+@@ -1357,7 +1375,7 @@ get_next_corpse(struct net *net, int (*iter)(struct nf_conn *i, void *data),
+ 	for (; *bucket < net->ct.htable_size; (*bucket)++) {
+ 		lockp = &nf_conntrack_locks[*bucket % CONNTRACK_LOCKS];
+ 		local_bh_disable();
+-		spin_lock(lockp);
++		nf_conntrack_lock(lockp);
+ 		if (*bucket < net->ct.htable_size) {
+ 			hlist_nulls_for_each_entry(h, n, &net->ct.hash[*bucket], hnnode) {
+ 				if (NF_CT_DIRECTION(h) != IP_CT_DIR_ORIGINAL)
+diff --git a/net/netfilter/nf_conntrack_helper.c b/net/netfilter/nf_conntrack_helper.c
+index bd9d315..3b40ec5 100644
+--- a/net/netfilter/nf_conntrack_helper.c
++++ b/net/netfilter/nf_conntrack_helper.c
+@@ -425,7 +425,7 @@ static void __nf_conntrack_helper_unregister(struct nf_conntrack_helper *me,
+ 	}
+ 	local_bh_disable();
+ 	for (i = 0; i < net->ct.htable_size; i++) {
+-		spin_lock(&nf_conntrack_locks[i % CONNTRACK_LOCKS]);
++		nf_conntrack_lock(&nf_conntrack_locks[i % CONNTRACK_LOCKS]);
+ 		if (i < net->ct.htable_size) {
+ 			hlist_nulls_for_each_entry(h, nn, &net->ct.hash[i], hnnode)
+ 				unhelp(h, me);
+diff --git a/net/netfilter/nf_conntrack_netlink.c b/net/netfilter/nf_conntrack_netlink.c
+index 6b8b0ab..868dc72 100644
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@ -808,7 +808,7 @@ ctnetlink_dump_table(struct sk_buff *skb, struct netlink_callback *cb)
+ 	for (; cb->args[0] < net->ct.htable_size; cb->args[0]++) {
+ restart:
+ 		lockp = &nf_conntrack_locks[cb->args[0] % CONNTRACK_LOCKS];
+-		spin_lock(lockp);
++		nf_conntrack_lock(lockp);
+ 		if (cb->args[0] >= net->ct.htable_size) {
+ 			spin_unlock(lockp);
+ 			goto out;
+-- 
+1.7.9.5
+
