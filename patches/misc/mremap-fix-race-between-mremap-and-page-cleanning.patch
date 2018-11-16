@@ -1,0 +1,237 @@
+From de725d43b4c9d6790df22ae5bbdcb190a7dc7e7a Mon Sep 17 00:00:00 2001
+From: Aaron Lu <aaron.lu@intel.com>
+Date: Thu, 10 Nov 2016 17:16:33 +0800
+Subject: [PATCH 1/2] mremap: fix race between mremap() and page cleanning
+
+commit 5d1904204c99596b50a700f092fe49d78edba400 upstream
+
+Prior to 3.15, there was a race between zap_pte_range() and
+page_mkclean() where writes to a page could be lost.  Dave Hansen
+discovered by inspection that there is a similar race between
+move_ptes() and page_mkclean().
+
+We've been able to reproduce the issue by enlarging the race window with
+a msleep(), but have not been able to hit it without modifying the code.
+So, we think it's a real issue, but is difficult or impossible to hit in
+practice.
+
+The zap_pte_range() issue is fixed by commit 1cf35d47712d("mm: split
+'tlb_flush_mmu()' into tlb flushing and memory freeing parts").  And
+this patch is to fix the race between page_mkclean() and mremap().
+
+Here is one possible way to hit the race: suppose a process mmapped a
+file with READ | WRITE and SHARED, it has two threads and they are bound
+to 2 different CPUs, e.g.  CPU1 and CPU2.  mmap returned X, then thread
+1 did a write to addr X so that CPU1 now has a writable TLB for addr X
+on it.  Thread 2 starts mremaping from addr X to Y while thread 1
+cleaned the page and then did another write to the old addr X again.
+The 2nd write from thread 1 could succeed but the value will get lost.
+
+        thread 1                           thread 2
+     (bound to CPU1)                    (bound to CPU2)
+
+  1: write 1 to addr X to get a
+     writeable TLB on this CPU
+
+                                        2: mremap starts
+
+                                        3: move_ptes emptied PTE for addr X
+                                           and setup new PTE for addr Y and
+                                           then dropped PTL for X and Y
+
+  4: page laundering for N by doing
+     fadvise FADV_DONTNEED. When done,
+     pageframe N is deemed clean.
+
+  5: *write 2 to addr X
+
+                                        6: tlb flush for addr X
+
+  7: munmap (Y, pagesize) to make the
+     page unmapped
+
+  8: fadvise with FADV_DONTNEED again
+     to kick the page off the pagecache
+
+  9: pread the page from file to verify
+     the value. If 1 is there, it means
+     we have lost the written 2.
+
+  *the write may or may not cause segmentation fault, it depends on
+  if the TLB is still on the CPU.
+
+Please note that this is only one specific way of how the race could
+occur, it didn't mean that the race could only occur in exact the above
+config, e.g. more than 2 threads could be involved and fadvise() could
+be done in another thread, etc.
+
+For anonymous pages, they could race between mremap() and page reclaim:
+THP: a huge PMD is moved by mremap to a new huge PMD, then the new huge
+PMD gets unmapped/splitted/pagedout before the flush tlb happened for
+the old huge PMD in move_page_tables() and we could still write data to
+it.  The normal anonymous page has similar situation.
+
+To fix this, check for any dirty PTE in move_ptes()/move_huge_pmd() and
+if any, did the flush before dropping the PTL.  If we did the flush for
+every move_ptes()/move_huge_pmd() call then we do not need to do the
+flush in move_pages_tables() for the whole range.  But if we didn't, we
+still need to do the whole range flush.
+
+Alternatively, we can track which part of the range is flushed in
+move_ptes()/move_huge_pmd() and which didn't to avoid flushing the whole
+range in move_page_tables().  But that would require multiple tlb
+flushes for the different sub-ranges and should be less efficient than
+the single whole range flush.
+
+KBuild test on my Sandybridge desktop doesn't show any noticeable change.
+v4.9-rc4:
+  real    5m14.048s
+  user    32m19.800s
+  sys     4m50.320s
+
+With this commit:
+  real    5m13.888s
+  user    32m19.330s
+  sys     4m51.200s
+
+Reported-by: Dave Hansen <dave.hansen@intel.com>
+Signed-off-by: Aaron Lu <aaron.lu@intel.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Rui Wang <rui.wang@windriver.com>
+---
+ include/linux/huge_mm.h |    2 +-
+ mm/huge_memory.c        |    9 ++++++++-
+ mm/mremap.c             |   32 ++++++++++++++++++++++----------
+ 3 files changed, 31 insertions(+), 12 deletions(-)
+
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index a193bb3..d85e10a 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -29,7 +29,7 @@ extern int move_huge_pmd(struct vm_area_struct *vma,
+ 			 struct vm_area_struct *new_vma,
+ 			 unsigned long old_addr,
+ 			 unsigned long new_addr, unsigned long old_end,
+-			 pmd_t *old_pmd, pmd_t *new_pmd);
++			 pmd_t *old_pmd, pmd_t *new_pmd, bool *need_flush);
+ extern int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+ 			unsigned long addr, pgprot_t newprot,
+ 			int prot_numa);
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 1cbc935..1cac6b2 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -1439,12 +1439,13 @@ int mincore_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+ int move_huge_pmd(struct vm_area_struct *vma, struct vm_area_struct *new_vma,
+ 		  unsigned long old_addr,
+ 		  unsigned long new_addr, unsigned long old_end,
+-		  pmd_t *old_pmd, pmd_t *new_pmd)
++		  pmd_t *old_pmd, pmd_t *new_pmd, bool *need_flush)
+ {
+ 	int ret = 0;
+ 	pmd_t pmd;
+ 
+ 	struct mm_struct *mm = vma->vm_mm;
++	bool force_flush = false;
+ 
+ 	if ((old_addr & ~HPAGE_PMD_MASK) ||
+ 	    (new_addr & ~HPAGE_PMD_MASK) ||
+@@ -1463,9 +1464,15 @@ int move_huge_pmd(struct vm_area_struct *vma, struct vm_area_struct *new_vma,
+ 
+ 	ret = __pmd_trans_huge_lock(old_pmd, vma);
+ 	if (ret == 1) {
++		if (pmd_present(*old_pmd) && pmd_dirty(*old_pmd))
++			force_flush = true;
+ 		pmd = pmdp_get_and_clear(mm, old_addr, old_pmd);
+ 		VM_BUG_ON(!pmd_none(*new_pmd));
+ 		set_pmd_at(mm, new_addr, new_pmd, pmd);
++		if (force_flush)
++			flush_tlb_range(vma, old_addr, old_addr + PMD_SIZE);
++		else
++			*need_flush = true;
+ 		spin_unlock(&mm->page_table_lock);
+ 	}
+ out:
+diff --git a/mm/mremap.c b/mm/mremap.c
+index c0c7a92..f626a78 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -72,13 +72,15 @@ static pmd_t *alloc_new_pmd(struct mm_struct *mm, struct vm_area_struct *vma,
+ static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
+ 		unsigned long old_addr, unsigned long old_end,
+ 		struct vm_area_struct *new_vma, pmd_t *new_pmd,
+-		unsigned long new_addr, bool need_rmap_locks)
++		unsigned long new_addr, bool need_rmap_locks, bool *need_flush)
+ {
+ 	struct address_space *mapping = NULL;
+ 	struct anon_vma *anon_vma = NULL;
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pte_t *old_pte, *new_pte, pte;
+ 	spinlock_t *old_ptl, *new_ptl;
++	bool force_flush = false;
++	unsigned long len = old_end - old_addr;
+ 
+ 	/*
+ 	 * When need_rmap_locks is true, we take the i_mmap_mutex and anon_vma
+@@ -124,6 +126,14 @@ static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
+ 				   new_pte++, new_addr += PAGE_SIZE) {
+ 		if (pte_none(*old_pte))
+ 			continue;
++
++		/*
++		 * We are remapping a dirty PTE, make sure to
++		 * flush TLB before we drop the PTL for the
++		 * old PTE or we may race with page_mkclean().
++		 */
++		if (pte_present(*old_pte) && pte_dirty(*old_pte))
++			force_flush = true;
+ 		pte = ptep_get_and_clear(mm, old_addr, old_pte);
+ 		pte = move_pte(pte, new_vma->vm_page_prot, old_addr, new_addr);
+ 
+@@ -138,6 +148,10 @@ static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
+ 	arch_leave_lazy_mmu_mode();
+ 	if (new_ptl != old_ptl)
+ 		spin_unlock(new_ptl);
++	if (force_flush)
++		flush_tlb_range(vma, old_end - len, old_end);
++	else
++		*need_flush = true;
+ 	pte_unmap(new_pte - 1);
+ 	pte_unmap_unlock(old_pte - 1, old_ptl);
+ 	if (anon_vma)
+@@ -184,13 +198,12 @@ unsigned long move_page_tables(struct vm_area_struct *vma,
+ 			if (extent == HPAGE_PMD_SIZE)
+ 				err = move_huge_pmd(vma, new_vma, old_addr,
+ 						    new_addr, old_end,
+-						    old_pmd, new_pmd);
+-			if (err > 0) {
+-				need_flush = true;
++						    old_pmd, new_pmd,
++						    &need_flush);
++			if (err > 0)
+ 				continue;
+-			} else if (!err) {
++			else if (!err)
+ 				split_huge_page_pmd(vma, old_addr, old_pmd);
+-			}
+ 			VM_BUG_ON(pmd_trans_huge(*old_pmd));
+ 		}
+ 		if (pmd_none(*new_pmd) && __pte_alloc(new_vma->vm_mm, new_vma,
+@@ -201,11 +214,10 @@ unsigned long move_page_tables(struct vm_area_struct *vma,
+ 			extent = next - new_addr;
+ 		if (extent > LATENCY_LIMIT)
+ 			extent = LATENCY_LIMIT;
+-		move_ptes(vma, old_pmd, old_addr, old_addr + extent,
+-			  new_vma, new_pmd, new_addr, need_rmap_locks);
+-		need_flush = true;
++		move_ptes(vma, old_pmd, old_addr, old_addr + extent, new_vma,
++			  new_pmd, new_addr, need_rmap_locks, &need_flush);
+ 	}
+-	if (likely(need_flush))
++	if (need_flush)
+ 		flush_tlb_range(vma, old_end-len, old_addr);
+ 
+ 	mmu_notifier_invalidate_range_end(vma->vm_mm, mmun_start, mmun_end);
+-- 
+1.7.9.5
+
